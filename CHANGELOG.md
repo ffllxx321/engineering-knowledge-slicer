@@ -29,6 +29,11 @@
 - `DEFAULT_SETTINGS.settingsVersion` 4 → 5；
 - `manifest.json` 版本 1.1.2 → 1.1.3。
 
+### 🐞 Hotfix — 2026-07-14
+- **跨 bundle 模块作用域修复**：v1.1.3 把 `normalizeUnicodeForm` 加在 main.js 顶层，但 `"src/core/migration.js"` 是 IIFE 内独立作用域模块，导致 `migrateTaskLedgerV3` 引用该函数时抛 `normalizeUnicodeForm is not defined`。
+- 修复：在 `src/core/migration.js` 模块内**内嵌一份与主定义完全一致的副本**（含 NFC 规范化、控制字符剥离、全角空格替换）。
+- 同样的主定义保留在主 IIFE 顶层（plugin class 方法闭包可见），保持单一职责。
+
 ---
 
 ## v1.1.2 — 2026-07-14 升级正确性修复

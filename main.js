@@ -3166,6 +3166,19 @@ const crypto = require("crypto");
 const LEGACY_ACTIVE = new Set(['extracting', 'parsing', 'classifying', 'summarizing', 'slicing', 'atomizing', 'validating', 'writing']);
 const VALID_TERMINAL = new Set(['queued', 'written', 'needs_review', 'failed', 'skipped', 'cancelled', 'unsupported', 'paused']);
 
+// v1.1.3: bundle 内每个模块都是独立作用域，main.js 顶层定义进不来。
+// 这里保留一份与主定义完全一致的局部副本，专门给 migrateTaskLedgerV3 用。
+function normalizeUnicodeForm(value) {
+  let str = String(value || '');
+  if (!str) return str;
+  if (typeof str.normalize === 'function') {
+    try { str = str.normalize('NFC'); } catch { /* 不可用则忽略 */ }
+  }
+  str = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]﻿/g, '');
+  str = str.replace(/[  ]/g, ' ');
+  return str;
+}
+
 function migrateTaskLedgerV3(tasks, versions = {}) {
   const pipelineVersion = versions.pipelineVersion || '1.1.1';
   const promptBundleVersion = versions.promptBundleVersion || '1.1';

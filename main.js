@@ -38,6 +38,16 @@ const { runKnowledgeWorkflow } = require("src/core/workflow.js");
 const { buildCardRecord, cardFileName, renderKnowledgeCard, renderStructuredSummary } = require("src/core/markdown-renderer.js");
 const { groupReviewItems, applyBatchAction } = require("src/core/review-service.js");
 
+// v1.1.9: 把诊断共享状态挂到 globalThis，让 src/core/ai-pipeline.js 等独立闭包模块也能调用 diag()
+// 历史背景：v1.1.6 起在 src/core/ai-pipeline.js（line 3928-4609）里加了 3 个 diag() 调用
+//          （minimax.timeout / minimax.transport / minimax.http），但 ai-pipeline.js 是独立 bundle 模块闭包，
+//          main.js 里 function diag 对它不可见，运行到错路径时直接报 "diag is not defined"。
+// 修复：所有 diag / keyFingerprint / 缓冲都通过 globalThis.__eksDiag，单一来源；各模块加 1 行 wrapper 即可访问。
+//      这样保持 main.js 现有 16 处 diag() 调用源码不动，ai-pipeline.js 也只需加一个本地函数名。
+if (!globalThis.__eksDiag) {
+  globalThis.__eksDiag = { state: { logPath: null, buffer: [], flushTimer: null } };
+}
+
 // v1.1.3 + v1.1.5: 字符串规范化工具，做 NFC + 控制字符剥离 + 全角→半角空格。
 // 必须放在 main.js 模块的"主代码区"（plugin class 闭包能直接看到的位置）。
 // 之前误放在 src/core/task.js 模块内，那是独立作用域，main.js 模块内的 plugin class 方法看不到。
@@ -58,9 +68,8 @@ function normalizeUnicodeForm(value) {
 // 用户在 Obsidian DevTools Console 里 grep 一行就能定位。
 // v1.1.7: 同时写到 .obsidian/plugins/engineering-knowledge-slicer/diag.log 文件，
 //        让没法开 DevTools 的用户也能拿到日志（用 Obsidian 自身打开该 Markdown 文件即可查看）。
-let __diagLogPath = null;
-let __diagBuffer = [];
-let __diagFlushTimer = null;
+// v1.1.9: 共享状态 (__diagLogPath / __diagBuffer / __diagFlushTimer) 全部搬上 globalThis.__eksDiag.state，
+//        这样 src/core/ai-pipeline.js 等独立 bundle 模块（line 3928-4609）也能写入同一个 diag.log。
 function diag(scope, payload) {
   try {
     const data = payload && typeof payload === 'object' ? payload : { value: payload };
@@ -74,18 +83,21 @@ function diag(scope, payload) {
     const line = `[EKS diag] ${scope} ${serialized}`;
     console.log(line);
     // 写入文件：先入缓冲区，1 秒后批量 flush，避免每条诊断都同步 IO 卡 UI
-    if (__diagLogPath) {
-      __diagBuffer.push(new Date().toISOString() + ' ' + line);
-      if (!__diagFlushTimer) {
-        __diagFlushTimer = setTimeout(flushDiagLog, 1000);
+    const state = globalThis.__eksDiag && globalThis.__eksDiag.state;
+    if (state && state.logPath) {
+      state.buffer.push(new Date().toISOString() + ' ' + line);
+      if (!state.flushTimer) {
+        state.flushTimer = setTimeout(flushDiagLog, 1000);
       }
     }
   } catch (e) { /* 诊断日志自身不能炸 */ }
 }
 
 function flushDiagLog() {
-  __diagFlushTimer = null;
-  if (!__diagLogPath || !__diagBuffer.length) return;
+  const state = globalThis.__eksDiag && globalThis.__eksDiag.state;
+  if (!state) return;
+  state.flushTimer = null;
+  if (!state.logPath || !state.buffer.length) return;
   try {
     const fs = require('fs');
     const path = require('path');
@@ -95,16 +107,16 @@ function flushDiagLog() {
       '',
       '> 这份文件由插件自动写入，记录所有 `[EKS diag]` 诊断事件。',
       '> 复制本文件全部内容（除了这一段说明）发给开发者即可定位问题。',
-      '> 文件位置：`' + __diagLogPath + '`',
+      '> 文件位置：`' + state.logPath + '`',
       '> 日志会自动 trim 到最近约 2000 行，避免文件无限增长。',
       '',
       ''
     ].join('\n');
-    const lines = __diagBuffer.join('\n') + '\n';
-    __diagBuffer = [];
+    const lines = state.buffer.join('\n') + '\n';
+    state.buffer = [];
     // 读旧内容、追加、trim
     let existing = '';
-    try { existing = fs.readFileSync(__diagLogPath, 'utf-8'); } catch (_) { /* 不存在则忽略 */ }
+    try { existing = fs.readFileSync(state.logPath, 'utf-8'); } catch (_) { /* 不存在则忽略 */ }
     // 去掉旧 header（如果存在）再合并
     const headerEndMarker = '\n\n';
     const oldBodyStart = existing.indexOf(headerEndMarker + headerEndMarker);
@@ -114,8 +126,8 @@ function flushDiagLog() {
     const allLines = merged.split('\n');
     const MAX_LINES = 2000;
     const trimmed = allLines.length > MAX_LINES ? allLines.slice(allLines.length - MAX_LINES).join('\n') : merged;
-    fs.mkdirSync(path.dirname(__diagLogPath), { recursive: true });
-    fs.writeFileSync(__diagLogPath, trimmed, 'utf-8');
+    fs.mkdirSync(path.dirname(state.logPath), { recursive: true });
+    fs.writeFileSync(state.logPath, trimmed, 'utf-8');
   } catch (e) {
     // 写日志失败不能炸插件
     try { console.warn('[EKS diag] flush failed', String(e && e.message || e)); } catch (_) {}
@@ -124,7 +136,8 @@ function flushDiagLog() {
 
 // 强制立即 flush（用于进程退出前的最后一批日志）
 function forceFlushDiag() {
-  if (__diagFlushTimer) { clearTimeout(__diagFlushTimer); __diagFlushTimer = null; }
+  const state = globalThis.__eksDiag && globalThis.__eksDiag.state;
+  if (state && state.flushTimer) { clearTimeout(state.flushTimer); state.flushTimer = null; }
   flushDiagLog();
 }
 
@@ -236,8 +249,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const adapter = this.app.vault && this.app.vault.adapter;
       if (adapter && typeof adapter.getBasePath === 'function') {
         const path = require('path');
-        __diagLogPath = path.join(adapter.getBasePath(), '.obsidian', 'plugins', 'engineering-knowledge-slicer', 'diag.log');
-        diag('onload.diagLogPath', { path: __diagLogPath });
+        // v1.1.9: logPath 现在是 globalThis.__eksDiag.state 上的共享变量
+        globalThis.__eksDiag.state.logPath = path.join(adapter.getBasePath(), '.obsidian', 'plugins', 'engineering-knowledge-slicer', 'diag.log');
+        diag('onload.diagLogPath', { path: globalThis.__eksDiag.state.logPath });
       }
     } catch (_) { /* 取不到路径就退化到 console only */ }
     diag('onload.keys.effective', {
@@ -281,12 +295,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
     this.addSettingTab(new SlicerSettingTab(this.app, this));
     // v1.1.7: 通知用户诊断日志文件位置（首次加载时显示一次，之后静默）
+    // v1.1.9: 通知版本也跟进，避免旧用户重复弹窗同时提醒现在 diag 对所有路径都能写入
     try {
       const prev = await this.loadData();
-      const notified = prev && prev.__diagLogNotifiedVersion === '1.1.7';
-      if (!notified && __diagLogPath) {
-        new Notice(`工程知识切片 诊断日志已启用：${__diagLogPath}\n遇到问题时把该文件内容发给我即可定位。`);
-        this.settings.__diagLogNotifiedVersion = '1.1.7';
+      const notified = prev && prev.__diagLogNotifiedVersion === '1.1.9';
+      const logPath = globalThis.__eksDiag && globalThis.__eksDiag.state && globalThis.__eksDiag.state.logPath;
+      if (!notified && logPath) {
+        new Notice(`工程知识切片 诊断日志已启用：${logPath}\n遇到问题时把该文件内容发给我即可定位。`);
+        this.settings.__diagLogNotifiedVersion = '1.1.9';
         await this.saveData(this.settings);
       }
     } catch (_) { /* 通知失败不能影响插件加载 */ }
@@ -370,12 +386,17 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
   // v1.1.8: 轻量级进度刷新，只更新进度条 DOM 属性 + 已用时文本
   // 不写盘、不重渲染整个 dashboard，给 1 秒一次心跳用
+  // v1.1.9: 加 try/catch 兜底 + null-safe 迭代，避免心跳触发 "object is not iterable" 把插件炸掉
   refreshProgressOnly(task) {
-    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_SLICER)) {
-      if (leaf.view && typeof leaf.view.refreshProgress === 'function') {
-        try { leaf.view.refreshProgress(task); } catch (_) { /* 单个视图失败不影响其他 */ }
+    try {
+      if (!this.app || !this.app.workspace || typeof this.app.workspace.getLeavesOfType !== 'function') return;
+      const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SLICER) || [];
+      for (const leaf of leaves) {
+        if (leaf && leaf.view && typeof leaf.view.refreshProgress === 'function') {
+          try { leaf.view.refreshProgress(task); } catch (_) { /* 单个视图失败不影响其他 */ }
+        }
       }
-    }
+    } catch (_) { /* 心跳失败不能炸插件 */ }
   }
 
   openSettings() {
@@ -2114,7 +2135,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 8,
+  settingsVersion: 9,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -2167,7 +2188,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 8;
+  migrated.settingsVersion = 9;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -3927,6 +3948,18 @@ module.exports = { validateSchema };
 },
 "src/core/ai-pipeline.js": function(require, module, exports) {
 const { validateSchema } = require("src/core/schema-validator.js");
+
+// v1.1.9: ai-pipeline.js 是独立 bundle 模块闭包，main.js 里的本地 function diag 对它不可见。
+// 通过 globalThis.__eksDiag 委托到唯一的诊断入口，确保 minimax.timeout/transport/http 等
+// 失败打点能正常工作而不报 "diag is not defined"。若共享诊断还没初始化，则静默 no-op（不抛错）。
+function diag(scope, payload) {
+  try { return globalThis.__eksDiag && globalThis.__eksDiag.diag ? globalThis.__eksDiag.diag(scope, payload) : undefined; }
+  catch (_) { /* 诊断日志自身不能炸 */ }
+}
+function keyFingerprint(value) {
+  try { return globalThis.__eksDiag && globalThis.__eksDiag.keyFingerprint ? globalThis.__eksDiag.keyFingerprint(value) : 'fp:<unavailable>'; }
+  catch (_) { return 'fp:<unavailable>'; }
+}
 
 function buildClassificationPrompt({ classifierPrompt, folderMap, parsePackage }) {
   const whitelist = (folderMap.routes || []).map((route) => ({

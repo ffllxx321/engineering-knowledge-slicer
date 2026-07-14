@@ -1,5 +1,33 @@
 # 工程知识切片 变更记录
 
+## v1.1.9 — 2026-07-14 diag 跨模块作用域修复
+
+### 🔴 修了两个 v1.1.8 残留的报错
+
+**1. `ReferenceError: diag is not defined`**
+
+v1.1.6 在 `src/core/ai-pipeline.js` 模块（main.js bundle 内 line 3928-4609）里加了 3 个 `diag()` 调用（`minimax.timeout` / `minimax.transport` / `minimax.http`），但 **ai-pipeline.js 是和 main.js 各自独立的 IIFE 闭包模块** —— main.js 模块里 `function diag` 对它**词法不可见**。v1.1.8 暴露了这个 bug：用户一触发请求失败路径，ai-pipeline 的 catch handler 调用 `diag(...)` 就 throw `ReferenceError`。
+
+**修复**：把共享状态（`__diagLogPath` / `__diagBuffer` / `__diagFlushTimer`）和 `diag` / `keyFingerprint` / `flushDiagLog` / `forceFlushDiag` 全部搬到 `globalThis.__eksDiag`。`ai-pipeline.js` 顶部加两个一行的本地 wrapper（`function diag` 委托到 `globalThis.__eksDiag.diag`），保持 main.js 现有 16 处 diag 调用源代码 0 改动。共享缓冲写同一个 diag.log 文件。
+
+**历史背景**：这是 v1.1.3 / v1.1.5 修过的**同款 scope 错第二次出现**（当时是 `normalizeUnicodeForm`）。修法也保持同款：用 `globalThis` 当跨模块的"全局黑板"，本地 wrapper 收敛。
+
+**2. `TypeError: object is not iterable`（疑似 heartbeat 触发空迭代）**
+
+v1.1.8 新增 `refreshProgressOnly()` 给心跳用，每秒一次迭代 `this.app.workspace.getLeavesOfType(...)`。如果在 Obsidian 还没完全就绪（如 view 还没 open）的瞬间心跳触发，`getLeavesOfType` 可能拿到异常值。
+
+**修复**：`refreshProgressOnly` 加防御：
+- `if (!this.app || !this.app.workspace || typeof this.app.workspace.getLeavesOfType !== 'function') return;`
+- 叶子数组也用 `|| []` 兜底
+- 单 leaf.refreshProgress 也包 try/catch
+- 整个方法外再包一层 try/catch，确保心跳自身永不炸插件
+
+### ⚙ 版本号
+- `DEFAULT_SETTINGS.settingsVersion` 8 → **9**
+- `manifest.json` 版本 1.1.8 → **1.1.9**
+
+---
+
 ## v1.1.8 — 2026-07-14 实时进度条
 
 ### 📊 进度条 UI

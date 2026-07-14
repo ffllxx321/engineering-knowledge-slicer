@@ -1,0 +1,285 @@
+.eks-view {
+  --eks-border: var(--background-modifier-border);
+  --eks-muted: var(--text-muted);
+  --eks-panel: var(--background-secondary);
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
+  padding: 16px;
+}
+
+.workspace-leaf-content[data-type="engineering-knowledge-slicer-dashboard"] .view-content {
+  overflow: hidden;
+}
+
+.eks-header,
+.eks-actions,
+.eks-row-actions,
+.eks-paths {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.eks-header {
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.eks-header h2,
+.eks-header h3 {
+  margin: 0;
+}
+
+.eks-overview,
+.eks-queue,
+.eks-review {
+  margin-bottom: 12px;
+}
+
+.eks-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+  gap: 8px;
+  margin-bottom: 0;
+}
+
+.eks-compact-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(136px, 1fr));
+  gap: 8px;
+  margin: 8px 0 12px;
+}
+
+.eks-progress-message {
+  border: 1px solid var(--eks-border);
+  border-radius: 6px;
+  padding: 10px;
+  background: var(--background-primary);
+  font-weight: 600;
+}
+
+.eks-progress-title {
+  color: var(--eks-muted);
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.eks-progress-text {
+  overflow-wrap: anywhere;
+}
+
+.eks-stat {
+  border: 1px solid var(--eks-border);
+  border-radius: 6px;
+  padding: 10px;
+  background: var(--background-primary);
+}
+
+.eks-stat-value {
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.eks-stat-label,
+.eks-task-meta,
+.eks-empty {
+  color: var(--eks-muted);
+  font-size: 12px;
+}
+
+.eks-paths,
+.eks-ecosystem,
+.eks-quick-settings {
+  border: 1px solid var(--eks-border);
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+
+.eks-paths {
+  flex: 0 0 auto;
+  margin-bottom: 0;
+}
+
+.eks-ecosystem h3 {
+  margin: 0 0 8px;
+}
+
+.eks-quick-settings {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.eks-quick-settings h3 {
+  margin: 0 8px 0 0;
+}
+
+.eks-quick-settings input,
+.eks-quick-settings select {
+  min-width: 220px;
+}
+
+.eks-draft-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+}
+
+.eks-draft-table th,
+.eks-draft-table td {
+  border-top: 1px solid var(--eks-border);
+  padding: 4px 6px;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.eks-draft-table th {
+  width: 140px;
+  color: var(--eks-muted);
+  font-weight: 600;
+}
+
+.eks-plugin-row {
+  display: grid;
+  grid-template-columns: 72px 140px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  padding: 4px 0;
+}
+
+.eks-plugin-ok {
+  color: var(--text-success);
+  font-weight: 600;
+}
+
+.eks-plugin-muted {
+  color: var(--eks-muted);
+}
+
+.eks-panel {
+  min-width: 0;
+  border: 1px solid var(--eks-border);
+  border-radius: 6px;
+  padding: 12px;
+  background: var(--eks-panel);
+}
+
+.eks-panel h3 {
+  margin-top: 0;
+}
+
+.eks-overview h3 {
+  margin: 0;
+}
+
+.eks-review {
+  display: flex;
+  flex: 1 1 120px;
+  flex-direction: column;
+  font-size: 0.82em;
+  min-height: 96px;
+  overflow: hidden;
+}
+
+.eks-review-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 6px;
+}
+
+.eks-review h4 {
+  font-size: 1em;
+  line-height: 1.35;
+}
+
+.eks-review .eks-draft-table th,
+.eks-review .eks-draft-table td,
+.eks-review .eks-task-meta,
+.eks-review .eks-empty {
+  font-size: 0.92em;
+}
+
+.eks-review button {
+  font-size: 0.9em;
+  padding: 4px 8px;
+}
+
+.eks-review-group {
+  border-top: 1px solid var(--eks-border);
+  padding: 10px 0 12px;
+}
+
+.eks-review-group:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.eks-review-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.eks-review-group-header h4 {
+  margin: 0 0 4px;
+  overflow-wrap: anywhere;
+}
+
+.eks-review-reason {
+  margin: 4px 0;
+  color: var(--text-warning);
+  overflow-wrap: anywhere;
+}
+
+.eks-task-row,
+.eks-draft {
+  border-top: 1px solid var(--eks-border);
+  padding: 10px 0;
+}
+
+.eks-task-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: start;
+}
+
+.eks-task-title {
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+.eks-draft-block {
+  margin-bottom: 16px;
+}
+
+.eks-draft pre {
+  max-height: 360px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px solid var(--eks-border);
+  background: var(--background-primary);
+  white-space: pre-wrap;
+}
+
+@media (max-width: 920px) {
+  .eks-task-row {
+    grid-template-columns: 20px minmax(0, 1fr);
+  }
+
+  .eks-row-actions {
+    grid-column: 2;
+  }
+}

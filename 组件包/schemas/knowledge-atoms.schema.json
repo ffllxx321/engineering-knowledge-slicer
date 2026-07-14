@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "engineering-knowledge-slicer://schema/knowledge-atoms-1.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["atoms", "coverage", "schema_version"],
+  "properties": {
+    "atoms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["atom_id", "title", "card_kind", "library", "folder_type", "content", "source", "model_confidence", "validation_issues"],
+        "properties": {
+          "atom_id": { "type": "string" },
+          "title": { "type": "string" },
+          "card_kind": { "enum": ["static", "event"] },
+          "Info_Type": { "type": "string" },
+          "Event_Type": { "type": "string" },
+          "library": { "enum": ["bid", "business"] },
+          "folder_type": { "type": "string" },
+          "Category": { "type": "string" },
+          "TagL1": { "type": "string" },
+          "TagL2": { "type": "string" },
+          "content": { "type": "object" },
+          "source": {
+            "type": "object",
+            "required": ["source_link", "source_locator", "evidence_quote", "parent_summary"]
+          },
+          "related_candidates": { "type": "array", "items": { "type": "object" } },
+          "model_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "validation_issues": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["point_ids", "complete"],
+      "properties": {
+        "point_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "complete": { "type": "boolean" }
+      }
+    },
+    "schema_version": { "const": "1.1" }
+  }
+}

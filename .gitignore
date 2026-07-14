@@ -1,0 +1,23 @@
+# Obsidian plugin build artifacts
+node_modules/
+*.log
+.DS_Store
+
+# esbuild 输出（仅当使用 src/ 开发时）
+main.js.map
+
+# 用户本地 data（绝不进版本库）
+data.json
+data.json.*-backup
+
+# 临时测试
+tmp/
+test-out/
+
+# Python 缓存（paddleocr_extract.py 引用）
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "engineering-knowledge-slicer://schema/parse-package-1.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source_path", "source_hash", "source_type", "parser", "language", "markdown", "pages", "quality", "schema_version"],
+  "properties": {
+    "source_path": { "type": "string", "minLength": 1 },
+    "source_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "source_type": { "type": "string", "minLength": 1 },
+    "parser": { "enum": ["mineru-api", "paddleocr-api", "text-normalizer", "eml-parser"] },
+    "parser_model": { "type": "string" },
+    "remote_job_id": { "type": "string" },
+    "language": { "enum": ["zh", "en", "ja", "mixed", "unknown"] },
+    "markdown": { "type": "string" },
+    "pages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["page", "text"],
+        "properties": {
+          "page": { "type": "integer", "minimum": 1 },
+          "text": { "type": "string" }
+        }
+      }
+    },
+    "images": { "type": "array", "items": { "type": "object" } },
+    "quality": {
+      "type": "object",
+      "required": ["readable", "score", "components"],
+      "properties": {
+        "readable": { "type": "boolean" },
+        "score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "components": { "type": "object" }
+      }
+    },
+    "schema_version": { "const": "1.1" }
+  }
+}

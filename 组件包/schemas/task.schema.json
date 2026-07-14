@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "engineering-knowledge-slicer://schema/task-1.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "run_id", "source_path", "source_hash", "source_type", "library", "pipeline_version", "prompt_bundle_version", "schema_version", "status", "created_at", "updated_at"],
+  "properties": {
+    "task_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "source_path": { "type": "string", "minLength": 1 },
+    "source_aliases": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "source_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "source_type": { "type": "string", "minLength": 1 },
+    "library": { "enum": ["bid", "business"] },
+    "pipeline_version": { "type": "string", "minLength": 1 },
+    "prompt_bundle_version": { "type": "string", "minLength": 1 },
+    "schema_version": { "const": "1.1" },
+    "status": { "enum": ["discovered", "queued", "parsing", "parsed", "classifying", "classified", "summarizing", "summarized", "atomizing", "validating", "writing", "written", "paused", "cancelled", "failed", "needs_review", "skipped", "unsupported"] },
+    "remote_jobs": { "type": "array", "items": { "type": "object" } },
+    "retry_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+    "artifacts": { "type": "object", "additionalProperties": { "type": "string" } },
+    "written_card_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "review_atom_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "errors": { "type": "array", "items": { "type": "object" } },
+    "progress": { "type": "object" },
+    "lease": { "type": ["object", "null"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  }
+}

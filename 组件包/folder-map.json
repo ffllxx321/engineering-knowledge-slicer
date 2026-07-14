@@ -1,0 +1,33 @@
+{
+  "version": "1.1",
+  "routes": [
+    { "library": "bid", "folder_type": "00-项目总览", "output_folder": "06-知识库/wiki/招投标/00-项目总览", "prompt": "提示词/招投标/00-项目总览.md" },
+    { "library": "bid", "folder_type": "01-营业与客户信息", "output_folder": "06-知识库/wiki/招投标/01-营业与客户信息", "prompt": "提示词/招投标/01-营业与客户信息.md" },
+    { "library": "bid", "folder_type": "02-招标文件解读", "output_folder": "06-知识库/wiki/招投标/02-招标文件解读", "prompt": "提示词/招投标/02-招标文件解读.md" },
+    { "library": "bid", "folder_type": "03-投标决策与立项", "output_folder": "06-知识库/wiki/招投标/03-投标决策与立项", "prompt": "提示词/招投标/03-投标决策与立项.md" },
+    { "library": "bid", "folder_type": "04-设计优化方案", "output_folder": "06-知识库/wiki/招投标/04-设计优化方案", "prompt": "提示词/招投标/04-设计优化方案.md" },
+    { "library": "bid", "folder_type": "04-设计优化方案及设计方案(EPC工程)", "output_folder": "06-知识库/wiki/招投标/04-设计优化方案及设计方案(EPC工程)", "prompt": "提示词/招投标/04-EPC设计方案.md" },
+    { "library": "bid", "folder_type": "05-报批报建（当地政策）", "output_folder": "06-知识库/wiki/招投标/05-报批报建（当地政策）", "prompt": "提示词/招投标/05-报批报建.md" },
+    { "library": "bid", "folder_type": "06-技术标", "output_folder": "06-知识库/wiki/招投标/06-技术标", "prompt": "提示词/招投标/06-技术标.md" },
+    { "library": "bid", "folder_type": "07-商务报价", "output_folder": "06-知识库/wiki/招投标/07-商务报价", "prompt": "提示词/招投标/07-商务报价.md" },
+    { "library": "bid", "folder_type": "08-采购与分包", "output_folder": "06-知识库/wiki/招投标/08-采购与分包", "prompt": "提示词/招投标/08-采购与分包.md" },
+    { "library": "bid", "folder_type": "09-风险评估与合规", "output_folder": "06-知识库/wiki/招投标/09-风险评估与合规", "prompt": "提示词/招投标/09-风险评估与合规.md" },
+    { "library": "bid", "folder_type": "10-内部会议与评审", "output_folder": "06-知识库/wiki/招投标/10-内部会议与评审", "prompt": "提示词/招投标/10-内部会议与评审.md" },
+    { "library": "bid", "folder_type": "11-答疑澄清与投标过程", "output_folder": "06-知识库/wiki/招投标/11-答疑澄清与投标过程", "prompt": "提示词/招投标/11-答疑澄清与投标过程.md" },
+    { "library": "bid", "folder_type": "12-开标评标与中标跟踪", "output_folder": "06-知识库/wiki/招投标/12-开标评标与中标跟踪", "prompt": "提示词/招投标/12-开标评标与中标跟踪.md" },
+    { "library": "bid", "folder_type": "13-合同谈判与签约", "output_folder": "06-知识库/wiki/招投标/13-合同谈判与签约", "prompt": "提示词/招投标/13-合同谈判与签约.md" },
+    { "library": "bid", "folder_type": "14-发表资料与对外汇报", "output_folder": "06-知识库/wiki/招投标/14-发表资料与对外汇报", "prompt": "提示词/招投标/14-发表资料与对外汇报.md" },
+    { "library": "bid", "folder_type": "15-复盘与知识沉淀", "output_folder": "06-知识库/wiki/招投标/15-复盘与知识沉淀", "prompt": "提示词/招投标/15-复盘与知识沉淀.md" },
+    { "library": "bid", "folder_type": "90-通用知识库", "output_folder": "06-知识库/wiki/招投标/90-通用知识库", "prompt": "提示词/招投标/90-通用知识库.md" },
+    { "library": "bid", "folder_type": "91-模板库", "output_folder": "06-知识库/wiki/招投标/91-模板库", "prompt": "提示词/招投标/91-模板库.md" },
+    { "library": "business", "folder_type": "01-客户库", "output_folder": "06-知识库/wiki/业务库/01-客户库", "prompt": "提示词/业务库/01-客户库.md" },
+    { "library": "business", "folder_type": "02-案例库", "output_folder": "06-知识库/wiki/业务库/02-案例库", "prompt": "提示词/业务库/02-案例库.md" },
+    { "library": "business", "folder_type": "03-提案库", "output_folder": "06-知识库/wiki/业务库/03-提案库", "prompt": "提示词/业务库/03-提案库.md" },
+    { "library": "business", "folder_type": "04-报价库", "output_folder": "06-知识库/wiki/业务库/04-报价库", "prompt": "提示词/业务库/04-报价库.md" },
+    { "library": "business", "folder_type": "05-施工计划库", "output_folder": "06-知识库/wiki/业务库/05-施工计划库", "prompt": "提示词/业务库/05-施工计划库.md" },
+    { "library": "business", "folder_type": "06-风险库", "output_folder": "06-知识库/wiki/业务库/06-风险库", "prompt": "提示词/业务库/06-风险库.md" },
+    { "library": "business", "folder_type": "07-失败中成长", "output_folder": "06-知识库/wiki/业务库/07-失败中成长", "prompt": "提示词/业务库/07-失败中成长.md" },
+    { "library": "business", "folder_type": "08-人才能力库", "output_folder": "06-知识库/wiki/业务库/08-人才能力库", "prompt": "提示词/业务库/08-人才能力库.md" },
+    { "library": "business", "folder_type": "09-政府申请（报批报建）", "output_folder": "06-知识库/wiki/业务库/09-政府申请（报批报建）", "prompt": "提示词/业务库/09-政府申请.md" }
+  ]
+}

@@ -30,9 +30,12 @@
 - `manifest.json` 版本 1.1.2 → 1.1.3。
 
 ### 🐞 Hotfix — 2026-07-14
-- **跨 bundle 模块作用域修复**：v1.1.3 把 `normalizeUnicodeForm` 加在 main.js 顶层，但 `"src/core/migration.js"` 是 IIFE 内独立作用域模块，导致 `migrateTaskLedgerV3` 引用该函数时抛 `normalizeUnicodeForm is not defined`。
-- 修复：在 `src/core/migration.js` 模块内**内嵌一份与主定义完全一致的副本**（含 NFC 规范化、控制字符剥离、全角空格替换）。
-- 同样的主定义保留在主 IIFE 顶层（plugin class 方法闭包可见），保持单一职责。
+- **跨 bundle 模块作用域修复 (v1.1.5)**：v1.1.3 / v1.1.4 把 `normalizeUnicodeForm` **错误地**落在 `src/core/task.js` bundle 模块内部（line 1987）。`"src/core/task.js"` 是 IIFE 内独立作用域模块，**Plugin class** 所在的 `main.js` bundle 模块里的方法（`processTask`、`isInIntake`、`isInternalSlicerFile`）词法作用域看不到它，于是运行时仍报 `normalizeUnicodeForm is not defined`。
+- v1.1.5 修复：
+  1. 在 `main.js` bundle 模块顶部（与 `loadSecretsFile` / `RateLimiter` 同级，plugin class 闭包可见）添加**权威定义**（line 46）。
+  2. 删除原 task.js 模块内的误导性副本（line 2003）。
+  3. `src/core/migration.js` 模块内的同款副本（line 3172）保留——`migration.js` 是独立 bundle 模块，必须自带定义才能被 `migrateTaskLedgerV3` 看到。
+- **最终可达性**：8 处 `normalizeUnicodeForm` 引用全部可解析——6 处在 `main.js` 模块内 → 走 line 46 的主定义；2 处在 `src/core/migration.js` 模块内 → 走 line 3172 的模块内副本。
 
 ---
 

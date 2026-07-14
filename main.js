@@ -38,6 +38,22 @@ const { runKnowledgeWorkflow } = require("src/core/workflow.js");
 const { buildCardRecord, cardFileName, renderKnowledgeCard, renderStructuredSummary } = require("src/core/markdown-renderer.js");
 const { groupReviewItems, applyBatchAction } = require("src/core/review-service.js");
 
+// v1.1.3 + v1.1.5: 字符串规范化工具，做 NFC + 控制字符剥离 + 全角→半角空格。
+// 必须放在 main.js 模块的"主代码区"（plugin class 闭包能直接看到的位置）。
+// 之前误放在 src/core/task.js 模块内，那是独立作用域，main.js 模块内的 plugin class 方法看不到。
+// v1.1.5 把它抬到 main.js bundle 模块的 closure 内，使 plugin class 的所有方法都能解析到。
+// migration.js 模块内的同款副本保留一份独立副本，避免跨模块引用崩。
+function normalizeUnicodeForm(value) {
+  let str = String(value || '');
+  if (!str) return str;
+  if (typeof str.normalize === 'function') {
+    try { str = str.normalize('NFC'); } catch { /* 不可用则忽略 */ }
+  }
+  str = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F﻿]/g, '');
+  str = str.replace(/[  ]/g, ' ');
+  return str;
+}
+
 function loadSecretsFile() {
   try {
     const fs = require('fs');
@@ -1982,21 +1998,6 @@ function safeBufferFrom(input, encoding) {
   try { return Buffer.from(String(input), 'utf8'); } catch { return Buffer.alloc(0); }
 }
 
-// v1.1.2: 把字符串里的 NUL / 控制字符 / 全角空格替换为安全形态，
-// 防止 vault 同步过来的文件名含不可见控制字符导致卡片命名或链接构造失败。
-function normalizeUnicodeForm(value) {
-  let str = String(value || '');
-  if (!str) return str;
-  // 优先用 Node 内置 NFC；旧版本 / 浏览器 fallback 用 regex 替换 NFD 组合字符
-  if (typeof str.normalize === 'function') {
-    try { str = str.normalize('NFC'); } catch { /* 不可用则忽略 */ }
-  }
-  // 清除夹带的控制字符（保留换行回车之外的不可见字符）
-  str = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F﻿]/g, '');
-  // 全角空格 / 不间断空格统一成普通空格
-  str = str.replace(/[　 ]/g, ' ');
-  return str;
-}
 
 function detectSourceType(filePath) {
   const ext = path.extname(String(filePath || '')).toLowerCase();

@@ -233,14 +233,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   isInIntake(path) {
-    const normalized = normalizeVaultPath(path);
+    const normalized = normalizeUnicodeForm(normalizeVaultPath(path));
     return [this.settings.bidIntakePath, this.settings.businessIntakePath]
-      .some((root) => normalized.startsWith(`${normalizeVaultPath(root)}/`));
+      .some((root) => normalized.startsWith(`${normalizeVaultPath(normalizeUnicodeForm(root))}/`));
   }
 
   isInternalSlicerFile(path) {
-    const normalized = normalizeVaultPath(path);
-    return normalized.startsWith(`${normalizeVaultPath(this.settings.artifactsPath)}/`)
+    const normalized = normalizeUnicodeForm(normalizeVaultPath(path));
+    return normalized.startsWith(`${normalizeVaultPath(normalizeUnicodeForm(this.settings.artifactsPath))}/`)
       || normalized.startsWith(`${this.settings.draftPath}/`)
       || normalized.startsWith(`${this.settings.logPath}/`);
   }
@@ -405,11 +405,16 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const current = tasks.find((item) => item.task_id === task.task_id) || task;
     const startedAt = Date.now();
     try {
+      // v1.1.2: 旧任务 / 第三方写入可能留下 source_path 为空的情况，统一兜底成空字符串
+      // 防止后续 readBinary / Notice 拼接时出现 'undefined'/'null' 字面。
+      current.source_path = normalizeVaultPath(current.source_path || '');
+      current.source_path = normalizeUnicodeForm(current.source_path);
       this.sessionStats.current = current.source_path;
       current.errors = [];
       current.review_atom_ids = [];
       current.written_card_ids = [];
       await this.setTaskProgress(current, '准备处理源文件', { stage: 'start', startedAt: new Date(startedAt).toISOString() });
+      if (!current.source_path) throw new Error('源文件路径为空，请在扫描源文件后重试。');
       if (!isProcessableSource(current.source_path)) {
         current.status = 'unsupported';
         current.updated_at = new Date().toISOString();
@@ -1769,8 +1774,14 @@ function validateAtomLabels(library, atom) {
   return required.every(([allowed, value]) => Boolean(value) && allowed && allowed.has(value));
 }
 
+// 统一遮蔽多种 API 密钥形态（OpenAI sk-、Bearer JWT、URL 里的 token= / api_key= / apikey=）
+// v1.1.2 之前只匹配 sk-*，会把 MiniMax / PaddleOCR / MinerU 的密钥原样漏进 Notice。
 function sanitizeSecret(message) {
-  return String(message || '').replace(/sk-[A-Za-z0-9_-]+/g, 'sk-***');
+  return String(message || '')
+    .replace(/(bearer\s+)[A-Za-z0-9._\-+/=]{12,}/gi, '$1***')
+    .replace(/\b(sk-|sk_|key-)[A-Za-z0-9._\-+/=]{8,}/g, '$1***')
+    .replace(/([?&](?:token|access_token|api[_-]?key|apikey|password|secret)=)[^&\s"']+/gi, '$1***')
+    .replace(/("|\b)([A-Za-z0-9_-]{32,})("|\b)(?=.*(?:key|token|secret))/g, '$1***$3');
 }
 
 function getMarkdownTitle(markdown) {
@@ -1821,7 +1832,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 4,
+  settingsVersion: 5,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -1874,7 +1885,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 4;
+  migrated.settingsVersion = 5;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -1956,6 +1967,35 @@ const PROCESSABLE_TYPES = new Set(['md', 'txt', 'pdf', 'docx', 'pptx', 'xlsx', '
 
 function normalizeVaultPath(filePath) {
   return String(filePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
+// v1.1.2: 把 Buffer.from 的副作用收拢到一处。
+// 当 input 是 null / undefined / 字符串数字时，行为统一：空缓冲区。
+// 同时避免 ArrayBuffer/SharedArrayBuffer/Uint8Array 等非 Buffer 输入在
+// multipart / uploadBody 等路径中产生 Buffer.from(... ) 期待 Buffer 的边界 bug。
+function safeBufferFrom(input, encoding) {
+  if (input == null) return Buffer.alloc(0);
+  if (Buffer.isBuffer(input)) return encoding ? input.toString(encoding) : input;
+  if (input instanceof ArrayBuffer) return Buffer.from(input);
+  if (ArrayBuffer.isView(input)) return Buffer.from(input.buffer, input.byteOffset, input.byteLength);
+  if (typeof input === 'string') return encoding ? Buffer.from(input, encoding) : Buffer.from(input, 'utf8');
+  try { return Buffer.from(String(input), 'utf8'); } catch { return Buffer.alloc(0); }
+}
+
+// v1.1.2: 把字符串里的 NUL / 控制字符 / 全角空格替换为安全形态，
+// 防止 vault 同步过来的文件名含不可见控制字符导致卡片命名或链接构造失败。
+function normalizeUnicodeForm(value) {
+  let str = String(value || '');
+  if (!str) return str;
+  // 优先用 Node 内置 NFC；旧版本 / 浏览器 fallback 用 regex 替换 NFD 组合字符
+  if (typeof str.normalize === 'function') {
+    try { str = str.normalize('NFC'); } catch { /* 不可用则忽略 */ }
+  }
+  // 清除夹带的控制字符（保留换行回车之外的不可见字符）
+  str = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F﻿]/g, '');
+  // 全角空格 / 不间断空格统一成普通空格
+  str = str.replace(/[　 ]/g, ' ');
+  return str;
 }
 
 function detectSourceType(filePath) {
@@ -2291,6 +2331,13 @@ function readableTextResult(text, sourceType, decoded = {}) {
 
 function decodeTextBuffer(buffer) {
   const input = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || '');
+  if (input.length === 0) return decodedCandidate('utf-8', '');
+  // 文本缓冲区告警：含 NUL 字节的文件几乎可以肯定是二进制（PDF/ZIP/图片等），
+  // 即便扩展名是 .md/.txt 也要拒收，避免二进制字节流被当文本送进 AI。
+  const nulCount = countByte(input, 0x00);
+  if (nulCount > 0 && (!looksLikeLegitimateText(input) || nulCount > 2)) {
+    return decodedCandidate('binary-rejected', '');
+  }
   if (input.length >= 3 && input[0] === 0xef && input[1] === 0xbb && input[2] === 0xbf) {
     return decodedCandidate('utf-8-bom', input.slice(3).toString('utf8'));
   }
@@ -2316,8 +2363,34 @@ function decodeTextBuffer(buffer) {
     candidate.score += encodingHeuristicBonus(input, candidate.encoding, candidate.text);
   }
   candidates.sort((a, b) => b.score - a.score);
-  return candidates[0] || decodedCandidate('utf-8', input.toString('utf8'));
+  // 自适应兜底：当最优候选的 readability 分数仍低于阈值时，认为解码失败。
+  // 返回 'utf-8' 空文本而不是乱码文本，让调用方走 failed 分支。
+  const best = candidates[0];
+  if (!best || best.score < DECODE_MIN_CONFIDENCE) {
+    return decodedCandidate('low-confidence', best ? best.text : '');
+  }
+  return best;
 }
+
+// 文本缓冲区中含 NUL 字节时是否仍可能是合法文本？
+// 唯一例外是使用了 PUA/控制字符的某些专业日志，但通用插件场景下 NUL ≈ 二进制。
+function looksLikeLegitimateText(buffer) {
+  if (Buffer.isBuffer(buffer) && buffer.length >= 3) {
+    if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) return true;
+    if (buffer[0] === 0xff && buffer[1] === 0xfe) return true;
+    if (buffer[0] === 0xfe && buffer[1] === 0xff) return true;
+  }
+  return false;
+}
+
+function countByte(buffer, byte) {
+  let n = 0;
+  const len = Buffer.isBuffer(buffer) ? buffer.length : 0;
+  for (let i = 0; i < len; i += 1) if (buffer[i] === byte) n += 1;
+  return n;
+}
+
+const DECODE_MIN_CONFIDENCE = -0.15;
 
 function encodingHeuristicBonus(buffer, encoding, text) {
   const enc = String(encoding || '').toLowerCase();
@@ -3094,11 +3167,13 @@ const LEGACY_ACTIVE = new Set(['extracting', 'parsing', 'classifying', 'summariz
 const VALID_TERMINAL = new Set(['queued', 'written', 'needs_review', 'failed', 'skipped', 'cancelled', 'unsupported', 'paused']);
 
 function migrateTaskLedgerV3(tasks, versions = {}) {
-  const pipelineVersion = versions.pipelineVersion || '1.1.0';
+  const pipelineVersion = versions.pipelineVersion || '1.1.1';
   const promptBundleVersion = versions.promptBundleVersion || '1.1';
   return (Array.isArray(tasks) ? tasks : []).map((task) => {
     const canonical = task.schema_version === '1.1' && Boolean(task.task_id) && Boolean(task.run_id);
-    const sourcePath = String(task.source_path || task.sourcePath || '').replace(/\\/g, '/');
+    // v1.1.2: 旧任务 source_path 可能在 macOS 上是 NFD 编码、Windows 上是 GBK，统一规范成 NFC，
+    // 避免按路径查文件时因编码不一致出现"找不到源文件"。
+    const sourcePath = normalizeUnicodeForm(String(task.source_path || task.sourcePath || '').replace(/\\/g, '/'));
     const sourceHash = String(task.source_hash || task.sourceHash || '');
     const taskId = task.task_id || task.taskId || `slicer-${sourceHash.slice(0, 12)}`;
     const library = task.library || (sourcePath.includes('/业务库/') ? 'business' : 'bid');

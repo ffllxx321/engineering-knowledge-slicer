@@ -1,5 +1,36 @@
 # 工程知识切片 变更记录
 
+## v1.1.3 — 2026-07-14 编码 / 二进制乱码根治
+
+### 🔒 错误信息不再泄密（F1）
+- `sanitizeSecret` 重写，原正则只匹配 `sk-*`，无法遮蔽 MiniMax、PaddleOCR、MinerU、Bearer JWT、URL `?api_key=` 等形态。现改为四段组合：
+  - `Bearer <token>`、`sk-…` / `sk_…` / `key-…`
+  - URL 中的 `token=`、`access_token=`、`api_key=`、`apikey=`、`password=`、`secret=`
+  - 32 字符以上 + 紧邻 `key/token/secret` 上下文的字面长串
+- 同时 `sanitizeError` 调用点回归到 `sanitizeSecret`，统一遮蔽规则。
+
+### 🛡 二进制文件不再被当文本送 AI（F2 + F6）
+- `decodeTextBuffer` 在 BOM / UTF-16 检测之前增加 **NUL 字节防线**：
+  含 NUL 且不属于合法 UTF-8/UTF-16 BOM 上下文的缓冲区直接返回 `binary-rejected`，让上游走 `failed` 分支而不是把 PDF/ZIP/图片字节流送进 AI。
+- 解码结束后增加 **最低自信度兜底**（`DECODE_MIN_CONFIDENCE = -0.15`）：
+  当所有候选编码评分都低于阈值时返回 `low-confidence`，避免"挑出最不坏"的乱码文本。
+- 单元测试覆盖：UTF-8 长中文、UTF-8 BOM、GBK、Shift-JIS、PDF 含 NUL、ZIP 含 NUL、空 buffer、随机短字节、emoji 中文混合，均按预期分类。
+
+### 🔧 路径与文本规范化（F4）
+- 新增 `normalizeUnicodeForm(value)`：先做 NFC 规范化（防 macOS NFD vs Windows NFC 失配），再剥离不可见控制字符，统一全角空格为半角空格。
+- `processTask` 入口、`migrateTaskLedgerV3`、`isInIntake` / `isInternalSlicerFile` 全部统一调用 `normalizeUnicodeForm` 后再比较路径。
+- 老任务里 `source_path` 字段空值 / NUL / 控制字符都会被规范化掉，减少"找不到源文件"的报错。
+
+### 🧱 健壮性（F3 + F5）
+- `processTask` 入口断言 `current.source_path` 不为空，否则抛"源文件路径为空"明确信息，而非后续 NPE。
+- 新增 `safeBufferFrom(input, encoding)` 助手：统一处理 `null`、`undefined`、`Buffer`、`ArrayBuffer`、`TypedArray`、`string`、`其他` 这 7 种输入形态，避免 multipart / uploadBody 路径上 Buffer 构造在边缘输入下崩溃。
+
+### ⚙ 版本号
+- `DEFAULT_SETTINGS.settingsVersion` 4 → 5；
+- `manifest.json` 版本 1.1.2 → 1.1.3。
+
+---
+
 ## v1.1.2 — 2026-07-14 升级正确性修复
 
 ### 🔴 升级一致性

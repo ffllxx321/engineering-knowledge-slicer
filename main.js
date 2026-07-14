@@ -54,6 +54,32 @@ function normalizeUnicodeForm(value) {
   return str;
 }
 
+// v1.1.6: 统一诊断日志入口。所有诊断输出都带 `[EKS diag]` 前缀，
+// 用户在 Obsidian DevTools Console 里 grep 一行就能定位。
+function diag(scope, payload) {
+  try {
+    const data = payload && typeof payload === 'object' ? payload : { value: payload };
+    console.log('[EKS diag]', scope, JSON.stringify(data, (_k, v) => {
+      // 任何看起来像密钥的字面量自动转指纹，禁止在诊断日志里泄露原值
+      if (typeof v === 'string' && /^(sk-|sk_|key-|eyJ|[A-Za-z0-9_-]{24,})/.test(v) && /(key|token|secret|password)/i.test(_k || '')) {
+        return keyFingerprint(v);
+      }
+      return v;
+    }));
+  } catch (e) { /* 诊断日志自身不能炸 */ }
+}
+
+// 计算密钥指纹（sha256 前 8 字符），绝不暴露原值。
+// 即使指纹出现在日志中也不会泄露密钥本身。
+function keyFingerprint(value) {
+  try {
+    const crypto = require('crypto');
+    return 'fp:' + crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 8);
+  } catch (_) {
+    return 'fp:<unavailable>';
+  }
+}
+
 function loadSecretsFile() {
   try {
     const fs = require('fs');
@@ -61,9 +87,21 @@ function loadSecretsFile() {
     const os = require('os');
     const secretsPath = path.join(os.homedir(), '.eks-secrets.json');
     if (fs.existsSync(secretsPath)) {
-      return JSON.parse(fs.readFileSync(secretsPath, 'utf-8'));
+      const raw = fs.readFileSync(secretsPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      diag('secrets.loaded', {
+        path: secretsPath,
+        sizeBytes: raw.length,
+        keys: Object.keys(parsed || {}).reduce((acc, k) => {
+          acc[k] = parsed[k] ? keyFingerprint(parsed[k]) : '<empty>';
+          return acc;
+        }, {})
+      });
+      return parsed;
     }
+    diag('secrets.missing', { path: secretsPath, hint: '请创建该文件并写入 minimaxApiKey/pdfMineruApiKey/pdfPaddleOcrApiKey 三个字段' });
   } catch (e) {
+    diag('secrets.error', { message: String(e && e.message || e) });
     console.warn('工程知识切片: 密钥文件加载失败', e);
   }
   return {};
@@ -109,6 +147,16 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       if (_secrets.pdfMineruApiKey) this.settings.pdfMineruApiKey = _secrets.pdfMineruApiKey;
       if (_secrets.pdfPaddleOcrApiKey) this.settings.pdfPaddleOcrApiKey = _secrets.pdfPaddleOcrApiKey;
     }
+    // v1.1.6: 报告 effective 密钥指纹（绝不是原值），便于诊断"密钥填了但被插件忽略"类问题
+    diag('onload.keys.effective', {
+      useEnvKeys: this.settings.useEnvKeys,
+      minimaxApiKey: this.settings.minimaxApiKey ? keyFingerprint(this.settings.minimaxApiKey) : '<empty>',
+      pdfMineruApiKey: this.settings.pdfMineruApiKey ? keyFingerprint(this.settings.pdfMineruApiKey) : '<empty>',
+      pdfPaddleOcrApiKey: this.settings.pdfPaddleOcrApiKey ? keyFingerprint(this.settings.pdfPaddleOcrApiKey) : '<empty>',
+      minimaxEndpoint: this.settings.minimaxEndpoint,
+      pdfMineruApiEndpoint: this.settings.pdfMineruApiEndpoint,
+      pdfPaddleOcrApiEndpoint: this.settings.pdfPaddleOcrApiEndpoint
+    });
     // 密钥注入后再写盘，确保 data.json 不会因为顺序问题而清掉 secrets
     await this.saveData(this.settings);
     this.rateLimiter = new RateLimiter(this.settings.rateLimitMs || 1000, this.settings.rateLimitMaxConcurrent || 2);
@@ -152,21 +200,45 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
   async testServiceConnection(service) {
     const config = serviceConnectionConfig(service, this.settings);
+    diag('testConnection.start', { service, url: config.url, apiKey: config.apiKey ? keyFingerprint(config.apiKey) : '<empty>' });
     if (!config.apiKey) {
+      diag('testConnection.noKey', { service, hint: '请确认 ~/.eks-secrets.json 中字段名拼写正确：minimaxApiKey / pdfMineruApiKey / pdfPaddleOcrApiKey' });
       new Notice(`${config.label} 密钥未配置。`);
       return false;
     }
     if (typeof fetch !== 'function') {
+      diag('testConnection.noFetch', { service });
       new Notice('当前 Obsidian 环境不支持网络请求。');
       return false;
     }
     try {
       const response = await obsidianRequest(config.url, config.request);
-      if (response.status === 401 || response.status === 403) throw new Error('鉴权失败，请检查密钥。');
+      diag('testConnection.response', {
+        service,
+        status: response.status,
+        ok: response.ok,
+        url: config.url
+      });
+      if (response.status === 401 || response.status === 403) {
+        let body = '';
+        try { body = String(await response.text() || '').slice(0, 300); } catch (_) { /* 忽略 */ }
+        diag('testConnection.auth', {
+          service,
+          status: response.status,
+          serverResponse: body
+        });
+        throw new Error(`鉴权失败（HTTP ${response.status}）。${body ? '服务端响应：' + body.slice(0, 200) : ''}`);
+      }
       if (service === 'minimax' && !response.ok) throw new Error(`HTTP ${response.status}`);
       new Notice(`${config.label} 连接可用。`);
       return true;
     } catch (error) {
+      diag('testConnection.error', {
+        service,
+        errorClass: error && error.constructor ? error.constructor.name : typeof error,
+        errorMessage: String(error && error.message || error),
+        errorStack: String(error && error.stack || '').split('\n').slice(0, 6).join(' | ')
+      });
       new Notice(`${config.label} 连接失败：${sanitizeSecret(error.message)}`);
       return false;
     }
@@ -540,7 +612,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       await this.saveTasks(upsertTask(await this.loadTasks(), current));
       this.sessionStats.failed += 1;
       this.sessionStats.lastMessage = `处理失败：${current.source_path}`;
-      new Notice(`工程知识切片处理失败：${sanitizeSecret(error.message)}`);
+      // v1.1.6: 诊断日志 + 更明确的 Notice（带阶段名），避免错误被截图渲染误导
+      diag('processTask.failed', {
+        sourcePath: current.source_path,
+        stage: current.progress?.stage,
+        errorClass: error && error.constructor ? error.constructor.name : typeof error,
+        errorMessage: String(error && error.message || error)
+      });
+      new Notice(`工程知识切片处理失败（${current.progress?.stage || 'process'}）：${sanitizeSecret(error.message)}`);
     } finally {
       await this.refreshViews();
     }
@@ -1848,7 +1927,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 5,
+  settingsVersion: 6,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -1901,7 +1980,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 5;
+  migrated.settingsVersion = 6;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -4174,13 +4253,28 @@ async function requestMiniMaxJson({ settings, prompt, fetchImpl, context }) {
       body: JSON.stringify(body)
     }, settings);
   } catch (error) {
-    if (error && error.name === 'AbortError') throw new Error(`MiniMax 国内版请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
+    if (error && error.name === 'AbortError') {
+      diag('minimax.timeout', { endpoint, timeoutMs, stage: context && context.stage });
+      throw new Error(`MiniMax 国内版请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
+    }
+    diag('minimax.transport', {
+      endpoint,
+      stage: context && context.stage,
+      errorClass: error && error.constructor ? error.constructor.name : typeof error,
+      errorMessage: String(error && error.message || error)
+    });
     throw new Error(`MiniMax 国内版请求失败：${sanitizeError(error)}`);
   } finally {
     if (timer) clearTimeout(timer);
   }
   if (!response.ok) {
     const detail = await safeResponseText(response);
+    diag('minimax.http', {
+      endpoint,
+      stage: context && context.stage,
+      status: response.status,
+      bodySnippet: String(detail || '').slice(0, 500)
+    });
     throw new Error(`MiniMax 国内版请求失败（HTTP ${response.status}）${detail ? `：${detail}` : ''}`);
   }
   const payload = await response.json();

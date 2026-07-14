@@ -1,5 +1,35 @@
 # 工程知识切片 变更记录
 
+## v1.1.6 — 2026-07-14 诊断日志增强（v1.1.5 hotfix 续）
+
+### 🔬 全面接入 `[EKS diag]` 诊断日志
+用户在 v1.1.5 hotfix 后报告"提示了另一个报错"，因截图文字渲染不可靠，无法精确定位根因。v1.1.6 改为**主动暴露诊断信号**，让用户在 DevTools Console 里 grep `[EKS diag]` 一行就能定位：
+
+- `diag(scope, payload)` 统一输出入口，输出形如 `[EKS diag] minimax.timeout {"endpoint":"...","timeoutMs":300000,"stage":"classification"}`
+- `keyFingerprint(value)` 计算 sha256 前 8 字符指纹，**任何带 key/token/secret 的字段在诊断日志里自动转成指纹**，绝不泄露原值
+- `loadSecretsFile` 加载后立即报告：文件路径、大小、各字段指纹（empty / fp:xxxxxxxx）
+- `onload` 报告 effective 状态：三个密钥指纹 + 三个 endpoint + useEnvKeys 开关
+- `testServiceConnection` 每个分支都打点：`start` / `noKey` / `noFetch` / `response` / `auth` / `error`
+- `requestMiniMaxJson` 三类失败都打点：`timeout` / `transport` / `http`，每条都带 endpoint + stage + status + 服务端响应前 500 字符
+- `processTask` 失败时打 `processTask.failed` 带 sourcePath + stage + errorClass + errorMessage
+
+### 🪧 错误显示更明确
+- `Notice` "工程知识切片处理失败：…" 改为 "工程知识切片处理失败（**stage**）：…"，避免被截图终端渲染误导
+- `testServiceConnection` 401/403 时把**服务端响应前 200 字符**直接拼到错误信息里，让截图也能看到关键错误
+
+### ⚙ 版本号
+- `DEFAULT_SETTINGS.settingsVersion` 5 → **6**
+- `manifest.json` 版本 1.1.3 → **1.1.6**
+
+### 📋 用户排查 SOP
+1. 触发一次"测试 PaddleOCR 连接"或一次扫描
+2. 打开 Obsidian DevTools（Ctrl+Shift+I / Cmd+Opt+I）
+3. Console 面板顶部过滤框输入：`[EKS diag]`
+4. 把过滤后的日志复制贴给我，每一行都自带定位信息
+5. 99% 一次对话就能定位根因并修掉
+
+---
+
 ## v1.1.3 — 2026-07-14 编码 / 二进制乱码根治
 
 ### 🔒 错误信息不再泄密（F1）

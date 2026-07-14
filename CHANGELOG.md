@@ -1,5 +1,29 @@
 # 工程知识切片 变更记录
 
+## v1.1.7 — 2026-07-14 诊断日志写入文件
+
+### 📄 文件版诊断日志
+用户反馈无法打开 Obsidian DevTools（Ctrl+Shift+I），v1.1.6 的 console-only 诊断日志拿不到。v1.1.7 改为同时把诊断日志**写入文件**：
+
+- 路径：`<vault>/.obsidian/plugins/engineering-knowledge-slicer/diag.log`
+- 文件包含自解释 header（告诉用户这个文件是干什么的、怎么用）
+- 每次 diag 调用入缓冲区，**1 秒后批量 flush**，避免每条诊断都同步 IO 卡 UI
+- 文件大小自动 trim 到最近 **2000 行**，避免无限增长
+- 卸载插件时 `forceFlushDiag()` 确保最后一批日志落盘
+- 首次加载时用 `Notice` 告知用户文件位置（用 `__diagLogNotifiedVersion` 字段避免每次启动都骚扰）
+- 密钥指纹规则保持：所有带 `key/token/secret/password` 字段名的字符串值自动转 `fp:xxxxxxxx` 指纹
+
+### 📋 用户排查 SOP（v1.1.7 路径）
+1. 触发一次扫描或点一次"测试 PaddleOCR 连接"
+2. 在 Obsidian 里打开 `<vault>/.obsidian/plugins/engineering-knowledge-slicer/diag.log` 文件
+3. 全文选中 → 复制 → 发给我
+
+### ⚙ 版本号
+- `DEFAULT_SETTINGS.settingsVersion` 6 → **7**
+- `manifest.json` 版本 1.1.6 → **1.1.7**
+
+---
+
 ## v1.1.6 — 2026-07-14 诊断日志增强（v1.1.5 hotfix 续）
 
 ### 🔬 全面接入 `[EKS diag]` 诊断日志

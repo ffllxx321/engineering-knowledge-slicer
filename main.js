@@ -56,17 +56,76 @@ function normalizeUnicodeForm(value) {
 
 // v1.1.6: 统一诊断日志入口。所有诊断输出都带 `[EKS diag]` 前缀，
 // 用户在 Obsidian DevTools Console 里 grep 一行就能定位。
+// v1.1.7: 同时写到 .obsidian/plugins/engineering-knowledge-slicer/diag.log 文件，
+//        让没法开 DevTools 的用户也能拿到日志（用 Obsidian 自身打开该 Markdown 文件即可查看）。
+let __diagLogPath = null;
+let __diagBuffer = [];
+let __diagFlushTimer = null;
 function diag(scope, payload) {
   try {
     const data = payload && typeof payload === 'object' ? payload : { value: payload };
-    console.log('[EKS diag]', scope, JSON.stringify(data, (_k, v) => {
+    const serialized = JSON.stringify(data, (_k, v) => {
       // 任何看起来像密钥的字面量自动转指纹，禁止在诊断日志里泄露原值
       if (typeof v === 'string' && /^(sk-|sk_|key-|eyJ|[A-Za-z0-9_-]{24,})/.test(v) && /(key|token|secret|password)/i.test(_k || '')) {
         return keyFingerprint(v);
       }
       return v;
-    }));
+    });
+    const line = `[EKS diag] ${scope} ${serialized}`;
+    console.log(line);
+    // 写入文件：先入缓冲区，1 秒后批量 flush，避免每条诊断都同步 IO 卡 UI
+    if (__diagLogPath) {
+      __diagBuffer.push(new Date().toISOString() + ' ' + line);
+      if (!__diagFlushTimer) {
+        __diagFlushTimer = setTimeout(flushDiagLog, 1000);
+      }
+    }
   } catch (e) { /* 诊断日志自身不能炸 */ }
+}
+
+function flushDiagLog() {
+  __diagFlushTimer = null;
+  if (!__diagLogPath || !__diagBuffer.length) return;
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    // 每次 flush 前预留头部，方便用户打开文件第一眼就看到说明
+    const header = [
+      '# 工程知识切片 诊断日志',
+      '',
+      '> 这份文件由插件自动写入，记录所有 `[EKS diag]` 诊断事件。',
+      '> 复制本文件全部内容（除了这一段说明）发给开发者即可定位问题。',
+      '> 文件位置：`' + __diagLogPath + '`',
+      '> 日志会自动 trim 到最近约 2000 行，避免文件无限增长。',
+      '',
+      ''
+    ].join('\n');
+    const lines = __diagBuffer.join('\n') + '\n';
+    __diagBuffer = [];
+    // 读旧内容、追加、trim
+    let existing = '';
+    try { existing = fs.readFileSync(__diagLogPath, 'utf-8'); } catch (_) { /* 不存在则忽略 */ }
+    // 去掉旧 header（如果存在）再合并
+    const headerEndMarker = '\n\n';
+    const oldBodyStart = existing.indexOf(headerEndMarker + headerEndMarker);
+    const oldBody = oldBodyStart >= 0 ? existing.substring(oldBodyStart + headerEndMarker.length + headerEndMarker.length) : existing;
+    const merged = header + oldBody + lines;
+    // trim 到最近 2000 行
+    const allLines = merged.split('\n');
+    const MAX_LINES = 2000;
+    const trimmed = allLines.length > MAX_LINES ? allLines.slice(allLines.length - MAX_LINES).join('\n') : merged;
+    fs.mkdirSync(path.dirname(__diagLogPath), { recursive: true });
+    fs.writeFileSync(__diagLogPath, trimmed, 'utf-8');
+  } catch (e) {
+    // 写日志失败不能炸插件
+    try { console.warn('[EKS diag] flush failed', String(e && e.message || e)); } catch (_) {}
+  }
+}
+
+// 强制立即 flush（用于进程退出前的最后一批日志）
+function forceFlushDiag() {
+  if (__diagFlushTimer) { clearTimeout(__diagFlushTimer); __diagFlushTimer = null; }
+  flushDiagLog();
 }
 
 // 计算密钥指纹（sha256 前 8 字符），绝不暴露原值。
@@ -148,6 +207,15 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       if (_secrets.pdfPaddleOcrApiKey) this.settings.pdfPaddleOcrApiKey = _secrets.pdfPaddleOcrApiKey;
     }
     // v1.1.6: 报告 effective 密钥指纹（绝不是原值），便于诊断"密钥填了但被插件忽略"类问题
+    // v1.1.7: 同时初始化 diag.log 文件路径，让没法开 DevTools 的用户也能拿到日志
+    try {
+      const adapter = this.app.vault && this.app.vault.adapter;
+      if (adapter && typeof adapter.getBasePath === 'function') {
+        const path = require('path');
+        __diagLogPath = path.join(adapter.getBasePath(), '.obsidian', 'plugins', 'engineering-knowledge-slicer', 'diag.log');
+        diag('onload.diagLogPath', { path: __diagLogPath });
+      }
+    } catch (_) { /* 取不到路径就退化到 console only */ }
     diag('onload.keys.effective', {
       useEnvKeys: this.settings.useEnvKeys,
       minimaxApiKey: this.settings.minimaxApiKey ? keyFingerprint(this.settings.minimaxApiKey) : '<empty>',
@@ -188,9 +256,21 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     }));
 
     this.addSettingTab(new SlicerSettingTab(this.app, this));
+    // v1.1.7: 通知用户诊断日志文件位置（首次加载时显示一次，之后静默）
+    try {
+      const prev = await this.loadData();
+      const notified = prev && prev.__diagLogNotifiedVersion === '1.1.7';
+      if (!notified && __diagLogPath) {
+        new Notice(`工程知识切片 诊断日志已启用：${__diagLogPath}\n遇到问题时把该文件内容发给我即可定位。`);
+        this.settings.__diagLogNotifiedVersion = '1.1.7';
+        await this.saveData(this.settings);
+      }
+    } catch (_) { /* 通知失败不能影响插件加载 */ }
   }
 
   onunload() {
+    // v1.1.7: 卸载前最后 flush 一次，确保所有诊断日志落盘
+    try { forceFlushDiag(); } catch (_) {}
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_SLICER);
   }
 
@@ -1927,7 +2007,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 6,
+  settingsVersion: 7,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -1980,7 +2060,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 6;
+  migrated.settingsVersion = 7;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;

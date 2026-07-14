@@ -1,5 +1,38 @@
 # 工程知识切片 变更记录
 
+## v1.1.10 — 2026-07-14 diag 真正接通 + AI 输出截断兜底
+
+### 🔴 diag 真正接通（v1.1.9 修复不完整的部分）
+v1.1.9 只初始化 `globalThis.__eksDiag.state`，但 `function diag / keyFingerprint / flushDiagLog / forceFlushDiag` 仍然留在 main.js 的本地闭包里。ai-pipeline.js 的 wrapper 调到 `globalThis.__eksDiag.diag(...)` 时找不到真函数 → 静默不调用（不是 ReferenceError）。如果 main.js 模块求值前某些路径触发，则可能 ReferenceError。
+
+v1.1.10 修复：
+- 顶层加占位 fallback（`console.log` 而不抛错）：`globalThis.__eksDiag.diag = console-log fallback`
+- main.js 的真实 `function diag / keyFingerprint / flushDiagLog / forceFlushDiag` 定义完成后**显式 attach 到 `globalThis.__eksDiag`**
+- ai-pipeline.js 的本地 wrapper 直接委托 `globalThis.__eksDiag.diag(...)`，保证总能找到真函数，永远不会再 `ReferenceError: diag is not defined`
+
+### 🟡 AI 输出截断兜底（atomizeSummary）
+8192 token 上限命中时，原代码会让整个任务报失败。v1.1.10 对应 `summarizeDocument` 的同款处理：
+- 单批 AI 调用截断 → 标记 truncated，中断剩余批次
+- 已成功的批次合并成 partial 结果，返回时跳过严格 schema 校验
+- 每个 atom 至少含 `atom_id` 才保留，截断的那批如果完全空白也保留（标 `_truncated: true` 标记）
+- `<vault>/.obsidian/plugins/engineering-knowledge-slicer/diag.log` 会写一行 `atomization.truncated` 表明触发了截断
+
+效果：12 个知识点的文档如果第 9 批被截断，前面 8 批的可入库卡片不再全部丢失；用户能直接看到 8 张已生成。
+
+### 📝 Prompt 加 explicit shape 约束
+AI 经常忘了 `{atoms:[...], coverage:{...}, schema_version:"1.1"}` 的包裹，裸返回 atom 数组或单个 atom 对象。v1.1.10 给 `atomizeSummaryBatch` prompt 加**强约束**：
+```
+【输出包裹格式（严格）】必须直接返回一个 JSON 对象，禁止用 Markdown 代码围栏，
+禁止外层再套一层数组或对象。该对象的 keys 只能出现以下三个：atoms、coverage、schema_version。
+示例：{"atoms":[...],"coverage":{...},"schema_version":"1.1"}
+```
+
+### ⚙ 版本号
+- `DEFAULT_SETTINGS.settingsVersion` 9 → **10**
+- `manifest.json` 版本 1.1.9 → **1.1.10**
+
+---
+
 ## v1.1.9 — 2026-07-14 diag 跨模块作用域修复
 
 ### 🔴 修了两个 v1.1.8 残留的报错

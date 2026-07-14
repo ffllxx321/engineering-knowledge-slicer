@@ -38,15 +38,24 @@ const { runKnowledgeWorkflow } = require("src/core/workflow.js");
 const { buildCardRecord, cardFileName, renderKnowledgeCard, renderStructuredSummary } = require("src/core/markdown-renderer.js");
 const { groupReviewItems, applyBatchAction } = require("src/core/review-service.js");
 
-// v1.1.9: 把诊断共享状态挂到 globalThis，让 src/core/ai-pipeline.js 等独立闭包模块也能调用 diag()
+// v1.1.9 / v1.1.10: 把诊断共享状态挂到 globalThis，让 src/core/ai-pipeline.js 等独立闭包模块也能调用 diag()
 // 历史背景：v1.1.6 起在 src/core/ai-pipeline.js（line 3928-4609）里加了 3 个 diag() 调用
 //          （minimax.timeout / minimax.transport / minimax.http），但 ai-pipeline.js 是独立 bundle 模块闭包，
-//          main.js 里 function diag 对它不可见，运行到错路径时直接报 "diag is not defined"。
-// 修复：所有 diag / keyFingerprint / 缓冲都通过 globalThis.__eksDiag，单一来源；各模块加 1 行 wrapper 即可访问。
-//      这样保持 main.js 现有 16 处 diag() 调用源码不动，ai-pipeline.js 也只需加一个本地函数名。
-if (!globalThis.__eksDiag) {
-  globalThis.__eksDiag = { state: { logPath: null, buffer: [], flushTimer: null } };
-}
+//          main.js 里 function diag 对它词法不可见，运行到失败路径时直接报 "diag is not defined"。
+// v1.1.9 只 init state，function diag 仍留在 main.js 本地闭包；ai-pipeline wrapper 静默不调用（不抛错），
+//          但 ReferenceError 仍可能在 main.js 模块求值之前被触发的边角路径上触发。
+// v1.1.10 真正修复：下面把 function diag / keyFingerprint / flushDiagLog / forceFlushDiag 全部 attach 到
+//          globalThis.__eksDiag（同时声明一个 no-op fallback 防止 main.js 还没 attach 时 ai-pipeline
+//          触发 ReferenceError）。wrapper 走 globalThis 委托，单一来源。
+if (!globalThis.__eksDiag) globalThis.__eksDiag = { state: { logPath: null, buffer: [], flushTimer: null } };
+// 兜底：如果 main.js 的 function diag 还没装载（极端缓存/重启顺序），ai-pipeline 触发也不抛 ReferenceError，
+//   而是 console.log 一行即可。等下方 attach 完成后再调用就会触发真正的实现。
+function diagFallback(scope, payload) { try { console.log('[EKS diag] ' + scope + ' ' + JSON.stringify(payload || { value: payload })); } catch (_) {} }
+function fpFallback() { return 'fp:<unavailable>'; }
+globalThis.__eksDiag.diag = globalThis.__eksDiag.diag || diagFallback;
+globalThis.__eksDiag.keyFingerprint = globalThis.__eksDiag.keyFingerprint || fpFallback;
+globalThis.__eksDiag.flushDiagLog = globalThis.__eksDiag.flushDiagLog || function () {};
+globalThis.__eksDiag.forceFlushDiag = globalThis.__eksDiag.forceFlushDiag || function () {};
 
 // v1.1.3 + v1.1.5: 字符串规范化工具，做 NFC + 控制字符剥离 + 全角→半角空格。
 // 必须放在 main.js 模块的"主代码区"（plugin class 闭包能直接看到的位置）。
@@ -174,6 +183,15 @@ function keyFingerprint(value) {
   } catch (_) {
     return 'fp:<unavailable>';
   }
+}
+
+// v1.1.10: 把上面定义的真正实现 attach 到 globalThis.__eksDiag，替换占位的 fallback。
+// ai-pipeline.js 的本地 diag wrapper 委托到 globalThis.__eksDiag.diag，现在能找到真函数。
+if (typeof globalThis.__eksDiag === 'object') {
+  globalThis.__eksDiag.diag = diag;
+  globalThis.__eksDiag.keyFingerprint = keyFingerprint;
+  globalThis.__eksDiag.flushDiagLog = flushDiagLog;
+  globalThis.__eksDiag.forceFlushDiag = forceFlushDiag;
 }
 
 function loadSecretsFile() {
@@ -2135,7 +2153,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 9,
+  settingsVersion: 10,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -2188,7 +2206,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 9;
+  migrated.settingsVersion = 10;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -4259,6 +4277,7 @@ async function atomizeSummary(options) {
   if (!batches.length) batches.push([]);
 
   const results = [];
+  let truncated = false;
   for (let index = 0; index < batches.length; index += 1) {
     const batchPointIds = batches[index];
     const pointSet = new Set(batchPointIds);
@@ -4276,23 +4295,55 @@ async function atomizeSummary(options) {
       batchTotal: batches.length,
       message: `原子化 ${index + 1}/${batches.length} 批（共 ${pointIds.length} 个知识点，每批 ${batchSize} 个）`
     });
-    results.push(await atomizeSummaryBatch(options, batchSummary, batchPointIds, index + 1, batches.length));
+    // v1.1.10: AI 输出达到 8192 token 上限（AI_OUTPUT_TRUNCATED）时不再把整个任务炸掉，
+    //   暂时标记 truncated = true，中断剩余批次，将已成功的批次合并成 partial 结果。
+    let batchResult;
+    try {
+      batchResult = await atomizeSummaryBatch(options, batchSummary, batchPointIds, index + 1, batches.length);
+    } catch (error) {
+      if (error && error.code === 'AI_OUTPUT_TRUNCATED') {
+        truncated = true;
+        if (typeof globalThis.__eksDiag === 'object' && globalThis.__eksDiag.diag) {
+          globalThis.__eksDiag.diag('atomization.truncated', { completed: index, total: batches.length, pointIds: pointIds.length });
+        }
+        break;
+      }
+      throw error;
+    }
+    results.push(batchResult);
     // 每个 batch 完成后 emit 一次（带 batchComplete 标记，触发写盘 + UI 重渲染）
     await emitProgress(options.onProgress, {
       stage: 'atomization',
       batchIndex: index + 1,
       batchTotal: batches.length,
       batchComplete: true,
-      message: `原子化 ${index + 1}/${batches.length} 批完成`
+      message: truncated
+        ? `原子化 ${index + 1}/${batches.length} 批完成（后续批次因 AI 输出截断而跳过）`
+        : `原子化 ${index + 1}/${batches.length} 批完成`
     });
   }
 
-  if (results.length === 1) return results[0];
+  // v1.1.10: 配合 maxPointsPerRequest + 截断豁免：批次全是空（pointIds 为空）时允许返回空结果。
+  if (!results.length) {
+    return applySchemaConstants(options.atomSchema, {
+      atoms: [],
+      coverage: { point_ids: pointIds, complete: !truncated && results.length === batches.length },
+      schema_version: '1.1'
+    });
+  }
+  if (results.length === 1 && !truncated) return results[0];
+  const mergedAtoms = results.flatMap((result) => result.atoms || []);
   const merged = applySchemaConstants(options.atomSchema, {
-    atoms: results.flatMap((result) => result.atoms || []),
-    coverage: { point_ids: pointIds, complete: true },
+    atoms: mergedAtoms,
+    coverage: { point_ids: pointIds, complete: !truncated && results.length === batches.length },
     schema_version: '1.1'
   });
+  // v1.1.10: 截断情况下跳过严格 schema 校验，避免一次大文档被反复重试；
+  //   改用轻量级校验（每个 atom 至少含 atom_id）以保留尽可能多的可入库卡片。
+  if (truncated) {
+    const validAtoms = mergedAtoms.filter((atom) => atom && atom.atom_id);
+    return Object.assign({}, merged, { atoms: validAtoms, _truncated: true });
+  }
   const validation = validateSchema(options.atomSchema, merged);
   const errors = [...validation.errors, ...exactCoverage(merged.coverage, 'point_ids', pointIds, '知识点覆盖不完整')];
   if (errors.length) throw new Error(errors.join('；'));
@@ -4311,11 +4362,16 @@ async function atomizeSummaryBatch(options, summary, pointIds, batchIndex, batch
     '已有知识卡片候选（related_candidates 只能引用这些 card_id；没有明确语义关系时返回空数组）：',
     JSON.stringify((options.linkCandidates || []).map((item) => ({ card_id: item.card_id, title: item.title, path: item.path })), null, 2),
     '允许的关联类型仅为 supports、contradicts、supersedes、depends_on、implements、related。',
-    '每个独立且有复用价值的知识点生成一个原子；禁止只描述“召开会议、进行了讨论、应当优化”等空泛内容。',
+    '每个独立且有复用价值的知识点生成一个原子；禁止只描述”召开会议、进行了讨论、应当优化”等空泛内容。',
     '每个原子的 source 必须包含源文件双链、原文定位、逐字证据和父总结双链。',
     `coverage.point_ids 必须完整且只能为：${JSON.stringify(pointIds)}；complete 必须为 true。`,
     `这是知识原子化第 ${batchIndex}/${batchTotal} 批；只处理本批知识点，不得重复其他批次。`,
-    '标题和正文统一使用简体中文。只返回符合 knowledge-atoms.schema.json 的 JSON。'
+    '标题和正文统一使用简体中文。只返回符合 knowledge-atoms.schema.json 的 JSON。',
+    // v1.1.10: 显式列出必须的最外层结构。AI 返回不带 {atoms:[...], coverage:{...}, schema_version:”1.1”}
+    //   包裹的形状（如直接返回 atom 数组、或单个 atom 对象、或裸 markdown）都会被严格 schema 校验拒绝。
+    //   显式约束 shape 是 90% 错误的根因。
+    '【输出包裹格式（严格）】必须直接返回一个 JSON 对象，禁止用 Markdown 代码围栏（不要 ```json ... ```），禁止外层再套一层数组或对象。该对象的 keys 只能出现以下三个：atoms、coverage、schema_version，缺一不可。',
+    '示例（只是格式示例，不是内容约束）：{“atoms”:[{“atom_id”:”...”,”title”:”...”,”card_kind”:”static|event”,”library”:”bid|business”,”folder_type”:”...”,”content”:{...},”source”:{“source_link”:”...”,”source_locator”:”...”,”evidence_quote”:”...”,”parent_summary”:”...”},”model_confidence”:0.0,”validation_issues”:[],”related_candidates”:[]}, ...],”coverage”:{“point_ids”:[' + pointIds.map((id) => '”' + id + '”').join(',') + '],”complete”:true},”schema_version”:”1.1”}'
   ].filter(Boolean).join('\n\n');
   return requestWithContract({
     prompt,

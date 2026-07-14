@@ -128,6 +128,30 @@ function forceFlushDiag() {
   flushDiagLog();
 }
 
+// v1.1.8: 实时进度条 + 心跳
+// 1 秒一次刷新 elapsedMs / at，不写盘、不重渲染整个 dashboard，只更新进度条 DOM
+function startProgressHeartbeat(plugin, task, startedAt) {
+  return setInterval(() => {
+    try {
+      if (!task || !plugin) return;
+      task.progress = task.progress || {};
+      task.progress.elapsedMs = Date.now() - startedAt;
+      task.progress.at = new Date().toISOString();
+      plugin.refreshProgressOnly?.(task);
+    } catch (_) { /* 心跳失败不能炸 */ }
+  }, 1000);
+}
+
+// v1.1.8: 根据已用时 + 已完成批次数估算剩余时间
+function computeEtaText(progress) {
+  if (!progress || !progress.batchTotal || !progress.batchIndex || !progress.elapsedMs) return '';
+  const avgPerBatch = progress.elapsedMs / progress.batchIndex;
+  const remaining = progress.batchTotal - progress.batchIndex;
+  if (remaining <= 0) return '';
+  const etaMs = Math.round(avgPerBatch * remaining);
+  return `预计剩余 ${formatDuration(etaMs)}`;
+}
+
 // 计算密钥指纹（sha256 前 8 字符），绝不暴露原值。
 // 即使指纹出现在日志中也不会泄露密钥本身。
 function keyFingerprint(value) {
@@ -340,6 +364,16 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           console.error('工程知识切片界面刷新失败', error);
           new Notice(`工程知识切片界面刷新失败：${error.message}`);
         }
+      }
+    }
+  }
+
+  // v1.1.8: 轻量级进度刷新，只更新进度条 DOM 属性 + 已用时文本
+  // 不写盘、不重渲染整个 dashboard，给 1 秒一次心跳用
+  refreshProgressOnly(task) {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_SLICER)) {
+      if (leaf.view && typeof leaf.view.refreshProgress === 'function') {
+        try { leaf.view.refreshProgress(task); } catch (_) { /* 单个视图失败不影响其他 */ }
       }
     }
   }
@@ -614,7 +648,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const tagLibraryText = await this.loadTagLibraryText();
       const tagLibrary = parseTagLibrary(tagLibraryText);
       const existingCards = await this.loadExistingCards(current.source_hash);
-      const workflow = await runKnowledgeWorkflow({
+      // v1.1.8: 启动心跳，1 秒一次更新已用时 / 进度条，避免 18 分钟黑屏
+      const heartbeat = startProgressHeartbeat(this, current, startedAt);
+      diag('heartbeat.start', { sourcePath: current.source_path, intervalMs: 1000 });
+      let workflow;
+      try {
+        workflow = await runKnowledgeWorkflow({
         parsePackage,
         folderMap: contracts.folderMap,
         schemas: contracts.schemas,
@@ -633,10 +672,23 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         onProgress: async (progress) => {
           this.assertTaskCanContinue(current);
           current.status = workflowStatus(progress.stage);
-          await this.setTaskProgress(current, progress.message, Object.assign({}, progress, { elapsedMs: Date.now() - startedAt }));
+          // v1.1.8: 关键节点（batchComplete 或阶段变化）才走 setTaskProgress（写盘 + 全重渲染），
+          // 其他进度回调走轻量级 refreshProgressOnly（只刷进度条 DOM + 已用时文本）
+          const isKeyPoint = progress.batchComplete || progress.stage !== current.progress?.stage;
+          const merged = Object.assign({}, progress, { elapsedMs: Date.now() - startedAt });
+          current.progress = merged;
+          if (isKeyPoint) {
+            await this.setTaskProgress(current, progress.message, merged);
+          } else {
+            this.refreshProgressOnly(current);
+          }
         },
         onArtifact: (name, value) => this.persistArtifact(current, name, value)
       });
+      } finally {
+        clearInterval(heartbeat);
+        diag('heartbeat.stop', { sourcePath: current.source_path, totalElapsedMs: Date.now() - startedAt });
+      }
 
       const summaryLink = current.artifacts.summary_markdown
         ? `[[${current.artifacts.summary_markdown.replace(/\.md$/i, '')}]]`
@@ -1254,6 +1306,42 @@ class SlicerDashboardView extends ItemView {
     }
   }
 
+  // v1.1.8: 轻量级进度更新，1 秒一次心跳用，不重建整个 dashboard DOM
+  refreshProgress(task) {
+    if (!task || !task.progress) return;
+    const root = this.containerEl;
+    // 更新进度条
+    const bar = root.querySelector('.eks-progress-bar');
+    if (bar) {
+      const batchIndex = Number(task.progress.batchIndex) || 0;
+      const batchTotal = Number(task.progress.batchTotal) || 0;
+      const chunkIndex = Number(task.progress.chunkIndex) || 0;
+      const chunkTotal = Number(task.progress.chunkTotal) || 0;
+      if (batchTotal > 0) {
+        bar.max = String(batchTotal);
+        bar.value = String(batchIndex);
+      } else if (chunkTotal > 0) {
+        bar.max = String(chunkTotal);
+        bar.value = String(chunkIndex);
+      }
+    }
+    // 更新已用时文本
+    const elapsedEl = root.querySelector('.eks-task-meta.elapsed');
+    if (elapsedEl && task.progress.elapsedMs !== undefined) {
+      elapsedEl.textContent = `已用时：${formatDuration(task.progress.elapsedMs)} · 最后更新：${formatLocalTime(task.progress.at)}`;
+    }
+    // 更新进度消息文本
+    const textEl = root.querySelector('.eks-progress-text');
+    if (textEl && task.progress.message) {
+      textEl.textContent = task.progress.message;
+    }
+    // 更新 ETA
+    const etaEl = root.querySelector('.eks-task-meta.eta');
+    if (etaEl) {
+      etaEl.textContent = computeEtaText(task.progress);
+    }
+  }
+
   async renderContent(container) {
     const tasks = await this.plugin.loadTasks();
     const counts = statusCounts(tasks);
@@ -1338,14 +1426,33 @@ class SlicerDashboardView extends ItemView {
     const progress = grid.createDiv('eks-progress-message');
     progress.createDiv({ cls: 'eks-progress-title', text: `当前进度 · ${stageLabel(activeTask?.status || progressData.stage)}` });
     progress.createDiv({ cls: 'eks-progress-text', text: progressData.message || stats.lastMessage || '等待开始处理' });
+    // v1.1.8: HTML5 进度条，按 batch 或 chunk 进度填充
+    const progressTotal = Number(progressData.batchTotal) || Number(progressData.chunkTotal) || 0;
+    const progressIndex = Number(progressData.batchIndex) || Number(progressData.chunkIndex) || 0;
+    if (progressTotal > 0) {
+      progress.createEl('progress', {
+        cls: 'eks-progress-bar',
+        attr: { max: String(progressTotal), value: String(progressIndex) }
+      });
+      const etaText = computeEtaText(progressData);
+      const label = progressData.batchTotal
+        ? `原子化：${progressIndex}/${progressTotal}${etaText ? ' · ' + etaText : ''}`
+        : `MiniMax 分块：${progressIndex}/${progressTotal}；第 ${progressData.attempt || 1} 次请求`;
+      progress.createDiv({ cls: 'eks-task-meta', text: label });
+    } else if (progressData.chunkTotal || progressData.chunkIndex) {
+      progress.createDiv({ cls: 'eks-task-meta', text: `MiniMax 分块：${progressData.chunkIndex || 0}/${progressData.chunkTotal || '?'}；第 ${progressData.attempt || 1} 次请求` });
+    }
     if (progressData.totalPages || progressData.extractedPages) {
       progress.createDiv({ cls: 'eks-task-meta', text: `解析页数：${progressData.extractedPages || 0}/${progressData.totalPages || '?'}` });
     }
-    if (progressData.chunkTotal || progressData.chunkIndex) {
-      progress.createDiv({ cls: 'eks-task-meta', text: `MiniMax 分块：${progressData.chunkIndex || 0}/${progressData.chunkTotal || '?'}；第 ${progressData.attempt || 1} 次请求` });
+    if (progressData.elapsedMs !== undefined) {
+      progress.createDiv({
+        cls: 'eks-task-meta elapsed',
+        text: `已用时：${formatDuration(progressData.elapsedMs)} · 最后更新：${formatLocalTime(progressData.at)}`
+      });
+    } else if (progressData.at) {
+      progress.createDiv({ cls: 'eks-task-meta', text: `最后更新：${formatLocalTime(progressData.at)}` });
     }
-    if (progressData.elapsedMs !== undefined) progress.createDiv({ cls: 'eks-task-meta', text: `已用时：${formatDuration(progressData.elapsedMs)}` });
-    if (progressData.at) progress.createDiv({ cls: 'eks-task-meta', text: `最后更新：${formatLocalTime(progressData.at)}` });
     stat(grid, '过往已处理', historical);
     stat(grid, '本次处理文件', stats.processed || 0);
     stat(grid, '本次已入库卡片', stats.written || 0);
@@ -2007,7 +2114,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 7,
+  settingsVersion: 8,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -2060,7 +2167,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 7;
+  migrated.settingsVersion = 8;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -4108,7 +4215,10 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
 
 async function atomizeSummary(options) {
   const pointIds = (options.summary.key_points || []).map((point) => point.point_id);
-  const batchSize = Math.max(1, Math.min(3, Number(options.maxPointsPerRequest) || 1));
+  // v1.1.8: 默认拆细到每批 1 个知识点，调用次数 +N-3N 但每批之间能 emit 进度，
+  // 用户不再面对 18 分钟黑屏。可在 settings.maxPointsPerRequest 调高（1-3）恢复。
+  const configuredBatchSize = Number(options.maxPointsPerRequest) || 1;
+  const batchSize = Math.max(1, Math.min(3, configuredBatchSize));
   const batches = [];
   for (let offset = 0; offset < pointIds.length; offset += batchSize) {
     batches.push(pointIds.slice(offset, offset + batchSize));
@@ -4126,7 +4236,22 @@ async function atomizeSummary(options) {
       key_points: keyPoints,
       evidence: (options.summary.evidence || []).filter((item) => evidenceIds.has(item.evidence_id))
     });
+    // 每个 batch 开始前 emit 一次（在调用前已知批次信息）
+    await emitProgress(options.onProgress, {
+      stage: 'atomization',
+      batchIndex: index + 1,
+      batchTotal: batches.length,
+      message: `原子化 ${index + 1}/${batches.length} 批（共 ${pointIds.length} 个知识点，每批 ${batchSize} 个）`
+    });
     results.push(await atomizeSummaryBatch(options, batchSummary, batchPointIds, index + 1, batches.length));
+    // 每个 batch 完成后 emit 一次（带 batchComplete 标记，触发写盘 + UI 重渲染）
+    await emitProgress(options.onProgress, {
+      stage: 'atomization',
+      batchIndex: index + 1,
+      batchTotal: batches.length,
+      batchComplete: true,
+      message: `原子化 ${index + 1}/${batches.length} 批完成`
+    });
   }
 
   if (results.length === 1) return results[0];

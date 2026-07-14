@@ -1,5 +1,48 @@
 # 工程知识切片 变更记录
 
+## v1.1.8 — 2026-07-14 实时进度条
+
+### 📊 进度条 UI
+用户反馈「知识原子化调用 MiniMax 已经 18 分钟了，想知道进度」—— 这是因为：
+- `requestWithContract` 只在每次 AI 请求**前**和**修复重试前**各 emit 一次 progress
+- 一个原子化批次（1-3 个知识点）通常 20-60 秒，期间零信号，UI 冻住
+- AI 请求是 batch 模式，等整个响应回来再处理
+
+v1.1.8 给出三件东西：
+- **HTML5 `<progress>` 元素**（带主题适配 CSS，跨 Obsidian 浅色/深色主题可读）
+- **批次进度**「原子化：5/12」直观的批次计数器
+- **ETA 估算**「预计剩余 3 分 20 秒」（根据已用时 + 已完成批数推算）
+
+### ⏱ 心跳刷新
+- 新增 `startProgressHeartbeat(plugin, task, startedAt)`，1 秒一次 `setInterval`
+- 心跳调用新增的 `refreshProgressOnly(task)` 轻量级刷新：**只更新 DOM 属性，不写盘、不重渲染整个 dashboard**
+- 心跳启动/停止打 `[EKS diag] heartbeat.start` / `heartbeat.stop`，便于排障
+- `processTask` 末尾 `finally` 块清理 heartbeat，即使异常也不会泄漏
+
+### 🔀 智能进度路由
+`onProgress` 回调改为：
+- **关键节点**（`batchComplete: true` 或 `stage` 切换）→ 走 `setTaskProgress`（写盘 + 重渲染）
+- **其余中间回调**（每批开始、chunk 进度、attempt 重试）→ 走 `refreshProgressOnly`（只刷 DOM）
+- 拆细原子化批次：默认 `maxPointsPerRequest: 1`（之前是 1-3），12 个知识点变成 12 次 API 调用而非 4-12 次，每批之间都能刷进度
+
+### 🎨 新增辅助
+- `computeEtaText(progress)` —— 根据 batchIndex/batchTotal/elapsedMs 计算剩余时间字符串
+- `refreshProgress(task)` —— SlicerDashboardView 新方法，只更新 `.eks-progress-bar` 和 `.eks-task-meta.elapsed` 文本
+- `refreshProgressOnly(task)` —— Plugin 新方法，分发到所有 dashboard 视图的 `refreshProgress`
+
+### ⚙ 版本号
+- `DEFAULT_SETTINGS.settingsVersion` 7 → **8**
+- `manifest.json` 版本 1.1.7 → **1.1.8**
+
+### 🔧 回滚
+如果拆分批次后总耗时变长（确实会变长一点，因为多 N-3N 个 API 请求的开销），只需在设置里把 `maxPointsPerRequest` 调到 2 或 3 即可。心跳和进度条 UI 是纯增量，可以独立保留。
+
+### ❌ 不在本版本范围
+- **SSE 流式接收**：架构改动太大，留给 v1.2
+- **服务端 token 计数显示**：MiniMax API 响应里有 `usage` 字段但本次不读取
+
+---
+
 ## v1.1.7 — 2026-07-14 诊断日志写入文件
 
 ### 📄 文件版诊断日志

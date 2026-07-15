@@ -1,5 +1,24 @@
 # 工程知识切片 变更记录
 
+## v2.0.0 — 2026-07-15 Markdown 渲染加固 (M-06)
+
+### 🐛 真实 bug 修复
+**`renderCardMarkdown` 未定义导致的 TypeError**：dashboard 渲染卡片时调用了一个从未导出的函数名 `renderCardMarkdown(card)`，但模块实际导出的是 `renderKnowledgeCard`。结果是该路径在卡片渲染时抛 `renderCardMarkdown is not defined`，dashboard 跳过卡片区。修正为 `renderKnowledgeCard(card)`，路径恢复。
+
+### 🛡 renderKnowledgeCard 容错加固
+所有可能为空的字段（summary / key_points / glossary / relations / sources）用 `optionalSection()` 包起来，缺失字段不渲染章节、不抛错：
+- `summary`：`Array.isArray && length > 0` 才输出 `## 摘要`
+- `key_points`：每条独立 trim / 空串过滤 / toString
+- `glossary`：每条 term 缺失时回退为 term 自身
+- `sources`：`Array.isArray && length > 0` 才输出 `## 来源`
+- `relations` / `semantic_links`：防御性 `for...of` 迭代，混合类型（字符串 / 对象）均能处理
+- `confidence_decision` 与 `confidence` 拆为独立行（之前塞在一行 Yaml 里）
+
+### ⚠️ 风险
+本次涉及所有已批准 / 已落盘卡片的 Markdown 重新渲染逻辑（dashboard 实时预览 + 卡片归档）。v1.9.0 之前已写入 vault 的卡片**不会**自动重写（仍是旧格式）；如需重渲染请在设置面板里点「重写所有卡片」。
+
+---
+
 ## v1.9.0 — 2026-07-15 性能 + 路径解析 + 死代码清理后续
 
 ### ⏱ M-04 写盘防抖

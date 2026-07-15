@@ -1038,7 +1038,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           card.Status = '#status/needs_fix';
           card.Validation_Errors = validation.errors;
         }
-        const markdown = renderCardMarkdown(card);
+        const markdown = renderKnowledgeCard(card);
         const question = this.isQuestionableCard(card, validation);
         if (question) {
           const draftPath = `${this.settings.draftPath}/${safeCardFileName(card.Title, current.sourceHash)}`;
@@ -5343,15 +5343,17 @@ function renderKnowledgeCard(card) {
   if (card.card_kind === 'event') renderEventBody(lines, card.content || {});
   else renderStaticBody(lines, card.content || {});
 
-  lines.push('## 来源证据', '', `- 来源文件：${card.source_link}`, `- 证据位置：${card.source_locator || card.source_page}`, `- 原文摘录：${card.evidence_quote}`, '');
-  lines.push('## 关联知识', '', `- 上游总结：${card.parent_summary}`);
-  for (const relation of card.content.semantic_links || []) lines.push(`- ${relation.relation || 'related'} ${relation.target || relation.target_card_id || ''}`);
-  const relationTargets = new Set();
-  for (const relation of card.relations || []) {
-    relationTargets.add(relation.target);
-    lines.push(`- ${relation.relation || 'related'} ${relation.target}`);
-  }
-  for (const target of card.related || []) if (!relationTargets.has(target)) lines.push(`- related ${target}`);
+  optionalSection(lines, '来源证据', [
+    `- 来源文件：${card.source_link}`,
+    `- 证据位置：${card.source_locator || card.source_page}`,
+    `- 原文摘录：${card.evidence_quote}`
+  ]);
+  optionalSection(lines, '关联知识', [
+    `- 上游总结：${card.parent_summary}`,
+    ...(Array.isArray(card.content && card.content.semantic_links) ? card.content.semantic_links : []).map((relation) => `- ${relation.relation || 'related'} ${relation.target || relation.target_card_id || ''}`),
+    ...(Array.isArray(card.relations) ? card.relations : []).map((relation) => `- ${relation.relation || 'related'} ${relation.target}`),
+    ...(Array.isArray(card.related) ? card.related : []).map((target) => `- related ${target}`)
+  ]);
   return `${lines.join('\n').replace(/\n{3,}/g, '\n\n')}\n`;
 }
 

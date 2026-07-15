@@ -1,5 +1,57 @@
 # 工程知识切片 变更记录
 
+## v1.4.0 — 2026-07-15 P1 安全加固：内容指纹 + 截断 UI + 迁移备份
+
+### 🔒 S-02 内容指纹脱敏（不再依赖键名）
+旧版 `diag` 只在键名匹配 `/(key|token|secret|password)/i` 时才指纹化，调方改个 key 名就漏出来。新版改为**内容指纹**：
+- JWT（`eyJ...`）、GitHub PAT（`ghp_/gho_/ghs_/ghu_/ghr_/ghx_`）、`sk-`/`sk_`/`key-`/`paddle-` 前缀的 token
+- 长度 ≥ 40 字符且字符类 ≥ 3 种（大小写/数字/+/=）的高熵串 → 视为凭证
+- 不会被误伤：短字符串、含空格的自然语言、路径、URL 前缀
+- 同时升级 `sanitizeSecret`（Notice 用的脱敏）也走同一套逻辑
+
+### 📂 M-10 路径比较顺序统一
+旧版散落 5+ 处 `normalizeVaultPath → normalizeUnicodeForm` / `normalizeUnicodeForm → normalizeVaultPath` 互换。统一抽出 `normalizePathForCompare` 入口（顺序固定 normalizeVaultPath → normalizeUnicodeForm），所有调用点替换。
+
+同时修复 `isInternalSlicerFile` 的 bug：原来 `draftPath` / `logPath` 没经过 normalize，导致配置里写全角空格或前后斜杠的边界条件下漏判。已修复。
+
+### 💾 M-11 写盘前自动备份 + 暂停/恢复
+旧版 `recoverStaleProcessingTasks` 把中断任务一刀切改为 `failed`，用户无法批量恢复。改进：
+- `saveTasks` 写盘前自动备份上一版到 `tasks.json.bak.{ISO-timestamp}.json`（setting `backupTasksOnSave`，默认 true，可关）
+- 中断任务改记为 `paused`（可在 dashboard 重新入队）
+- 新增 dashboard 按钮 **"恢复暂停任务"**：把所有 `paused` 状态任务批量回 `queued`
+
+### 🛡 M-05 apply_correction 白名单校验
+旧版 `applyBatchAction` 用 `Object.assign({}, atom, correction)` 直接合并，用户在 prompt 输入什么就接受什么（甚至能改 `_id` 之类内部字段）。
+
+新版：
+- 字段白名单：`Category / TagL1 / TagL2 / Info_Type / Event_Type / Card_Type / Map_Index`
+- 类型校验：必须是 string
+- 长度上限 100 字符
+- 空字符串视为"不修改该字段"
+- 提示文案明确告知白名单
+
+### ⚠️ M-07 AI 截断 fallback UI
+v1.1.10 加了 `_truncated` 标志但没有 UI 反馈。新版：
+- workflow 返回 `truncated` / `truncatedCompleted` 字段
+- 任务保存时记录 `task.truncated` / `task.truncated_completed`
+- 触发时弹 Notice 一次
+- dashboard 顶部 banner 汇总所有被截断的任务（前 5 个 + 总数）
+- 配套 styles.css `.eks-banner-warning` 样式
+
+### 🛡 风险
+- 内容指纹可能把"长 base64 编码的内容片段"误判为凭证，引入新 false positive。
+  - **缓解**：40 字符阈值 + 字符类数 ≥ 3 + 不含空格三道闸门，自然语言片段不会被误判。
+- 备份文件占用 vault 空间（每写一次多一个 .bak）。
+  - **缓解**：默认开启但提供 `backupTasksOnSave` 设置项可关；用户可定期手动清理 .bak。
+
+### 🔍 验证步骤
+1. `node --check main.js` 通过
+2. 在 settings 里加任意长字符串到某条任务的 progress.message，刷新 dashboard → 确认 banner 显示
+3. 把 tasks.json 改坏再触发处理 → 看到 `tasks.json.bak.{ts}.json` 被自动创建
+4. 在 dashboard prompt 输入 `{"foo":"bar"}` → 被白名单拒绝
+
+---
+
 ## v1.3.0 — 2026-07-15 P0 合规：diag.log 移出 vault + 上传前确认 + 版本号对齐
 
 ### 🔒 上传源文件到 MinerU/PaddleOCR 之前要二次确认（审核报告 S-04）

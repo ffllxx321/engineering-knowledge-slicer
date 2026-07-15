@@ -63,6 +63,11 @@ globalThis.__eksDiag.forceFlushDiag = globalThis.__eksDiag.forceFlushDiag || fun
 // 之前误放在 src/core/task.js 模块内，那是独立作用域，main.js 模块内的 plugin class 方法看不到。
 // v1.1.5 把它抬到 main.js bundle 模块的 closure 内，使 plugin class 的所有方法都能解析到。
 // migration.js 模块内的同款副本保留一份独立副本，避免跨模块引用崩。
+// v1.4: 新增 normalizePathForCompare 作为路径比较的唯一入口。
+//       顺序固定为 normalizeVaultPath → normalizeUnicodeForm，调用方不再各自拼。
+function normalizePathForCompare(value) {
+  return normalizeUnicodeForm(normalizeVaultPath(value));
+}
 function normalizeUnicodeForm(value) {
   let str = String(value || '');
   if (!str) return str;
@@ -84,10 +89,10 @@ function diag(scope, payload) {
   try {
     const data = payload && typeof payload === 'object' ? payload : { value: payload };
     const serialized = JSON.stringify(data, (_k, v) => {
-      // 任何看起来像密钥的字面量自动转指纹，禁止在诊断日志里泄露原值
-      if (typeof v === 'string' && /^(sk-|sk_|key-|eyJ|[A-Za-z0-9_-]{24,})/.test(v) && /(key|token|secret|password)/i.test(_k || '')) {
-        return keyFingerprint(v);
-      }
+      // v1.4: 改为"内容指纹"模式，不再依赖键名匹配。
+      //       任何看起来像凭证的字面量都自动转指纹，与键名无关（防止调用方改个 key 名就漏出来）。
+      //       同时也覆盖 JWT (eyJ...)、GitHub PAT (ghp_/gho_/ghs_/ghu_)、MinerU / PaddleOCR / MiniMax (sk-/key-) 各种前缀。
+      if (typeof v === 'string') return redactCredential(v);
       return v;
     });
     const line = `[EKS diag] ${scope} ${serialized}`;
@@ -101,6 +106,40 @@ function diag(scope, payload) {
       }
     }
   } catch (e) { /* 诊断日志自身不能炸 */ }
+}
+
+// v1.4: 内容指纹脱敏。基于凭证特征（不是键名）判定一个字符串是否需要指纹化。
+//       已识别的模式：
+//         - JWT: 以 "eyJ" 开头的 base64url（典型长度 100+，形如 eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9....）
+//         - GitHub PAT: ghp_/gho_/ghs_/ghu_/ghr_ 前缀的 36+ 字符字母数字
+//         - OpenAI/Anthropic 风格: sk- 前缀，32+ 字符
+//         - MinerU/PaddleOCR/MiniMax 风格: key- / paddle- / sk_ 前缀，32+ 字符
+//         - 高熵长 base64/hex 串: 长度 ≥ 40 且几乎全是字母数字+/=- → 高概率是 secret
+//       不会误伤：
+//         - 短字符串（< 24 字符）
+//         - 含空格 / 标点的自然语言片段
+//         - 路径、URL、文件名前缀
+function redactCredential(value) {
+  const str = String(value || '');
+  if (str.length < 24) return str;
+  // JWT
+  if (/^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/.test(str)) return keyFingerprint(str);
+  // GitHub PAT / API Token (ghp_/gho_/ghs_/ghu_/ghr_/gho_/ghx_)
+  if (/^gh[pousxr]_[A-Za-z0-9]{30,}/.test(str)) return keyFingerprint(str);
+  // sk- / sk_ / key- / paddle- 前缀的 token
+  if (/^(sk-|sk_|key-|paddle-)[A-Za-z0-9]{16,}/.test(str)) return keyFingerprint(str);
+  // 高熵长 base64/hex 串（≥ 40 字符，几乎全是 [A-Za-z0-9+/=_-]）
+  if (str.length >= 40 && /^[A-Za-z0-9+/=_-]+$/.test(str)) {
+    const charClasses = new Set(str.split('').map((c) => {
+      if (/[A-Z]/.test(c)) return 'U';
+      if (/[a-z]/.test(c)) return 'L';
+      if (/[0-9]/.test(c)) return 'D';
+      if (c === '+' || c === '/' || c === '=') return 'B';
+      return c; // _ -
+    }));
+    if (charClasses.size >= 3) return keyFingerprint(str);
+  }
+  return str;
 }
 
 function flushDiagLog() {
@@ -489,16 +528,18 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   isInIntake(path) {
-    const normalized = normalizeUnicodeForm(normalizeVaultPath(path));
+    // v1.4: 统一用 normalizePathForCompare 入口
+    const normalized = normalizePathForCompare(path);
     return [this.settings.bidIntakePath, this.settings.businessIntakePath]
-      .some((root) => normalized.startsWith(`${normalizeVaultPath(normalizeUnicodeForm(root))}/`));
+      .some((root) => normalized.startsWith(`${normalizePathForCompare(root)}/`));
   }
 
   isInternalSlicerFile(path) {
-    const normalized = normalizeUnicodeForm(normalizeVaultPath(path));
-    return normalized.startsWith(`${normalizeVaultPath(normalizeUnicodeForm(this.settings.artifactsPath))}/`)
-      || normalized.startsWith(`${this.settings.draftPath}/`)
-      || normalized.startsWith(`${this.settings.logPath}/`);
+    // v1.4: 统一用 normalizePathForCompare 入口；修复原代码对 draftPath/logPath 不 normalize 的 bug
+    const normalized = normalizePathForCompare(path);
+    return normalized.startsWith(`${normalizePathForCompare(this.settings.artifactsPath)}/`)
+      || normalized.startsWith(`${normalizePathForCompare(this.settings.draftPath)}/`)
+      || normalized.startsWith(`${normalizePathForCompare(this.settings.logPath)}/`);
   }
 
   async processSingleFile(file) {
@@ -663,8 +704,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     try {
       // v1.1.2: 旧任务 / 第三方写入可能留下 source_path 为空的情况，统一兜底成空字符串
       // 防止后续 readBinary / Notice 拼接时出现 'undefined'/'null' 字面。
-      current.source_path = normalizeVaultPath(current.source_path || '');
-      current.source_path = normalizeUnicodeForm(current.source_path);
+      // v1.4: 用 normalizePathForCompare 统一 normalize 顺序
+      current.source_path = normalizePathForCompare(current.source_path || '');
       this.sessionStats.current = current.source_path;
       current.errors = [];
       current.review_atom_ids = [];
@@ -775,6 +816,13 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         elapsedMs: Date.now() - startedAt,
         at: current.updated_at
       };
+      // v1.4 (M-07): 记录 AI 截断标志，dashboard 顶部 banner 与 Notice 会消费
+      if (workflow.truncated) {
+        current.truncated = true;
+        current.truncated_completed = workflow.truncatedCompleted || 0;
+        new Notice(`⚠️ AI 输出超过 8192 token 上限被截断。已成功 ${current.truncated_completed} 个原子。dashboard 顶部有警告。`);
+        diag('workflow.truncated', { sourcePath: current.source_path, completed: current.truncated_completed });
+      }
       await this.writeTaskLog(current);
       await this.saveTasks(upsertTask(await this.loadTasks(), current));
       this.sessionStats.processed += 1;
@@ -1073,7 +1121,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     }
 
     const selectedIds = new Set(group.items.map((item) => item.atom_id));
-    const changed = applyBatchAction(group.items, action, correction);
+    // v1.4 (M-05): apply_correction 必须先过白名单校验
+    let safeCorrection = correction;
+    if (action === 'apply_correction') {
+      safeCorrection = validateCorrection(correction);
+    }
+    const changed = applyBatchAction(group.items, action, safeCorrection);
     const tagLibrary = await this.loadTagLibrary();
     const folderMap = (await this.loadRuntimeContracts()).folderMap;
     const unresolved = [];
@@ -1224,7 +1277,39 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
   async saveTasks(tasks) {
     await this.ensureFolders();
-    await writeFile(this.app, tasksPath(this.settings), JSON.stringify(tasks, null, 2));
+    const target = tasksPath(this.settings);
+    // v1.4 (M-11): 写盘前先备份上一版 tasks.json 到 tasks.json.bak.{ts}，
+    //              便于迁移出错或 schema 升级失败时回退。
+    if (this.settings.backupTasksOnSave !== false) {
+      try {
+        const existing = this.app.vault.getAbstractFileByPath(target);
+        if (existing instanceof TFile) {
+          const ts = new Date().toISOString().replace(/[:.]/g, '-');
+          const backupPath = target.replace(/\.json$/i, `.bak.${ts}.json`);
+          const content = await this.app.vault.read(existing);
+          await writeFile(this.app, backupPath, content);
+        }
+      } catch (e) {
+        try { diag('tasks.backup.error', { message: String(e && e.message || e) }); } catch (_) {}
+      }
+    }
+    await writeFile(this.app, target, JSON.stringify(tasks, null, 2));
+  }
+
+  // v1.4 (M-11): 手动把所有 paused 任务重新入队（dashboard 按钮触发）
+  async restorePausedTasks() {
+    const tasks = await this.loadTasks();
+    let restored = 0;
+    for (const task of tasks) {
+      if (task.status !== 'paused') continue;
+      task.status = 'queued';
+      task.errors = (task.errors || []).filter((e) => e?.stage !== 'stale-processing');
+      task.updated_at = new Date().toISOString();
+      restored += 1;
+    }
+    if (restored > 0) await this.saveTasks(tasks);
+    await this.refreshViews();
+    return restored;
   }
 
   async setTaskProgress(task, message, details = {}) {
@@ -1249,16 +1334,18 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       if (!PROCESSING_STATUSES.has(task.status)) continue;
       const updatedAt = Date.parse(task.updated_at || task.progress?.at || '');
       if (!updatedAt || now - updatedAt < staleMs) continue;
-      task.status = 'failed';
+      // v1.4 (M-11): 改 'failed' 为 'paused'，避免被一刀切失败。
+      //               用户可在 dashboard 点"恢复暂停任务"批量重排队。
+      task.status = 'paused';
       task.updated_at = new Date().toISOString();
       task.errors = [...(task.errors || []), {
         stage: 'stale-processing',
-        message: `任务在 ${minutes} 分钟内没有进度更新，已判定为中断。请使用“重试失败并处理”。`,
+        message: `任务在 ${minutes} 分钟内没有进度更新，已判定为中断并暂停。可在 dashboard 点"恢复暂停任务"重排队。`,
         at: task.updated_at
       }];
       task.progress = {
         stage: 'stale-processing',
-        message: '任务长时间没有进度更新，已转为失败，可重试',
+        message: '任务长时间没有进度更新，已暂停等待恢复',
         at: task.updated_at
       };
       changed = true;
@@ -1572,6 +1659,26 @@ class SlicerDashboardView extends ItemView {
     const tasks = await this.plugin.loadTasks();
     const counts = statusCounts(tasks);
 
+    // v1.4 (M-07): AI 截断 dashboard 顶部 banner
+    const truncatedTasks = tasks.filter((t) => t.truncated === true);
+    if (truncatedTasks.length) {
+      const banner = container.createDiv({ cls: 'eks-banner eks-banner-warning' });
+      banner.createEl('strong', { text: `⚠️ ${truncatedTasks.length} 个任务的 AI 输出被截断（8192 token 上限）。` });
+      banner.createDiv({
+        cls: 'eks-task-meta',
+        text: `部分文档的知识点可能未生成完整。检查后可用「重试失败任务」重新处理。`
+      });
+      const list = banner.createDiv({ cls: 'eks-task-meta' });
+      for (const t of truncatedTasks.slice(0, 5)) {
+        const item = list.createDiv();
+        item.createSpan({ text: `· ${t.source_path}` });
+        if (t.truncated_completed) item.createSpan({ text: ` (已生成 ${t.truncated_completed} 个原子)` });
+      }
+      if (truncatedTasks.length > 5) {
+        list.createDiv({ text: `… 还有 ${truncatedTasks.length - 5} 个` });
+      }
+    }
+
     const overview = container.createDiv('eks-panel eks-overview');
     const header = overview.createDiv('eks-header');
     header.createEl('h3', { text: '总览' });
@@ -1579,6 +1686,11 @@ class SlicerDashboardView extends ItemView {
     button(actions, '扫描并自动处理', () => this.plugin.scanSourceFiles(true));
     button(actions, '继续自动处理', () => this.plugin.autoProcessQueue(true));
     button(actions, '重试失败任务', () => this.plugin.retryFailedAndAutoProcess(true));
+    // v1.4 (M-11): 恢复所有 paused 任务（recoverStaleProcessingTasks / 用户暂停 → 重新入队）
+    button(actions, '恢复暂停任务', async () => {
+      const restored = await this.plugin.restorePausedTasks();
+      new Notice(restored > 0 ? `已恢复 ${restored} 个暂停任务到队列` : '当前没有暂停任务');
+    });
     button(actions, '打开设置', () => this.plugin.openSettings());
 
     const stats = overview.createDiv('eks-stats');
@@ -1762,8 +1874,10 @@ class SlicerDashboardView extends ItemView {
         const actions = block.createDiv('eks-actions');
         button(actions, '整组批准入库', () => this.plugin.applyReviewGroup(task.task_id, group.group_id, 'approve_group'));
         button(actions, '批量修正标签', async () => {
+          // v1.4 (M-05): prompt 文案明确白名单，避免用户误以为能改任意字段
           const initial = '{"Category":"","TagL1":"","TagL2":""}';
-          const raw = window.prompt('输入要批量修正的标签 JSON；不修改的字段请删除', initial);
+          const hint = '输入 JSON 修正标签；只接受白名单字段：Category / TagL1 / TagL2 / Info_Type / Event_Type / Card_Type / Map_Index；空字符串视为不修改该字段；其他字段或非字符串会被拒绝。';
+          const raw = window.prompt(hint, initial);
           if (!raw) return;
           try {
             await this.plugin.applyReviewGroup(task.task_id, group.group_id, 'apply_correction', JSON.parse(raw));
@@ -2364,12 +2478,21 @@ function validateAtomLabels(library, atom) {
 
 // 统一遮蔽多种 API 密钥形态（OpenAI sk-、Bearer JWT、URL 里的 token= / api_key= / apikey=）
 // v1.1.2 之前只匹配 sk-*，会把 MiniMax / PaddleOCR / MinerU 的密钥原样漏进 Notice。
+// v1.4: 用户可见错误（Notice / dashboard）的密钥脱敏。
+//       优先复用 redactCredential（更严格），再针对 URL query / Bearer 前缀等结构化场景做兜底。
 function sanitizeSecret(message) {
-  return String(message || '')
-    .replace(/(bearer\s+)[A-Za-z0-9._\-+/=]{12,}/gi, '$1***')
-    .replace(/\b(sk-|sk_|key-)[A-Za-z0-9._\-+/=]{8,}/g, '$1***')
-    .replace(/([?&](?:token|access_token|api[_-]?key|apikey|password|secret)=)[^&\s"']+/gi, '$1***')
-    .replace(/("|\b)([A-Za-z0-9_-]{32,})("|\b)(?=.*(?:key|token|secret))/g, '$1***$3');
+  const text = String(message || '');
+  // 1) URL query 参数（?token=xxx &api_key=yyy）—— redactCredential 不会触发
+  let result = text.replace(/([?&](?:token|access_token|api[_-]?key|apikey|password|secret)=)[^&\s"']+/gi, '$1***');
+  // 2) Bearer / Basic 前缀的 token
+  result = result.replace(/(bearer\s+|basic\s+)[A-Za-z0-9._\-+/=]{12,}/gi, '$1***');
+  // 3) 内容指纹级（覆盖所有凭证模式）—— 在已脱敏的基础上最后一道防线
+  result = result.replace(/[A-Za-z0-9+/=_\-]{24,}/g, (match) => {
+    // 对剩余长字符串也走一次 redactCredential（只对会触发指纹的子串替换）
+    const fingerprinted = redactCredential(match);
+    return fingerprinted === match ? match : fingerprinted;
+  });
+  return result;
 }
 
 function getMarkdownTitle(markdown) {
@@ -2420,7 +2543,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 12,
+  settingsVersion: 13,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -2471,7 +2594,10 @@ const DEFAULT_SETTINGS = {
   diagLogInVault: false,
   // v1.3: 上传源文件到 MinerU/PaddleOCR 之前是否弹 Notice 二次确认。
   //        合规优先；设为 false 跳过确认（自动化流水线场景）。
-  confirmUploads: true
+  confirmUploads: true,
+  // v1.4 (M-11): 写盘前是否自动备份上一版 tasks.json 到 tasks.json.bak.{ts}。
+  //               关闭后回到原行为（仅写一份 tasks.json）。备份文件独立占用 vault 空间。
+  backupTasksOnSave: true
 };
 
 function migrateSettings(stored = {}) {
@@ -2480,7 +2606,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 12;
+  migrated.settingsVersion = 13;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -5402,7 +5528,17 @@ async function runKnowledgeWorkflow(options) {
       });
     }
   }
-  return { classification, route, summary, atomResult, accepted, review };
+  // v1.4 (M-07): 透传截断标志，dashboard 可显示警告
+  return {
+    classification,
+    route,
+    summary,
+    atomResult,
+    accepted,
+    review,
+    truncated: !!(atomResult && atomResult._truncated),
+    truncatedCompleted: Array.isArray(atomResult?.coverage?.point_ids) ? atomResult.coverage.point_ids.length : (atomResult?.atoms?.length || 0)
+  };
 }
 
 function reconcileAtomLinks(atom, candidates) {
@@ -5441,6 +5577,38 @@ function groupReviewItems(items) {
     groups.get(key).items.push(item);
   }
   return [...groups.values()].sort((left, right) => right.items.length - left.items.length || left.label.localeCompare(right.label, 'zh-CN'));
+}
+
+// v1.4 (M-05): 批量修正的字段白名单与校验器。
+//       用户在 dashboard prompt 输入 JSON 后，必须先过 validateCorrection 才会真正落到 atom。
+//       任意不在白名单的字段、类型不是 string、数值空字符串都会被拒绝。
+const ALLOWED_CORRECTION_FIELDS = new Set([
+  'Category', 'TagL1', 'TagL2', 'Info_Type', 'Event_Type', 'Card_Type', 'Map_Index'
+]);
+function validateCorrection(correction) {
+  if (!correction || typeof correction !== 'object' || Array.isArray(correction)) {
+    throw new Error('修正内容必须是 JSON 对象，例如 {"Category":"…","TagL1":"…"}');
+  }
+  const cleaned = {};
+  for (const [key, value] of Object.entries(correction)) {
+    if (!ALLOWED_CORRECTION_FIELDS.has(key)) {
+      throw new Error(`字段 "${key}" 不在白名单（${[...ALLOWED_CORRECTION_FIELDS].join(' / ')}）内，已被拒绝`);
+    }
+    if (value == null || value === '') continue; // 视为"不修改该字段"
+    if (typeof value !== 'string') {
+      throw new Error(`字段 "${key}" 必须是字符串，当前为 ${typeof value}`);
+    }
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    if (trimmed.length > 100) {
+      throw new Error(`字段 "${key}" 长度超过 100 字符`);
+    }
+    cleaned[key] = trimmed;
+  }
+  if (Object.keys(cleaned).length === 0) {
+    throw new Error('没有可应用的修正字段（所有字段都是空字符串）');
+  }
+  return cleaned;
 }
 
 function applyBatchAction(items, action, correction = {}) {

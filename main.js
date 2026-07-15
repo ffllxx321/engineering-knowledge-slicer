@@ -5,6 +5,7 @@ const __modules = {
 "main.js": function(require, module, exports) {
 const {
   ItemView,
+  Modal,
   Notice,
   Plugin,
   PluginSettingTab,
@@ -1314,6 +1315,80 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 };
 
+// v1.2: 审核工作台的"查看异常详情"按钮打开的 Modal —— 把整组的异常原子一一展开成可滚动列表，
+// 每条显示标题、ID、原因、可信度和摘要，方便人工逐条确认。注意只读，不在这里改数据。
+class ReviewExceptionModal extends Modal {
+  constructor(app, group, sourcePath) {
+    super(app);
+    this.group = group;
+    this.sourcePath = sourcePath;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass('eks-review-exception-modal');
+    contentEl.createEl('h2', { text: `异常详情 · ${this.group.label}` });
+    contentEl.createDiv({
+      cls: 'eks-task-meta',
+      text: `共 ${this.group.items.length} 项 · 源文档：${this.sourcePath || '(未知)'}`
+    });
+    contentEl.createDiv({
+      cls: 'eks-task-meta',
+      text: `类别：${this.group.library || '未知库'} · ${this.group.folder_type || '未知目录'}`
+    });
+    if (this.group.reasons && this.group.reasons.length) {
+      contentEl.createDiv({
+        cls: 'eks-task-meta',
+        text: `整组原因：${this.group.reasons.join('；')}`
+      });
+    }
+
+    const list = contentEl.createDiv({ cls: 'eks-review-exception-list' });
+    for (let index = 0; index < this.group.items.length; index += 1) {
+      const item = this.group.items[index];
+      const block = list.createDiv({ cls: 'eks-review-exception-item' });
+      const head = block.createDiv({ cls: 'eks-review-exception-head' });
+      head.createSpan({ text: `${index + 1}. `, cls: 'eks-review-exception-index' });
+      head.createEl('strong', { text: item.atom?.title || item.atom_id || '(无标题)' });
+      if (item.atom_id) {
+        head.createSpan({ text: ` · ${item.atom_id}`, cls: 'eks-task-meta' });
+      }
+      const reasons = (item.reasons || []).join('；');
+      if (reasons) block.createDiv({ cls: 'eks-task-meta', text: `原因：${reasons}` });
+      const score = Number(item.confidence?.score || 0);
+      block.createDiv({
+        cls: 'eks-task-meta',
+        text: `可信度：${score.toFixed(2)} (${item.confidence?.decision || 'unknown'})`
+      });
+      const summary = String(
+        item.atom?.content?.summary
+        || item.atom?.content?.executive_summary
+        || item.atom?.content?.description
+        || ''
+      ).trim();
+      if (summary) {
+        const preview = summary.length > 240 ? `${summary.slice(0, 240)}…` : summary;
+        block.createDiv({ cls: 'eks-task-meta', text: `摘要：${preview}` });
+      }
+    }
+
+    const actions = contentEl.createDiv({ cls: 'eks-review-exception-actions' });
+    actions.createEl('button', { text: '打开源文档', cls: 'mod-cta' }).addEventListener('click', async () => {
+      if (!this.sourcePath) { new Notice('源文档路径未知'); return; }
+      const file = this.app.vault.getAbstractFileByPath(this.sourcePath);
+      if (file instanceof TFile) {
+        await this.app.workspace.openLinkText(this.sourcePath, '', false);
+      } else {
+        new Notice(`源文档不在 vault 中：${this.sourcePath}`);
+      }
+    });
+    actions.createEl('button', { text: '关闭' }).addEventListener('click', () => this.close());
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class SlicerDashboardView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -1508,12 +1583,17 @@ class SlicerDashboardView extends ItemView {
 
     const exceptions = tasks.filter((task) => ['failed', 'skipped', 'unsupported'].includes(task.status));
     if (exceptions.length) {
+      // v1.2: 失败/跳过原因不再直接展示在 dashboard 上（用户视角噪声太大）。
+      //   改为只收集统计 + 写一条 diag 日志；详情见审核工作台 → "查看异常详情" 按钮。
       const reasons = new Map();
       for (const task of exceptions) {
         const reason = task.errors?.at(-1)?.message || stageLabel(task.status);
         reasons.set(reason, (reasons.get(reason) || 0) + 1);
       }
-      parent.createDiv({ cls: 'eks-task-meta', text: `失败/跳过原因：${[...reasons].map(([reason, count]) => `${reason}（${count}）`).join('；')}` });
+      const summary = [...reasons].map(([reason, count]) => `${reason} (${count})`).join('；');
+      if (typeof globalThis.__eksDiag === 'object' && typeof globalThis.__eksDiag.diag === 'function') {
+        globalThis.__eksDiag.diag('dashboard.exceptions.summary', { total: exceptions.length, breakdown: summary });
+      }
     }
   }
 
@@ -1581,6 +1661,10 @@ class SlicerDashboardView extends ItemView {
         });
         button(actions, '仅重做知识原子', () => this.plugin.applyReviewGroup(task.task_id, group.group_id, 'regenerate_group'));
         button(actions, '整组丢弃', () => this.plugin.applyReviewGroup(task.task_id, group.group_id, 'discard_group'));
+        // v1.2: 把该组所有异常原子展开到一个 Modal，方便人工逐条确认（标题/原因/可信度/摘要）
+        button(actions, '查看异常详情', () => {
+          new ReviewExceptionModal(this.app, group, task.source_path).open();
+        });
       }
     }
   }
@@ -1631,6 +1715,43 @@ class SlicerSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl('h2', { text: '工程知识切片设置' });
+    // v1.2: 一键打开诊断日志，方便没 DevTools 环境的用户直接查看文件路径
+    new Setting(containerEl)
+      .setName('诊断日志')
+      .setDesc('所有 [EKS diag] 事件写入 .obsidian/plugins/engineering-knowledge-slicer/diag.log，遇到问题时把文件内容发给我即可定位。')
+      .addButton((button) => button
+        .setButtonText('打开诊断日志')
+        .setCta()
+        .onClick(async () => {
+          const logPath = (typeof globalThis.__eksDiag === 'object' && globalThis.__eksDiag.state)
+            ? globalThis.__eksDiag.state.logPath
+            : null;
+          if (!logPath) {
+            new Notice('诊断日志尚未初始化，请先等待插件加载完成或重载。');
+            return;
+          }
+          // 把 vault 绝对路径转回 vault-相对路径，以便 openLinkText 能在 vault 中定位文件
+          let relPath = logPath;
+          try {
+            const adapter = this.app.vault && this.app.vault.adapter;
+            if (adapter && typeof adapter.getBasePath === 'function') {
+              const basePath = adapter.getBasePath();
+              if (basePath && relPath.startsWith(basePath)) {
+                relPath = relPath.substring(basePath.length).replace(/^[\\/]+/, '');
+              }
+            }
+          } catch (_) { /* fallback: 直接试绝对路径 */ }
+          let file = this.app.vault.getAbstractFileByPath(relPath);
+          if (!file && relPath !== logPath) file = this.app.vault.getAbstractFileByPath(logPath);
+          if (!file) {
+            try { file = await this.app.vault.create(relPath, ''); } catch (_) { /* 文件可能已存在，忽略 */ }
+          }
+          if (file instanceof TFile) {
+            await this.app.workspace.openLinkText(relPath, '', false);
+          } else {
+            new Notice(`诊断日志路径：${logPath}\n请在 Obsidian 文件浏览器中手动打开。`);
+          }
+        }));
     pathSetting(containerEl, this.plugin, '招投标源文件路径', '固定读取招投标源文件。', 'bidIntakePath');
     pathSetting(containerEl, this.plugin, '业务库源文件路径', '固定读取业务库源文件。', 'businessIntakePath');
     pathSetting(containerEl, this.plugin, '招投标输出路径', '招投标知识卡片固定输出根目录。', 'bidOutputPath');
@@ -2153,7 +2274,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 10,
+  settingsVersion: 11,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -2206,7 +2327,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 10;
+  migrated.settingsVersion = 11;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;

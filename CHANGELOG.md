@@ -1,5 +1,48 @@
 # 工程知识切片 变更记录
 
+## v2.1.0 — 2026-07-15 源码结构文档化 (S-01 lite)
+
+### 📚 22 个 IIFE 模块加 JSDoc 头注释
+main.js 内部 CommonJS IIFE 之前只有 `"src/core/<name>.js": function(...)` 这一行作为边界标识，IDE 折叠 / Go-to-Definition 全部失效。
+本次在每个模块入口前补 `@module` / `@exports` 注释块（共 22 个）：
+
+| 模块 | 职责摘要 |
+|------|----------|
+| `task` | 默认配置 / runtimeVersions |
+| `tags` | 标签库 / Map_Index / 卡片字段校验 |
+| `extractors` | 文本提取入口 |
+| `moc` | 文件夹 MOC 生成 |
+| `ecosystem` | vault 生态插件探测 |
+| `routing` | folder_type → vault 路径 |
+| `external-pdf` | 外部 OCR 调度 |
+| `mineru-api` | MinerU 上传+轮询+下载 |
+| `paddleocr-api` | 飞桨 OCR |
+| `zip` | 轻量 zip 解压 |
+| `component-contracts` | 共享契约 |
+| `migration` | tasks.json 老格式迁移 |
+| `document-parser` | 文档解析计划 |
+| `identity` | 卡片 ID 指纹 |
+| `pipeline` | 单文件流水线骨架 |
+| `schema-validator` | AI 输出 schema 校验 |
+| `ai-pipeline` | MiniMax 调用层 |
+| `confidence` | 置信度评分 |
+| `markdown-renderer` | 卡片 Markdown 渲染 |
+| `link-service` | 卡片间链接 |
+| `workflow` | 顶层工作流编排 |
+| `review-service` | 审核面板 |
+
+### 📄 新增 BUILD.md
+- 解释单文件 bundle 模式 + 开发模式（npm run dev / build）
+- 列出 22 个 IIFE 模块的入口行号 / 职责
+- 跨模块通信约定（globalThis.__eksDiag / __eksUploadConfirm 黑板）
+- "添加新模块" SOP（位置 + require 用法）
+- ESM 切包（v3.0 独立规划）的简短路线
+
+### ⚠️ 范围说明
+S-01 原计划包含 1-3 天的真 source split（拆 src/ 树 + esbuild 真切包）。该部分**仍按原计划留作 v3.0 / M-03 独立 PR**，本 PR 只交付**轻量版文档化**：JSDoc + BUILD.md + 注释。运行时行为零变化，可安全升级。
+
+---
+
 ## v2.0.0 — 2026-07-15 Markdown 渲染加固 (M-06)
 
 ### 🐛 真实 bug 修复

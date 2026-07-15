@@ -2679,6 +2679,12 @@ function approvedStatus(library) {
 }
 
 },
+/**
+ * @module src/core/task
+ * 任务默认配置 / 运行时 schema 版本号常量
+ * @exports DEFAULT_SETTINGS
+ * @exports runtimeVersions
+ */
 "src/core/task.js": function(require, module, exports) {
 const crypto = require("crypto");
 const path = require("path");
@@ -2931,6 +2937,13 @@ module.exports = {
 };
 
 },
+/**
+ * @module src/core/tags
+ * 标签库解析 / Map_Index 建议 / 卡片字段校验
+ * @exports parseTagLibrary
+ * @exports suggestMapIndex
+ * @exports validateCard
+ */
 "src/core/tags.js": function(require, module, exports) {
 function emptyLibrary() {
   return {
@@ -3061,6 +3074,11 @@ module.exports = {
 };
 
 },
+/**
+ * @module src/core/extractors
+ * 二进制 / 纯文本文件解析入口；委托给 document-parser + external-pdf
+ * @exports extractTextFromBuffer
+ */
 "src/core/extractors.js": function(require, module, exports) {
 const { createParsePackage, documentPlan } = require("src/core/document-parser.js");
 const { extractDocumentWithApis } = require("src/core/external-pdf.js");
@@ -3418,6 +3436,12 @@ module.exports = {
 };
 
 },
+/**
+ * @module src/core/moc
+ * 工程资料文件夹的 Map-of-Content（索引）Markdown 生成
+ * @exports createFolderIndexMarkdown
+ * @exports folderIndexPath
+ */
 "src/core/moc.js": function(require, module, exports) {
 function folderIndexPath(route) {
   return `${String(route.output_folder || '').replace(/\/$/, '')}/_索引.md`;
@@ -3432,6 +3456,12 @@ module.exports = { createFolderIndexMarkdown, folderIndexPath };
 
 
 },
+/**
+ * @module src/core/ecosystem
+ * 检测 vault 中已安装的 Obsidian 生态插件（dataview / templater / quickadd 等）
+ * 用于自适应地插入 MOC / frontmatter 链接
+ * @exports detectEcosystemPlugins
+ */
 "src/core/ecosystem.js": function(require, module, exports) {
 const OPTIONAL_PLUGINS = [
   { id: 'dataview', name: 'Dataview', role: 'MOC 表格和动态查询' },
@@ -3463,6 +3493,13 @@ module.exports = {
 };
 
 },
+/**
+ * @module src/core/routing
+ * 卡片输出路径解析：folder_type → 实际 vault 路径
+ * 处理 EPC / 安全 / 质量 等不同 folder_type 的固定路由
+ * @exports cardOutputPath
+ * @exports resolveFixedRoute
+ */
 "src/core/routing.js": function(require, module, exports) {
 // v1.8 (M-09): 解析固定目录映射。优先精确匹配；找不到时退化到前缀匹配（处理 EPC 工程类合并条目）。
 //       例如 AI 输出 "04-设计优化方案(EPC工程)" 但 folder-map 只有 "04-设计优化方案及设计方案(EPC工程)"，
@@ -3516,6 +3553,11 @@ module.exports = { cardOutputPath, resolveFixedRoute, sanitizeFileName };
 
 
 },
+/**
+ * @module src/core/external-pdf
+ * 外部 OCR/PDF API 调度：MinerU 与 PaddleOCR，按文件类型 / 配置路由
+ * @exports extractDocumentWithApis
+ */
 "src/core/external-pdf.js": function(require, module, exports) {
 const { runMineruApi } = require("src/core/mineru-api.js");
 const { runPaddleOcrApi } = require("src/core/paddleocr-api.js");
@@ -3683,6 +3725,11 @@ module.exports = {
 };
 
 },
+/**
+ * @module src/core/mineru-api
+ * MinerU 云端 OCR API 调用层：上传 + 轮询 + 下载 zip
+ * @exports runMineruApi
+ */
 "src/core/mineru-api.js": function(require, module, exports) {
 const { extractZipEntryEndingWith } = require("src/core/zip.js");
 
@@ -3790,6 +3837,11 @@ async function emit(options, payload) {
 module.exports = { runMineruApi };
 
 },
+/**
+ * @module src/core/paddleocr-api
+ * 飞桨 PaddleOCR API 调用层：单页/多页图像 OCR
+ * @exports runPaddleOcrApi
+ */
 "src/core/paddleocr-api.js": function(require, module, exports) {
 async function runPaddleOcrApi(buffer, options = {}) {
   if (!options.apiKey) return unavailable('未配置 PaddleOCR API Token。');
@@ -3937,6 +3989,11 @@ async function emit(options, payload) {
 module.exports = { parsePaddleJsonl, runPaddleOcrApi };
 
 },
+/**
+ * @module src/core/zip
+ * 轻量 zip 解压（仅 zip.js / fflate-free，避免大依赖）
+ * @exports extractZipEntryEndingWith
+ */
 "src/core/zip.js": function(require, module, exports) {
 const zlib = require("zlib");
 
@@ -3987,6 +4044,10 @@ function findEndOfCentralDirectory(buffer) {
 module.exports = { extractZipEntryEndingWith };
 
 },
+/**
+ * @module src/core/component-contracts
+ * 跨模块共享的契约 / 类型守卫 / 卡片字段约束
+ */
 "src/core/component-contracts.js": function(require, module, exports) {
 function parseFolderMap(text) {
   let parsed;
@@ -4059,6 +4120,12 @@ module.exports = {
 };
 
 },
+/**
+ * @module src/core/migration
+ * tasks.json 老格式迁移：v1/v2 ledger → v3 标准格式
+ * 含字段补全 / 状态重映射 / 备份
+ * @exports migrateTaskLedgerV3
+ */
 "src/core/migration.js": function(require, module, exports) {
 const crypto = require("crypto");
 
@@ -4162,6 +4229,12 @@ module.exports = {
 };
 
 },
+/**
+ * @module src/core/document-parser
+ * 文档解析计划 / 解析包产出：根据文件类型选 OCR / 直读 / 拆分
+ * @exports documentPlan
+ * @exports createParsePackage
+ */
 "src/core/document-parser.js": function(require, module, exports) {
 const crypto = require("crypto");
 
@@ -4251,6 +4324,13 @@ module.exports = {
 };
 
 },
+/**
+ * @module src/core/identity
+ * 卡片身份指纹：源文件 hash + 内容 fingerprint → 稳定卡片 ID
+ * @exports atomFingerprint
+ * @exports sourceIdentity
+ * @exports runIdentity
+ */
 "src/core/identity.js": function(require, module, exports) {
 const crypto = require("crypto");
 
@@ -4309,6 +4389,11 @@ module.exports = {
 };
 
 },
+/**
+ * @module src/core/pipeline
+ * 单文件任务流水线的骨架：创建任务记录、驱动 AI 流水线、产出卡片
+ * @exports createTaskRecord
+ */
 "src/core/pipeline.js": function(require, module, exports) {
 const { runIdentity, sourceIdentity } = require("src/core/identity.js");
 
@@ -4357,6 +4442,11 @@ module.exports = {
 };
 
 },
+/**
+ * @module src/core/schema-validator
+ * AI 输出结构校验：classification.schema.json / card.schema.json 实例校验
+ * @exports validateSchema
+ */
 "src/core/schema-validator.js": function(require, module, exports) {
 function validateSchema(schema, value) {
   const errors = [];
@@ -4436,6 +4526,15 @@ module.exports = { validateSchema };
 
 
 },
+/**
+ * @module src/core/ai-pipeline
+ * MiniMax M3 API 调用层：summarizeDocument / atomizeSummary / classifyDocument
+ * 含重试 / 修复 / schema 校验 / 截断兜底
+ * @exports requestMiniMaxJson
+ * @exports summarizeDocument
+ * @exports atomizeSummary
+ * @exports classifyDocument
+ */
 "src/core/ai-pipeline.js": function(require, module, exports) {
 const { validateSchema } = require("src/core/schema-validator.js");
 
@@ -5168,6 +5267,11 @@ module.exports = {
 };
 
 },
+/**
+ * @module src/core/confidence
+ * 卡片置信度评分：基于 schema 合规度 / AI 不确定性 / 字段完整度
+ * @exports calculateConfidence
+ */
 "src/core/confidence.js": function(require, module, exports) {
 const WEIGHTS = { P: 0.25, T: 0.15, E: 0.35, S: 0.15, A: 0.10 };
 
@@ -5274,6 +5378,15 @@ function round(value) {
 module.exports = { WEIGHTS, calculateConfidence, extractedFacts };
 
 },
+/**
+ * @module src/core/markdown-renderer
+ * 知识卡片 Markdown 渲染：buildCardRecord / renderKnowledgeCard / renderStructuredSummary
+ * 含 YAML frontmatter / 章节拼接 / 空字段容错
+ * @exports buildCardRecord
+ * @exports cardFileName
+ * @exports renderKnowledgeCard
+ * @exports renderStructuredSummary
+ */
 "src/core/markdown-renderer.js": function(require, module, exports) {
 const { atomFingerprint, cardIdentity } = require("src/core/identity.js");
 
@@ -5421,6 +5534,12 @@ function hasValue(value) {
 module.exports = { buildCardRecord, cardFileName, renderKnowledgeCard, renderStructuredSummary, yamlValue };
 
 },
+/**
+ * @module src/core/link-service
+ * 卡片间链接建议：基于标签 / Map_Index / 共享实体的双向链接候选
+ * @exports findLinkCandidates
+ * @exports validateRelations
+ */
 "src/core/link-service.js": function(require, module, exports) {
 const RELATION_TYPES = Object.freeze(['supports', 'contradicts', 'supersedes', 'depends_on', 'implements', 'related']);
 
@@ -5484,6 +5603,12 @@ module.exports = { RELATION_TYPES, findLinkCandidates, validateRelations };
 
 
 },
+/**
+ * @module src/core/workflow
+ * 顶层工作流编排：parse → classify → summarize → atomize → buildCard → save
+ * 串联 ai-pipeline / routing / link-service / markdown-renderer / confidence
+ * @exports runKnowledgeWorkflow
+ */
 "src/core/workflow.js": function(require, module, exports) {
 const { atomizeSummary, classifyDocument, summarizeDocument } = require("src/core/ai-pipeline.js");
 const { calculateConfidence } = require("src/core/confidence.js");
@@ -5612,6 +5737,12 @@ async function emitArtifact(handler, name, value) {
 module.exports = { runKnowledgeWorkflow };
 
 },
+/**
+ * @module src/core/review-service
+ * 审核面板服务：按文件夹 / 状态 / 标签分组 + 批量审批
+ * @exports groupReviewItems
+ * @exports applyBatchAction
+ */
 "src/core/review-service.js": function(require, module, exports) {
 function groupReviewItems(items) {
   const groups = new Map();

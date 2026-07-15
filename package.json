@@ -1,6 +1,6 @@
 {
   "name": "engineering-knowledge-slicer",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "通过 MinerU/PaddleOCR 与 MiniMax M3，把工程资料转为中文、可追溯、固定目录归档的 Obsidian 知识卡片。",
   "main": "main.js",
   "scripts": {

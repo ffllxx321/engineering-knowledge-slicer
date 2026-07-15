@@ -1,5 +1,34 @@
 # 工程知识切片 变更记录
 
+## v2.3.0 — 2026-07-15 ESM 切包可行性研究 (M-03)
+
+### 📋 docs/ESM_FEASIBILITY.md
+完整评估把 main.js（5500+ 行 IIFE CommonJS bundle）切成真 ESM + src/ 树的可行性、路径与风险。结论：v2.3 仍发「研究 + 框架」版（不动 main.js 内部 IIFE），完整切换留 v3.0 单独 PR。详见文档。
+
+### 🛠 esbuild.config.mjs 修正
+- 修正 `entryPoints: ["src/main.ts"]` → `["src/main.js"]`（之前指向不存在的文件）
+- 加详细注释说明 v2.3 / v3.0 切包路径
+- 仍保持 `format: "cjs"`（IIFE 时代不动）
+
+### 📁 src/main.js 占位文件
+- 抛友好错误，明确告知 Obsidian 应加载仓库根目录的 main.js（IIFE bundle）
+- 防止误用 `npm run dev` 时直接看到 obscure esbuild 错误
+
+### ⚠️ 为什么 v2.3 不真切
+1. **破坏性**：所有 fork / 二次开发者需要重新走 esbuild build，CI / 自动化脚本要同步升级
+2. **测试覆盖**：移动端 (iOS) ESM 插件兼容性需要在真机回归
+3. **范围控制**：5000+ 行 IIFE → ESM 是 2-3 天的纯重构工作，单独 PR 更利于 review
+4. **风险收益比**：当前 IIFE 自包含的发布形态对终端用户最友好（无 source map 暴露、单文件可加载）
+
+### 📌 v3.0 切包 checklist（已写入文档）
+- [ ] 选 2.1 / 2.2 哪条路径（最小破坏 vs 真多文件）
+- [ ] 写迁移脚本：22 个 IIFE factory → 22 个 `export function`
+- [ ] esbuild config: `format: "esm"`
+- [ ] 移动端端到端测一遍
+- [ ] 二次开发者文档更新
+
+---
+
 ## v2.2.0 — 2026-07-15 SSE 流式 POC (PR 4)
 
 ### 🌊 MiniMax SSE 流式接收 (opt-in)

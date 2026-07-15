@@ -1,5 +1,29 @@
 # 工程知识切片 变更记录
 
+## v2.2.0 — 2026-07-15 SSE 流式 POC (PR 4)
+
+### 🌊 MiniMax SSE 流式接收 (opt-in)
+之前所有 AI 请求都是「等整个响应回来再解析」—— 18 分钟等待期只能靠 1 秒一次的心跳看到 elapsedMs。现在新增一条流式路径：
+
+- **`sseJsonRequest(url, init, onDelta)`**：用 `globalThis.fetch`（Obsidian 桌面端是 Electron 27+，原生支持 ReadableStream）按 `text/event-stream` 协议逐 `data:` 块读取
+- **`requestMiniMaxStream({ settings, prompt, context })`**：与 `requestMiniMaxJson` 等价的请求体，但启用 `stream: true` 并在 Anthropic 协议下累积 `content_block_delta`（`text_delta` + `input_json_delta`）成完整 JSON 文本
+- **`collectSseTextDeltas(event, state)`**：增量累积器，复用于两套事件格式（`text_delta` 自由文本 / `input_json_delta` 工具调用参数）
+- **设置开关**：新增 `useStreamingAi` (默认 `false`)。开启时 `requestWithContract` 在第 0 次尝试走 SSE，失败自动回退非流式；第 1+ 次（修复重试）继续走非流式
+- **降级路径**：流式失败时记录 `diag('minimax.stream-fallback')`，调用方无感
+
+### 🎯 影响范围
+- `requestWithContract` 加 `streaming: true` + `requestStream` 两个可选参数
+- `summarizeDocument` 把 `requestStream` 透传到两次 `requestWithContract` 调用（`summary-map` / `summary-reduce`）
+- 其它阶段（classification / atomize）暂不接 SSE，留待 v2.3 评估
+
+### ⚠️ POC 限制
+- 仅在 Obsidian **桌面端**（Electron）有效；iOS / Android mobile 不保证 ReadableStream 行为一致
+- 流式失败时**不**走 `fetchWithTransientRetry` 的瞬态重试，直接降级
+- 未做增量 token 计数 / 实时 UI 显示（SSE 文本进 `onProgressText` 钩子但 dashboard 暂未消费）
+- 移动端用户开启该开关会看到降级日志（`stream-fallback`），可关
+
+---
+
 ## v2.1.0 — 2026-07-15 源码结构文档化 (S-01 lite)
 
 ### 📚 22 个 IIFE 模块加 JSDoc 头注释

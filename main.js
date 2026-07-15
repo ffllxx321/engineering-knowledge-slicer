@@ -853,6 +853,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         existingFingerprints: existingCards.map((card) => card.atom_fingerprint).filter(Boolean),
         validateLabels: (atom) => validateAtomLabels(tagLibrary, atom),
         requestJson: (prompt, context) => requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest }),
+        requestStream: this.settings.useStreamingAi
+          ? (prompt, context, hooks) => requestMiniMaxStream({ settings: this.settings, prompt, context, onDelta: hooks && hooks.onDelta, onProgressText: hooks && hooks.onProgressText })
+          : null,
+
         onProgress: async (progress) => {
           this.assertTaskCanContinue(current);
           current.status = workflowStatus(progress.stage);
@@ -2165,6 +2169,15 @@ class SlicerSettingTab extends PluginSettingTab {
     passwordSetting(containerEl, this.plugin, 'MiniMax API Key', '用于调用 MiniMax 国内版。仅保存在本地插件设置中，不写入 Markdown 或任务日志。', 'minimaxApiKey', 'MiniMax API Key');
     textSetting(containerEl, this.plugin, 'MiniMax 模型', '默认使用 MiniMax-M3，可按账户实际可用模型修改。', 'minimaxModel', 'MiniMax-M3');
     textSetting(containerEl, this.plugin, 'MiniMax M3 接口地址', '国内版默认使用 Anthropic 兼容接口，以支持更长的结构化输出。', 'minimaxEndpoint', 'https://api.minimaxi.com/anthropic/v1/messages');
+    new Setting(containerEl)
+      .setName('启用 SSE 流式输出 (POC)')
+      .setDesc('调用 MiniMax 时走 text/event-stream，逐 token 累积 JSON 文本；失败时自动回退到非流式。需 Obsidian 桌面端（Electron 27+）。')
+      .addToggle((control) => control
+        .setValue(Boolean(this.plugin.settings.useStreamingAi))
+        .onChange(async (value) => {
+          this.plugin.settings.useStreamingAi = Boolean(value);
+          await this.plugin.saveData(this.plugin.settings);
+        }));
     connectionTestSetting(containerEl, this.plugin, '测试 MiniMax 连接', 'minimax');
 
     new Setting(containerEl)
@@ -2730,6 +2743,7 @@ const DEFAULT_SETTINGS = {
   rateLimitMaxConcurrent: 2,
   rateLimitBackoffMaxMs: 30000,
   rateLimitWindowSize: 10,
+  useStreamingAi: false,
   useEnvKeys: true,
   staleProcessingMinutes: 20,
   targetLanguage: 'zh-CN',
@@ -4674,6 +4688,8 @@ async function summarizeDocument(options) {
       stage: 'summary-map',
       schema: options.summarySchema,
       requestJson: options.requestJson,
+      requestStream: options.requestStream,
+      streaming: !!options.requestStream,
       maxRepairAttempts: options.maxRepairAttempts,
       onProgress: options.onProgress,
       context: { chunk, chunkIndex: index + 1, chunkTotal: chunks.length },
@@ -4703,6 +4719,8 @@ async function summarizeDocument(options) {
       stage: 'summary-reduce',
       schema: options.summarySchema,
       requestJson: options.requestJson,
+      requestStream: options.requestStream,
+      streaming: !!options.requestStream,
       maxRepairAttempts: options.maxRepairAttempts,
       onProgress: options.onProgress,
       context: { chunkIds, partialCount: partials.length },
@@ -4986,18 +5004,40 @@ function normalizeAtomBatch(value, summary, pointIds) {
 
 async function requestWithContract(options) {
   const maxRepairs = options.maxRepairAttempts === undefined ? 1 : Math.max(0, Number(options.maxRepairAttempts));
+  const useStream = options.streaming === true && typeof options.requestStream === 'function';
   let prompt = options.prompt;
   let lastErrors = [];
   for (let attempt = 0; attempt <= maxRepairs; attempt += 1) {
     await emitProgress(options.onProgress, Object.assign({}, options.context || {}, {
       stage: options.stage,
       attempt: attempt + 1,
-      message: attempt ? '正在修正不符合契约的 AI 结果' : '正在调用 MiniMax M3'
+      message: attempt ? '正在修正不符合契约的 AI 结果' : (useStream ? '正在调用 MiniMax M3 (SSE)' : '正在调用 MiniMax M3')
     }));
     let rawValue;
     let value;
     try {
-      rawValue = await options.requestJson(prompt, Object.assign({ stage: options.stage, attempt: attempt + 1, schema: options.schema }, options.context || {}));
+      if (useStream && attempt === 0) {
+        // 第一次尝试走 SSE 流式；失败则降级到非流式
+        try {
+          rawValue = await options.requestStream(prompt, Object.assign({ stage: options.stage, attempt: attempt + 1, schema: options.schema }, options.context || {}), {
+            onDelta: (event, state) => {
+              if (typeof options.onStreamDelta === 'function') {
+                try { options.onStreamDelta(event, state); } catch (_) {}
+              }
+            },
+            onProgressText: (text) => {
+              if (typeof options.onStreamText === 'function') {
+                try { options.onStreamText(text); } catch (_) {}
+              }
+            }
+          });
+        } catch (streamError) {
+          diag('minimax.stream-fallback', { stage: options.stage, errorMessage: String(streamError && streamError.message || streamError) });
+          rawValue = await options.requestJson(prompt, Object.assign({ stage: options.stage, attempt: attempt + 1, schema: options.schema }, options.context || {}));
+        }
+      } else {
+        rawValue = await options.requestJson(prompt, Object.assign({ stage: options.stage, attempt: attempt + 1, schema: options.schema }, options.context || {}));
+      }
       value = parseJsonPayload(rawValue);
     } catch (error) {
       if (error?.code !== 'AI_INVALID_JSON') throw error;
@@ -5161,6 +5201,156 @@ async function requestMiniMaxJson({ settings, prompt, fetchImpl, context }) {
   const content = toolCall?.function?.arguments || (choice && choice.message && choice.message.content);
   if (!content) throw new Error('MiniMax 国内版返回内容为空');
   return parseJsonPayload(content);
+}
+
+/**
+ * v2.2 (PR 4) SSE 流式请求 POC
+ *
+ * 用 globalThis.fetch 的 ReadableStream 读取 text/event-stream，
+ * 把 data: {json} 事件按 \n\n 切分，逐条 JSON.parse 后回调 onDelta。
+ *
+ * ⚠️ 限制：
+ * - Obsidian 的 `requestUrl` 不暴露 stream，所以这里走 globalThis.fetch
+ *   （Obsidian 桌面端是 Electron / Chromium 27+，fetch + ReadableStream 都有）
+ * - iOS 移动端 fetch 也支持，但 ReadableStream 行为可能差异更大
+ * - 失败时不重试（与 fetchWithTransientRetry 行为不同），调用方需自己 try/catch
+ */
+async function sseJsonRequest(url, init, onDelta) {
+  const response = await globalThis.fetch(url, init);
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`SSE 请求失败（HTTP ${response.status}）${text ? `：${text.slice(0, 200)}` : ''}`);
+  }
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    throw new Error('当前环境不支持 ReadableStream，无法使用 SSE 流式');
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  let eventCount = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let sepIndex;
+    while ((sepIndex = buffer.indexOf('\n\n')) >= 0) {
+      const block = buffer.slice(0, sepIndex);
+      buffer = buffer.slice(sepIndex + 2);
+      const event = parseSseEvent(block);
+      if (!event) continue;
+      eventCount += 1;
+      if (typeof onDelta === 'function') onDelta(event);
+      if (event.type === 'message_stop' || event.type === 'done' || event.type === 'response.done') {
+        try { await reader.cancel(); } catch (_) {}
+        return { ok: true, events: eventCount };
+      }
+    }
+  }
+  return { ok: true, events: eventCount };
+}
+
+function parseSseEvent(block) {
+  const lines = block.split('\n');
+  let eventName = 'message';
+  const dataLines = [];
+  for (const line of lines) {
+    if (!line || line.startsWith(':')) continue;
+    if (line.startsWith('event:')) eventName = line.slice(6).trim();
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+  }
+  if (!dataLines.length) return null;
+  const dataStr = dataLines.join('\n');
+  if (dataStr === '[DONE]') return { type: 'done', raw: dataStr };
+  let data;
+  try { data = JSON.parse(dataStr); } catch (_) { return { type: eventName, raw: dataStr }; }
+  return Object.assign({ type: eventName }, data);
+}
+
+/**
+ * 累积 Anthropic-style content_block_delta 事件里的 text 增量，
+ * 以及 tool_use block 里的 input_json_delta（拼成完整 JSON 字符串）。
+ */
+function collectSseTextDeltas(event, state) {
+  if (!event) return;
+  // Anthropic Messages API SSE
+  if (event.type === 'content_block_start' && event.content_block && event.content_block.type === 'tool_use') {
+    state.toolUseId = event.content_block.id;
+    state.toolInputJson = '';
+  }
+  if (event.type === 'content_block_delta' && event.delta) {
+    if (event.delta.type === 'text_delta' && typeof event.delta.text === 'string') {
+      state.text += event.delta.text;
+    } else if (event.delta.type === 'input_json_delta' && typeof event.delta.partial_json === 'string') {
+      state.toolInputJson += event.delta.partial_json;
+    }
+  }
+}
+
+/**
+ * v2.2 (PR 4) MiniMax 流式变体
+ * 与 requestMiniMaxJson 等价的请求体，但启用 stream:true 并通过 SSE 累积返回。
+ * 返回字符串（与 requestMiniMaxJson 的 parseJsonPayload 输入等价）。
+ */
+async function requestMiniMaxStream({ settings, prompt, context, onDelta, onProgressText }) {
+  if (!settings || !settings.minimaxApiKey) throw new Error('MiniMax 国内版 API Key 未配置');
+  const endpoint = settings.minimaxEndpoint || 'https://api.minimaxi.com/anthropic/v1/messages';
+  const anthropicProtocol = /\/anthropic\/v1\/messages\/?$/i.test(endpoint);
+  const body = {
+    model: settings.minimaxModel || 'MiniMax-M3',
+    messages: anthropicProtocol
+      ? [{ role: 'user', content: prompt }]
+      : [{ role: 'system', content: '你是工程知识处理引擎。严格返回 JSON，不要输出 Markdown 代码围栏。' },
+         { role: 'user', content: prompt }],
+    max_completion_tokens: 2048,
+    reasoning_split: true,
+    temperature: context && context.stage === 'classification' ? 0.1 : 0.2,
+    stream: true
+  };
+  if (anthropicProtocol) {
+    body.max_tokens = 8192;
+    delete body.max_completion_tokens;
+    delete body.reasoning_split;
+    body.system = '你是工程知识处理引擎。只通过指定工具返回结构化结果，不要输出额外说明。';
+  }
+  let headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.minimaxApiKey}` };
+  if (context?.schema) {
+    body.tools = anthropicProtocol
+      ? [{ name: 'return_structured_result', description: '返回严格符合输入 Schema 的工程知识处理结果。', input_schema: context.schema }]
+      : [{ type: 'function', function: { name: 'return_structured_result', description: '返回严格符合参数 Schema 的工程知识处理结果。', parameters: context.schema } }];
+    body.tool_choice = anthropicProtocol ? { type: 'tool', name: 'return_structured_result' } : 'auto';
+  }
+  if (anthropicProtocol) {
+    headers = { 'Content-Type': 'application/json', 'x-api-key': settings.minimaxApiKey, 'anthropic-version': '2023-06-01' };
+  }
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timeoutMs = Math.max(10000, Number(settings.aiRequestTimeoutMs) || 180000);
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const state = { text: '', toolInputJson: '' };
+    await sseJsonRequest(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller ? controller.signal : undefined
+    }, (event) => {
+      collectSseTextDeltas(event, state);
+      if (typeof onDelta === 'function') onDelta(event, state);
+      // 透传进度文本（每 30 字符报告一次，避免 onProgress 风暴）
+      if (typeof onProgressText === 'function' && state.text.length % 30 < 2) {
+        onProgressText(state.text);
+      }
+    });
+    const finalContent = state.toolInputJson || state.text;
+    if (!finalContent) throw new Error('MiniMax 流式返回内容为空');
+    return finalContent;
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      throw new Error(`MiniMax 流式请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function exactCoverage(coverage, key, expected, message) {
@@ -5638,6 +5828,7 @@ async function runKnowledgeWorkflow(options) {
     maxChunkChars: options.maxChunkChars,
     maxRepairAttempts: 2,
     requestJson: options.requestJson,
+    requestStream: options.requestStream,
     onProgress: options.onProgress
   });
   await emitArtifact(options.onArtifact, 'summary', summary);

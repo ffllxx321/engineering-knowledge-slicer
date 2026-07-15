@@ -296,6 +296,8 @@ class RateLimiter {
     if (!this.waiters.length) return;
     const next = this.waiters.shift();
     clearTimeout(next.timer);
+    if (next.done) return this._scheduleNextWaiter(); // 已被前一次 timer 处理过；跳过
+    next.done = true;
     next.resolve();
   }
 
@@ -310,24 +312,26 @@ class RateLimiter {
         resolve();
         return;
       }
-      // 排队：等下一个 100ms 的"窗口滑过"或等到最早的请求出窗口
+      // 排队：等下一个"窗口滑过"或最早的请求出窗口
       const earliest = this.timestamps[0] || now;
       const waitMs = Math.max(100, (earliest + this.intervalMs) - now);
-      const waiter = { resolve, startedAt: now };
-      waiter.timer = setTimeout(() => {
-        // 重新检查（可能被前面的人放行了）
+      const waiter = { resolve, startedAt: now, done: false };
+      const tryFire = () => {
+        if (waiter.done) return; // 已被 _scheduleNextWaiter 处理
         const t = Date.now();
         this._cleanupExpired(t);
         if (this._activeInWindow(t) < this.maxConcurrent) {
           this.timestamps.push(t);
+          waiter.done = true;
           resolve();
-        } else {
-          // 再排队
-          this.waiters.unshift(waiter);
-          // 触发下一轮 schedule
-          this._scheduleNextWaiter();
+          return;
         }
-      }, waitMs);
+        // 仍未空：再排一次队（重设 timer），不修改 waiters 数组以免重复入队
+        const earliest2 = this.timestamps[0] || t;
+        const waitMs2 = Math.max(100, (earliest2 + this.intervalMs) - t);
+        waiter.timer = setTimeout(tryFire, waitMs2);
+      };
+      waiter.timer = setTimeout(tryFire, waitMs);
       this.waiters.push(waiter);
     });
   }
@@ -2814,6 +2818,9 @@ function migrateSettings(stored = {}) {
   if (migrated.useEnvKeys === undefined) migrated.useEnvKeys = DEFAULT_SETTINGS.useEnvKeys;
   if (!Number(migrated.aiRequestMaxAttempts)) migrated.aiRequestMaxAttempts = DEFAULT_SETTINGS.aiRequestMaxAttempts;
   if (!Number(migrated.aiRetryBaseMs)) migrated.aiRetryBaseMs = DEFAULT_SETTINGS.aiRetryBaseMs;
+  if (migrated.useStreamingAi === undefined) migrated.useStreamingAi = DEFAULT_SETTINGS.useStreamingAi;
+  if (!Number(migrated.rateLimitBackoffMaxMs)) migrated.rateLimitBackoffMaxMs = DEFAULT_SETTINGS.rateLimitBackoffMaxMs;
+  if (!Number(migrated.rateLimitWindowSize)) migrated.rateLimitWindowSize = DEFAULT_SETTINGS.rateLimitWindowSize;
   return migrated;
 }
 
@@ -5407,11 +5414,50 @@ function parseJsonPayload(value) {
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
   if (start >= 0 && end > start) {
-    try { return JSON.parse(text.slice(start, end + 1).replace(/,\s*([}\]])/g, '$1')); } catch {}
+    const sliced = text.slice(start, end + 1).replace(/,\s*([}\]])/g, '$1');
+    try { return JSON.parse(sliced); } catch {}
+    // 兜底：尝试补全未闭合的括号/引号
+    const repaired = repairJsonText(sliced);
+    if (repaired) {
+      try { return JSON.parse(repaired); } catch {}
+    }
   }
   const error = new Error('AI 返回内容不是有效 JSON');
   error.code = 'AI_INVALID_JSON';
   throw error;
+}
+
+/**
+ * v2.4: AI 输出截断时尝试补全 JSON。
+ * - 去掉尾部逗号
+ * - 补全未闭合的字符串 / 数组 / 对象
+ * 返回补全后的文本；仍不可解析则返回 null。
+ */
+function repairJsonText(text) {
+  if (!text || typeof text !== 'string') return null;
+  let s = text.replace(/,\s*$/, '');
+  // 在 escape 状态外，记录最后未闭合的引号
+  let inString = false;
+  let escape = false;
+  const stack = []; // 期望闭合的括号，'[' 或 '{'
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\') { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{' || ch === '[') stack.push(ch === '{' ? '}' : ']');
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+  // 收尾
+  if (inString) s += '"';
+  while (stack.length) {
+    const closer = stack.pop();
+    s += closer;
+  }
+  // 二次去尾随逗号
+  s = s.replace(/,\s*([}\]])/g, '$1').replace(/,\s*$/, '');
+  try { JSON.parse(s); return s; } catch { return null }
 }
 
 function unwrapTextJson(value) {
@@ -5450,6 +5496,7 @@ module.exports = {
   classificationSample,
   findRoute,
   parseJsonPayload,
+  repairJsonText,
   requestMiniMaxJson,
   requestWithContract,
   splitMarkdownSections,

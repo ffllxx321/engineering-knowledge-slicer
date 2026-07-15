@@ -1,5 +1,41 @@
 # 工程知识切片 变更记录
 
+## v2.4.0 — 2026-07-15 自我代码审查 + 鲁棒性补丁
+
+### 🐛 RateLimiter 内存泄漏修复
+v1.7 重写的 `RateLimiter.acquire()` 有一个边界 bug：定时器触发时如果仍有并发占用，旧代码会 `unshift(waiter)` + `_scheduleNextWaiter()`，但**未先从 `waiters` 数组移除原 push 的 waiter**，导致同一 waiter 在数组中出现两次并泄漏。修复：
+- 加 `waiter.done` 标志
+- 定时器触发后判断 `done` 跳过（已被 `_scheduleNextWaiter` 处理）
+- 重排队时不再 `unshift`，而是重设同一个 timer
+- `_scheduleNextWaiter` 移出已 done 的 waiter 时递归跳过
+
+### 🛠 parseJsonPayload 补全 JSON 修复
+v1.5 CHANGELOG 说加了 `repairJsonText`，但实际从未进入 main.js。AI 触达 8192 token 上限时常返回**未闭合** JSON（`{"a": "hello` 或 `{"items": [{"x": 1,`），之前直接抛 `AI_INVALID_JSON` 让用户重试。新增 `repairJsonText` 补全策略：
+- 去除尾随逗号
+- 关闭未闭合字符串
+- 补全缺失的 `}` / `]`
+- 补全后再次 JSON.parse 验证，可解析才返回；不可解析返回 `null` 让上层抛错
+- `parseJsonPayload` 在 slice-between-braces 失败后兜底调用一次
+
+### 🧪 烟雾测试套件
+新增 `scripts/` 目录两个独立可运行的 Node 脚本：
+- `scripts/smoke-ratelimit.js`：20 个并发请求 → 验证 waiters 数组不泄漏；backoff 算式；窗口淘汰
+- `scripts/smoke-json-repair.js`：6 个修复用例（已完整 / 缺 } / 未闭合字符串 / 多层级 / 平衡态）
+
+跑法：`node scripts/smoke-ratelimit.js` / `node scripts/smoke-json-repair.js`。CI 接入留 v3.0。
+
+### ⚙️ settings 迁移补全
+- 新增 `useStreamingAi` 默认值迁移
+- 新增 `rateLimitBackoffMaxMs` / `rateLimitWindowSize` 迁移
+- 旧用户升级 v2.4 时这些新设置会平滑落到 `DEFAULT_SETTINGS`，避免 UI 显示「undefined」
+
+### ⚠️ 范围说明
+- RateLimiter 修复改变了并发行为时序（用 `done` 标志 + 单一 timer），但**对外行为一致**：acquire 仍按 FIFO 等待、超时后再次尝试、backoff 仍生效
+- parseJsonPayload 修复**仅在原有失败路径上**增加兜底；正常 JSON 解析路径完全不变
+- 两个 smoke test 是开发工具，**不打包**进 main.js，**不影响**最终用户
+
+---
+
 ## v2.3.0 — 2026-07-15 ESM 切包可行性研究 (M-03)
 
 ### 📋 docs/ESM_FEASIBILITY.md

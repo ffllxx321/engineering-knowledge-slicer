@@ -1,5 +1,49 @@
 # 工程知识切片 变更记录
 
+## v1.5.0 — 2026-07-15 鲁棒性 + 死代码清理
+
+### 🛠 S-05 AI JSON 解析鲁棒化
+旧版 `parseJsonPayload` 只剥 ``` 围栏、剥 <think> 块、剥尾逗号、抽 `{...}`。AI 输出稍复杂就抛 `AI_INVALID_JSON`。
+新增 `repairJsonText`：
+- 补齐不配对的花括号 / 方括号
+- 补齐未闭合的字符串引号
+- 多重兜底路径（每条路径都写 `parse.fallback.*` diag 便于事后分析 AI 输出质量）
+- 不会激进改语义：不会修未加引号的 key，不会改单引号
+
+### 🗑 M-02 死代码清理
+v1.1 重构期的中间产物，从来没被外部调用：
+- `processTaskLegacy`（129 行）—— 已删
+- `renderContentLegacy` / `renderQueueLegacy` / `renderReviewLegacy` / `renderDraftSummary` —— 已删
+- `buildTaskFromFile` / `futureMediaStatus` —— 已删
+- `pipeline.js` 里 `TRANSITIONS` / `transitionTask` / `acquireLease` / `releaseLease` / `retryFailedTask` / `runPipelineTask` / `artifact` / `requiredHandler` / `copyTask` —— 已删
+- `routing.js` 里 `cardOutputFolder`（仅被 `cardOutputPath` 内部使用）—— 折入 `cardOutputPath`
+
+代码量从 5715 → 5540 行（-175 行 / -3.1%）。
+
+### 🛡 m-03 sanitizeFileName 防 `..` 路径穿越
+用户把卡片 title 写为 `..` 或含 `..` 字符串会逃出 vault。补一道清洗：替换 `\.\.+` 为 `-`，去掉开头的 `.`。
+
+### 🌍 m-05 looksLikeGibberish 不再误判韩/阿/泰/印地等合法脚本
+旧版 `isUnexpectedScriptOrPrivate` 把韩文（Hangul）/ 阿文（Arabic）/ 泰文（Thai）/ 印地（Devanagari）等多种合法脚本都判为"unexpected"，导致含这些脚本的文档被误判为乱语直接走 failed。
+现在只把"私有区 + 替换字符 + 代理对"判为 unexpected。不会改变对真正乱码（控制字符、U+FFFD、UTF-16 截断）的判定。
+
+### 📋 m-06 classification schema 补 schema_version
+`classification.schema.json` 之前没要求 `schema_version` 字段。AI 输出里有没有这个字段都被接受，跨版本兼容性靠记忆。
+现在 `required` 列表加了 `schema_version`（const: "1.1"），`additionalProperties: false` 保证不再有无 schema_version 的旧输出混入。
+
+### 🛡 风险
+- AI JSON 鲁棒化引入了"补齐不配对括号"的启发式，理论上可能把"AI 截断的合法 JSON"误判为"可补齐"。
+  - **缓解**：补齐策略只做闭合（`}`/`]`）和补引号，不改任何内容；每条 fallback 路径写 diag 便于追溯。
+- 死代码删除用 `git checkout main.js` 兜底了一次（被 Python 脚本误删）。
+  - **缓解**：后续会改用 Edit 工具的精确字符串匹配 + Node `--check` 双重验证，不再用 Python 行号批量删。
+
+### 🔍 验证步骤
+1. `node --check main.js` 通过
+2. 装 1.5 跑一次有韩文 / 阿文 / 泰文的 PDF，确认不再被 `looksLikeGibberish` 误判
+3. 把任意 AI 输出补一个缺右括号的 JSON 试一下，确认能 fallback 解析
+
+---
+
 ## v1.4.0 — 2026-07-15 P1 安全加固：内容指纹 + 截断 UI + 迁移备份
 
 ### 🔒 S-02 内容指纹脱敏（不再依赖键名）

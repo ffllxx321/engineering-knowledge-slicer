@@ -3259,8 +3259,11 @@ function isExpectedReadableChar(ch) {
   return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}A-Za-z0-9\s，。、“”：《》；：！？（）【】,.()[\]{}:;!?/+\-=_%#&'"|@<>·•、~￥$…—℃±×÷≤≥²³°′″㎡µΩ]/u.test(ch);
 }
 
+// v1.5 (m-05): \u4E4B\u524D\u628A\u97E9/\u963F/\u6CF0/\u5370\u5730\u7B49\u5408\u6CD5\u811A\u672C\u5F53 unexpected_script\uFF0C
+//              \u5BFC\u81F4\u97E9\u6587 / \u963F\u62C9\u4F2F\u6587\u6587\u6863\u88AB\u8BEF\u5224\u4E3A\u4E71\u8BED\u76F4\u63A5\u8D70 failed\u3002
+//              \u6539\u4E3A\u53EA\u628A"\u79C1\u6709\u533A + \u66FF\u6362\u5B57\u7B26 + \u4EE3\u7406\u5BF9"\u8FD9\u4E9B\u771F\u6B63\u53EF\u7591\u7684\u5224\u4E3A unexpected\u3002
 function isUnexpectedScriptOrPrivate(ch) {
-  return /[\p{Script=Hangul}\p{Script=Arabic}\p{Script=Devanagari}\p{Script=Bengali}\p{Script=Tamil}\p{Script=Kannada}\p{Script=Telugu}\p{Script=Thai}\uE000-\uF8FF\uF0000-\uFFFFD\u100000-\u10FFFD]/u.test(ch);
+  return /[\uE000-\uF8FF\uF0000-\uFFFFD\u100000-\u10FFFD\uFFFD]/u.test(ch);
 }
 
 module.exports = {
@@ -3326,20 +3329,21 @@ function resolveFixedRoute(folderMap, value) {
   return route;
 }
 
-function cardOutputFolder(folderMap, card) {
-  return resolveFixedRoute(folderMap, card).output_folder.replace(/\/$/, '');
-}
-
+// v1.5 (M-02 + m-03): cardOutputFolder 折入 cardOutputPath 内部，避免外部多跳一层。
+//                     sanitizeFileName 同步处理 '..' 路径穿越（m-03）。
 function cardOutputPath(folderMap, card, fileName) {
-  return `${cardOutputFolder(folderMap, card)}/${sanitizeFileName(fileName)}`;
+  const outputFolder = resolveFixedRoute(folderMap, card).output_folder.replace(/\/$/, '');
+  return `${outputFolder}/${sanitizeFileName(fileName)}`;
 }
 
 function sanitizeFileName(value) {
-  const fileName = String(value || 'card.md').replace(/[\\/:*?"<>|#\[\]]+/g, '-').replace(/-+/g, '-');
+  let fileName = String(value || 'card.md').replace(/[\\/:*?"<>|#\[\]]+/g, '-').replace(/-+/g, '-');
+  // v1.5 (m-03): 防 '..' 路径穿越（用户可能把 title 写为 ".."）
+  fileName = fileName.replace(/\.\.+/g, '-').replace(/^\.+/, '');
   return fileName.toLowerCase().endsWith('.md') ? fileName : `${fileName}.md`;
 }
 
-module.exports = { cardOutputFolder, cardOutputPath, resolveFixedRoute, sanitizeFileName };
+module.exports = { cardOutputPath, resolveFixedRoute, sanitizeFileName };
 
 
 },
@@ -4133,22 +4137,10 @@ module.exports = {
 "src/core/pipeline.js": function(require, module, exports) {
 const { runIdentity, sourceIdentity } = require("src/core/identity.js");
 
-const TRANSITIONS = {
-  discovered: new Set(['queued', 'skipped', 'unsupported']),
-  queued: new Set(['parsing', 'paused', 'cancelled', 'failed']),
-  parsing: new Set(['parsed', 'paused', 'cancelled', 'failed']),
-  parsed: new Set(['classifying', 'paused', 'cancelled', 'failed']),
-  classifying: new Set(['classified', 'paused', 'cancelled', 'failed']),
-  classified: new Set(['summarizing', 'paused', 'cancelled', 'failed']),
-  summarizing: new Set(['summarized', 'paused', 'cancelled', 'failed']),
-  summarized: new Set(['atomizing', 'paused', 'cancelled', 'failed']),
-  atomizing: new Set(['validating', 'paused', 'cancelled', 'failed']),
-  validating: new Set(['writing', 'needs_review', 'paused', 'cancelled', 'failed']),
-  writing: new Set(['written', 'needs_review', 'paused', 'cancelled', 'failed']),
-  failed: new Set(['queued', 'cancelled']),
-  paused: new Set(['queued', 'cancelled']),
-  needs_review: new Set(['writing', 'written', 'cancelled'])
-};
+// v1.5 (M-02): 删除 TRANSITIONS / transitionTask / acquireLease / releaseLease /
+//              retryFailedTask / runPipelineTask / artifact / requiredHandler /
+//              copyTask 死代码；只保留 createTaskRecord（主流程还在用）。
+//              这些都是 v1.1 重构期的中间产物，从来没被 main.js 外部调用。
 
 function createTaskRecord(options) {
   const versions = options.versions || {};
@@ -4185,123 +4177,8 @@ function createTaskRecord(options) {
   };
 }
 
-function transitionTask(task, nextStatus, options = {}) {
-  const allowed = TRANSITIONS[task.status];
-  if (!allowed || !allowed.has(nextStatus)) {
-    throw new Error(`illegal pipeline transition: ${task.status} -> ${nextStatus}`);
-  }
-  const next = copyTask(task);
-  next.status = nextStatus;
-  next.updated_at = options.at || new Date().toISOString();
-  if (options.progress) next.progress = Object.assign({}, next.progress, options.progress);
-  if (options.artifact?.key && options.artifact?.path) {
-    next.artifacts[options.artifact.key] = options.artifact.path;
-  }
-  if (options.error) next.errors.push(options.error);
-  return next;
-}
-
-function acquireLease(task, owner, now = new Date(), durationMs = 60_000) {
-  const current = task.lease;
-  if (current && current.owner !== owner && new Date(current.expires_at).getTime() > now.getTime()) {
-    throw new Error(`task is leased by another worker: ${current.owner}`);
-  }
-  const next = copyTask(task);
-  next.lease = {
-    owner,
-    acquired_at: now.toISOString(),
-    expires_at: new Date(now.getTime() + durationMs).toISOString()
-  };
-  return next;
-}
-
-function releaseLease(task, owner) {
-  if (task.lease && task.lease.owner !== owner) throw new Error(`cannot release lease owned by ${task.lease.owner}`);
-  const next = copyTask(task);
-  next.lease = null;
-  return next;
-}
-
-function retryFailedTask(task, options = {}) {
-  if (task.status !== 'failed') throw new Error('only failed tasks can be retried');
-  const maxRetries = Number(options.maxRetries || 3);
-  const stage = task.errors?.at(-1)?.stage || 'unknown';
-  const current = Number(task.retry_counts?.[stage] || 0);
-  if (current >= maxRetries) throw new Error(`retry limit reached for ${stage}`);
-  const next = transitionTask(task, 'queued', { at: options.at });
-  next.retry_counts[stage] = current + 1;
-  next.progress = {};
-  next.lease = null;
-  return next;
-}
-
-async function runPipelineTask(initialTask, handlers, persist = async () => {}) {
-  let task = copyTask(initialTask);
-  let steps = 0;
-  try {
-    while (!['written', 'needs_review', 'failed', 'cancelled', 'unsupported', 'skipped'].includes(task.status)) {
-      if (steps++ > 20) throw new Error('pipeline exceeded maximum transition count');
-      if (task.status === 'queued') task = transitionTask(task, 'parsing');
-      else if (task.status === 'parsing') task = transitionTask(task, 'parsed', { artifact: artifact('parsed', await requiredHandler(handlers, 'parse', task)) });
-      else if (task.status === 'parsed') task = transitionTask(task, 'classifying');
-      else if (task.status === 'classifying') task = transitionTask(task, 'classified', { artifact: artifact('classification', await requiredHandler(handlers, 'classify', task)) });
-      else if (task.status === 'classified') task = transitionTask(task, 'summarizing');
-      else if (task.status === 'summarizing') task = transitionTask(task, 'summarized', { artifact: artifact('summary', await requiredHandler(handlers, 'summarize', task)) });
-      else if (task.status === 'summarized') task = transitionTask(task, 'atomizing');
-      else if (task.status === 'atomizing') task = transitionTask(task, 'validating', { artifact: artifact('atoms', await requiredHandler(handlers, 'atomize', task)) });
-      else if (task.status === 'validating') task = transitionTask(task, 'writing', { artifact: artifact('validated', await requiredHandler(handlers, 'validate', task)) });
-      else if (task.status === 'writing') {
-        const written = await requiredHandler(handlers, 'write', task);
-        task = transitionTask(task, 'written');
-        task.written_card_ids = Array.isArray(written) ? written : [];
-      } else {
-        throw new Error(`pipeline cannot resume from status: ${task.status}`);
-      }
-      await persist(copyTask(task));
-    }
-    return task;
-  } catch (error) {
-    if (TRANSITIONS[task.status]?.has('failed')) {
-      task = transitionTask(task, 'failed', {
-        error: { stage: task.status, message: error.message, at: new Date().toISOString() }
-      });
-      await persist(copyTask(task));
-    }
-    throw error;
-  }
-}
-
-function artifact(key, path) {
-  return { key, path: String(path || '') };
-}
-
-async function requiredHandler(handlers, name, task) {
-  if (typeof handlers?.[name] !== 'function') throw new Error(`pipeline handler is missing: ${name}`);
-  return handlers[name](copyTask(task));
-}
-
-function copyTask(task) {
-  return Object.assign({}, task, {
-    source_aliases: [...(task.source_aliases || [])],
-    remote_jobs: [...(task.remote_jobs || [])],
-    retry_counts: Object.assign({}, task.retry_counts || {}),
-    artifacts: Object.assign({}, task.artifacts || {}),
-    written_card_ids: [...(task.written_card_ids || [])],
-    review_atom_ids: [...(task.review_atom_ids || [])],
-    errors: [...(task.errors || [])],
-    progress: Object.assign({}, task.progress || {}),
-    lease: task.lease ? Object.assign({}, task.lease) : null
-  });
-}
-
 module.exports = {
-  TRANSITIONS,
-  acquireLease,
-  createTaskRecord,
-  releaseLease,
-  retryFailedTask,
-  runPipelineTask,
-  transitionTask
+  createTaskRecord
 };
 
 },

@@ -3,8 +3,9 @@
   "$id": "engineering-knowledge-slicer://schema/classification-1.1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["library", "folder_type", "document_type", "model_confidence", "reason", "evidence", "alternatives"],
+  "required": ["schema_version", "library", "folder_type", "document_type", "model_confidence", "reason", "evidence", "alternatives"],
   "properties": {
+    "schema_version": { "const": "1.1" },
     "library": { "enum": ["bid", "business"] },
     "folder_type": { "type": "string", "minLength": 1 },
     "document_type": { "type": "string", "minLength": 1 },

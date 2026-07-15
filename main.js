@@ -4643,7 +4643,7 @@ function findRoute(folderMap, classification) {
 function splitMarkdownSections(markdown, options = {}) {
   const source = String(markdown || '');
   const maxChars = Math.max(100, Number(options.maxChars) || 12000);
-  if (!source) return [{ chunk_id: 'chunk-001', markdown: '', headings: [] }];
+  if (!source.trim()) return [{ chunk_id: 'chunk-001', markdown: source, headings: [] }];
   const tokens = source.match(/[^\n]*\n|[^\n]+$/g) || [source];
   const chunks = [];
   let current = '';
@@ -4666,6 +4666,9 @@ function splitMarkdownSections(markdown, options = {}) {
     current += token;
   }
   flush();
+
+  // 兜底：全空白或全过滤场景下确保返回至少 1 个 chunk
+  if (!chunks.length) chunks.push(source);
 
   return chunks.map((text, index) => ({
     chunk_id: `chunk-${String(index + 1).padStart(3, '0')}`,

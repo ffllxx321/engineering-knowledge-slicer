@@ -1,5 +1,29 @@
 # 工程知识切片 变更记录
 
+## v2.5.0 — 2026-07-15 splitMarkdownSections 边界修复
+
+### 🐛 全空白输入导致下游崩溃
+当 vault 里碰到「全换行 / 全空白 / 被前面预处理清空的 markdown」时，`splitMarkdownSections` 会返回 `[]`（tokens 全部被过滤），下游 `summarizeDocument` 走到 `partials[0]` 时拿到 `undefined`，触发 `Cannot read properties of undefined`。这是真实存在的崩溃路径（用户报过类似「拆 chunk 卡死」）。
+
+修复：
+- 空字符串判断从 `!source` → `!source.trim()`，覆盖纯空白
+- 主循环结束后兜底 `if (!chunks.length) chunks.push(source)`
+- 含义：哪怕输入是空字符串，也至少返回 1 个 chunk（`{ chunk_id: 'chunk-001', markdown: '', headings: [] }`）
+
+### 🧪 烟雾测试 `scripts/smoke-split.js`
+6 个用例覆盖边界：空字符串 / 纯空白 / 全换行 / 普通文本 / 超大单行（25000 字符应切 3 段）/ 多个 heading 边界。
+
+### ⚠️ 行为变化
+- 之前：空 markdown → 1 个空 chunk
+- 之前：纯空白 markdown → 0 个 chunk（崩）
+- 现在：空 / 纯空白 → 1 个 chunk（不崩，下游 schema 校验会拿到 `core_knowledge: ''` 走 needs_fix 分支）
+
+### 🔧 其它微调
+- v2.4 顺手补的 settings 迁移现在覆盖 v2.2 (useStreamingAi) + v2.4 (rateLimitBackoffMaxMs / rateLimitWindowSize)
+- 不再列出对终端用户可见的变化
+
+---
+
 ## v2.4.0 — 2026-07-15 自我代码审查 + 鲁棒性补丁
 
 ### 🐛 RateLimiter 内存泄漏修复

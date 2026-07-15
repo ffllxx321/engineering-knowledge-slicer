@@ -1,5 +1,61 @@
 # 工程知识切片 变更记录
 
+## v1.9.0 — 2026-07-15 性能 + 路径解析 + 死代码清理后续
+
+### ⏱ M-04 写盘防抖
+12 批次原子化会触发 30+ 次磁盘 IO。改为 500ms 防抖：
+- `saveTasks(tasks)` 不再立即写盘，而是把任务挂到 `this._pendingSaveTasks` 并起一个 setTimeout(500ms)
+- 期间再次调用 `saveTasks` 会更新 pending tasks 并重置定时器
+- `_flushSaveTasks()` 在定时器触发后真正落盘（保留 M-11 的备份逻辑）
+- 关键节点（onunload）走 `flushSaveTasksImmediate()` 强制立即落盘，避免防抖窗口内的写丢失
+
+效果：磁盘 IO 从 30+ 次/任务降到 1 次/任务（连续心跳 / 批次完成聚合）。
+
+### 🔄 M-01 RateLimiter 重写
+旧实现：100ms 轮询忙等 + 没有 backoff。
+新实现：
+- **滑动窗口**：保留过去 N 次（默认 10）请求时间戳，窗口内并发数 ≤ maxConcurrent 才放行
+- **事件驱动**：FIFO 等待队列 + setTimeout resolve，不做 100ms 轮询
+- **指数退避**：失败时 `intervalMs × 2^failures`，上限 `backoffMaxMs`（默认 30s）
+- 每次 `run(fn)` 成功后清零失败计数；失败时累加
+- 新增 settings: `rateLimitBackoffMaxMs` / `rateLimitWindowSize`
+
+### 🆔 M-08 cardIdentity 防碰撞
+旧版 `card-${sourceHash.slice(0,12)}-${fingerprint.slice(0,12)}` —— 两个 12 字符 hex 切片独立碰撞域，约 65k 文档级别就可能撞 ID。
+新版：完整 sourceHash[:16] + fingerprint[:16] + 加 library 前缀（bid/business）。
+碰撞概率降到 ~2^64（生日界）。
+
+### 📁 M-09 EPC folder_type 模糊匹配
+folder-map.json 里 "04-设计优化方案" 和 "04-设计优化方案及设计方案(EPC工程)" 是两条不同的 route。AI 可能输出 `04-设计优化方案(EPC工程)`，旧版精确匹配失败直接抛错。
+新版 `resolveFixedRoute`：
+1. 精确匹配
+2. 任一包含（prefix.includes）
+3. 反向包含
+4. 去掉括号再次精确匹配
+任一命中即返回 route，避免抛错。
+
+### 📋 m-01 readFrontmatterValue 支持 YAML 列表 + 多行
+旧版正则 `[^\"\n]+` 不能处理：
+- `Tags: [a, b, c]` —— 列表
+- `Tags:\n  - a\n  - b` —— 多行列表
+- `Title: "value with spaces"` —— 双引号已经能处理
+新版：能解析 inline list、多行 list、多行字符串（折成空格分隔）。
+
+### 🛡 风险
+- 写盘防抖窗口（500ms）内如果 Obsidian 崩溃，写丢失。
+  - **缓解**：onunload 强制 flush；setTaskProgress 在 status 转换时也可走 flushSaveTasksImmediate（v1.10 再加）。
+- RateLimiter 滑动窗口大小 10 —— 高频场景下窗口外的请求会立即放行。
+  - **缓解**：可用 setting 调整到 30/60。
+- cardIdentity 加 library 前缀 —— 如果以后用户把文档从一个 library 移到另一个，ID 会变（这是 feature，不是 bug —— 跨库应该被视为不同卡片）。
+
+### 🔍 验证步骤
+1. `node --check main.js` 通过
+2. 跑一个 12 批次任务，看磁盘 IO 次数（可用 iostat）
+3. 把 AI 的请求间隔调到 100ms，看 RateLimiter 是否会 backoff
+4. 在 folder-map 加一条 "04-设计优化方案及设计方案(EPC工程)"，触发一次 "04-设计优化方案(EPC工程)" 看能否路由成功
+
+---
+
 ## v1.5.0 — 2026-07-15 鲁棒性 + 死代码清理
 
 ### 🛠 S-05 AI JSON 解析鲁棒化

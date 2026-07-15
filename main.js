@@ -261,31 +261,113 @@ function loadSecretsFile() {
   return {};
 }
 
+// v1.7 (M-01): 重写 RateLimiter。
+//       旧实现是"两段互斥"——并发上限 + 最小间隔，但 100ms 忙等轮询会无谓唤醒；
+//       失败 / 超时没有 backoff，会立刻重试打到上游。
+//       新实现：
+//         - 滑动窗口（保留过去 N 次请求时间戳），窗口内请求数 ≤ maxConcurrent 才放行
+//         - 最小间隔仍是 intervalMs，但用事件驱动（resolve 链）取代 100ms 轮询
+//         - 失败时指数退避：连续失败次数 × intervalMs 上限 backoffMs
+//         - run() 接受 fn，自动 acquire/release + onError 触发 backoff
 class RateLimiter {
-  constructor(intervalMs, maxConcurrent) {
-    this.intervalMs = intervalMs || 1000;
-    this.maxConcurrent = maxConcurrent || 2;
-    this.activeRequests = 0;
-    this.lastRequestTime = 0;
+  constructor({ intervalMs = 1000, maxConcurrent = 2, backoffMaxMs = 30_000, windowSize = 10 } = {}) {
+    this.intervalMs = intervalMs;
+    this.maxConcurrent = maxConcurrent;
+    this.backoffMaxMs = backoffMaxMs;
+    this.windowSize = windowSize;
+    this.timestamps = []; // 滑动窗口内最近 N 次请求的 timestamp
+    this.failures = 0;
+    this.waiters = []; // FIFO 等待队列，每项是 { resolve, startedAt }
   }
-  async acquire() {
-    while (this.activeRequests >= this.maxConcurrent) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    const now = Date.now();
-    const elapsed = now - this.lastRequestTime;
-    if (elapsed < this.intervalMs) {
-      await new Promise(resolve => setTimeout(resolve, this.intervalMs - elapsed));
-    }
-    this.activeRequests++;
-    this.lastRequestTime = Date.now();
+
+  _cleanupExpired(now) {
+    const cutoff = now - this.intervalMs * this.windowSize;
+    while (this.timestamps.length && this.timestamps[0] < cutoff) this.timestamps.shift();
   }
+
+  _activeInWindow(now) {
+    const cutoff = now - this.intervalMs;
+    let count = 0;
+    for (const t of this.timestamps) if (t >= cutoff) count += 1;
+    return count;
+  }
+
+  _scheduleNextWaiter() {
+    if (!this.waiters.length) return;
+    const next = this.waiters.shift();
+    clearTimeout(next.timer);
+    next.resolve();
+  }
+
+  acquire() {
+    return new Promise((resolve) => {
+      const now = Date.now();
+      this._cleanupExpired(now);
+      const active = this._activeInWindow(now);
+      if (active < this.maxConcurrent) {
+        // 有空位，立即放行
+        this.timestamps.push(now);
+        resolve();
+        return;
+      }
+      // 排队：等下一个 100ms 的"窗口滑过"或等到最早的请求出窗口
+      const earliest = this.timestamps[0] || now;
+      const waitMs = Math.max(100, (earliest + this.intervalMs) - now);
+      const waiter = { resolve, startedAt: now };
+      waiter.timer = setTimeout(() => {
+        // 重新检查（可能被前面的人放行了）
+        const t = Date.now();
+        this._cleanupExpired(t);
+        if (this._activeInWindow(t) < this.maxConcurrent) {
+          this.timestamps.push(t);
+          resolve();
+        } else {
+          // 再排队
+          this.waiters.unshift(waiter);
+          // 触发下一轮 schedule
+          this._scheduleNextWaiter();
+        }
+      }, waitMs);
+      this.waiters.push(waiter);
+    });
+  }
+
   release() {
-    this.activeRequests--;
+    // 滑动窗口是自管理的（按时间戳淘汰），但 _activeInWindow 是按 intervalMs 算的。
+    // 这里只需要 schedule 下一个等待者即可。
+    this._scheduleNextWaiter();
   }
+
+  // 记录一次失败；后续 acquire 会自动指数退避
+  recordFailure() {
+    this.failures += 1;
+  }
+  recordSuccess() {
+    this.failures = 0;
+  }
+  backoffMs() {
+    if (this.failures === 0) return 0;
+    // 1, 2, 4, 8 ... 指数退避到 backoffMaxMs
+    return Math.min(this.backoffMaxMs, this.intervalMs * Math.pow(2, Math.min(this.failures - 1, 10)));
+  }
+
   async run(fn) {
+    const backoff = this.backoffMs();
+    if (backoff > 0) {
+      try { diag('ratelimit.backoff', { failures: this.failures, backoffMs: backoff }); } catch (_) {}
+      await new Promise((r) => setTimeout(r, backoff));
+    }
     await this.acquire();
-    try { return await fn(); } finally { this.release(); }
+    try {
+      const result = await fn();
+      this.recordSuccess();
+      return result;
+    } catch (e) {
+      this.recordFailure();
+      throw e;
+    } finally {
+      this.release();
+    }
   }
 }
 
@@ -337,7 +419,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     setEksUploadConfirm(this);
     // 密钥注入后再写盘，确保 data.json 不会因为顺序问题而清掉 secrets
     await this.saveData(this.settings);
-    this.rateLimiter = new RateLimiter(this.settings.rateLimitMs || 1000, this.settings.rateLimitMaxConcurrent || 2);
+    this.rateLimiter = new RateLimiter({
+      intervalMs: this.settings.rateLimitMs || 1000,
+      maxConcurrent: this.settings.rateLimitMaxConcurrent || 2,
+      backoffMaxMs: Number(this.settings.rateLimitBackoffMaxMs || 30000),
+      windowSize: Number(this.settings.rateLimitWindowSize || 10)
+    });
     this.autoProcessing = false;
     this.pauseRequested = false;
     this.cancelRequestedTaskId = '';
@@ -383,6 +470,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   onunload() {
     // v1.1.7: 卸载前最后 flush 一次，确保所有诊断日志落盘
     try { forceFlushDiag(); } catch (_) {}
+    // v1.6 (M-04): 卸载前 flush pending tasks，避免防抖窗口内的写丢失
+    try { this.flushSaveTasksImmediate(); } catch (_) {}
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_SLICER);
   }
 
@@ -1275,7 +1364,32 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     }
   }
 
+  // v1.6 (M-04): 写盘防抖。setTaskProgress / upsertTask 高频调用 saveTasks，
+  //              一次 12 批次原子化可能触发 30+ 次磁盘 IO。改为 500ms 防抖，
+  //              关键节点（status 转换 / 错误落库 / onunload）走 flushSaveTasksImmediate 立即落。
   async saveTasks(tasks) {
+    this._pendingSaveTasks = tasks;
+    this._pendingSaveDirty = true;
+    if (this._saveTasksTimer) clearTimeout(this._saveTasksTimer);
+    this._saveTasksTimer = setTimeout(() => {
+      // 异步落盘；调用方 await 的话可以走 flushSaveTasksImmediate
+      this._flushSaveTasks().catch((e) => {
+        try { diag('tasks.save.flush.error', { message: String(e && e.message || e) }); } catch (_) {}
+      });
+    }, 500);
+  }
+
+  // v1.6 (M-04): 立即落盘（绕过防抖）。用在 status 转换 / 错误落库 / onunload 等关键节点。
+  async flushSaveTasksImmediate() {
+    if (this._saveTasksTimer) { clearTimeout(this._saveTasksTimer); this._saveTasksTimer = null; }
+    await this._flushSaveTasks();
+  }
+
+  async _flushSaveTasks() {
+    if (!this._pendingSaveDirty) return;
+    const tasks = this._pendingSaveTasks;
+    this._pendingSaveTasks = null;
+    this._pendingSaveDirty = false;
     await this.ensureFolders();
     const target = tasksPath(this.settings);
     // v1.4 (M-11): 写盘前先备份上一版 tasks.json 到 tasks.json.bak.{ts}，
@@ -2500,9 +2614,36 @@ function getMarkdownTitle(markdown) {
   return match ? match[1].trim() : '';
 }
 
+// v1.9 (m-01): 读 frontmatter 单字段，支持：
+//                - 纯字符串:  Key: value
+//                - 双引号包:   Key: "value with spaces"
+//                - YAML 列表:  Key: [a, b, c]   → 返回 "a, b, c"
+//                - 多行列表:  Key:\n  - a\n  - b  → 返回 "a, b"
 function readFrontmatterValue(markdown, key) {
-  const match = String(markdown || '').match(new RegExp(`^${key}:\\s*\"?([^\"\\n]+)\"?`, 'm'));
-  return match ? match[1].trim() : '';
+  const text = String(markdown || '');
+  const re = new RegExp(`^${key}:\\s*(.*?)(?=^\\w+:|\\Z)`, 'ms');
+  const match = text.match(re);
+  if (!match) return '';
+  let raw = match[1].replace(/\s+$/, '');
+  // 单行列表 [a, b, c]
+  const inlineList = raw.match(/^\s*\[\s*(.+?)\s*\]\s*$/);
+  if (inlineList) {
+    return inlineList[1].split(',').map((s) => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean).join(', ');
+  }
+  // 多行列表：key 后的所有 "- value"
+  if (/^\s*$/.test(raw.split('\n')[0])) {
+    const items = [];
+    for (const line of raw.split('\n')) {
+      const itemMatch = line.match(/^\s*-\s+(.+?)\s*$/);
+      if (itemMatch) items.push(itemMatch[1].replace(/^["']|["']$/g, ''));
+    }
+    if (items.length) return items.join(', ');
+  }
+  // 单行值（去引号）
+  raw = raw.replace(/^["']|["']$/g, '').trim();
+  // 多行（普通换行 → 空格）
+  raw = raw.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
+  return raw;
 }
 
 function cardFromMarkdown(markdown) {
@@ -2543,7 +2684,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 13,
+  settingsVersion: 14,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -2581,6 +2722,8 @@ const DEFAULT_SETTINGS = {
   maxConcurrentDocuments: 3,
   rateLimitMs: 1000,
   rateLimitMaxConcurrent: 2,
+  rateLimitBackoffMaxMs: 30000,
+  rateLimitWindowSize: 10,
   useEnvKeys: true,
   staleProcessingMinutes: 20,
   targetLanguage: 'zh-CN',
@@ -2606,7 +2749,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 13;
+  migrated.settingsVersion = 14;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -3321,12 +3464,38 @@ module.exports = {
 
 },
 "src/core/routing.js": function(require, module, exports) {
+// v1.8 (M-09): 解析固定目录映射。优先精确匹配；找不到时退化到前缀匹配（处理 EPC 工程类合并条目）。
+//       例如 AI 输出 "04-设计优化方案(EPC工程)" 但 folder-map 只有 "04-设计优化方案及设计方案(EPC工程)"，
+//       走前缀匹配把两者归到同一个目录。
 function resolveFixedRoute(folderMap, value) {
-  const route = (folderMap && folderMap.routes || []).find((item) => (
+  const routes = (folderMap && folderMap.routes || []);
+  const exact = routes.find((item) => (
     item.library === value.library && item.folder_type === value.folder_type
   ));
-  if (!route) throw new Error(`固定目录映射中不存在：${value.library || 'unknown'} / ${value.folder_type || 'unknown'}`);
-  return route;
+  if (exact) return exact;
+  // 前缀 fallback：同 library 下找 folder_type 包含 value 的
+  if (value.folder_type) {
+    const prefix = routes.find((item) => (
+      item.library === value.library && item.folder_type.includes(value.folder_type)
+    ));
+    if (prefix) return prefix;
+    // 反向：value 包含某个 route
+    const contain = routes.find((item) => (
+      item.library === value.library && value.folder_type.includes(item.folder_type)
+    ));
+    if (contain) return contain;
+  }
+  // 公共前缀（N- 段）：截断到第一个 "（" 或 "(" 之前再试一次
+  if (value.folder_type) {
+    const baseType = value.folder_type.split(/[（(]/)[0].trim();
+    if (baseType && baseType !== value.folder_type) {
+      const baseRoute = routes.find((item) => (
+        item.library === value.library && item.folder_type === baseType
+      ));
+      if (baseRoute) return baseRoute;
+    }
+  }
+  throw new Error(`固定目录映射中不存在：${value.library || 'unknown'} / ${value.folder_type || 'unknown'}`);
 }
 
 // v1.5 (M-02 + m-03): cardOutputFolder 折入 cardOutputPath 内部，避免外部多跳一层。
@@ -4103,8 +4272,14 @@ function atomFingerprint(atom) {
   return hash(stableStringify(normalizeValue(identityFields)));
 }
 
-function cardIdentity(sourceHash, fingerprint) {
-  return `card-${String(sourceHash || '').slice(0, 12)}-${String(fingerprint || '').slice(0, 12)}`;
+// v1.8 (M-08): cardIdentity 改用完整 sourceHash + 完整 fingerprint，
+//              避免 slice(0,12) 截断导致的 48-bit 生日碰撞（~16M 文档级别）。
+//              加库名前缀（bid/business）防止跨库碰撞。
+function cardIdentity(library, sourceHash, fingerprint) {
+  const lib = String(library || 'unknown').slice(0, 8);
+  const src = String(sourceHash || '').slice(0, 16);
+  const fp = String(fingerprint || '').slice(0, 16);
+  return `card-${lib}-${src}-${fp}`;
 }
 
 function normalizeValue(value) {
@@ -5105,7 +5280,7 @@ const { atomFingerprint, cardIdentity } = require("src/core/identity.js");
 function buildCardRecord(options) {
   const atom = options.atom;
   const fingerprint = atomFingerprint(atom);
-  const cardId = cardIdentity(options.sourceHash, fingerprint);
+  const cardId = cardIdentity(options.library, options.sourceHash, fingerprint);
   const now = typeof options.now === 'string' ? options.now : (options.now || new Date()).toISOString();
   const related = (atom.related_candidates || []).map((item) => typeof item === 'string' ? item : item.target).filter(Boolean);
   const relations = (atom.related_candidates || []).filter((item) => item && typeof item === 'object' && item.target).map((item) => ({

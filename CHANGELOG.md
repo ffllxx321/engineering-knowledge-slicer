@@ -1,5 +1,55 @@
 # 工程知识切片 变更记录
 
+## v1.3.0 — 2026-07-15 P0 合规：diag.log 移出 vault + 上传前确认 + 版本号对齐
+
+### 🔒 上传源文件到 MinerU/PaddleOCR 之前要二次确认（审核报告 S-04）
+之前调用 `extractDocumentWithApis` 直接上传源文件到云端，没有给用户任何反悔的机会。审核报告把这点列为严重风险（涉及保密与数据外发合规）。
+
+**改**：
+- 入口处通过 `globalThis.__eksUploadConfirm` 弹一个 `UploadConfirmModal`（Obsidian Modal 子类），显示**文件名 / 大小 / 目标解析器**，必须点"确认上传"才会真正发请求。
+- 加 setting `confirmUploads`（默认 `true`）。自动流水线场景可关闭。
+- 弹窗里有个"本次会话不再重复询问"的勾选框，避免每个文档都弹一次。
+- 用户取消 → 返回 `status: 'cancelled'`，任务被记入 dashboard 异常汇总但不算失败。
+
+### 📂 diag.log 默认写到 vault 之外（审核报告 S-03）
+之前 diag.log 落在 `.obsidian/plugins/engineering-knowledge-slicer/diag.log`，会被 iCloud / OneDrive / Git 同步反复上传。
+
+**改**：
+- 默认路径改为 `~/.eks/logs/diag.log`（跨 vault 同步，避开 vault 同步工具的扫描与冲突）。
+- 加 setting `diagLogInVault`（默认 `false`）。需要本地看的话，勾上回退到 vault 内路径，重启插件后生效。
+- 设置页"打开诊断日志"按钮：vault 内路径走 `openLinkText`；vault 外走 `electron.shell.openPath` 用系统默认编辑器打开（macOS 文本编辑器、Windows 记事本等）。
+
+### 🔢 版本号三处对齐（审核报告 S-07）
+之前 `manifest.json` = 1.2.0，但 `package.json` 还停在 1.1.2，`settingsVersion` 11，三处对不上。手工改易遗漏。
+
+**改**：
+- `manifest.json` `1.2.0` → `1.3.0`
+- `package.json` `1.1.2` → `1.3.0`
+- `DEFAULT_SETTINGS.settingsVersion` `11` → `12`（加了 `diagLogInVault` / `confirmUploads` 两个新 key，迁移路径自动加默认值）
+- `migrateSettings` 同步把目标 `settingsVersion` 改成 12
+- `data.json` 升级时会自动用 DEFAULT_SETTINGS 里的新 key 兜底（已有逻辑）
+
+### 📜 添加 LICENSE 文件（审核报告 S-06）
+- 新增 `LICENSE`（标准 MIT），与 `package.json` 的 `"license": "MIT"` 声明对齐
+- Obsidian 插件市场推荐有 LICENSE 文件供社区参考
+
+### ❌ m-07（cardFromMarkdown/validateCard 死代码）— 维持现状
+- 这两个函数实际被 `approveDraft` 路径（dashboard 草稿审批按钮）使用，删除会破坏交互。
+- 决定保留并在审核回复里说明。**该条不计入本次改动。**
+
+### 🔍 验证步骤
+1. `node --check main.js` 通过
+2. 加载插件后，settings 顶部"诊断日志"显示新路径 `~/.eks/logs/diag.log`
+3. 切到 vault 外部文件，触发任意 OCR 解析，会弹上传确认窗
+4. 取消上传 → 任务标 cancelled，进异常汇总
+5. 点"打开诊断日志" → 系统文本编辑器打开
+
+### 🛡 风险
+- 上传确认弹窗是**同步阻塞**的，自动化脚本（Obsidian 命令面板批量任务）会被卡住等待点击。给 setting 提供了 `confirmUploads: false` 关闭。
+- diag.log 移出 vault 后，跨设备调试时需要 SSH 同步 `~/.eks/logs/`，已写在弹窗描述里。
+
+---
+
 ## v1.2.0 — 2026-07-14 dashboard 清失败列表 + 设置/审核加交互按钮
 
 ### 🧹 处理概览去掉失败/跳过原因提示

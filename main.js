@@ -264,15 +264,27 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     }
     // v1.1.6: 报告 effective 密钥指纹（绝不是原值），便于诊断"密钥填了但被插件忽略"类问题
     // v1.1.7: 同时初始化 diag.log 文件路径，让没法开 DevTools 的用户也能拿到日志
+    // v1.3:   默认写到 vault 之外（~/.eks/logs/diag.log），
+    //         避免被 iCloud / OneDrive / Git 等同步工具重复上传/同步。
+    //         设置页可切回 vault 内（diagLogInVault: true）。
     try {
       const adapter = this.app.vault && this.app.vault.adapter;
-      if (adapter && typeof adapter.getBasePath === 'function') {
-        const path = require('path');
-        // v1.1.9: logPath 现在是 globalThis.__eksDiag.state 上的共享变量
-        globalThis.__eksDiag.state.logPath = path.join(adapter.getBasePath(), '.obsidian', 'plugins', 'engineering-knowledge-slicer', 'diag.log');
-        diag('onload.diagLogPath', { path: globalThis.__eksDiag.state.logPath });
+      const path = require('path');
+      const fs = require('fs');
+      const os = require('os');
+      let logPath = null;
+      if (this.settings.diagLogInVault && adapter && typeof adapter.getBasePath === 'function') {
+        logPath = path.join(adapter.getBasePath(), '.obsidian', 'plugins', 'engineering-knowledge-slicer', 'diag.log');
+      } else {
+        // vault 之外：~/.eks/logs/diag.log
+        const logDir = path.join(os.homedir(), '.eks', 'logs');
+        try { fs.mkdirSync(logDir, { recursive: true }); } catch (_) { /* 已存在或不可写就退化到 console */ }
+        logPath = path.join(logDir, 'diag.log');
       }
-    } catch (_) { /* 取不到路径就退化到 console only */ }
+      // v1.1.9: logPath 现在是 globalThis.__eksDiag.state 上的共享变量
+      globalThis.__eksDiag.state.logPath = logPath;
+      diag('onload.diagLogPath', { path: logPath, inVault: !!this.settings.diagLogInVault });
+    } catch (e) { /* 取不到路径就退化到 console only */ try { diag('onload.diagLogPath.error', { message: String(e && e.message || e) }); } catch (_) {} }
     diag('onload.keys.effective', {
       useEnvKeys: this.settings.useEnvKeys,
       minimaxApiKey: this.settings.minimaxApiKey ? keyFingerprint(this.settings.minimaxApiKey) : '<empty>',
@@ -282,6 +294,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       pdfMineruApiEndpoint: this.settings.pdfMineruApiEndpoint,
       pdfPaddleOcrApiEndpoint: this.settings.pdfPaddleOcrApiEndpoint
     });
+    // v1.3: 注册上传确认桥接，供闭包模块（external-pdf.js）弹上传确认弹窗
+    setEksUploadConfirm(this);
     // 密钥注入后再写盘，确保 data.json 不会因为顺序问题而清掉 secrets
     await this.saveData(this.settings);
     this.rateLimiter = new RateLimiter(this.settings.rateLimitMs || 1000, this.settings.rateLimitMaxConcurrent || 2);
@@ -1272,6 +1286,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       enabled: true,
       order: 'mineru-api,paddleocr-api',
       allowExternalUpload: this.settings.pdfAllowExternalUpload === true,
+      // v1.3: 上传前是否弹窗二次确认（默认开启）
+      confirmUploads: this.settings.confirmUploads !== false,
       timeoutMs: Number(this.settings.pdfExternalTimeoutMs || 300000),
       pollIntervalMs: Number(this.settings.pdfApiPollIntervalMs || 5000),
       mineruApiKey: this.settings.pdfMineruApiKey || '',
@@ -1386,6 +1402,102 @@ class ReviewExceptionModal extends Modal {
   }
   onClose() {
     this.contentEl.empty();
+  }
+}
+
+// v1.3: 上传源文件到外部解析器（MinerU / PaddleOCR）前的二次确认弹窗。
+//       通过 globalThis.__eksUploadConfirm 暴露给闭包模块（external-pdf.js）调用。
+class UploadConfirmModal extends Modal {
+  constructor(app, payload) {
+    super(app);
+    this.payload = payload || {};
+    this.resolved = false;
+    this.confirmed = false;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass('eks-upload-confirm-modal');
+    contentEl.createEl('h2', { text: '确认上传源文件到外部解析器' });
+    const bytes = Number(this.payload.sizeBytes || 0);
+    const sizeText = bytes > 0
+      ? `${(bytes / 1024 / 1024).toFixed(2)} MB`
+      : '未知大小';
+    const engineText = String(this.payload.engine || 'MinerU / PaddleOCR');
+    contentEl.createDiv({
+      cls: 'eks-task-meta',
+      text: `源文件：${this.payload.fileName || '(未知文件名)'}（${sizeText}）`
+    });
+    contentEl.createDiv({
+      cls: 'eks-task-meta',
+      text: `目标解析器：${engineText}`
+    });
+    contentEl.createDiv({
+      cls: 'eks-task-meta',
+      text: '请确认该源文件可以合法上传到云端解析服务，并已通过公司保密审批。'
+    });
+    const remember = contentEl.createEl('label', { cls: 'eks-upload-confirm-remember' });
+    const cb = remember.createEl('input', { attr: { type: 'checkbox' } });
+    remember.createSpan({ text: '本次会话不再重复询问（仍可在设置里取消）' });
+    const actions = contentEl.createDiv({ cls: 'eks-upload-confirm-actions' });
+    const cancelBtn = actions.createEl('button', { text: '取消上传' });
+    const confirmBtn = actions.createEl('button', { text: '确认上传', cls: 'mod-cta' });
+    const finish = (ok) => {
+      if (this.resolved) return;
+      this.resolved = true;
+      this.confirmed = !!ok;
+      this.remember = !!cb.checked;
+      this.close();
+    };
+    cancelBtn.addEventListener('click', () => finish(false));
+    confirmBtn.addEventListener('click', () => finish(true));
+  }
+  onClose() {
+    this.contentEl.empty();
+    if (!this.resolved) {
+      // 用户点了右上角 X → 当作取消
+      this.resolved = true;
+      this.confirmed = false;
+    }
+  }
+}
+
+// v1.3: globalThis 桥接：闭包模块（external-pdf.js 等）通过该入口弹上传确认弹窗。
+//       每个会话内 confirmAll=true 后不再询问；同时尊重 settings.confirmUploads。
+globalThis.__eksUploadConfirm = globalThis.__eksUploadConfirm || null;
+function setEksUploadConfirm(plugin) {
+  if (plugin && plugin.app && typeof plugin.settings === 'object') {
+    globalThis.__eksUploadConfirm = async function askUploadConfirm(payload) {
+      if (plugin.settings.confirmUploads === false) return true; // 设置关闭 → 跳过
+      const session = (typeof globalThis.__eksDiag === 'object' && globalThis.__eksDiag.state)
+        ? globalThis.__eksDiag.state
+        : {};
+      if (session.uploadConfirmedAll) return true; // 用户本会话已选择"不再询问"
+      const modal = new UploadConfirmModal(plugin.app, payload || {});
+      modal.open();
+      await new Promise((resolve) => {
+        // Modal 关闭后给一点事件循环时间，确保 onClose 已执行
+        const prevOnClose = modal.onClose.bind(modal);
+        modal.onClose = function() {
+          prevOnClose();
+          resolve();
+        };
+        // 兜底：若 onClose 路径上没 resolve，5 秒后强制 resolve
+        setTimeout(resolve, 5000);
+      });
+      if (modal.remember) session.uploadConfirmedAll = true;
+      try {
+        const diag = (typeof globalThis.__eksDiag === 'object' && globalThis.__eksDiag.diag) || (() => {});
+        diag('upload.confirm', {
+          fileName: payload?.fileName,
+          sizeBytes: payload?.sizeBytes,
+          engine: payload?.engine,
+          confirmed: !!modal.confirmed,
+          rememberAll: !!modal.remember
+        });
+      } catch (_) {}
+      return !!modal.confirmed;
+    };
   }
 }
 
@@ -1716,9 +1828,21 @@ class SlicerSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl('h2', { text: '工程知识切片设置' });
     // v1.2: 一键打开诊断日志，方便没 DevTools 环境的用户直接查看文件路径
+    // v1.3: 默认日志在 vault 之外（~/.eks/logs/diag.log），避开同步冲突；
+    //       勾选"写到 vault 内"则回退到 .obsidian/plugins/engineering-knowledge-slicer/diag.log。
+    const diagPathDesc = (typeof globalThis.__eksDiag === 'object' && globalThis.__eksDiag.state && globalThis.__eksDiag.state.logPath)
+      ? `所有 [EKS diag] 事件写入 ${globalThis.__eksDiag.state.logPath}。遇到问题时把文件内容发给我即可定位。`
+      : '所有 [EKS diag] 事件写入 ~/.eks/logs/diag.log（默认）。遇到问题时把文件内容发给我即可定位。';
     new Setting(containerEl)
       .setName('诊断日志')
-      .setDesc('所有 [EKS diag] 事件写入 .obsidian/plugins/engineering-knowledge-slicer/diag.log，遇到问题时把文件内容发给我即可定位。')
+      .setDesc(diagPathDesc)
+      .addToggle((toggle) => toggle
+        .setValue(!!this.plugin.settings.diagLogInVault)
+        .setTooltip('默认关闭：日志写到 ~/.eks/logs/diag.log（vault 之外）。打开后回到 vault 内的 .obsidian/plugins/engineering-knowledge-slicer/diag.log（重启后生效）。')
+        .onChange(async (value) => {
+          this.plugin.settings.diagLogInVault = !!value;
+          await this.plugin.saveData(this.plugin.settings);
+        }))
       .addButton((button) => button
         .setButtonText('打开诊断日志')
         .setCta()
@@ -1732,24 +1856,35 @@ class SlicerSettingTab extends PluginSettingTab {
           }
           // 把 vault 绝对路径转回 vault-相对路径，以便 openLinkText 能在 vault 中定位文件
           let relPath = logPath;
+          let inVault = false;
           try {
             const adapter = this.app.vault && this.app.vault.adapter;
             if (adapter && typeof adapter.getBasePath === 'function') {
               const basePath = adapter.getBasePath();
               if (basePath && relPath.startsWith(basePath)) {
                 relPath = relPath.substring(basePath.length).replace(/^[\\/]+/, '');
+                inVault = true;
               }
             }
           } catch (_) { /* fallback: 直接试绝对路径 */ }
-          let file = this.app.vault.getAbstractFileByPath(relPath);
-          if (!file && relPath !== logPath) file = this.app.vault.getAbstractFileByPath(logPath);
-          if (!file) {
-            try { file = await this.app.vault.create(relPath, ''); } catch (_) { /* 文件可能已存在，忽略 */ }
+          if (inVault) {
+            let file = this.app.vault.getAbstractFileByPath(relPath);
+            if (!file && relPath !== logPath) file = this.app.vault.getAbstractFileByPath(logPath);
+            if (!file) {
+              try { file = await this.app.vault.create(relPath, ''); } catch (_) { /* 文件可能已存在，忽略 */ }
+            }
+            if (file instanceof TFile) {
+              await this.app.workspace.openLinkText(relPath, '', false);
+              return;
+            }
           }
-          if (file instanceof TFile) {
-            await this.app.workspace.openLinkText(relPath, '', false);
-          } else {
-            new Notice(`诊断日志路径：${logPath}\n请在 Obsidian 文件浏览器中手动打开。`);
+          // 日志在 vault 之外 / openLinkText 不可用：先确保文件存在，再用系统默认编辑器打开
+          try {
+            const { shell } = require('electron');
+            await shell.openPath(logPath);
+            new Notice(`诊断日志：${logPath}`);
+          } catch (e) {
+            new Notice(`诊断日志路径：${logPath}\n请在系统文件管理器中手动打开。`);
           }
         }));
     pathSetting(containerEl, this.plugin, '招投标源文件路径', '固定读取招投标源文件。', 'bidIntakePath');
@@ -1824,6 +1959,17 @@ class SlicerSettingTab extends PluginSettingTab {
         .setValue(this.plugin.settings.pdfAllowExternalUpload === true)
         .onChange(async (value) => {
           this.plugin.settings.pdfAllowExternalUpload = value;
+          await this.plugin.saveSettings();
+        }));
+
+    // v1.3: 上传前是否弹窗二次确认。
+    new Setting(containerEl)
+      .setName('上传前弹窗确认')
+      .setDesc('开启后每次解析源文件前都会显示文件名 / 大小 / 目标解析器，并要求点确认。自动流水线场景可关闭。')
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.confirmUploads !== false)
+        .onChange(async (value) => {
+          this.plugin.settings.confirmUploads = value;
           await this.plugin.saveSettings();
         }));
 
@@ -2274,7 +2420,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 11,
+  settingsVersion: 12,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -2318,7 +2464,14 @@ const DEFAULT_SETTINGS = {
   maxExcerptLength: 500,
   pipelineVersion: '1.1.1',
   promptBundleVersion: '1.1',
-  schemaVersion: '1.1'
+  schemaVersion: '1.1',
+  // v1.3: 诊断日志默认写到 vault 之外（~/.eks/logs/diag.log），
+  //        避免被 iCloud / OneDrive / Git 等同步工具重复上传/同步触发性能问题与隐私扩散。
+  //        设为 true 时回到原行为（vault 内 .obsidian/plugins/.../diag.log）。
+  diagLogInVault: false,
+  // v1.3: 上传源文件到 MinerU/PaddleOCR 之前是否弹 Notice 二次确认。
+  //        合规优先；设为 false 跳过确认（自动化流水线场景）。
+  confirmUploads: true
 };
 
 function migrateSettings(stored = {}) {
@@ -2327,7 +2480,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 11;
+  migrated.settingsVersion = 12;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -3087,6 +3240,26 @@ async function extractDocumentWithApis(buffer, config = {}) {
       text: '',
       message: '文档超过 MinerU 精准解析 API 的 200 页上限，请拆分后重试。'
     };
+  }
+
+  // v1.3: 上传源文件到外部解析器前的二次确认。
+  //       通过 globalThis.__eksUploadConfirm 弹窗；用户取消时直接返回 cancelled。
+  if (config.confirmUploads !== false && typeof globalThis.__eksUploadConfirm === 'function') {
+    const engines = parseOrder(config.order || config.pdfExtractionOrder);
+    const primaryEngine = engines[0] || 'mineru-api';
+    const confirmed = await globalThis.__eksUploadConfirm({
+      fileName: config.fileName || '',
+      sizeBytes: Number(buffer?.length || 0),
+      engine: engineLabel(primaryEngine)
+    });
+    if (!confirmed) {
+      return {
+        status: 'cancelled',
+        engine: 'document-api',
+        text: '',
+        message: '用户取消上传源文件到外部解析器。'
+      };
+    }
   }
 
   if (typeof config.run === 'function') {

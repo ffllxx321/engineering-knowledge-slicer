@@ -293,12 +293,8 @@ class RateLimiter {
   }
 
   _scheduleNextWaiter() {
-    if (!this.waiters.length) return;
-    const next = this.waiters.shift();
-    clearTimeout(next.timer);
-    if (next.done) return this._scheduleNextWaiter(); // 已被前一次 timer 处理过；跳过
-    next.done = true;
-    next.resolve();
+    // 滑动窗口按请求开始时间限流，不能在请求结束时直接放行下一个 waiter。
+    // waiter 自己的定时器会在窗口腾出额度后放行并从队列移除。
   }
 
   acquire() {
@@ -323,6 +319,8 @@ class RateLimiter {
         if (this._activeInWindow(t) < this.maxConcurrent) {
           this.timestamps.push(t);
           waiter.done = true;
+          const waiterIndex = this.waiters.indexOf(waiter);
+          if (waiterIndex >= 0) this.waiters.splice(waiterIndex, 1);
           resolve();
           return;
         }
@@ -337,9 +335,7 @@ class RateLimiter {
   }
 
   release() {
-    // 滑动窗口是自管理的（按时间戳淘汰），但 _activeInWindow 是按 intervalMs 算的。
-    // 这里只需要 schedule 下一个等待者即可。
-    this._scheduleNextWaiter();
+    // 滑动窗口按时间自动释放额度；不能因单个请求提前结束而绕过 intervalMs。
   }
 
   // 记录一次失败；后续 acquire 会自动指数退避
@@ -852,13 +848,16 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         loadTypePrompt: (route) => this.loadComponentText(route.prompt),
         sourceHash: current.source_hash,
         maxChunkChars: this.settings.aiChunkSize,
+        maxPointsPerRequest: this.settings.maxPointsPerRequest,
+        atomizationConcurrency: this.settings.atomizationConcurrency,
+        shortDocumentMaxCards: this.settings.shortDocumentMaxCards,
         versions: runtimeVersions(this.settings),
         existingCards,
         existingFingerprints: existingCards.map((card) => card.atom_fingerprint).filter(Boolean),
         validateLabels: (atom) => validateAtomLabels(tagLibrary, atom),
-        requestJson: (prompt, context) => requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest }),
+        requestJson: (prompt, context) => this.rateLimiter.run(() => requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest })),
         requestStream: this.settings.useStreamingAi
-          ? (prompt, context, hooks) => requestMiniMaxStream({ settings: this.settings, prompt, context, onDelta: hooks && hooks.onDelta, onProgressText: hooks && hooks.onProgressText })
+          ? (prompt, context, hooks) => this.rateLimiter.run(() => requestMiniMaxStream({ settings: this.settings, prompt, context, onDelta: hooks && hooks.onDelta, onProgressText: hooks && hooks.onProgressText }))
           : null,
 
         onProgress: async (progress) => {
@@ -2313,6 +2312,41 @@ class SlicerSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName('每批知识点数')
+      .setDesc('每次原子化请求处理的知识点数量。默认 3，可显著减少 API 调用；复杂内容可调低到 1-2。')
+      .addDropdown((dropdown) => dropdown
+        .addOption('1', '1（最细，最慢）').addOption('2', '2（平衡）').addOption('3', '3（推荐）')
+        .setValue(String(this.plugin.settings.maxPointsPerRequest || 3))
+        .onChange(async (value) => {
+          this.plugin.settings.maxPointsPerRequest = Number(value);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('原子化并发数')
+      .setDesc('同时执行的原子化批次数。默认 2；出现 429 时建议调为 1。')
+      .addDropdown((dropdown) => dropdown
+        .addOption('1', '1（保守）').addOption('2', '2（推荐）').addOption('3', '3（较快）')
+        .setValue(String(this.plugin.settings.atomizationConcurrency || 2))
+        .onChange(async (value) => {
+          this.plugin.settings.atomizationConcurrency = Number(value);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('短文档卡片异常阈值')
+      .setDesc('3 页以内文档超过该数量时不自动入库，整批转入审核台；不会截断或丢弃卡片。默认 20。')
+      .addText((text) => text.setPlaceholder('20')
+        .setValue(String(this.plugin.settings.shortDocumentMaxCards || 20))
+        .onChange(async (value) => {
+          const count = Number(value);
+          if (Number.isFinite(count) && count >= 5 && count <= 100) {
+            this.plugin.settings.shortDocumentMaxCards = Math.round(count);
+            await this.plugin.saveSettings();
+          }
+        }));
+
+    new Setting(containerEl)
       .setName('卡住任务判定时间')
       .setDesc('处理中任务超过该时间没有任何进度更新，会自动转为失败，方便用“重试失败并处理”重新排队。')
       .addText((text) => text
@@ -2707,7 +2741,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 14,
+  settingsVersion: 15,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -2738,6 +2772,9 @@ const DEFAULT_SETTINGS = {
   pdfExternalTimeoutMs: 600000,
   aiChunkSize: 8000,
   aiMaxChunks: 100,
+  maxPointsPerRequest: 3,
+  atomizationConcurrency: 2,
+  shortDocumentMaxCards: 20,
   aiRequestTimeoutMs: 300000,
   aiRequestMaxAttempts: 3,
   aiRetryBaseMs: 800,
@@ -2773,7 +2810,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 14;
+  migrated.settingsVersion = 15;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -2803,6 +2840,12 @@ function migrateSettings(stored = {}) {
   }
   if (!migrated.aiMaxChunks || Number(migrated.aiMaxChunks) <= 8) migrated.aiMaxChunks = DEFAULT_SETTINGS.aiMaxChunks;
   if (!migrated.aiChunkSize || Number(migrated.aiChunkSize) === 12000) migrated.aiChunkSize = DEFAULT_SETTINGS.aiChunkSize;
+  if (!Number(migrated.maxPointsPerRequest)) migrated.maxPointsPerRequest = DEFAULT_SETTINGS.maxPointsPerRequest;
+  migrated.maxPointsPerRequest = Math.max(1, Math.min(3, Math.round(Number(migrated.maxPointsPerRequest))));
+  if (!Number(migrated.atomizationConcurrency)) migrated.atomizationConcurrency = DEFAULT_SETTINGS.atomizationConcurrency;
+  migrated.atomizationConcurrency = Math.max(1, Math.min(3, Math.round(Number(migrated.atomizationConcurrency))));
+  if (!Number(migrated.shortDocumentMaxCards)) migrated.shortDocumentMaxCards = DEFAULT_SETTINGS.shortDocumentMaxCards;
+  migrated.shortDocumentMaxCards = Math.max(5, Math.min(100, Math.round(Number(migrated.shortDocumentMaxCards))));
   if (!Number(migrated.pdfExternalTimeoutMs) || Number(migrated.pdfExternalTimeoutMs) <= 300000) {
     migrated.pdfExternalTimeoutMs = DEFAULT_SETTINGS.pdfExternalTimeoutMs;
   }
@@ -4875,9 +4918,12 @@ async function atomizeSummary(options) {
   }
   if (!batches.length) batches.push([]);
 
-  const results = [];
+  const results = new Array(batches.length);
   let truncated = false;
-  for (let index = 0; index < batches.length; index += 1) {
+  let nextBatchIndex = 0;
+  const concurrency = Math.max(1, Math.min(3, Number(options.atomizationConcurrency) || 2));
+  async function processBatch(index) {
+    if (truncated) return;
     const batchPointIds = batches[index];
     const pointSet = new Set(batchPointIds);
     const keyPoints = (options.summary.key_points || []).filter((point) => pointSet.has(point.point_id));
@@ -4905,11 +4951,11 @@ async function atomizeSummary(options) {
         if (typeof globalThis.__eksDiag === 'object' && globalThis.__eksDiag.diag) {
           globalThis.__eksDiag.diag('atomization.truncated', { completed: index, total: batches.length, pointIds: pointIds.length });
         }
-        break;
+        return;
       }
       throw error;
     }
-    results.push(batchResult);
+    results[index] = batchResult;
     // 每个 batch 完成后 emit 一次（带 batchComplete 标记，触发写盘 + UI 重渲染）
     await emitProgress(options.onProgress, {
       stage: 'atomization',
@@ -4921,20 +4967,29 @@ async function atomizeSummary(options) {
         : `原子化 ${index + 1}/${batches.length} 批完成`
     });
   }
+  async function worker() {
+    while (!truncated) {
+      const index = nextBatchIndex++;
+      if (index >= batches.length) return;
+      await processBatch(index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, batches.length) }, () => worker()));
+  const completedResults = results.filter(Boolean);
 
   // v1.1.10: 配合 maxPointsPerRequest + 截断豁免：批次全是空（pointIds 为空）时允许返回空结果。
-  if (!results.length) {
+  if (!completedResults.length) {
     return applySchemaConstants(options.atomSchema, {
       atoms: [],
-      coverage: { point_ids: pointIds, complete: !truncated && results.length === batches.length },
+      coverage: { point_ids: pointIds, complete: !truncated && completedResults.length === batches.length },
       schema_version: '1.1'
     });
   }
-  if (results.length === 1 && !truncated) return results[0];
-  const mergedAtoms = results.flatMap((result) => result.atoms || []);
+  if (completedResults.length === 1 && !truncated) return completedResults[0];
+  const mergedAtoms = completedResults.flatMap((result) => result.atoms || []);
   const merged = applySchemaConstants(options.atomSchema, {
     atoms: mergedAtoms,
-    coverage: { point_ids: pointIds, complete: !truncated && results.length === batches.length },
+    coverage: { point_ids: pointIds, complete: !truncated && completedResults.length === batches.length },
     schema_version: '1.1'
   });
   // v1.1.10: 截断情况下跳过严格 schema 校验，避免一次大文档被反复重试；
@@ -5890,6 +5945,8 @@ async function runKnowledgeWorkflow(options) {
     tagLibrary: options.prompts.tagLibrary,
     linkCandidates,
     atomSchema: options.schemas.atoms,
+    maxPointsPerRequest: options.maxPointsPerRequest,
+    atomizationConcurrency: options.atomizationConcurrency,
     requestJson: options.requestJson,
     onProgress: options.onProgress
   });
@@ -5901,6 +5958,11 @@ async function runKnowledgeWorkflow(options) {
   ]);
   const accepted = [];
   const review = [];
+  const pageCount = Array.isArray(options.parsePackage.pages) && options.parsePackage.pages.length
+    ? options.parsePackage.pages.length
+    : Number(options.parsePackage.total_pages || options.parsePackage.page_count || 0);
+  const shortDocumentMaxCards = Math.max(5, Number(options.shortDocumentMaxCards) || 20);
+  const quantityAnomaly = pageCount > 0 && pageCount <= 3 && (atomResult.atoms || []).length > shortDocumentMaxCards;
   for (const atom of atomResult.atoms || []) {
     atom.source = Object.assign({}, atom.source || {}, {
       source_link: `[[${options.parsePackage.source_path}]]`
@@ -5927,11 +5989,12 @@ async function runKnowledgeWorkflow(options) {
       versions: options.versions,
       now: options.now
     });
-    if (confidence.decision === 'auto_ingest') {
+    if (confidence.decision === 'auto_ingest' && !quantityAnomaly) {
       accepted.push(card);
       existingFingerprints.add(fingerprint);
     } else {
       const reasons = [...confidence.hard_rules, ...(atom.validation_issues || [])];
+      if (quantityAnomaly) reasons.push(`短文档数量异常：${pageCount} 页生成 ${(atomResult.atoms || []).length} 张卡片，超过阈值 ${shortDocumentMaxCards}，需整批人工确认`);
       if (!labelsValid && !reasons.some((reason) => /标签/.test(reason))) reasons.push('标签字典校验未通过');
       if (!routeValid && !reasons.some((reason) => /目录/.test(reason))) reasons.push('知识原子目录与文档分类不一致');
       if (duplicate && !reasons.some((reason) => /重复/.test(reason))) reasons.push('与已有知识卡片重复');

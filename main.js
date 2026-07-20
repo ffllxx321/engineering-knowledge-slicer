@@ -851,6 +851,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         maxPointsPerRequest: this.settings.maxPointsPerRequest,
         atomizationConcurrency: this.settings.atomizationConcurrency,
         shortDocumentMaxCards: this.settings.shortDocumentMaxCards,
+        chunkOverlapRatio: this.settings.chunkOverlapRatio,
+        coalesceTinyChunks: this.settings.coalesceTinyChunks,
         versions: runtimeVersions(this.settings),
         existingCards,
         existingFingerprints: existingCards.map((card) => card.atom_fingerprint).filter(Boolean),
@@ -2298,6 +2300,30 @@ class SlicerSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName('切片重叠比例')
+      .setDesc('v2.7（借鉴 WeKnora）：相邻分块之间的重叠比例，避免段落语境在切点处断裂。范围 0–0.5，建议 0.05–0.2；设为 0 关闭重叠。重叠会略增 AI 输入 token。')
+      .addText((text) => text
+        .setPlaceholder('0.1')
+        .setValue(String(this.plugin.settings.chunkOverlapRatio ?? 0.1))
+        .onChange(async (value) => {
+          const ratio = Number(value);
+          if (Number.isFinite(ratio) && ratio >= 0 && ratio <= 0.5) {
+            this.plugin.settings.chunkOverlapRatio = ratio;
+            await this.plugin.saveSettings();
+          }
+        }));
+
+    new Setting(containerEl)
+      .setName('合并过小切片')
+      .setDesc('v2.7（借鉴 WeKnora coalesceTinyChunks）：同一标题语境下过小的相邻切片自动合并，减少 AI 调用次数、提升处理速度。关闭后每个小节独立调用一次 AI。')
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.coalesceTinyChunks !== false)
+        .onChange(async (value) => {
+          this.plugin.settings.coalesceTinyChunks = value;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
       .setName('AI 最大分段数')
       .setDesc('限制单个文件的 AI 调用次数，默认 100。超过上限时任务会明确失败，不会静默遗漏后半部分。')
       .addText((text) => text
@@ -2741,7 +2767,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 15,
+  settingsVersion: 16,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -2775,6 +2801,13 @@ const DEFAULT_SETTINGS = {
   maxPointsPerRequest: 3,
   atomizationConcurrency: 2,
   shortDocumentMaxCards: 20,
+  // v2.7（借鉴 WeKnora 切片引擎）：相邻切片重叠比例（0–0.5）。
+  //   0.1 ≈ WeKnora 的 chunk_overlap 80 / chunk_size 512 ≈ 15% 思路，
+  //   避免段落语境在切点处断裂；会略增 AI 输入 token。
+  chunkOverlapRatio: 0.1,
+  // v2.7：同一标题语境下过小的相邻切片自动合并（WeKnora coalesceTinyChunks），
+  //   显著减少 AI 调用次数、提升整体处理速度。
+  coalesceTinyChunks: true,
   aiRequestTimeoutMs: 300000,
   aiRequestMaxAttempts: 3,
   aiRetryBaseMs: 800,
@@ -2810,7 +2843,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 15;
+  migrated.settingsVersion = 16;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -2846,6 +2879,12 @@ function migrateSettings(stored = {}) {
   migrated.atomizationConcurrency = Math.max(1, Math.min(3, Math.round(Number(migrated.atomizationConcurrency))));
   if (!Number(migrated.shortDocumentMaxCards)) migrated.shortDocumentMaxCards = DEFAULT_SETTINGS.shortDocumentMaxCards;
   migrated.shortDocumentMaxCards = Math.max(5, Math.min(100, Math.round(Number(migrated.shortDocumentMaxCards))));
+  // v2.7: 切片重叠比例与小节合并开关键迁移（非法值回退默认）
+  const storedOverlapRatio = Number(migrated.chunkOverlapRatio);
+  if (!Number.isFinite(storedOverlapRatio) || storedOverlapRatio < 0 || storedOverlapRatio > 0.5) {
+    migrated.chunkOverlapRatio = DEFAULT_SETTINGS.chunkOverlapRatio;
+  }
+  if (migrated.coalesceTinyChunks === undefined) migrated.coalesceTinyChunks = DEFAULT_SETTINGS.coalesceTinyChunks;
   if (!Number(migrated.pdfExternalTimeoutMs) || Number(migrated.pdfExternalTimeoutMs) <= 300000) {
     migrated.pdfExternalTimeoutMs = DEFAULT_SETTINGS.pdfExternalTimeoutMs;
   }
@@ -4683,55 +4722,429 @@ function findRoute(folderMap, classification) {
   return (folderMap.routes || []).find((route) => route.library === classification.library && route.folder_type === classification.folder_type) || null;
 }
 
+// ==================== v2.7 切片引擎（借鉴 Tencent/WeKnora 的知识点切片思路） ====================
+// 参考实现：
+//   - docreader/splitter/splitter.py        → 受保护模式 + 重叠合并（protected_regex / chunk_overlap）
+//   - internal/infrastructure/chunker/profiler.go        → 文档画像驱动策略选择（ProfileDocument / SelectStrategy）
+//   - internal/infrastructure/chunker/heading_splitter.go → 标题边界切分 + 层级面包屑（ContextHeader）+ 小节合并（coalesceTinyChunks）
+//   - internal/infrastructure/chunker/heuristic_splitter.go → 候选边界 + 贪心装箱（dropBoundsInsideSpans / bin-packing）
+// 与 WeKnora 相同的原则：
+//   1) 切块前先给文档做"画像"，按结构信号选择切分策略（heading / heuristic / legacy）
+//   2) 代码块 / 表格 / LaTeX 公式等"受保护区域"永不被拦腰切断
+//   3) 每个切片携带标题层级面包屑（ContextHeader），让下游 AI 拿到章节语境
+//   4) 相邻、同语境、过小的切片合并（coalesce），减少 AI 调用次数
+//   5) 切片之间保留可配置的重叠（overlap），避免段落语境在切点处断裂
+//   6) 切分结果做顺序 / 覆盖 / 超尺寸校验（只告警不阻断）
+
+// 受保护区域的正则：围栏代码块（含未闭合）、LaTeX 块级公式。
+// 表格按行组识别（见 findProtectedSpans），不走正则。
+const PROTECTED_SPAN_PATTERNS = [
+  /```[^\n]*\n[\s\S]*?(?:```|$)/g,
+  /\$\$[\s\S]*?\$\$/g
+];
+
+// 文档画像：一次性扫描文档，收集决定切分策略的结构信号。
+// 对应 WeKnora profiler.go 的 ProfileDocument + SelectStrategy。
+function profileMarkdown(text) {
+  const source = String(text || '');
+  const profile = {
+    totalChars: source.length,
+    totalLines: 0,
+    avgLineLen: 0,
+    headingCounts: {},
+    headingTotal: 0,
+    dominantHeadingLevel: 0,
+    numberedSectionCount: 0,
+    hasTables: false,
+    hasCode: false,
+    hasMath: false,
+    codeChars: 0,
+    codeRatio: 0,
+    blankParagraphBreaks: 0,
+    strategy: 'legacy'
+  };
+  if (!source) return profile;
+  const lines = source.split('\n');
+  profile.totalLines = lines.length;
+  let lengthSum = 0;
+  let lengthCount = 0;
+  let inFence = false;
+  for (const raw of lines) {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith('```')) { inFence = !inFence; profile.hasCode = true; continue; }
+    if (inFence) { profile.codeChars += raw.length; continue; }
+    lengthSum += raw.length;
+    lengthCount += 1;
+    const heading = raw.match(/^(#{1,6})\s+\S/);
+    if (heading) {
+      const level = heading[1].length;
+      profile.headingCounts[level] = (profile.headingCounts[level] || 0) + 1;
+      profile.headingTotal += 1;
+      continue;
+    }
+    if (/^\s*\d+(?:\.\d+)*[.、]\s*\S/.test(raw)) profile.numberedSectionCount += 1;
+    if (trimmed.startsWith('|') && trimmed.endsWith('|') && trimmed.length >= 2) profile.hasTables = true;
+    if (trimmed.includes('$$')) profile.hasMath = true;
+  }
+  if (lengthCount > 0) profile.avgLineLen = lengthSum / lengthCount;
+  if (profile.totalChars > 0) profile.codeRatio = profile.codeChars / profile.totalChars;
+  profile.blankParagraphBreaks = (source.match(/\n\n\n/g) || []).length;
+  // 主标题层级：优先取出现 >= 3 次的最低层级（真正的文档骨架），
+  // 否则取最深出现层级（小文档只有 H1 + 几个 H2 时的退化策略）。同 WeKnora DominantHeadingLevel。
+  for (let level = 1; level <= 6; level += 1) {
+    if ((profile.headingCounts[level] || 0) >= 3) { profile.dominantHeadingLevel = level; break; }
+  }
+  if (!profile.dominantHeadingLevel) {
+    for (let level = 6; level >= 1; level -= 1) {
+      if ((profile.headingCounts[level] || 0) > 0) { profile.dominantHeadingLevel = level; break; }
+    }
+  }
+  // 策略选择（同 WeKnora SelectStrategy 的 tier 思路）：
+  //   heading   —— 有 Markdown 标题骨架 → 优先按标题边界切分
+  //   heuristic —— 无标题但有段落结构 → 按安全换行装箱（受保护区域不切断）
+  //   legacy    —— 纯长文 → 同样走安全换行装箱（兜底）
+  if (profile.headingTotal >= 3 && profile.dominantHeadingLevel > 0) {
+    profile.strategy = 'heading';
+  } else if (profile.numberedSectionCount >= 5 || profile.blankParagraphBreaks > 0 || source.includes('\n\n')) {
+    profile.strategy = 'heuristic';
+  } else {
+    profile.strategy = 'legacy';
+  }
+  return profile;
+}
+
+// 计算受保护区域的 [start, end) 区间列表（升序、重叠区间合并）。
+// 落在这些区间内的换行不会成为切点，代码块 / 表格 / 公式因此不会被拦腰切断。
+function findProtectedSpans(text) {
+  const spans = [];
+  for (const pattern of PROTECTED_SPAN_PATTERNS) {
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      if (match[0].length > 0) spans.push([match.index, match.index + match[0].length]);
+      if (match.index === pattern.lastIndex) pattern.lastIndex += 1;
+    }
+  }
+  // Markdown 表格：连续 >= 2 行以 | 开头结尾的行视为一个表格整体。
+  // span 不含行尾换行，表格结束后紧跟的换行仍是合法切点。
+  const lines = text.split('\n');
+  let pos = 0;
+  let tableStart = -1;
+  let tableLineCount = 0;
+  let tableLastEnd = 0;
+  const flushTable = () => {
+    if (tableStart >= 0 && tableLineCount >= 2) spans.push([tableStart, tableLastEnd]);
+    tableStart = -1;
+    tableLineCount = 0;
+  };
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    const isTableLine = trimmed.startsWith('|') && trimmed.endsWith('|') && trimmed.length >= 2;
+    if (isTableLine) {
+      if (tableStart < 0) tableStart = pos;
+      tableLineCount += 1;
+      tableLastEnd = pos + line.length;
+    } else {
+      flushTable();
+    }
+    pos += line.length + (i < lines.length - 1 ? 1 : 0);
+  }
+  flushTable();
+  spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  const merged = [];
+  for (const span of spans) {
+    const last = merged[merged.length - 1];
+    if (last && span[0] <= last[1]) last[1] = Math.max(last[1], span[1]);
+    else merged.push([span[0], span[1]]);
+  }
+  return merged;
+}
+
+// 按主标题层级把文档切成带起止偏移与面包屑的 section 列表。
+// 返回 null 表示没有可用的标题骨架（调用方退回整段切分）。
+// 对应 WeKnora heading_splitter.go 的 findHeadingBoundaries + 层级面包屑快照。
+function splitByHeadings(text, primaryLevel) {
+  const lines = text.split('\n');
+  const bounds = [0];
+  const headingEvents = [];
+  let pos = 0;
+  let inFence = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (trimmed.startsWith('```')) {
+      inFence = !inFence;
+    } else if (!inFence) {
+      const match = line.match(/^(#{1,6})\s+\S/);
+      if (match) {
+        const level = match[1].length;
+        headingEvents.push({ pos, level, line: line.trim() });
+        if (level <= primaryLevel && pos > 0) bounds.push(pos);
+      }
+    }
+    pos += line.length + (i < lines.length - 1 ? 1 : 0);
+  }
+  if (bounds.length <= 1) return null;
+
+  const sections = [];
+  const stack = [];
+  let eventIndex = 0;
+  const renderBreadcrumb = () => stack.map((entry) => entry.text).join('\n');
+  for (let b = 0; b < bounds.length; b += 1) {
+    const start = bounds[b];
+    const end = b + 1 < bounds.length ? bounds[b + 1] : text.length;
+    let breadcrumb = '';
+    while (eventIndex < headingEvents.length && headingEvents[eventIndex].pos < end) {
+      const event = headingEvents[eventIndex];
+      while (stack.length && stack[stack.length - 1].level >= event.level) stack.pop();
+      stack.push({ level: event.level, text: event.line });
+      if (event.pos === start) breadcrumb = renderBreadcrumb();
+      eventIndex += 1;
+    }
+    // section 内部没有领头标题时，继承上一节的层级语境（同 WeKnora hierarchy 持续观测）
+    if (!breadcrumb && stack.length) breadcrumb = renderBreadcrumb();
+    sections.push({ text: text.slice(start, end), start, end, breadcrumb });
+  }
+  return sections;
+}
+
+// 找出所有"安全切点"：每个换行之后都是一个候选切点，但落在受保护区域内的换行被剔除。
+// 对应 WeKnora heuristic_splitter.go 的 dropBoundsInsideSpans。
+function buildSafeBreaks(text, spans) {
+  const breaks = [0];
+  let si = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) !== 10) continue;
+    while (si < spans.length && spans[si][1] <= i) si += 1;
+    const inside = si < spans.length && i >= spans[si][0];
+    if (!inside) breaks.push(i + 1);
+  }
+  breaks.push(text.length);
+  return breaks;
+}
+
+// 在安全切点上做贪心装箱：累积块直到超过 maxChars 再 flush，
+// flush 后按 overlapRatio 把起点回退到最近的安全切点形成重叠。
+// 对应 WeKnora heuristic_splitter.go 的 bin-packing + splitter.py 的 chunk_overlap。
+function packWithOverlap(text, breaks, maxChars, overlapRatio) {
+  const out = [];
+  const minChunkSize = Math.max(50, Math.floor(maxChars / 4));
+  const overlapChars = Math.floor(maxChars * overlapRatio);
+  let chunkStart = breaks[0];
+  let curEnd = breaks[0];
+  for (let i = 1; i < breaks.length; i += 1) {
+    const nextEnd = breaks[i];
+    const blockLen = nextEnd - curEnd;
+    if (blockLen > maxChars) {
+      // 单个块本身超尺寸（巨型表格 / 代码块 / 超长单行）：flush 当前累积后硬切该块
+      if (curEnd > chunkStart) {
+        out.push({ text: text.slice(chunkStart, curEnd), start: chunkStart, end: curEnd });
+        chunkStart = curEnd;
+      }
+      for (let offset = curEnd; offset < nextEnd; offset += maxChars) {
+        const pieceEnd = Math.min(offset + maxChars, nextEnd);
+        out.push({ text: text.slice(offset, pieceEnd), start: offset, end: pieceEnd });
+      }
+      curEnd = nextEnd;
+      chunkStart = nextEnd;
+      continue;
+    }
+    const accumulated = nextEnd - chunkStart;
+    if (accumulated > maxChars && curEnd - chunkStart >= minChunkSize) {
+      out.push({ text: text.slice(chunkStart, curEnd), start: chunkStart, end: curEnd });
+      // 重叠回退：取 [curEnd - overlapChars, curEnd] 内、大于旧 chunkStart 的最大安全切点
+      let overlapStart = -1;
+      if (overlapChars > 0) {
+        const floor = curEnd - overlapChars;
+        for (const candidate of breaks) {
+          if (candidate <= chunkStart) continue;
+          if (candidate < floor) continue;
+          // 严格小于 curEnd：候选 == curEnd 意味着零重叠，等价于关闭重叠
+          if (candidate >= curEnd) break;
+          overlapStart = candidate;
+        }
+      }
+      chunkStart = overlapStart >= 0 ? overlapStart : curEnd;
+    }
+    curEnd = nextEnd;
+  }
+  if (curEnd > chunkStart) out.push({ text: text.slice(chunkStart, curEnd), start: chunkStart, end: curEnd });
+  return out.length ? out : [{ text, start: 0, end: text.length }];
+}
+
+// 把一个（可能超尺寸的）文本段切成 <= maxChars 的带偏移片段，受保护区域不切断。
+function splitRespectingProtected(text, maxChars, overlapRatio) {
+  if (!text) return [];
+  if (text.length <= maxChars) return [{ text, start: 0, end: text.length }];
+  const spans = findProtectedSpans(text);
+  const breaks = buildSafeBreaks(text, spans);
+  return packWithOverlap(text, breaks, maxChars, overlapRatio);
+}
+
+// 两个面包屑的行对齐公共前缀。同 WeKnora heading_splitter.go 的 commonHeadingPrefix。
+function commonBreadcrumbPrefix(a, b) {
+  if (a === b) return a;
+  const la = String(a || '').split('\n');
+  const lb = String(b || '').split('\n');
+  const n = Math.min(la.length, lb.length);
+  let common = 0;
+  for (let i = 0; i < n; i += 1) {
+    if (la[i].trim() !== lb[i].trim()) break;
+    common = i + 1;
+  }
+  return common ? la.slice(0, common).join('\n') : '';
+}
+
+// 合并相邻、同语境、过小的切片，减少 AI 调用次数。
+// 只合并 cur.end === next.start（相邻且无重叠）的切片，避免重叠内容被拼接重复。
+// 对应 WeKnora heading_splitter.go 的 coalesceTinyChunks（target ≈ chunkSize/2）。
+function coalesceTinyChunks(chunks, maxChars) {
+  if (chunks.length <= 1) return chunks;
+  const target = Math.max(200, Math.floor(maxChars / 2));
+  const out = [];
+  let cur = chunks[0];
+  for (let i = 1; i < chunks.length; i += 1) {
+    const next = chunks[i];
+    const adjacent = cur.end === next.start;
+    const shared = commonBreadcrumbPrefix(cur.breadcrumb || '', next.breadcrumb || '');
+    const sameContext = (cur.breadcrumb || '') === (next.breadcrumb || '') || shared !== '';
+    const canMerge = adjacent
+      && sameContext
+      && cur.markdown.length < target
+      && cur.markdown.length + next.markdown.length <= maxChars;
+    if (canMerge) {
+      cur = {
+        markdown: cur.markdown + next.markdown,
+        start: cur.start,
+        end: next.end,
+        breadcrumb: shared || cur.breadcrumb || ''
+      };
+      continue;
+    }
+    out.push(cur);
+    cur = next;
+  }
+  out.push(cur);
+  return out;
+}
+
+// 切片校验：顺序升序、原文被完整覆盖（允许重叠）、超尺寸告警。
+// 只打 diag 日志不阻断流程。对应 WeKnora splitter.py 的 _validate_chunks 与 validator.go。
+function validateChunks(chunks, source, maxChars) {
+  try {
+    if (!chunks.length) {
+      diag('splitter.validate', { ok: false, reason: 'no-chunks', chars: source.length });
+      return false;
+    }
+    for (let i = 1; i < chunks.length; i += 1) {
+      if (chunks[i].start < chunks[i - 1].start) {
+        diag('splitter.validate', { ok: false, reason: 'order', index: i });
+        return false;
+      }
+    }
+    let covered = 0;
+    for (const chunk of chunks) {
+      if (chunk.start > covered) {
+        diag('splitter.validate', { ok: false, reason: 'gap', at: covered, next: chunk.start });
+        return false;
+      }
+      covered = Math.max(covered, chunk.end);
+    }
+    if (covered < source.length) {
+      diag('splitter.validate', { ok: false, reason: 'tail-gap', covered, total: source.length });
+      return false;
+    }
+    for (const chunk of chunks) {
+      const len = chunk.end - chunk.start;
+      if (len > maxChars * 1.5) diag('splitter.validate', { warn: 'oversize', len, max: maxChars });
+    }
+    return true;
+  } catch (error) {
+    diag('splitter.validate', { ok: false, reason: 'exception', message: String((error && error.message) || error) });
+    return false;
+  }
+}
+
+// v2.7 重写：WeKnora 式切片主入口。
+// options:
+//   maxChars      —— 单切片字符上限（默认 12000）
+//   overlapRatio  —— 相邻切片重叠比例（0–0.5，默认 0）
+//   coalesceTiny  —— 是否合并过小相邻切片（默认 true）
+//   profile       —— 预先算好的文档画像（可选，避免重复扫描）
+// 返回形状向后兼容：{ chunk_id, markdown, headings } 并新增 breadcrumb（标题层级语境）。
 function splitMarkdownSections(markdown, options = {}) {
   const source = String(markdown || '');
   const maxChars = Math.max(100, Number(options.maxChars) || 12000);
-  if (!source.trim()) return [{ chunk_id: 'chunk-001', markdown: source, headings: [] }];
-  const tokens = source.match(/[^\n]*\n|[^\n]+$/g) || [source];
-  const chunks = [];
-  let current = '';
+  const rawOverlap = Number(options.overlapRatio);
+  const overlapRatio = Number.isFinite(rawOverlap) ? Math.min(0.5, Math.max(0, rawOverlap)) : 0;
+  const coalesceTiny = options.coalesceTiny !== false;
+  if (!source.trim()) return [{ chunk_id: 'chunk-001', markdown: source, headings: [], breadcrumb: '' }];
 
-  function flush() {
-    if (!current) return;
-    chunks.push(current);
-    current = '';
+  const profile = options.profile && typeof options.profile === 'object' ? options.profile : profileMarkdown(source);
+  diag('splitter.profile', {
+    chars: profile.totalChars,
+    headings: profile.headingTotal,
+    dominant: profile.dominantHeadingLevel,
+    tables: profile.hasTables,
+    code: profile.hasCode,
+    codeRatio: Number((profile.codeRatio || 0).toFixed(3)),
+    strategy: profile.strategy
+  });
+
+  let sections = null;
+  if (profile.strategy === 'heading' && profile.dominantHeadingLevel > 0) {
+    sections = splitByHeadings(source, profile.dominantHeadingLevel);
+  }
+  if (!sections || !sections.length) {
+    sections = [{ text: source, start: 0, end: source.length, breadcrumb: '' }];
   }
 
-  for (const token of tokens) {
-    const heading = /^#{1,6}\s+/.test(token);
-    if (heading && current && current.length >= maxChars * 0.6) flush();
-    if (token.length > maxChars) {
-      flush();
-      for (let offset = 0; offset < token.length; offset += maxChars) chunks.push(token.slice(offset, offset + maxChars));
-      continue;
+  const rawChunks = [];
+  for (const section of sections) {
+    const pieces = splitRespectingProtected(section.text, maxChars, overlapRatio);
+    for (const piece of pieces) {
+      rawChunks.push({
+        markdown: piece.text,
+        start: section.start + piece.start,
+        end: section.start + piece.end,
+        breadcrumb: section.breadcrumb
+      });
     }
-    if (current && current.length + token.length > maxChars) flush();
-    current += token;
   }
-  flush();
 
-  // 兜底：全空白或全过滤场景下确保返回至少 1 个 chunk
-  if (!chunks.length) chunks.push(source);
+  const chunks = coalesceTiny ? coalesceTinyChunks(rawChunks, maxChars) : rawChunks;
+  validateChunks(chunks, source, maxChars);
 
-  return chunks.map((text, index) => ({
+  return chunks.map((chunk, index) => ({
     chunk_id: `chunk-${String(index + 1).padStart(3, '0')}`,
-    markdown: text,
-    headings: [...text.matchAll(/^#{1,6}\s+(.+)$/gm)].map((match) => match[1].trim())
+    markdown: chunk.markdown,
+    headings: [...String(chunk.markdown).matchAll(/^#{1,6}\s+(.+)$/gm)].map((match) => match[1].trim()),
+    breadcrumb: chunk.breadcrumb || ''
   }));
 }
 
 async function summarizeDocument(options) {
-  const chunks = splitMarkdownSections(options.parsePackage.markdown, { maxChars: options.maxChunkChars });
+  // v2.7: 透传 WeKnora 式切片参数（重叠比例 + 小节合并开关）
+  const chunks = splitMarkdownSections(options.parsePackage.markdown, {
+    maxChars: options.maxChunkChars,
+    overlapRatio: options.chunkOverlapRatio,
+    coalesceTiny: options.coalesceTinyChunks
+  });
   const partials = [];
   for (let index = 0; index < chunks.length; index += 1) {
     const chunk = chunks[index];
+    // v2.7: 把标题层级面包屑（WeKnora ContextHeader）注入 prompt，让 AI 拿到章节语境
+    const chunkContext = chunk.breadcrumb
+      ? `当前分块 ${chunk.chunk_id}（${index + 1}/${chunks.length}），所属章节路径：\n${chunk.breadcrumb}`
+      : `当前分块 ${chunk.chunk_id}（${index + 1}/${chunks.length}）：`;
     const prompt = [
       options.basePrompt,
       '当前文档类型专用规则：',
       options.typePrompt,
       '分类结果：',
       JSON.stringify(options.classification, null, 2),
-      `当前分块 ${chunk.chunk_id}（${index + 1}/${chunks.length}）：`,
+      chunkContext,
       chunk.markdown,
       `coverage.chunk_ids 必须且只能包含 ["${chunk.chunk_id}"]，complete 必须为 true。`,
       '所有面向使用者的内容统一使用简体中文。只返回符合 structured-summary.schema.json 的 JSON。'
@@ -4795,7 +5208,14 @@ function normalizeSummaryMap(value, options, chunk) {
     coverage: { chunk_ids: [chunk.chunk_id], complete: true }
   });
   if (Array.isArray(result.evidence)) {
-    var fallbackLocator = (chunk.headings && chunk.headings.length) ? chunk.headings[0] : chunk.chunk_id;
+    // v2.7: 优先用标题层级面包屑做定位（"第3章 结构 > 3.2 荷载"），退回 chunk 内首个标题
+    var breadcrumbPath = String(chunk.breadcrumb || '')
+      .split('\n')
+      .map(function(line) { return line.replace(/^#{1,6}\s+/, '').trim(); })
+      .filter(Boolean)
+      .join(' > ');
+    var fallbackLocator = breadcrumbPath
+      || ((chunk.headings && chunk.headings.length) ? chunk.headings[0] : chunk.chunk_id);
     var fallbackQuote = String(chunk.markdown || '').slice(0, 200).replace(/\n/g, ' ').trim() || fallbackLocator;
     result.evidence = result.evidence.map(function(item, index) {
       if (!item || typeof item !== 'object') return item;
@@ -5552,13 +5972,19 @@ module.exports = {
   buildClassificationPrompt,
   classifyDocument,
   classificationSample,
+  coalesceTinyChunks,
+  commonBreadcrumbPrefix,
+  findProtectedSpans,
   findRoute,
   parseJsonPayload,
+  profileMarkdown,
   repairJsonText,
   requestMiniMaxJson,
   requestWithContract,
+  splitByHeadings,
   splitMarkdownSections,
-  summarizeDocument
+  summarizeDocument,
+  validateChunks
 };
 
 },
@@ -5931,6 +6357,8 @@ async function runKnowledgeWorkflow(options) {
     typePrompt,
     summarySchema: options.schemas.summary,
     maxChunkChars: options.maxChunkChars,
+    chunkOverlapRatio: options.chunkOverlapRatio,
+    coalesceTinyChunks: options.coalesceTinyChunks,
     maxRepairAttempts: 2,
     requestJson: options.requestJson,
     requestStream: options.requestStream,

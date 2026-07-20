@@ -1,5 +1,58 @@
 # 工程知识切片 变更记录
 
+## v2.7.0 — 2026-07-20 切片引擎重写（借鉴 Tencent/WeKnora）
+
+研究了腾讯开源的 [WeKnora](https://github.com/Tencent/WeKnora) 的知识点切片思路（`docreader/splitter/splitter.py` 的受保护模式 + 重叠合并、`internal/infrastructure/chunker/` 的文档画像驱动策略 + 标题面包屑 + 小节合并 + 候选边界装箱），把其中与「切片质量 / 处理效率」直接相关的设计移植到本插件已有的切片流水线。**不引入 ask agent / WIKI 等新功能**，只优化已有功能。
+
+### ✨ 文档画像驱动策略选择（借鉴 profiler.go / SelectStrategy）
+新增 `profileMarkdown(text)`：切块前对文档做一次性轻量扫描，收集标题数量与层级分布、表格 / 代码 / 公式存在性、代码占比、编号章节数、段落断行数等结构信号，据此选择切分策略：
+- `heading` —— 标题 ≥ 3 个且有主层级 → 按标题边界切分（Tier 1）
+- `heuristic` —— 无标题骨架但有段落结构 → 按安全换行装箱（Tier 2）
+- `legacy` —— 纯长文 → 安全换行装箱兜底（Tier 3）
+
+画像结果打 `splitter.profile` 诊断日志，便于排障时确认走了哪条策略。
+
+### ✨ 标题边界切分 + 层级面包屑（借鉴 heading_splitter.go 的 ContextHeader）
+- 新 `splitByHeadings`：按主标题层级（出现 ≥ 3 次的最低层级，同 WeKnora `DominantHeadingLevel`）切 section，代码块内的 `#` 行不误判为标题
+- 每个切片新增 `breadcrumb` 字段：标题层级路径（如 `# 第三章 结构设计\n## 3.2 荷载计算`），与 WeKnora 一致——面包屑不塞进正文（保持「拼接即还原原文」的覆盖不变式），作为独立语境传递
+- 总结 prompt 注入 `所属章节路径：…`，AI 拿到的不再是孤零零的分块，而是带章节语境的分块 → 证据定位（evidence locator）更准：`normalizeSummaryMap` 的回退定位优先用面包屑路径（「第三章 结构设计 > 3.2 荷载计算」）而非首个标题
+
+### ✨ 受保护区域永不切断（借鉴 splitter.py 的 protected_regex）
+旧实现按行累积切分，表格 / 代码块 / LaTeX 公式可能被拦腰切成两半喂给 AI，总结质量直接塌方。新实现：
+- 识别围栏代码块（含未闭合兜底）、Markdown 表格（连续 ≥ 2 行 `|…|`）、`$$…$$` 块级公式为受保护区域
+- 受保护区域内的换行被剔除出候选切点（同 WeKnora `dropBoundsInsideSpans`）
+- 单个受保护区域超过 maxChars 时才硬切（同 WeKnora「太长则进一步分段」）
+
+### ✨ 小节合并 coalesceTinyChunks（借鉴 heading_splitter.go）
+同一标题语境下过小的相邻切片自动合并（目标 ≈ maxChars/2，同 WeKnora），**直接减少 AI 调用次数**——对「一节一两句话」的规范 / 清单类文档提速明显（此前这类文档每个小节都要独立调一次 AI）。合并规则：
+- 只合并 `cur.end === next.start`（相邻无重叠）的切片，有重叠的切片不合并，避免内容重复拼接
+- 只合并共享标题前缀（`commonBreadcrumbPrefix`，同 WeKnora `commonHeadingPrefix`）的切片，不跨顶级章节混并
+- 可在设置中关闭（「合并过小切片」开关）
+
+### ✨ 切片重叠 overlap（借鉴 splitter.py 的 chunk_overlap）
+新增 `chunkOverlapRatio` 设置（默认 0.1，对应 WeKnora 80/512 ≈ 15% 的思路；范围 0–0.5）：flush 一个切片后，下一个切片的起点回退到 `overlapChars` 窗口内最近的安全换行切点，段落语境不再在切点处断裂。设为 0 即关闭（关闭时「拼接所有 chunk === 原文」精确成立）。
+
+### ✨ 切片校验（借鉴 splitter.py _validate_chunks / validator.go）
+新 `validateChunks`：每次切分后自检「起点升序 / 原文完整覆盖（允许重叠）/ 超尺寸告警」，失败打 `splitter.validate` 诊断日志（只告警不阻断）。
+
+### ⚙️ 设置项（settingsVersion 15 → 16）
+- `chunkOverlapRatio`（默认 0.1）—— 切片重叠比例，设置面板「切片重叠比例」
+- `coalesceTinyChunks`（默认 true）—— 合并过小切片开关，设置面板「合并过小切片」
+- 非法值迁移回退默认；两项均从 `processTask → runKnowledgeWorkflow → summarizeDocument` 全链路透传
+
+### ⚠️ 行为变化
+- `splitMarkdownSections` 返回形状向后兼容：`{ chunk_id, markdown, headings }` 不变，**新增** `breadcrumb` 字段
+- 切分结果与旧版不再逐字节一致（按标题边界 + 合并 + 重叠重排）；artifact 缓存在任务重跑时自动覆盖，无需手动迁移
+- 无重叠无合并时 `join(chunks.markdown) === 原文` 精确成立（烟雾测试已锁定）
+
+### 🧪 测试
+- 新增 `scripts/smoke-splitter-v26.js`（21 用例）：画像 / 策略选择 / 标题切分 + 面包屑 / 受保护表格、代码块、LaTeX / 小节合并（含不跨章语境）/ 重叠 / 覆盖校验 / 向后兼容 / 边界夹取
+- 新增 `scripts/load-ai-pipeline.js`：从 main.js 抽取真实模块隔离执行的共享加载器（不再内嵌旧实现副本）
+- `scripts/smoke-split.js` 改用真实模块加载，v2.5 的 6 个回归用例全绿
+- 全部 4 套烟雾测试（split / splitter-v26 / ratelimit / json-repair）通过；`node --check` 通过；22 个 bundle 模块结构不变
+
+---
+
 ## v2.6.0 — 2026-07-15 短文档原子化性能优化
 
 ### ⚡ 原子化请求降量与有限并发

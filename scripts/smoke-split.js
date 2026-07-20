@@ -1,41 +1,8 @@
-// v2.5 splitMarkdownSections 边界测试
+// splitMarkdownSections 回归测试（v2.5 用例，v2.6 起改为从 main.js 真实模块抽取执行，
+// 不再内嵌旧实现副本 —— 测的是线上代码本身）
 
-const SRC = `
-function splitMarkdownSectionsInner(markdown, options = {}) {
-  const source = String(markdown || '');
-  const maxChars = Math.max(100, Number(options.maxChars) || 12000);
-  if (!source.trim()) return [{ chunk_id: 'chunk-001', markdown: source, headings: [] }];
-  const tokens = source.match(/[^\\n]*\\n|[^\\n]+$/g) || [source];
-  const chunks = [];
-  let current = '';
-  function flush() {
-    if (!current) return;
-    chunks.push(current);
-    current = '';
-  }
-  for (const token of tokens) {
-    const heading = /^#{1,6}\\s+/.test(token);
-    if (heading && current && current.length >= maxChars * 0.6) flush();
-    if (token.length > maxChars) {
-      flush();
-      for (let offset = 0; offset < token.length; offset += maxChars) chunks.push(token.slice(offset, offset + maxChars));
-      continue;
-    }
-    if (current && current.length + token.length > maxChars) flush();
-    current += token;
-  }
-  flush();
-  if (!chunks.length) chunks.push(source);
-  return chunks.map((text, index) => ({
-    chunk_id: \`chunk-\${String(index + 1).padStart(3, '0')}\`,
-    markdown: text,
-    headings: [...text.matchAll(/^#{1,6}\\s+(.+)$/gm)].map((match) => match[1].trim())
-  }));
-}
-splitMarkdownSectionsInner;
-`;
-
-const splitMarkdownSections = eval(SRC);
+const { loadAiPipeline } = require('./load-ai-pipeline');
+const { splitMarkdownSections } = loadAiPipeline().api;
 
 const cases = [
   {
@@ -54,13 +21,13 @@ const cases = [
     expectChunks: 1
   },
   {
-    name: '普通文本',
+    name: '普通文本（标题少于 3 个，走 heuristic）',
     input: '# 标题\n段落 1\n## 子标题\n段落 2',
     expectChunks: 1,
     expectHeadingsCount: 2
   },
   {
-    name: '超大单行',
+    name: '超大单行（硬切兜底）',
     input: 'a'.repeat(25000),
     expectChunks: 3,
     expectMaxChars: 12000
@@ -91,6 +58,8 @@ for (const c of cases) {
     // 每条 chunk_id 必须唯一
     const ids = new Set(result.map((r) => r.chunk_id));
     if (ids.size !== result.length) throw new Error('chunk_id 重复');
+    // v2.6: breadcrumb 字段必须存在（可为空串）
+    if (result.some((r) => typeof r.breadcrumb !== 'string')) throw new Error('缺少 breadcrumb 字段');
     console.log('  ✓ ' + c.name);
     pass += 1;
   } catch (e) {

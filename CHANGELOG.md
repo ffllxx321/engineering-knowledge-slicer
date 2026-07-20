@@ -1,5 +1,36 @@
 # 工程知识切片 变更记录
 
+## v2.8.1 — 2026-07-20 用户诊断日志反馈的四个问题修复
+
+根据用户实机诊断日志（`~/.eks/logs/diag.log`）定位并修复：
+
+### 🐛 诊断日志头部重复累积
+`flushDiagLog` 剥离旧头部时查找的 `'\n\n\n\n'` 标记在文件里从不出现（头部结尾只有 `\n\n`），旧头部永远剥不掉，每次 flush 都在文件最前面再摞一份头部说明（用户日志里累积了 27 份，还挤占 2000 行 trim 额度）。改为按行剥离文件开头的所有头部块（第一行为标题 + 后续空行/`>` 说明行），升级后第一次 flush 即自愈历史重复文件。
+
+### 🐛 MiniMax 529（服务端过载）不重试，一次就杀死整个任务
+`isTransientHttpStatus` 的可重试状态码清单没有 529（Anthropic 协议的 `overloaded_error`，MiniMax 国内版兼容接口会返回）。用户一份文档跑到原子化第 9 分钟，遇到一次 529 整个任务直接 failed。现在 529 与 429/5xx 一样走指数退避重试（`aiRequestMaxAttempts` 次）。
+
+### 🐛 上传确认弹窗点「确认」后仍被「未确认允许上传」拒绝
+弹窗确认（`confirmUploads`）与解析引擎的授权门（`settings.pdfAllowExternalUpload`）是两套独立逻辑：用户在弹窗点了确认，9ms 后 `runEngine` 仍以「未确认允许上传源文件到外部解析 API」拒绝，只能再去设置里手动开开关。现在：
+- 弹窗点「确认」→ 本次会话视为已授权（`runEngine` 放行）
+- 勾选「不再询问」→ 持久化 `pdfAllowExternalUpload = true`
+- `upload.confirm` 诊断事件新增 `sessionApproved` 字段
+
+### 🐛 「MiniMax 未生成任何可用知识原子」无诊断、无自救
+用户一份 21K 字 / 101 个标题的手册跑了 12 分钟后报此错误，日志里查不到任何原因。根因链路：AI 返回的原子在 `normalizeAtomBatch` 被静默丢弃（point_id 不匹配 / 重复归属 / 无归属），批次「成功」通过校验但 atoms 为空，最终在 writing 阶段才炸。现在：
+- `summary.merged` 诊断：总结合并后的知识点数 / 证据数（确认总结本身有没有产出）
+- `atomization.batch` 诊断：每批请求知识点数 vs 产出原子数
+- `atomization.normalize` 诊断：归一化丢弃计数（point_id 不匹配 / 重复 / 无归属）
+- `workflow.result` 诊断：最终 accepted / review 计数
+- 知识点非空但原子为 0 的批次会触发一次「带校验错误的修复提示词」重试，不再静默通过
+- 报错信息带上下文计数（总结知识点数、原子化产出数）和诊断事件指引
+
+### 🧪 测试
+- 新增 `scripts/smoke-diag-fixes.js`：从 main.js 抽取真实的 `stripDiagHeaders` / `isTransientHttpStatus` 验证（27 份重复头部一次清净、529 判定为瞬态）
+- 既有 4 套烟雾测试全部通过；`node --check` 通过
+
+---
+
 ## v2.8.0 — 2026-07-20 自动扫描改为设置项，默认关闭
 
 ### ⚙️ 启动自动扫描设置项（默认关闭）

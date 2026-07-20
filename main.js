@@ -142,6 +142,20 @@ function redactCredential(value) {
   return str;
 }
 
+// v2.8.1: 按行剥离文件开头已有的日志头部说明块（第一行为标题，随后是空行或以 > 开头的说明行）。
+//   旧实现用 indexOf('\n\n\n\n') 找头部边界，但该序列在文件里从不出现（头部结尾只有 \n\n），
+//   导致旧头部永远剥不掉，每次 flush 都在文件最前面再摞一份头部（用户日志里累积了 27 份）。
+//   循环剥离可自愈历史重复头部文件：升级后第一次 flush 即清理干净。
+function stripDiagHeaders(text) {
+  let lines = String(text || '').split('\n');
+  while (lines.length && lines[0] === '# 工程知识切片 诊断日志') {
+    let i = 1;
+    while (i < lines.length && (lines[i] === '' || lines[i].startsWith('>'))) i += 1;
+    lines = lines.slice(i);
+  }
+  return lines.join('\n');
+}
+
 function flushDiagLog() {
   const state = globalThis.__eksDiag && globalThis.__eksDiag.state;
   if (!state) return;
@@ -166,10 +180,8 @@ function flushDiagLog() {
     // 读旧内容、追加、trim
     let existing = '';
     try { existing = fs.readFileSync(state.logPath, 'utf-8'); } catch (_) { /* 不存在则忽略 */ }
-    // 去掉旧 header（如果存在）再合并
-    const headerEndMarker = '\n\n';
-    const oldBodyStart = existing.indexOf(headerEndMarker + headerEndMarker);
-    const oldBody = oldBodyStart >= 0 ? existing.substring(oldBodyStart + headerEndMarker.length + headerEndMarker.length) : existing;
+    // v2.8.1: 去掉旧 header（含历史累积的多份）再合并，保证文件里有且仅有一份头部
+    const oldBody = stripDiagHeaders(existing);
     const merged = header + oldBody + lines;
     // trim 到最近 2000 行
     const allLines = merged.split('\n');
@@ -917,7 +929,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         await this.persistArtifact(current, 'review', { version: '1.1', task_id: current.task_id, items: workflow.review });
         current.review_atom_ids = workflow.review.map((item) => item.atom_id);
       }
-      if (!workflow.accepted.length && !workflow.review.length) throw new Error('MiniMax 未生成任何可用知识原子');
+      if (!workflow.accepted.length && !workflow.review.length) {
+        // v2.8.1: 错误信息带上下文计数，告诉用户去 diag.log 看哪几个事件
+        const pointCount = (workflow.summary && Array.isArray(workflow.summary.key_points)) ? workflow.summary.key_points.length : 0;
+        const atomCount = (workflow.atomResult && Array.isArray(workflow.atomResult.atoms)) ? workflow.atomResult.atoms.length : 0;
+        throw new Error(`MiniMax 未生成任何可用知识原子（总结含 ${pointCount} 个知识点，原子化产出 ${atomCount} 个原子）。请查看诊断日志中的 summary.merged / atomization.batch / atomization.normalize 事件定位丢点位置后重试。`);
+      }
 
       current.status = workflow.review.length ? 'needs_review' : 'written';
       current.updated_at = new Date().toISOString();
@@ -1508,7 +1525,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     return {
       enabled: true,
       order: 'mineru-api,paddleocr-api',
-      allowExternalUpload: this.settings.pdfAllowExternalUpload === true,
+      // v2.8.1: 设置开关常开，或本次会话在确认弹窗点过"确认上传"，都视为已授权
+      allowExternalUpload: this.settings.pdfAllowExternalUpload === true || eksSessionUploadApproved(),
       // v1.3: 上传前是否弹窗二次确认（默认开启）
       confirmUploads: this.settings.confirmUploads !== false,
       timeoutMs: Number(this.settings.pdfExternalTimeoutMs || 300000),
@@ -1688,6 +1706,13 @@ class UploadConfirmModal extends Modal {
 // v1.3: globalThis 桥接：闭包模块（external-pdf.js 等）通过该入口弹上传确认弹窗。
 //       每个会话内 confirmAll=true 后不再询问；同时尊重 settings.confirmUploads。
 globalThis.__eksUploadConfirm = globalThis.__eksUploadConfirm || null;
+// v2.8.1: 用户在确认弹窗里点了"确认上传" → 本次会话视为已授权上传。
+//   修复旧行为：弹窗确认与 runEngine 的 allowExternalUpload 门是两套独立逻辑，
+//   用户点确认后 9ms 仍被"未确认允许上传源文件到外部解析 API"拒绝，只能再去设置里手动开开关。
+function eksSessionUploadApproved() {
+  const state = typeof globalThis.__eksDiag === 'object' && globalThis.__eksDiag && globalThis.__eksDiag.state;
+  return !!(state && state.uploadApprovedThisSession);
+}
 function setEksUploadConfirm(plugin) {
   if (plugin && plugin.app && typeof plugin.settings === 'object') {
     globalThis.__eksUploadConfirm = async function askUploadConfirm(payload) {
@@ -1709,6 +1734,15 @@ function setEksUploadConfirm(plugin) {
         setTimeout(resolve, 5000);
       });
       if (modal.remember) session.uploadConfirmedAll = true;
+      // v2.8.1: 弹窗确认 = 本次会话授权上传（runEngine 的 allowExternalUpload 门会认这个标记）；
+      //   勾选"不再询问"时持久化为 settings.pdfAllowExternalUpload = true。
+      if (modal.confirmed) {
+        session.uploadApprovedThisSession = true;
+        if (modal.remember && plugin.settings.pdfAllowExternalUpload !== true) {
+          plugin.settings.pdfAllowExternalUpload = true;
+          try { await plugin.saveData(plugin.settings); } catch (_) { /* 持久化失败不影响本次上传 */ }
+        }
+      }
       try {
         const diag = (typeof globalThis.__eksDiag === 'object' && globalThis.__eksDiag.diag) || (() => {});
         diag('upload.confirm', {
@@ -1716,7 +1750,8 @@ function setEksUploadConfirm(plugin) {
           sizeBytes: payload?.sizeBytes,
           engine: payload?.engine,
           confirmed: !!modal.confirmed,
-          rememberAll: !!modal.remember
+          rememberAll: !!modal.remember,
+          sessionApproved: !!session.uploadApprovedThisSession
         });
       } catch (_) {}
       return !!modal.confirmed;
@@ -5316,6 +5351,14 @@ function mergeStructuredSummaries(partials, chunkIds, schema) {
   const validation = validateSchema(schema, merged);
   const errors = [...validation.errors, ...exactCoverage(merged.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整')];
   if (errors.length) throw new Error(errors.join('；'));
+  // v2.8.1: 总结合并结果诊断——"未生成任何可用知识原子"排障第一步：确认总结本身有没有知识点
+  diag('summary.merged', {
+    chunks: chunkIds.length,
+    partials: partials.length,
+    keyPoints: keyPoints.length,
+    evidence: evidence.length,
+    title: merged.document_title
+  });
   return merged;
 }
 
@@ -5407,6 +5450,13 @@ async function atomizeSummary(options) {
       throw error;
     }
     results[index] = batchResult;
+    // v2.8.1: 每批原子化结果诊断（请求知识点数 vs 产出原子数），空批排障用
+    diag('atomization.batch', {
+      batchIndex: index + 1,
+      batchTotal: batches.length,
+      requestedPoints: batchPointIds.length,
+      atoms: (batchResult && Array.isArray(batchResult.atoms)) ? batchResult.atoms.length : 0
+    });
     // 每个 batch 完成后 emit 一次（带 batchComplete 标记，触发写盘 + UI 重渲染）
     await emitProgress(options.onProgress, {
       stage: 'atomization',
@@ -5487,7 +5537,14 @@ async function atomizeSummaryBatch(options, summary, pointIds, batchIndex, batch
     onProgress: options.onProgress,
     context: { pointIds, batchIndex, batchTotal },
     normalizeValue: (value) => normalizeAtomBatch(value, summary, pointIds),
-    extraValidation: (value) => exactCoverage(value.coverage, 'point_ids', pointIds, '知识点覆盖不完整')
+    // v2.8.1: 知识点非空但归一化后原子为 0 时，走一次"带校验错误的修复提示词"重试，
+    //   而不是静默通过、最后在 writing 阶段才炸"未生成任何可用知识原子"
+    extraValidation: (value) => [
+      ...exactCoverage(value.coverage, 'point_ids', pointIds, '知识点覆盖不完整'),
+      ...(pointIds.length && !(Array.isArray(value.atoms) && value.atoms.length)
+        ? [`本批 ${pointIds.length} 个知识点（${pointIds.join('、')}）却返回了 0 个可用原子，请为每个知识点至少生成一个符合 schema 的原子，并在 content.point_ids 中准确填写上述 point_id`]
+        : [])
+    ]
   });
 }
 
@@ -5497,12 +5554,18 @@ function normalizeAtomBatch(value, summary, pointIds) {
   const points = new Map((summary.key_points || []).map((point) => [point.point_id, point]));
   const evidence = new Map((summary.evidence || []).map((item) => [item.evidence_id, item]));
   const byPoint = new Map();
+  // v2.8.1: 统计归一化丢弃原因——旧实现静默丢弃，"未生成任何可用知识原子"无从查起
+  const rawCount = Array.isArray(value.atoms) ? value.atoms.length : 0;
+  let droppedMismatch = 0;
+  let droppedDuplicate = 0;
+  let droppedNoPoint = 0;
   for (const atom of value.atoms || []) {
     const rawPointIds = Array.isArray(atom?.content?.point_ids) ? atom.content.point_ids : [];
     const matched = rawPointIds.filter((pointId) => allowed.has(pointId));
-    if (rawPointIds.length && !matched.length) continue;
+    if (rawPointIds.length && !matched.length) { droppedMismatch += 1; continue; }
     const pointId = matched[0] || (pointIds.length === 1 ? pointIds[0] : '');
-    if (!pointId || byPoint.has(pointId)) continue;
+    if (!pointId) { droppedNoPoint += 1; continue; }
+    if (byPoint.has(pointId)) { droppedDuplicate += 1; continue; }
     const point = points.get(pointId);
     const evidenceItem = evidence.get(point?.evidence_ids?.[0]) || {};
     byPoint.set(pointId, Object.assign({}, atom, {
@@ -5515,7 +5578,19 @@ function normalizeAtomBatch(value, summary, pointIds) {
       })
     }));
   }
-  return Object.assign({}, value, { atoms: pointIds.map((pointId) => byPoint.get(pointId)).filter(Boolean) });
+  const keptAtoms = pointIds.map((pointId) => byPoint.get(pointId)).filter(Boolean);
+  // v2.8.1: AI 返回了原子但被归一化丢光时，必须留下可追查的诊断
+  if (rawCount > 0 && (droppedMismatch || droppedDuplicate || droppedNoPoint || !keptAtoms.length)) {
+    diag('atomization.normalize', {
+      requestedPoints: pointIds.length,
+      rawAtoms: rawCount,
+      keptAtoms: keptAtoms.length,
+      droppedPointIdMismatch: droppedMismatch,
+      droppedDuplicatePoint: droppedDuplicate,
+      droppedNoPointAttribution: droppedNoPoint
+    });
+  }
+  return Object.assign({}, value, { atoms: keptAtoms });
 }
 
 async function requestWithContract(options) {
@@ -5908,7 +5983,9 @@ async function fetchWithTransientRetry(fetcher, endpoint, options, settings) {
 }
 
 function isTransientHttpStatus(status) {
-  return [408, 425, 429, 500, 502, 503, 504].includes(Number(status));
+  // v2.8.1: 加入 529——Anthropic 协议（MiniMax 国内版兼容接口）的 overloaded_error，
+  //   纯服务端过载、稍后即恢复。旧版不重试 529，用户一次 529 就废掉整个已跑 9 分钟的任务。
+  return [408, 425, 429, 500, 502, 503, 504, 529].includes(Number(status));
 }
 
 function sleep(ms) {
@@ -6470,6 +6547,15 @@ async function runKnowledgeWorkflow(options) {
       });
     }
   }
+  // v2.8.1: 工作流最终产出诊断——accepted/review 全空时，这条日志直接说明原子在哪一步丢的
+  diag('workflow.result', {
+    title: summary && summary.document_title,
+    summaryKeyPoints: (summary && Array.isArray(summary.key_points)) ? summary.key_points.length : 0,
+    atoms: (atomResult && Array.isArray(atomResult.atoms)) ? atomResult.atoms.length : 0,
+    accepted: accepted.length,
+    review: review.length,
+    truncated: !!(atomResult && atomResult._truncated)
+  });
   // v1.4 (M-07): 透传截断标志，dashboard 可显示警告
   return {
     classification,

@@ -452,6 +452,19 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         .onClick(() => this.showHistoryForFile(file)));
     }));
 
+    // v2.8: 自动扫描改为设置项，默认关闭。
+    //   只有 autoScanOnStartup === true 时才在工作区布局就绪后自动扫描源文件目录
+    //   （扫描完按既有逻辑进入自动处理）；默认关闭状态下插件启动不读源文件、
+    //   不触发云端解析与 MiniMax 调用，用户需手动点「扫描并自动处理」或用命令。
+    if (this.settings.autoScanOnStartup === true) {
+      this.app.workspace.onLayoutReady(() => {
+        diag('autoScan.start', { reason: 'autoScanOnStartup=true' });
+        this.scanSourceFiles(true).catch((error) => {
+          try { diag('autoScan.error', { message: String(error && error.message || error) }); } catch (_) {}
+        });
+      });
+    }
+
     this.addSettingTab(new SlicerSettingTab(this.app, this));
     // v1.1.7: 通知用户诊断日志文件位置（首次加载时显示一次，之后静默）
     // v1.1.9: 通知版本也跟进，避免旧用户重复弹窗同时提醒现在 diag 对所有路径都能写入
@@ -2159,6 +2172,17 @@ class SlicerSettingTab extends PluginSettingTab {
           }
         }));
 
+    // v2.8: 自动扫描设置项，默认关闭
+    new Setting(containerEl)
+      .setName('启动时自动扫描')
+      .setDesc('默认关闭。开启后每次打开 Obsidian 会自动扫描源文件目录（招投标 / 业务库）并开始自动处理。扫描会触发云端解析与 MiniMax 计费，建议保持关闭，需要时手动点控制台「扫描并自动处理」按钮或执行命令「扫描源文件」。')
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.autoScanOnStartup === true)
+        .onChange(async (value) => {
+          this.plugin.settings.autoScanOnStartup = !!value;
+          await this.plugin.saveSettings();
+        }));
+
     new Setting(containerEl)
       .setName('启用外部密钥文件')
       .setDesc('开启后从 ~/.eks-secrets.json 读取密钥，避免 OneDrive/iCloud 同步目录中的 data.json 泄露密钥。')
@@ -2767,7 +2791,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 16,
+  settingsVersion: 17,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -2834,7 +2858,12 @@ const DEFAULT_SETTINGS = {
   confirmUploads: true,
   // v1.4 (M-11): 写盘前是否自动备份上一版 tasks.json 到 tasks.json.bak.{ts}。
   //               关闭后回到原行为（仅写一份 tasks.json）。备份文件独立占用 vault 空间。
-  backupTasksOnSave: true
+  backupTasksOnSave: true,
+  // v2.8: 启动时自动扫描源文件目录，默认关闭。
+  //   自动扫描会连带触发云端解析与 MiniMax 调用（计费），属于高成本行为，
+  //   必须由用户在设置中明确开启；关闭时只能通过控制台「扫描并自动处理」
+  //   按钮或「扫描源文件」命令手动触发。
+  autoScanOnStartup: false
 };
 
 function migrateSettings(stored = {}) {
@@ -2843,7 +2872,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 16;
+  migrated.settingsVersion = 17;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -2885,6 +2914,8 @@ function migrateSettings(stored = {}) {
     migrated.chunkOverlapRatio = DEFAULT_SETTINGS.chunkOverlapRatio;
   }
   if (migrated.coalesceTinyChunks === undefined) migrated.coalesceTinyChunks = DEFAULT_SETTINGS.coalesceTinyChunks;
+  // v2.8: 自动扫描默认关闭，只有明确存过 true 的才保持开启（布尔强转，杜绝字符串 "false" 之类脏值）
+  migrated.autoScanOnStartup = source.autoScanOnStartup === true;
   if (!Number(migrated.pdfExternalTimeoutMs) || Number(migrated.pdfExternalTimeoutMs) <= 300000) {
     migrated.pdfExternalTimeoutMs = DEFAULT_SETTINGS.pdfExternalTimeoutMs;
   }

@@ -1,6 +1,6 @@
 # 工程知识切片（Engineering Knowledge Slicer）
 
-> 当前版本 **v2.7.0**（settingsVersion 16）· Obsidian Desktop 1.5.0+ · MIT
+> 当前版本 **v2.8.0**（settingsVersion 17）· Obsidian Desktop 1.5.0+ · MIT
 
 通过 **MinerU / PaddleOCR + MiniMax M3**，把工程资料（PDF、Word、PPT、图片、邮件等）批量转化为**中文、可追溯、固定目录归档**的 Obsidian 知识卡片。
 
@@ -95,6 +95,7 @@
 
 | 设置 | 默认 | 说明 |
 |---|---|---|
+| **启动时自动扫描** | 关 | v2.8 新增，开启后每次打开 Obsidian 自动扫描源目录并开始处理；会触发云端解析与 AI 计费，默认关闭，建议手动点「扫描并自动处理」 |
 | 自动入库置信度门槛 | 0.9 | 低于门槛的卡片进入审核台 |
 | 并发处理文档数 | 3 | 同时处理的源文件数 |
 | AI 单段字符数 | 12000 | 切块上限（`maxChunkChars`） |

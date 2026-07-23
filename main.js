@@ -3634,7 +3634,9 @@ function decodeTextBuffer(buffer) {
   // 即便扩展名是 .md/.txt 也要拒收，避免二进制字节流被当文本送进 AI。
   const nulCount = countByte(input, 0x00);
   if (nulCount > 0 && (!looksLikeLegitimateText(input) || nulCount > 2)) {
-    return decodedCandidate('binary-rejected', '');
+    // v2.9.1: 无 BOM 的 UTF-16 文本（ASCII 字符隔字节为 0x00）含大量 NUL，
+    //   旧逻辑直接按二进制拒收。字节分布符合 UTF-16 特征时放行，交给候选评分。
+    if (!looksLikeUtf16Bytes(input)) return decodedCandidate('binary-rejected', '');
   }
   if (input.length >= 3 && input[0] === 0xef && input[1] === 0xbb && input[2] === 0xbf) {
     return decodedCandidate('utf-8-bom', input.slice(3).toString('utf8'));
@@ -3647,14 +3649,23 @@ function decodeTextBuffer(buffer) {
       || decodedCandidate('utf-16be-bom', swapUtf16Bytes(input.slice(2)).toString('utf16le'));
   }
 
+  // v2.9.1: gb18030 提到 shift_jis/windows-31j 之前——评分平手时 GB 优先。
+  //   真日文文档靠 looksLikeShiftJisBytes 的 +0.35 加分仍会胜出，不受影响；
+  //   而 GBK 文档被 ShiftJIS 解成半角片假名是最常见的静默乱码（评分经常打平）。
   const candidates = [
     decodedCandidate('utf-8', input.toString('utf8')),
     decodedCandidate('utf-16le', input.toString('utf16le')),
     decodeWithTextDecoder(input, 'utf-16be'),
+    decodeWithTextDecoder(input, 'gb18030'),
     decodeWithTextDecoder(input, 'shift_jis'),
     decodeWithTextDecoder(input, 'windows-31j'),
-    decodeWithTextDecoder(input, 'gb18030'),
     decodeWithTextDecoder(input, 'big5'),
+    // v2.9.1: 韩文 EUC-KR 与西欧 windows-1252 候选。
+    //   旧版缺 euc-kr → 韩文被 gb18030 静默误解成错误汉字（无任何报错）；
+    //   缺 windows-1252 → cp1252 特有字符（€ ’ “ 等 0x80-0x9F 区）按 latin1 解出 C1 控制符。
+    //   gb18030 排在 big5/euc-kr 之前：平分时 GB 优先（本插件语料以大陆简体为主）。
+    decodeWithTextDecoder(input, 'euc-kr'),
+    decodeWithTextDecoder(input, 'windows-1252'),
     decodedCandidate('latin1', input.toString('latin1'))
   ].filter(Boolean);
   for (const candidate of candidates) {
@@ -3693,21 +3704,85 @@ const DECODE_MIN_CONFIDENCE = -0.15;
 function encodingHeuristicBonus(buffer, encoding, text) {
   const enc = String(encoding || '').toLowerCase();
   const looksSjis = looksLikeShiftJisBytes(buffer);
-  // Fix: UTF-8 CJK 3-byte sequences (E4-E9, 80-BF, 80-BF) overlap with
-  // ShiftJIS lead-trail byte ranges, causing false-positive ShiftJIS detection.
-  // If buffer is valid UTF-8 (zero replacement chars) with CJK content,
-  // strongly prefer UTF-8 and reject ShiftJIS/GB18030/Big5 candidates.
+  // v2.9.1: UTF-8 优先门。旧版仅在「有效 UTF-8 且含 CJK」时加分，导致
+  //   越南语/俄语/法语等无 CJK 的合法 UTF-8 文档被 ShiftJIS/GB18030 候选
+  //   的伪 CJK 解码反超（UTF-8 三字节序列与 SJIS/GBK 双字节区间高度重叠）。
+  //   新判据：零替换字符 + 含任意非 ASCII 字节 → 该字节流几乎不可能是其他
+  //   编码（GBK/SJIS/Big5/EUC-KR 文本同时构成合法 UTF-8 序列的概率趋近于 0；
+  //   纯 ASCII 各编码解码相同，不需要仲裁）→ 强倾向 UTF-8 并压制误码候选。
   const utf8Text = buffer.toString('utf8');
   const utf8Valid = !utf8Text.includes('\uFFFD') && utf8Text.length > 0;
-  if (utf8Valid && hasCjk(utf8Text)) {
-    if (enc === 'utf-8' || enc === 'utf-8-bom') return 0.5;
-    if (enc === 'shift_jis' || enc === 'windows-31j' || enc === 'gb18030' || enc === 'big5') return -0.5;
+  let hasNonAscii = false;
+  for (let i = 0; i < utf8Text.length; i += 1) {
+    if (utf8Text.charCodeAt(i) > 127) { hasNonAscii = true; break; }
+  }
+  if (utf8Valid && hasNonAscii) {
+    if (enc === 'utf-8' || enc === 'utf-8-bom') return hasCjk(utf8Text) ? 0.5 : 0.45;
+    if (enc === 'shift_jis' || enc === 'windows-31j' || enc === 'gb18030' || enc === 'big5' || enc === 'euc-kr') return -0.5;
   }
   if ((enc === 'utf-16le' || enc === 'utf-16be') && !looksLikeUtf16Bytes(buffer)) return -2;
   if ((enc === 'shift_jis' || enc === 'windows-31j') && looksSjis && hasCjk(text)) return 0.35;
   if ((enc === 'gb18030' || enc === 'big5') && looksSjis) return -0.12;
+  // v2.9.1: 韩文 EUC-KR——字节符合 KS X 1001 韩文字区特征且解码后出现
+  //   韩文音节、无替换字符 → 强烈倾向 euc-kr；符合该字节特征的缓冲同时
+  //   惩罚 gb18030/big5/sjis，避免韩文被静默误解成错误汉字。
+  const eucKrBytes = looksLikeEucKrBytes(buffer);
+  if (enc === 'euc-kr' && eucKrBytes && /[가-힣]/.test(text) && !text.includes('�')) return 0.6;
+  if ((enc === 'gb18030' || enc === 'big5' || enc === 'shift_jis' || enc === 'windows-31j') && eucKrBytes) return -0.3;
+  // v2.9.1: Big5——解码出现注音符号即可较有把握判定为台湾内容。
+  //   不单独按字节结构加分：Big5 与 GB2312 字节段高度重叠，字节启发会把
+  //   简体中文误判成 Big5（静默乱码），平分时保持 gb18030 优先。
+  if (enc === 'big5' && /[ㄅ-ㄯ]/.test(text)) return 0.35;
+  // v2.9.1: 西欧单字节编码——合法重音字母现已计入可读字符不再扣分。
+  //   仅当「高字节密度异常（>15%）且解码文本确实带乱码证据」才惩罚：
+  //   GBK 误解成 latin1 会产生大量 C1 控制符，误解成 cp1252 会产生乱码
+  //   二联体（C0-DF 后跟 80-BF 区符号）；真西欧文本（含 € " ' 等
+  //   cp1252 专有符号）两个信号都为 0，不受惩罚。
+  if ((enc === 'latin1' || enc === 'windows-1252') && highByteRatio(buffer) > 0.15) {
+    const chars = [...String(text || '')];
+    const tn = chars.length || 1;
+    const c1 = chars.filter((ch) => { const cp = ch.codePointAt(0); return cp >= 0x80 && cp <= 0x9f; }).length / tn;
+    const dig = countMojibakeDigraphs(text) / tn;
+    if (c1 > 0.01 || dig > 0.02) return -0.6;
+  }
   if (enc === 'latin1') return -0.2;
   return 0;
+}
+
+// v2.9.1: KS X 1001 韩文字区字节特征：首字节 B0-C8 / 尾字节 A1-FE 的双字节对
+//   占绝对多数（其他高位双字节对不超过其 35%），且 ASCII 可打印字节（空格、
+//   英文、数字——韩文有词间空格而中文几乎没有）占比 > 12%。
+//   双条件排除 GBK 简体中文：GB2312 一级汉字区（B0A1-D7F9）虽也产生 B0-C8 对，
+//   但同时有大量 C9+ 首字节对（otherPairs 超标）且几乎没有 ASCII 空格。
+function looksLikeEucKrBytes(buffer) {
+  let hangulPairs = 0;
+  let otherPairs = 0;
+  let ascii = 0;
+  const len = Buffer.isBuffer(buffer) ? buffer.length : 0;
+  for (let i = 0; i < len; i += 1) {
+    const byte = buffer[i];
+    if (byte >= 0x20 && byte <= 0x7e) ascii += 1;
+    if (i + 1 >= len) break;
+    const trail = buffer[i + 1];
+    if (byte >= 0xb0 && byte <= 0xc8 && trail >= 0xa1 && trail <= 0xfe) {
+      hangulPairs += 1;
+      i += 1;
+    } else if (byte >= 0x81 && byte <= 0xfe && trail >= 0x41 && trail <= 0xfe && trail !== 0x7f) {
+      otherPairs += 1;
+      i += 1;
+    }
+  }
+  // 阈值说明：韩文词间空格使 ASCII 占比通常 >15%，但密集短句可低至 5-7%；
+  //   简体中文几乎无空格，otherPairs 条件（<35%）已排除 GB2312 一级汉字区误命中。
+  return hangulPairs >= 3 && otherPairs <= hangulPairs * 0.35 && ascii / len > 0.05;
+}
+
+function highByteRatio(buffer) {
+  const len = Buffer.isBuffer(buffer) ? buffer.length : 0;
+  if (!len) return 0;
+  let high = 0;
+  for (let i = 0; i < len; i += 1) if (buffer[i] >= 0x80) high += 1;
+  return high / len;
 }
 
 function looksLikeUtf16Bytes(buffer) {
@@ -3722,11 +3797,19 @@ function looksLikeUtf16Bytes(buffer) {
   return evenZeros / pairs > 0.25 || oddZeros / pairs > 0.25;
 }
 
+// v2.9.1 收紧：旧版「有一个合法双字节对就判定 ShiftJIS」——GBK 文档里
+//   E0-FC 首字节约占 13%，短文极易偶然凑出一两对，被加 SJIS 分后
+//   中文静默解成半角片假名乱码。新增条件：合法对覆盖的高位字节须占
+//   全部高位字节的 60% 以上（真 SJIS 文档高位字节几乎都是成对的；
+//   GBK 误凑对只占 ~13%；极短日文如「日本」4 字节 2 对仍满足）。
 function looksLikeShiftJisBytes(buffer) {
   let pairs = 0;
   let validPairs = 0;
-  for (let i = 0; i + 1 < buffer.length; i += 1) {
+  let highBytes = 0;
+  for (let i = 0; i < buffer.length; i += 1) {
     const lead = buffer[i];
+    if (lead >= 0x80) highBytes += 1;
+    if (i + 1 >= buffer.length) break;
     const trail = buffer[i + 1];
     if ((lead >= 0x81 && lead <= 0x9f) || (lead >= 0xe0 && lead <= 0xfc)) {
       pairs += 1;
@@ -3734,7 +3817,7 @@ function looksLikeShiftJisBytes(buffer) {
       i += 1;
     }
   }
-  return pairs > 0 && validPairs / pairs >= 0.75;
+  return pairs > 0 && validPairs / pairs >= 0.75 && validPairs * 2 >= highBytes * 0.6;
 }
 
 function hasCjk(text) {
@@ -3754,25 +3837,54 @@ function decodedCandidate(encoding, text) {
   return { encoding, text, score: readabilityScore(text) };
 }
 
+// v2.9.1: \u4E71\u7801\u4E8C\u8054\u4F53\uFF08mojibake digraph\uFF09\u2014\u2014UTF-8 \u591A\u5B57\u8282\u5E8F\u5217\u88AB\u8BEF\u6309 latin1/cp1252 \u5355\u5B57\u8282
+//   \u89E3\u7801\u7684\u5178\u578B\u4EA7\u7269\uFF1A\u9AD8\u4F4D\u9996\u5B57\u8282\uFF08\u00C0-\u00FF\uFF09\u7D27\u8DDF\u4E00\u4E2A\u7EED\u5B57\u8282\uFF08\u20AC-\u00BF\uFF09\u3002\u5408\u6CD5\u897F\u6B27\u8BED\u8A00\u6587\u672C\u91CC
+//   \u300C\u91CD\u97F3\u5B57\u6BCD + \u7EED\u5B57\u8282\u533A\u5B57\u7B26\u300D\u7684\u7EC4\u5408\u51E0\u4E4E\u4E0D\u51FA\u73B0\uFF0C\u662F\u6BD4\u300C\u811A\u672C\u767D\u540D\u5355\u300D\u53EF\u9760\u5F97\u591A\u7684\u4E71\u7801\u4FE1\u53F7\u3002
+const MOJIBAKE_DIGRAPH_PATTERN = /[\u00C0-\u00DF][\u0080-\u00BF]/g;
+
+function countMojibakeDigraphs(text) {
+  const matches = String(text || '').match(MOJIBAKE_DIGRAPH_PATTERN);
+  return matches ? matches.length : 0;
+}
+
+// v2.9.1: \u8BC4\u5206\u91CD\u6784\u2014\u2014\u65E7\u7248\u628A C0-FF \u91CD\u97F3\u5B57\u6BCD\u4E00\u5F8B\u5F53 mojibake \u6309\u300C\u4E2A\u6570\u300D\u6263\u5206\uFF0C
+//   \u6CD5\u8BED\u6587\u6863\u91CC\u51E0\u5341\u4E2A \u00E9/\u00E0 \u5C31\u80FD\u628A\u5206\u6570\u6263\u7A7F\uFF08\u5B9E\u6D4B -5.7\uFF09\uFF0C\u5408\u6CD5\u6587\u6863\u88AB\u8BEF\u5224\u4E71\u7801\u4E22\u5F03\u3002
+//   \u65B0\u7248\u5168\u90E8\u6309\u300C\u6BD4\u4F8B\u300D\u6263\u5206\uFF0C\u4E71\u7801\u4FE1\u53F7\u6362\u6210\u771F\u6B63\u7684\u4E09\u4EF6\u5957\uFF1A\u66FF\u6362\u5B57\u7B26 / \u63A7\u5236\u5B57\u7B26\uFF08\u542B
+//   C1 \u533A 80-9F\uFF0CUTF-8 \u7EED\u5B57\u8282\u8BEF\u8BFB\u7684\u5178\u578B\u4EA7\u7269\uFF09/ \u4E71\u7801\u4E8C\u8054\u4F53\u3002
 function readabilityScore(text) {
   const value = String(text || '');
   if (!value) return -100;
   const chars = [...value];
-  const replacement = chars.filter((ch) => ch === '\uFFFD').length;
-  const controls = chars.filter((ch) => /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(ch)).length;
-  const readable = chars.filter(isExpectedReadableChar).length;
-  const mojibake = chars.filter((ch) => /[\u00C0-\u00FF]/.test(ch) && !isExpectedReadableChar(ch)).length;
-  const unexpected = chars.filter(isUnexpectedScriptOrPrivate).length;
-  return (readable / chars.length) - (replacement * 0.25) - (controls * 0.2) - (mojibake * 0.06) - (unexpected * 0.08);
+  const n = chars.length;
+  const replacement = chars.filter((ch) => ch === '\uFFFD').length / n;
+  const controls = chars.filter((ch) => /[\x00-\x08\x0B\x0C\x0E-\x1F\u0080-\u009F]/.test(ch)).length / n;
+  const mojibake = countMojibakeDigraphs(value) / n;
+  const unexpected = chars.filter(isUnexpectedScriptOrPrivate).length / n;
+  const readable = chars.filter(isExpectedReadableChar).length / n;
+  return readable - (replacement * 0.9) - (controls * 1.5) - (mojibake * 0.6) - (unexpected * 0.8);
 }
 
+// v2.9.1: 补充韩/俄/阿/泰/印地语识别——sourceLanguage 会作为语言提示影响
+//   AI 总结/原子化措辞，旧版对非中日英一律返回 'unknown'。
 function detectDominantLanguage(text) {
   const value = String(text || '');
-  const kana = (value.match(/[\p{Script=Hiragana}\p{Script=Katakana}]/gu) || []).length;
-  const han = (value.match(/\p{Script=Han}/gu) || []).length;
+  const scriptCount = (pattern) => (value.match(pattern) || []).length;
+  const kana = scriptCount(/[\p{Script=Hiragana}\p{Script=Katakana}]/gu);
+  const hangul = scriptCount(/\p{Script=Hangul}/gu);
+  const han = scriptCount(/\p{Script=Han}/gu);
+  const cyrillic = scriptCount(/\p{Script=Cyrillic}/gu);
+  const arabic = scriptCount(/\p{Script=Arabic}/gu);
+  const thai = scriptCount(/\p{Script=Thai}/gu);
+  const devanagari = scriptCount(/\p{Script=Devanagari}/gu);
   const latin = (value.match(/[A-Za-z]/g) || []).length;
+  if (hangul > 0) return 'ko';
   if (kana > 0) return 'ja';
-  if (han > latin) return 'zh';
+  const others = Math.max(cyrillic, arabic, thai, devanagari);
+  if (han > latin && han >= others) return 'zh';
+  if (cyrillic > latin && cyrillic >= others) return 'ru';
+  if (arabic > latin && arabic >= others) return 'ar';
+  if (thai > latin && thai >= devanagari) return 'th';
+  if (devanagari > latin) return 'hi';
   if (latin > 0) return 'en';
   return 'unknown';
 }
@@ -3805,17 +3917,42 @@ function parseEmail(raw) {
   };
 }
 
+// v2.9.1: HTML 实体完整解码——旧版只解 4 个命名实体，邮件 HTML 正文里的
+//   &#20013; / &#x4E2D; / &eacute; / &copy; 等会原样漏进知识卡片（内容级乱码）。
+//   数字实体用 String.fromCodePoint 按码点还原（增补平面字符生成合法代理对）；
+//   代理区码点（0xD800-0xDFFF）会抛 RangeError，捕获后保留原文，杜绝孤立代理。
+const HTML_NAMED_ENTITIES = {
+  nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  copy: '©', reg: '®', trade: '™', deg: '°', plusmn: '±', micro: 'µ',
+  mdash: '—', ndash: '–', hellip: '…', bull: '•', middot: '·',
+  lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”', laquo: '«', raquo: '»',
+  times: '×', divide: '÷', frac12: '½', frac14: '¼', sup2: '²', sup3: '³',
+  euro: '€', yen: '¥', pound: '£', cent: '¢', sect: '§', para: '¶',
+  dagger: '†', permil: '‰', larr: '←', rarr: '→', uarr: '↑', darr: '↓',
+  eacute: 'é', egrave: 'è', agrave: 'à', ccedil: 'ç', ntilde: 'ñ',
+  auml: 'ä', ouml: 'ö', uuml: 'ü', szlig: 'ß', iexcl: '¡', iquest: '¿'
+};
+
+function decodeHtmlEntities(text) {
+  return String(text || '').replace(/&(#x[0-9a-fA-F]+|#[0-9]+|[a-zA-Z][a-zA-Z0-9]*);/g, (whole, body) => {
+    if (body[0] === '#') {
+      const code = body[1] === 'x' || body[1] === 'X'
+        ? parseInt(body.slice(2), 16)
+        : parseInt(body.slice(1), 10);
+      if (!Number.isFinite(code) || code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return whole;
+      try { return String.fromCodePoint(code); } catch (_) { return whole; }
+    }
+    return Object.prototype.hasOwnProperty.call(HTML_NAMED_ENTITIES, body) ? HTML_NAMED_ENTITIES[body] : whole;
+  });
+}
+
 function stripHtml(html) {
-  return String(html || '')
+  return decodeHtmlEntities(String(html || '')
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<style[\s\S]*?<\/style>/gi, '')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/p>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
+    .replace(/<[^>]+>/g, ''))
     .replace(/\n{3,}/g, '\n\n');
 }
 
@@ -4100,53 +4237,64 @@ function parseEmailMessage(buffer) {
   }
 }
 
+// v2.9.1: 乱码判定重构（配合 readabilityScore / isExpectedReadableChar 改造）：
+//   旧版把拉丁扩展（U+00C0-U+00FF）占比当乱码信号，合法法语/越南语文档被误杀；
+//   且「符号占比 > 0.22」一条就判死韩文/俄文/阿拉伯文等非白名单文字。
+//   新版只认真正的乱码信号：替换字符 U+FFFD、控制字符（含 C1 区 U+0080-U+009F，
+//   即 UTF-8 续字节被误按 latin1 单字节解码的产物）、乱码二联体、私用区字符。
+//   定位：解码阶段已尽量产出正确文本，本函数只是最后一道防线。
 function looksLikeGibberish(text) {
   const value = String(text || '');
   if (!value) return false;
   if (/\\u[0-9a-f]{4}/i.test(value)) return true;
   const chars = [...value];
-  // Split suspicious into truly suspicious (control/replacement/surrogate) vs
-  // Latin-Extended (À-ÿ) which may appear legitimately in names/loanwords.
-  const controlChars = chars.filter((ch) => /[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFD\uD800-\uDFFF]/.test(ch)).length;
-  const latinExtended = chars.filter((ch) => /[À-ÿ]/.test(ch)).length;
-  const suspicious = controlChars + latinExtended;
-  const readable = chars.filter(isExpectedReadableChar).length;
+  const n = chars.length;
+  const replacement = chars.filter((ch) => ch === '\uFFFD').length;
+  const controls = chars.filter((ch) => /[\x00-\x08\x0B\x0C\x0E-\x1F\u0080-\u009F]/.test(ch)).length;
+  const mojibake = countMojibakeDigraphs(value);
   const unexpected = chars.filter(isUnexpectedScriptOrPrivate).length;
-  const symbols = chars.filter((ch) => !isExpectedReadableChar(ch)).length;
-  if (chars.length < 80 && controlChars === 0 && unexpected === 0 && readable / chars.length > 0.75) return false;
-  // Lower the weight of Latin-Extended chars: they're suspicious only when
-  // they dominate (ratio > 0.15), unlike true control/replacement chars which
-  // are suspicious at any ratio > 0.03.
-  const controlRatio = controlChars / chars.length;
-  const latinExtendedRatio = latinExtended / chars.length;
-  return chars.length > 30 && (
-    controlRatio > 0.03
-    || latinExtendedRatio > 0.15
-    || unexpected / chars.length > 0.05
-    || readable / chars.length < 0.62
-    || symbols / chars.length > 0.22
+  const readable = chars.filter(isExpectedReadableChar).length;
+  if (n < 80 && controls === 0 && replacement === 0 && unexpected === 0 && readable / n > 0.75) return false;
+  return n > 30 && (
+    replacement / n > 0.02
+    || controls / n > 0.03
+    || mojibake / n > 0.05
+    || unexpected / n > 0.05
+    || readable / n < 0.62
   );
 }
 
+// v2.9.1: 「可读字符」不再用 CJK+ASCII 白名单——那会把法/越/韩/俄/阿/泰等一切
+//   非白名单文字当符号，合法文档被误判乱码。改用 Unicode 属性：任何人类语言文字
+//   （字母/标记/数字）、任何标点、任何符号、空白都算可读；真正的异常字符
+//   （控制符 / 替换符 / 私用区）由 readabilityScore 与 isUnexpectedScriptOrPrivate 负责。
 function isExpectedReadableChar(ch) {
-  return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}A-Za-z0-9\s，。、“”：《》；：！？（）【】,.()[\]{}:;!?/+\-=_%#&'"|@<>·•、~￥$…—℃±×÷≤≥²³°′″㎡µΩ]/u.test(ch);
+  return /[\p{L}\p{M}\p{N}\p{P}\p{S}\p{Z}\s]/u.test(ch);
 }
 
 // v1.5 (m-05): \u4E4B\u524D\u628A\u97E9/\u963F/\u6CF0/\u5370\u5730\u7B49\u5408\u6CD5\u811A\u672C\u5F53 unexpected_script\uFF0C
 //              \u5BFC\u81F4\u97E9\u6587 / \u963F\u62C9\u4F2F\u6587\u6587\u6863\u88AB\u8BEF\u5224\u4E3A\u4E71\u8BED\u76F4\u63A5\u8D70 failed\u3002
 //              \u6539\u4E3A\u53EA\u628A"\u79C1\u6709\u533A + \u66FF\u6362\u5B57\u7B26 + \u4EE3\u7406\u5BF9"\u8FD9\u4E9B\u771F\u6B63\u53EF\u7591\u7684\u5224\u4E3A unexpected\u3002
+// v2.9.1 \u4FEE\u590D\uFF1A\u65E7\u7248\u6B63\u5219\u6F0F\u5199 /u \u6807\u5FD7\u2014\u2014\u65E0 u \u6807\u5FD7\u65F6 \uF0000 \u88AB\u89E3\u6790\u6210
+//   \uF000 \u540E\u8DDF\u5B57\u9762\u5B57\u7B26 0\uFF0C0-\uFFFF \u9000\u5316\u6210\u300C0x30-0xFFFF \u5168\u5B57\u7B26\u8303\u56F4\u300D\uFF0C
+//   \u4EFB\u4F55\u5B57\u6BCD/\u6570\u5B57/CJK/\u97E9\u6587\u90FD\u88AB\u8BA1\u4E3A unexpected\uFF0C\u6240\u6709\u6587\u6863\u53EF\u8BFB\u6027\u8BC4\u5206\u88AB
+//   \u538B\u5230 0.2-0.4\uFF08\u6B63\u5E38\u5E94\u63A5\u8FD1 1.0\uFF09\u3002\u8865 u \u6807\u5FD7\u5E76\u6539\u7528 \u{...} \u62EC\u53F7\u5199\u6CD5\u3002
 function isUnexpectedScriptOrPrivate(ch) {
-  return /[\uE000-\uF8FF\uF0000-\uFFFFD\u100000-\u10FFFD\uFFFD]/u.test(ch);
+  return /[\uE000-\uF8FF\u{F0000}-\u{FFFFD}\u{100000}-\u{10FFFD}\uFFFD]/u.test(ch);
 }
 
 module.exports = {
+  countMojibakeDigraphs,
+  decodeHtmlEntities,
   decodeMimeWords,
   decodeQuotedPrintable,
   decodeTextBuffer,
   detectDominantLanguage,
   extractTextFromBuffer,
+  looksLikeGibberish,
   parseEmail,
   parseEmailMessage,
+  readabilityScore,
   sanitizeAttachmentFileName,
   stripHtml
 };
@@ -4728,7 +4876,7 @@ function extractZipEntryEndingWith(buffer, suffix) {
     const extraLength = input.readUInt16LE(cursor + 30);
     const commentLength = input.readUInt16LE(cursor + 32);
     const localHeaderOffset = input.readUInt32LE(cursor + 42);
-    const name = input.slice(cursor + 46, cursor + 46 + fileNameLength).toString('utf8').replace(/\\/g, '/');
+    const name = decodeZipFileName(input, cursor).replace(/\\/g, '/');
     if (name.toLowerCase().endsWith(String(suffix || '').toLowerCase())) {
       const content = readLocalEntry(input, localHeaderOffset, compressedSize, method);
       return content.toString('utf8');
@@ -4736,6 +4884,31 @@ function extractZipEntryEndingWith(buffer, suffix) {
     cursor += 46 + fileNameLength + extraLength + commentLength;
   }
   return '';
+}
+
+// v2.9.1: ZIP 文件名解码。旧版一律按 UTF-8 解，而 Windows 资源管理器压缩、
+//   旧版 7-Zip 等会把文件名以 GBK 字节直接写入且不设 EFS 标志
+//   （通用位标志 bit 11 = 0x800），中文条目名变成「娴嬭瘯.md」式乱码，
+//   按后缀查找 .md 条目时匹配不到。规则：
+//   EFS 置位 → UTF-8；否则字节流构成合法 UTF-8（纯 ASCII 或含非 ASCII 均算）
+//   → UTF-8；含非法序列 → 试 GBK（Windows 中文环境最常见）；最终兜底 latin1。
+function decodeZipFileName(input, centralDirOffset) {
+  const flags = input.readUInt16LE(centralDirOffset + 8);
+  const fileNameLength = input.readUInt16LE(centralDirOffset + 28);
+  const raw = input.slice(centralDirOffset + 46, centralDirOffset + 46 + fileNameLength);
+  if (flags & 0x800) return raw.toString('utf8');
+  const utf8 = raw.toString('utf8');
+  if (!utf8.includes('\uFFFD')) return utf8;
+  // 含非法序列 → 不是 UTF-8，按 GBK 解码（Windows 中文压缩工具最常见）
+  try {
+    if (typeof TextDecoder === 'function') {
+      const gbk = new TextDecoder('gbk', { fatal: false }).decode(raw);
+      if (gbk && !gbk.includes('\uFFFD')) return gbk;
+    }
+  } catch {
+    // 忽略：落到 latin1 兜底
+  }
+  return raw.toString('latin1');
 }
 
 function readLocalEntry(buffer, offset, compressedSize, method) {
@@ -5296,10 +5469,29 @@ function buildClassificationPrompt({ classifierPrompt, folderMap, parsePackage }
   ].filter(Boolean).join('\n\n');
 }
 
+// v2.9.1: 代理对安全截断。JS 字符串是 UTF-16，BMP 外字符（emoji、CJK 扩展 B
+//   汉字如 𠀀、部分数学符号）占两个码元，slice 正好切在高低代理之间会产出
+//   孤立代理（lone surrogate）——写 frontmatter / JSON.stringify / 送 AI 时
+//   变成乱码方块或损坏的 JSON。切点落在代理对中间时，把切点前移到高位代理之前。
+function adjustSurrogateCut(text, index) {
+  const hi = text.charCodeAt(index - 1);
+  const lo = text.charCodeAt(index);
+  if (hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff) return index - 1;
+  return index;
+}
+
+// v2.9.1: 定长截取统一入口——起止两端都做代理对校正。按换行符边界切的场景
+//   天然安全（0x0A 不会出现在代理对中间），只有「按固定字符数截断」需要它。
+function safeSlice(text, start, end) {
+  const from = adjustSurrogateCut(text, start);
+  const to = adjustSurrogateCut(text, end);
+  return text.slice(from, to);
+}
+
 function classificationSample(markdown, maxChars = 24000) {
   const text = String(markdown || '');
   if (text.length <= maxChars) return text;
-  const headingLines = (text.match(/^#{1,6}\s+.+$/gm) || []).join('\n').slice(0, 4000);
+  const headingLines = safeSlice((text.match(/^#{1,6}\s+.+$/gm) || []).join('\n'), 0, 4000);
   const remaining = Math.max(6000, maxChars - headingLines.length - 120);
   const frontSize = Math.floor(remaining * 0.5);
   const middleSize = Math.floor(remaining * 0.2);
@@ -5308,13 +5500,16 @@ function classificationSample(markdown, maxChars = 24000) {
   const lastHeading = Math.max(text.lastIndexOf('\n# '), text.lastIndexOf('\n## '), text.lastIndexOf('\n### '));
   const sectionTailSize = Math.floor(endSize * 0.6);
   const absoluteTailSize = endSize - sectionTailSize;
-  const sectionTail = lastHeading >= 0 ? text.slice(lastHeading + 1, lastHeading + 1 + sectionTailSize) : text.slice(-sectionTailSize);
+  // v2.9.1: 全部定长截取改走 safeSlice，避免 emoji / CJK 扩展 B 汉字被切出孤立代理
+  const sectionTail = lastHeading >= 0
+    ? safeSlice(text, lastHeading + 1, lastHeading + 1 + sectionTailSize)
+    : safeSlice(text, Math.max(0, text.length - sectionTailSize), text.length);
   return [
-    text.slice(0, frontSize),
+    safeSlice(text, 0, frontSize),
     '\n\n[文档标题目录汇总]\n', headingLines,
-    '\n\n[文档中段代表内容]\n', text.slice(middleStart, middleStart + middleSize),
+    '\n\n[文档中段代表内容]\n', safeSlice(text, middleStart, middleStart + middleSize),
     '\n\n[最后章节开头]\n', sectionTail,
-    '\n\n[文档实际尾部]\n', text.slice(-absoluteTailSize)
+    '\n\n[文档实际尾部]\n', safeSlice(text, Math.max(0, text.length - absoluteTailSize), text.length)
   ].join('');
 }
 
@@ -5558,9 +5753,15 @@ function packWithOverlap(text, breaks, maxChars, overlapRatio) {
         out.push({ text: text.slice(chunkStart, curEnd), start: chunkStart, end: curEnd });
         chunkStart = curEnd;
       }
-      for (let offset = curEnd; offset < nextEnd; offset += maxChars) {
-        const pieceEnd = Math.min(offset + maxChars, nextEnd);
+      // v2.9.1: 硬切点做代理对校正——超长块（巨型表格/代码块）按 maxChars 截断时
+      //   可能切在 emoji / CJK 扩展 B 汉字中间产出孤立代理；pieceEnd 由校正后的
+      //   位置推进，校正最多前移 1 字符，pieceEnd <= offset 时兜底前进 1 防死循环。
+      for (let offset = curEnd; offset < nextEnd;) {
+        let pieceEnd = Math.min(offset + maxChars, nextEnd);
+        if (pieceEnd < nextEnd) pieceEnd = adjustSurrogateCut(text, pieceEnd);
+        if (pieceEnd <= offset) pieceEnd = Math.min(offset + 1, nextEnd);
         out.push({ text: text.slice(offset, pieceEnd), start: offset, end: pieceEnd });
+        offset = pieceEnd;
       }
       curEnd = nextEnd;
       chunkStart = nextEnd;
@@ -5832,7 +6033,7 @@ function normalizeSummaryMap(value, options, chunk) {
       .join(' > ');
     var fallbackLocator = breadcrumbPath
       || ((chunk.headings && chunk.headings.length) ? chunk.headings[0] : chunk.chunk_id);
-    var fallbackQuote = String(chunk.markdown || '').slice(0, 200).replace(/\n/g, ' ').trim() || fallbackLocator;
+    var fallbackQuote = safeSlice(String(chunk.markdown || ''), 0, 200).replace(/\n/g, ' ').trim() || fallbackLocator;
     result.evidence = result.evidence.map(function(item, index) {
       if (!item || typeof item !== 'object') return item;
       return Object.assign({}, item, {
@@ -6213,8 +6414,9 @@ async function requestWithContract(options) {
 }
 
 function buildRepairPrompt(originalPrompt, errors, previousValue) {
+  // v2.9.1: 定长截断走 safeSlice——切断的代理对进入修复 prompt 会干扰 AI 输出
   const previous = typeof previousValue === 'string'
-    ? previousValue.slice(0, 12000)
+    ? safeSlice(previousValue, 0, 12000)
     : JSON.stringify(previousValue, null, 2);
   return [
     originalPrompt,
@@ -6639,6 +6841,7 @@ module.exports = {
   repairJsonText,
   requestMiniMaxJson,
   requestWithContract,
+  safeSlice,
   splitByHeadings,
   splitMarkdownSections,
   summarizeDocument,

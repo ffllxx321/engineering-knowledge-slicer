@@ -1,6 +1,6 @@
 # 工程知识切片（Engineering Knowledge Slicer）
 
-> 当前版本 **v2.9.0**（settingsVersion 17）· Obsidian Desktop 1.5.0+ · MIT
+> 当前版本 **v2.9.1**（settingsVersion 17）· Obsidian Desktop 1.5.0+ · MIT
 
 通过 **MinerU / PaddleOCR + MiniMax M3**，把工程资料（PDF、Word、PPT、图片、邮件等）批量转化为**中文、可追溯、固定目录归档**的 Obsidian 知识卡片。
 
@@ -17,6 +17,7 @@
 - **密钥外部化**：API 密钥读取自 `~/.eks-secrets.json`，避免 OneDrive/iCloud 同步泄露
 - **诊断日志**：全链路脱敏 diag 日志，默认写到 `~/.eks/logs/diag.log`
 - **会话级失败缓存与启动续传（v2.9）**：失败文件在审核工作台显示原因（可重试/移除），重启后自动清空；启动时检测上次中断的任务，可「继续」（断点续传）或「放弃」
+- **多语言编码健壮性（v2.9.1）**：自适应字符集探测覆盖 UTF-8 / GBK / EUC-KR（韩文）/ ShiftJIS / Big5 / windows-1252 / 无 BOM UTF-16；ZIP 文件名识别 EFS 标志与 GBK 回退；所有定长截断做代理对安全校正（emoji / 生僻汉字不切坏）——解码侧把文本产出正确，而非检出乱码后拒绝输出
 
 ## 仓库结构
 
@@ -37,6 +38,7 @@
 │   ├── smoke-json-repair.js # JSON 修复烟雾测试
 │   ├── smoke-diag-fixes.js  # 诊断日志相关修复的回归测试
 │   ├── smoke-email-mime.js  # v2.9 MIME 邮件解析 + 附件提取烟雾测试
+│   ├── smoke-encoding.js    # v2.9.1 编码根因修复回归（21 例）
 │   ├── paddleocr_extract.py # PaddleOCR CLI 包装（开发辅助，不参与运行）
 │   └── pdf_extract.py       # PDF 元数据提取（开发辅助，不参与运行）
 └── 组件包/
@@ -132,6 +134,7 @@ node scripts/smoke-ratelimit.js      # 限流器
 node scripts/smoke-json-repair.js    # JSON 修复
 node scripts/smoke-diag-fixes.js     # 诊断修复回归
 node scripts/smoke-email-mime.js     # MIME 邮件解析（v2.9）
+node scripts/smoke-encoding.js       # 编码根因修复回归（v2.9.1，21 例）
 ```
 
 ## 诊断与排障

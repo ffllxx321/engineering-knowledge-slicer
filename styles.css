@@ -329,3 +329,41 @@
 .eks-banner .eks-task-meta {
   margin-top: 4px;
 }
+
+/* v2.9.0: 审核工作台「处理失败」区块（会话级，重启自动清空） */
+.eks-failed-group h4 {
+  color: var(--text-error);
+  margin: 0 0 6px;
+}
+
+.eks-failed-item {
+  border-top: 1px solid var(--eks-border);
+  padding: 8px 0;
+}
+
+.eks-failed-item strong {
+  overflow-wrap: anywhere;
+}
+
+.eks-failed-item .eks-task-meta {
+  margin: 4px 0;
+  color: var(--text-error);
+  overflow-wrap: anywhere;
+}
+
+/* v2.9.0: 启动续传询问弹窗 */
+.eks-interrupted-modal .eks-task-meta {
+  margin: 8px 0;
+}
+
+.eks-interrupted-list {
+  max-height: 220px;
+  overflow-y: auto;
+  margin: 8px 0;
+  padding-left: 20px;
+  overflow-wrap: anywhere;
+}
+
+.eks-interrupted-modal .eks-actions {
+  margin-top: 12px;
+}

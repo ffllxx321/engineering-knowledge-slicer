@@ -1,5 +1,31 @@
 # 工程知识切片 变更记录
 
+## v2.9.0 — 2026-07-23 邮件附件切片 + 会话级失败缓存与启动续传
+
+### 📎 邮件附件：保存、切片、双向链接
+- **MIME 解析器**（`parseEmailMessage`）：对 .eml 原始字节做 multipart 递归解析（mixed/alternative/related），支持 base64 / quoted-printable 传输编码、RFC 2047 编码词（`=?UTF-8?B?…?=`，中文主题/发件人/附件名不再乱码）、charset 声明解码（GBK/Big5 等，失败回退自适应探测）；畸形邮件自动回退旧的纯文本路径，不差于 v2.8
+- **附件保存 + 自动入队切片**：附件保存到 `<邮件所在目录>/_attachments/<邮件名>/`（仍在 intake 根内，重扫按 hash 去重）；可处理类型（pdf/docx/xlsx/pptx/图片/txt/md/html）的附件**立即建任务入队**，同轮自动处理即接管
+- **双向链接**：邮件知识卡片追加「## 关联附件」节（`[[附件.pdf]]`）；附件切出的卡片追加「> 来源邮件：[[邮件名]]」回链；附件卡 frontmatter 的 `source_link` 天然指向附件文件，附件文件→卡片方向由 Obsidian 反向链接面板提供
+- **衍生**：嵌套邮件（message/rfc822）整体存为 `.eml` 递归进流水线；无文件名的内联 CID 图片（签名/logo 装饰图）不进附件，避免垃圾任务；**正文为空但有附件的邮件不再整体判 failed**（合成占位正文，附件照常保存切片）；新增 `email.attachments` 诊断事件
+- `.msg`（Outlook）仍维持「暂不支持，请导出 EML」
+- 复用点：断点续传零新增代码——附件任务的解析/总结/原子化产物沿用既有 artifacts 缓存（`artifactsPath/<run_id>/*.json`）
+
+### 🗑️ 会话级失败缓存（审核工作台）
+- 处理失败的文件现在显示在**审核工作台**顶部「处理失败的文件」区块：文件名 + 失败阶段 + 错误原因，每条带「重试」（沿用 `retryTask`，自动断点续传）和「移除」按钮
+- **会话级语义**：插件启动时（`sessionStartupCleanup`）自动从任务账本清除上一会话遗留的 failed 记录——失败展示只存在于当前会话，关闭软件后不再显示；处理概览的「失败」统计因此同样只反映本次会话
+
+### ▶️ 启动续传询问
+- 打开软件时检测上次关闭时处于解析/判定/总结/原子化/写入/排队中的任务，弹窗列出文件名并询问：
+  - **「继续处理」**→ 重新入队，`processTask` 经 artifacts 缓存**自动从上次完成的步骤接着往下**（已解析不重解析、已总结不重总结）
+  - **「放弃」**→ 从账本移除这些记录，保持处理概览干净（源文件仍在 vault，可重新扫描）
+- 启动清理全程 try/catch 兜底并打诊断日志（`startup.failedCleared` / `startup.interruptedFound` / `startup.interruptedDiscarded`），不会阻塞插件加载
+
+### 🧪 测试
+- 新增 `scripts/smoke-email-mime.js`：从 main.js 抽取真实 extractors 模块，覆盖 multipart 结构、plain 优先于 html、base64 字节完整性、QP 解码、GBK 正文、编码词附件名、内联 CID 跳过、嵌套邮件、二进制垃圾兜底、`extractTextFromBuffer` email 分支端到端（含 parsePackage 元数据透传与可序列化性）
+- 既有 5 套烟雾测试全部通过；`node --check` 通过
+
+---
+
 ## v2.8.1 — 2026-07-20 用户诊断日志反馈的四个问题修复
 
 根据用户实机诊断日志（`~/.eks/logs/diag.log`）定位并修复：

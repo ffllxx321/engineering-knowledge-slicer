@@ -1,12 +1,13 @@
 # 工程知识切片（Engineering Knowledge Slicer）
 
-> 当前版本 **v2.8.0**（settingsVersion 17）· Obsidian Desktop 1.5.0+ · MIT
+> 当前版本 **v2.9.0**（settingsVersion 17）· Obsidian Desktop 1.5.0+ · MIT
 
 通过 **MinerU / PaddleOCR + MiniMax M3**，把工程资料（PDF、Word、PPT、图片、邮件等）批量转化为**中文、可追溯、固定目录归档**的 Obsidian 知识卡片。
 
 ## 核心能力
 
 - **端到端流水线**：源文件 → 云端文档解析（MinerU 主 / PaddleOCR 补盲）→ 类型判定 → 结构化总结 → 知识原子化 → 自动入库 / 审核台
+- **邮件附件闭环（v2.9）**：.eml 的附件保存到 `_attachments/` 并自动入队切片；邮件卡与附件卡互相「[[…]]」双向链接，附件文件→卡片方向由 Obsidian 反向链接面板提供
 - **固定目录归档**：业务库 / 招投标两条线，由 `组件包/folder-map.json` 唯一路由到 28 个固定目录
 - **v2.7 切片引擎**：借鉴 Tencent/WeKnora 的知识点切片思路——文档画像驱动策略选择、标题层级面包屑、受保护区域（表格/代码块/公式）永不切断、小节合并、切片重叠、覆盖校验
 - **可信度门槛**：五维加权（解析/类型/证据/结构/原子质量）+ 硬性门槛，低于 `autoApproveConfidenceThreshold`（默认 0.9）的卡片进入审核台
@@ -15,13 +16,14 @@
 - **SSE 流式输出（POC）**：可选开启，AI 调用期间逐 token 回显
 - **密钥外部化**：API 密钥读取自 `~/.eks-secrets.json`，避免 OneDrive/iCloud 同步泄露
 - **诊断日志**：全链路脱敏 diag 日志，默认写到 `~/.eks/logs/diag.log`
+- **会话级失败缓存与启动续传（v2.9）**：失败文件在审核工作台显示原因（可重试/移除），重启后自动清空；启动时检测上次中断的任务，可「继续」（断点续传）或「放弃」
 
 ## 仓库结构
 
 ```
 .
 ├── manifest.json            # Obsidian 插件元信息
-├── main.js                  # 插件主入口（自包含 bundle，22 个内嵌模块，可直接发布）
+├── main.js                  # 插件主入口（自包含 bundle，23 个内嵌模块，可直接发布）
 ├── styles.css               # 仪表盘 / 进度条样式
 ├── data.json                # 插件默认 settings（不含密钥）
 ├── LICENSE                  # MIT
@@ -33,6 +35,8 @@
 │   ├── smoke-splitter-v26.js# v2.7 WeKnora 式切片引擎烟雾测试（21 例）
 │   ├── smoke-ratelimit.js   # 限流器烟雾测试
 │   ├── smoke-json-repair.js # JSON 修复烟雾测试
+│   ├── smoke-diag-fixes.js  # 诊断日志相关修复的回归测试
+│   ├── smoke-email-mime.js  # v2.9 MIME 邮件解析 + 附件提取烟雾测试
 │   ├── paddleocr_extract.py # PaddleOCR CLI 包装（开发辅助，不参与运行）
 │   └── pdf_extract.py       # PDF 元数据提取（开发辅助，不参与运行）
 └── 组件包/
@@ -126,6 +130,8 @@ node scripts/smoke-split.js          # v2.5 切片回归（6 例）
 node scripts/smoke-splitter-v26.js   # v2.7 切片引擎（21 例）
 node scripts/smoke-ratelimit.js      # 限流器
 node scripts/smoke-json-repair.js    # JSON 修复
+node scripts/smoke-diag-fixes.js     # 诊断修复回归
+node scripts/smoke-email-mime.js     # MIME 邮件解析（v2.9）
 ```
 
 ## 诊断与排障

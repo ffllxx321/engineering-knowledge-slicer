@@ -27,7 +27,7 @@ const {
   statusCounts,
   tasksPath
 } = require("src/core/task.js");
-const { extractTextFromBuffer } = require("src/core/extractors.js");
+const { extractTextFromBuffer, sanitizeAttachmentFileName } = require("src/core/extractors.js");
 const { createFolderIndexMarkdown, folderIndexPath } = require("src/core/moc.js");
 const { parseTagLibrary, suggestMapIndex, validateCard } = require("src/core/tags.js");
 const { detectEcosystemPlugins } = require("src/core/ecosystem.js");
@@ -464,6 +464,15 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         .onClick(() => this.showHistoryForFile(file)));
     }));
 
+    // v2.9.0: 会话级失败缓存清理 + 中断任务续传询问。
+    //   注册在 autoScan 之前：失败记录先清掉，续传询问先弹出；
+    //   用户选择「继续」后 autoProcessQueue 与自动扫描由 autoProcessing 锁串行，不会打架。
+    this.app.workspace.onLayoutReady(() => {
+      this.sessionStartupCleanup().catch((error) => {
+        try { diag('startup.cleanup.error', { message: String(error && error.message || error) }); } catch (_) {}
+      });
+    });
+
     // v2.8: 自动扫描改为设置项，默认关闭。
     //   只有 autoScanOnStartup === true 时才在工作区布局就绪后自动扫描源文件目录
     //   （扫描完按既有逻辑进入自动处理）；默认关闭状态下插件启动不读源文件、
@@ -847,6 +856,16 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         });
         if (extracted.status !== 'ok' || !extracted.parsePackage) throw new Error(extracted.message || '文档解析 API 未返回可用 Markdown');
         parsePackage = extracted.parsePackage;
+        // v2.9.0: 邮件附件落盘 + 入队切片。只在首次解析执行；
+        //   续传时 parsed artifact 已含 emailAttachments（保存路径），跳过本块。
+        if (Array.isArray(extracted.attachments) && extracted.attachments.length) {
+          const savedAttachments = await this.saveEmailAttachments(current, extracted.attachments);
+          if (savedAttachments.length) {
+            parsePackage.metadata = Object.assign({}, parsePackage.metadata, {
+              emailAttachments: savedAttachments.map((item) => ({ filename: item.filename, path: item.path, size: item.size }))
+            });
+          }
+        }
         current.status = 'parsed';
         await this.persistArtifact(current, 'parsed', parsePackage);
       }
@@ -915,6 +934,27 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       for (const item of workflow.review) {
         item.atom.source.parent_summary = summaryLink;
         item.proposed_card.parent_summary = summaryLink;
+      }
+
+      // v2.9.0: 邮件 ↔ 附件双向链接注入（writeAcceptedCard 负责落笔）。
+      //   邮件任务：卡片带「关联附件」链接列表；附件任务：卡片带「来源邮件」回链。
+      const emailAttachments = parsePackage.metadata && Array.isArray(parsePackage.metadata.emailAttachments)
+        ? parsePackage.metadata.emailAttachments : [];
+      const attachmentLinks = emailAttachments
+        .map((item) => (item && item.filename ? `[[${item.filename}]]` : ''))
+        .filter(Boolean);
+      const parentSourceLink = current.parent_source_path
+        ? `[[${normalizeVaultPath(current.parent_source_path).split('/').pop().replace(/\.[^.]+$/, '')}]]`
+        : '';
+      if (attachmentLinks.length || parentSourceLink) {
+        for (const card of workflow.accepted) {
+          if (attachmentLinks.length) card.attachment_links = attachmentLinks;
+          if (parentSourceLink) card.parent_source_link = parentSourceLink;
+        }
+        for (const item of workflow.review) {
+          if (attachmentLinks.length) item.proposed_card.attachment_links = attachmentLinks;
+          if (parentSourceLink) item.proposed_card.parent_source_link = parentSourceLink;
+        }
       }
 
       current.status = 'writing';
@@ -1169,6 +1209,80 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     return path;
   }
 
+  // v2.9.0: 写入二进制附件。writeUnique 只服务 .md（冲突时加 -N.md 后缀），
+  //   附件需要按原扩展名避让冲突，且走 createBinary 保证字节完整。
+  async writeUniqueBinary(targetPath, buffer) {
+    const normalized = normalizeVaultPath(targetPath);
+    const folder = normalized.split('/').slice(0, -1).join('/');
+    const fileName = normalized.split('/').pop();
+    const dot = fileName.lastIndexOf('.');
+    const stem = dot > 0 ? fileName.slice(0, dot) : fileName;
+    const ext = dot > 0 ? fileName.slice(dot) : '';
+    await ensureFolder(this.app, folder);
+    let candidate = normalized;
+    let index = 1;
+    while (this.app.vault.getAbstractFileByPath(candidate)) {
+      candidate = `${folder}/${stem}-${index}${ext}`;
+      index += 1;
+    }
+    const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    if (typeof this.app.vault.createBinary !== 'function') {
+      throw new Error('当前 Obsidian 版本不支持写入二进制附件（缺少 vault.createBinary）。');
+    }
+    await this.app.vault.createBinary(candidate, arrayBuffer);
+    return candidate;
+  }
+
+  // v2.9.0: 邮件附件保存 + 入队切片。
+  //   保存位置：<邮件所在目录>/_attachments/<邮件名>/ 下，仍在 intake 根内，
+  //   重新扫描时按 source_hash 天然去重；可处理类型的附件立即建任务入队，
+  //   autoProcessQueue 同轮循环即接管，任务记录携带父邮件链接供双向链接使用。
+  async saveEmailAttachments(task, attachments) {
+    const sourcePath = normalizeVaultPath(task.source_path || '');
+    const dir = sourcePath.includes('/') ? sourcePath.slice(0, sourcePath.lastIndexOf('/')) : '';
+    const mailBaseName = (sourcePath.split('/').pop() || 'email').replace(/\.[^.]+$/, '');
+    const tasks = await this.loadTasks();
+    const saved = [];
+    let enqueued = 0;
+    for (const attachment of attachments || []) {
+      if (!attachment || !attachment.data || !attachment.data.length) continue;
+      const fileName = sanitizeAttachmentFileName(attachment.filename || `attachment-${saved.length + 1}`);
+      const targetPath = `${dir ? dir + '/' : ''}_attachments/${mailBaseName}/${fileName}`;
+      const writtenPath = await this.writeUniqueBinary(targetPath, attachment.data);
+      saved.push({
+        filename: writtenPath.split('/').pop(),
+        path: writtenPath,
+        size: attachment.data.length,
+        contentType: attachment.contentType || ''
+      });
+      if (!isProcessableSource(writtenPath)) continue;
+      const hash = sourceHash(attachment.data);
+      const library = libraryForPath(writtenPath, this.settings);
+      const existing = tasks.find((item) => item.source_hash === hash && item.library === library);
+      if (existing) continue;
+      const attachmentTask = createTaskRecord({
+        sourcePath: writtenPath,
+        sourceHash: hash,
+        sourceType: detectSourceType(writtenPath),
+        library,
+        versions: runtimeVersions(this.settings)
+      });
+      attachmentTask.parent_task_id = task.task_id;
+      attachmentTask.parent_source_path = task.source_path;
+      tasks.push(attachmentTask);
+      enqueued += 1;
+    }
+    if (enqueued) await this.saveTasks(tasks);
+    diag('email.attachments', {
+      sourcePath: task.source_path,
+      count: (attachments || []).length,
+      saved: saved.length,
+      enqueued,
+      files: saved.map((item) => item.path).slice(0, 10)
+    });
+    return saved;
+  }
+
   async loadExistingFingerprints(excludeSourceHash = '') {
     const roots = [this.settings.bidOutputPath, this.settings.businessOutputPath].map(normalizeVaultPath);
     const fingerprints = [];
@@ -1210,7 +1324,18 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const path = normalizeVaultPath(`${route.output_folder}/${cardFileName(card)}`);
     const existing = this.app.vault.getAbstractFileByPath(path);
     const previous = existing instanceof TFile ? await this.app.vault.read(existing) : null;
-    await writeFile(this.app, path, renderKnowledgeCard(card));
+    let markdown = renderKnowledgeCard(card);
+    // v2.9.0: 邮件 ↔ 附件双向链接正文节（frontmatter 结构保持不变）。
+    //   附件卡 → 来源邮件；邮件卡 → 关联附件清单。附件文件→卡片方向由
+    //   Obsidian 反向链接面板天然提供（二进制文件无法内嵌链接）。
+    const attachmentLinks = Array.isArray(card.attachment_links) ? card.attachment_links.filter(Boolean) : [];
+    if (attachmentLinks.length) {
+      markdown += `\n## 关联附件\n\n${attachmentLinks.map((link) => `- ${link}`).join('\n')}\n`;
+    }
+    if (card.parent_source_link) {
+      markdown += `\n> 来源邮件：${card.parent_source_link}\n`;
+    }
+    await writeFile(this.app, path, markdown);
     await this.appendRollback({
       task_id: task.task_id,
       card_id: card.card_id,
@@ -1372,6 +1497,16 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     await this.refreshViews();
   }
 
+  // v2.9.0: 审核台失败区块「移除」按钮——从账本删除该记录（源文件不受影响，
+  //   下次扫描可重新发现）。失败记录本来也会在重启时被 sessionStartupCleanup 清除。
+  async dismissTask(taskId) {
+    const tasks = await this.loadTasks();
+    const next = tasks.filter((item) => item.task_id !== taskId);
+    if (next.length === tasks.length) return;
+    await this.saveTasks(next);
+    await this.refreshViews();
+  }
+
   async loadTagLibrary() {
     return parseTagLibrary(await this.loadTagLibraryText());
   }
@@ -1463,6 +1598,51 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     if (restored > 0) await this.saveTasks(tasks);
     await this.refreshViews();
     return restored;
+  }
+
+  // v2.9.0: 会话级失败缓存 + 启动续传。每次启动执行一次：
+  //   1) 失败任务只在上一次会话内展示（审核工作台），重启后从账本清除——
+  //      因此 dashboard 的「失败」统计与审核台失败块天然只反映本次会话；
+  //   2) 上次关闭时处于解析/总结/原子化/写入/排队中的任务，弹窗询问
+  //      继续（重新入队，artifact 缓存自动断点续传）或放弃（移除记录）。
+  async sessionStartupCleanup() {
+    const tasks = await this.loadTasks();
+    const failedTasks = tasks.filter((task) => task.status === 'failed');
+    if (failedTasks.length) {
+      const failedIds = new Set(failedTasks.map((task) => task.task_id));
+      await this.saveTasks(tasks.filter((task) => !failedIds.has(task.task_id)));
+      diag('startup.failedCleared', {
+        count: failedTasks.length,
+        files: failedTasks.slice(0, 10).map((task) => task.source_path)
+      });
+    }
+    const interrupted = tasks.filter((task) => PROCESSING_STATUSES.has(task.status)
+      || task.status === 'parsed' || task.status === 'queued');
+    if (!interrupted.length) return;
+    diag('startup.interruptedFound', {
+      count: interrupted.length,
+      statuses: interrupted.map((task) => task.status).slice(0, 20)
+    });
+    const interruptedIds = new Set(interrupted.map((task) => task.task_id));
+    new InterruptedTasksModal(this.app, interrupted, {
+      onResume: async () => {
+        const latest = await this.loadTasks();
+        for (const task of latest) {
+          if (!interruptedIds.has(task.task_id)) continue;
+          task.status = 'queued';
+          task.updated_at = new Date().toISOString();
+        }
+        await this.saveTasks(latest);
+        await this.refreshViews();
+        await this.autoProcessQueue(false);
+      },
+      onDiscard: async () => {
+        const latest = await this.loadTasks();
+        await this.saveTasks(latest.filter((task) => !interruptedIds.has(task.task_id)));
+        await this.refreshViews();
+        diag('startup.interruptedDiscarded', { count: interrupted.length });
+      }
+    }).open();
   }
 
   async setTaskProgress(task, message, details = {}) {
@@ -1759,6 +1939,43 @@ function setEksUploadConfirm(plugin) {
   }
 }
 
+// v2.9.0: 启动续传询问弹窗。上次关闭时有正在处理的任务 → 询问继续/放弃。
+//   继续：任务重新入队，processTask 经 artifacts 缓存自动从断点阶段往下跑；
+//   放弃：从任务账本移除这些记录，保持处理概览干净（源文件仍在，可重新扫描）。
+class InterruptedTasksModal extends Modal {
+  constructor(app, tasks, handlers) {
+    super(app);
+    this.tasks = Array.isArray(tasks) ? tasks : [];
+    this.handlers = handlers || {};
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass('eks-interrupted-modal');
+    contentEl.createEl('h2', { text: '检测到上次未完成的处理' });
+    contentEl.createDiv({
+      cls: 'eks-task-meta',
+      text: `上次关闭软件时有 ${this.tasks.length} 个文件正在处理。「继续处理」将从上次缓存到的步骤接着往下；「放弃」则清空这些记录，保持处理概览干净。`
+    });
+    const list = contentEl.createEl('ul', { cls: 'eks-interrupted-list' });
+    for (const task of this.tasks.slice(0, 10)) {
+      list.createEl('li', { text: `${task.source_path || '(未知文件)'}（${stageLabel(task.status)}）` });
+    }
+    if (this.tasks.length > 10) {
+      contentEl.createDiv({ cls: 'eks-task-meta', text: `… 还有 ${this.tasks.length - 10} 个` });
+    }
+    const actions = contentEl.createDiv({ cls: 'eks-actions' });
+    actions.createEl('button', { text: '继续处理', cls: 'mod-cta' }).addEventListener('click', async () => {
+      this.close();
+      try { await this.handlers.onResume(); } catch (error) { new Notice(`恢复处理失败：${error.message}`); }
+    });
+    actions.createEl('button', { text: '放弃，保持概览干净' }).addEventListener('click', async () => {
+      this.close();
+      try { await this.handlers.onDiscard(); } catch (error) { new Notice(`清理中断任务失败：${error.message}`); }
+    });
+  }
+}
+
 class SlicerDashboardView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -2024,9 +2241,30 @@ class SlicerDashboardView extends ItemView {
   }
 
   async renderReview(parent, tasks) {
+    // v2.9.0: 会话级「处理失败」区块——失败记录重启后由 sessionStartupCleanup
+    //   自动清除，所以这里只会展示本次会话内的失败，满足"关机即删、重开不显示"。
+    const failedTasks = tasks.filter((task) => task.status === 'failed');
+    if (failedTasks.length) {
+      const block = parent.createDiv('eks-review-group eks-failed-group');
+      block.createEl('h4', { text: `处理失败的文件（${failedTasks.length} 个 · 重启 Obsidian 后自动清空）` });
+      for (const task of failedTasks) {
+        const item = block.createDiv('eks-failed-item');
+        item.createEl('strong', { text: task.source_path || '(未知文件)' });
+        const lastError = Array.isArray(task.errors) && task.errors.length ? task.errors.at(-1) : null;
+        item.createDiv({
+          cls: 'eks-task-meta',
+          text: `失败阶段：${stageLabel(lastError?.stage || task.progress?.stage || 'process')} · 原因：${lastError?.message || '未知错误'}`
+        });
+        const actions = item.createDiv('eks-actions');
+        button(actions, '重试', () => this.plugin.retryTask(task.task_id));
+        button(actions, '移除', () => this.plugin.dismissTask(task.task_id));
+      }
+    }
     const reviewTasks = tasks.filter((task) => task.status === 'needs_review' && task.artifacts?.review);
     if (!reviewTasks.length) {
-      parent.createDiv({ cls: 'eks-empty', text: '暂无异常项。可信结果会自动入库，不需要逐条审核。' });
+      if (!failedTasks.length) {
+        parent.createDiv({ cls: 'eks-empty', text: '暂无异常项。可信结果会自动入库，不需要逐条审核。' });
+      }
       return;
     }
     for (const task of reviewTasks) {
@@ -3271,16 +3509,40 @@ async function extractTextFromBuffer(filePath, buffer, options = {}) {
     });
   }
   if (plan.mode === 'email') {
-    const decoded = decodeTextBuffer(buffer);
-    const email = parseEmail(decoded.text);
-    return withParsePackage(Object.assign(readableTextResult(email.text, 'email', decoded), {
-      title: email.subject,
-      metadata: Object.assign({}, email, { sourceEncoding: decoded.encoding })
-    }), {
+    // v2.9.0: 改走 MIME 解析（parseEmailMessage），提取附件二进制与完整头部。
+    const email = parseEmailMessage(buffer);
+    const attachmentMeta = (email.attachments || []).map((item) => ({
+      filename: item.filename,
+      contentType: item.contentType,
+      size: item.data ? item.data.length : 0
+    }));
+    // v2.9.0: 空正文但有附件的邮件不再判 failed，合成占位正文，
+    //   保证附件一定能进入保存/切片流程，同时给总结阶段附件上下文。
+    const bodyText = email.text || (attachmentMeta.length
+      ? `本邮件正文为空，包含 ${attachmentMeta.length} 个附件：${attachmentMeta.map((item) => item.filename).join('、')}。`
+      : '');
+    const metadata = {
+      subject: email.subject,
+      from: email.from,
+      to: email.to,
+      cc: email.cc,
+      date: email.date,
+      messageId: email.messageId,
+      sourceEncoding: 'mime',
+      attachments: attachmentMeta
+    };
+    const result = readableTextResult(bodyText, 'email', { encoding: 'mime' });
+    result.title = email.subject;
+    result.metadata = metadata;
+    // 附件二进制挂在 result 上（不进 parsePackage 的 JSON 序列化），
+    // 由 processTask 落盘到 _attachments 并入队切片。
+    result.attachments = email.attachments || [];
+    return withParsePackage(result, {
       sourcePath: filePath,
       buffer,
       sourceType: 'email',
-      parser: 'eml-parser'
+      parser: 'eml-parser',
+      metadata
     });
   }
 
@@ -3557,6 +3819,287 @@ function stripHtml(html) {
     .replace(/\n{3,}/g, '\n\n');
 }
 
+// ---------------------------------------------------------------------------
+// v2.9.0: MIME multipart 邮件解析（含附件二进制提取）
+//   设计约束：附件是二进制，必须对原始 Buffer 做字节级结构解析。
+//   latin1 是 1:1 字节映射，用它定位边界/头部后，载荷用 Buffer.slice 按
+//   相同索引切出，二进制字节不受损。parseEmail（纯文本版）保留兼容旧调用。
+// ---------------------------------------------------------------------------
+
+const MIME_EXTENSIONS = {
+  'application/pdf': 'pdf',
+  'application/zip': 'zip',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'application/vnd.ms-powerpoint': 'ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+  'application/json': 'json',
+  'application/xml': 'xml',
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/tiff': 'tiff',
+  'text/plain': 'txt',
+  'text/html': 'html',
+  'text/csv': 'csv',
+  'message/rfc822': 'eml'
+};
+
+function mimeExtension(subtype) {
+  return MIME_EXTENSIONS[String(subtype || '').toLowerCase()] || 'bin';
+}
+
+function mimeHeader(headers, name) {
+  return headers ? String(headers[String(name || '').toLowerCase()] || '') : '';
+}
+
+// 从 Content-Type / Content-Disposition 里取参数值（支持引号包裹）
+function mimeParam(headerValue, name) {
+  const match = String(headerValue || '').match(new RegExp(`${name}\\s*=\\s*("([^"]*)"|([^;\\s]+))`, 'i'));
+  if (!match) return '';
+  return match[2] !== undefined ? match[2] : (match[3] || '');
+}
+
+// 头部解析：支持 RFC 2822 折叠行续行（以空格/制表符开头的行并入上一行）
+function parseMimeHeaders(headerText) {
+  // headerText 来自 latin1 结构解析（1:1 字节映射）。真实邮件中未走
+  // RFC 2047 编码词的 8-bit 头部几乎都是 UTF-8 字节，统一转回 UTF-8；
+  // 纯 ASCII（含编码词本身）转换是恒等的，不影响后续 decodeMimeWords。
+  const toUtf8 = (value) => Buffer.from(value, 'latin1').toString('utf8');
+  const headers = {};
+  let currentKey = null;
+  for (const line of String(headerText || '').split(/\r?\n/)) {
+    if (/^[ \t]/.test(line) && currentKey) {
+      headers[currentKey] = `${headers[currentKey]} ${toUtf8(line.trim())}`.trim();
+      continue;
+    }
+    const match = line.match(/^([^:]+):\s*(.*)$/);
+    if (match) {
+      currentKey = match[1].toLowerCase();
+      headers[currentKey] = toUtf8(match[2].trim());
+    }
+  }
+  return headers;
+}
+
+// 解析单个 MIME 实体：返回 { headers, body } 或 { headers, children }（multipart）
+function parseMimeEntity(buf) {
+  const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || '');
+  const text = input.toString('latin1');
+  let headerEnd = text.indexOf('\r\n\r\n');
+  let separatorLength = 4;
+  if (headerEnd < 0) {
+    headerEnd = text.indexOf('\n\n');
+    separatorLength = 2;
+  }
+  if (headerEnd < 0) {
+    headerEnd = input.length;
+    separatorLength = 0;
+  }
+  const headers = parseMimeHeaders(text.slice(0, headerEnd));
+  const bodyStart = headerEnd + separatorLength;
+  const contentType = mimeHeader(headers, 'content-type') || 'text/plain';
+  const boundary = mimeParam(contentType, 'boundary');
+  if (/^multipart\//i.test(contentType) && boundary) {
+    return { headers, children: splitMultipart(input, text, bodyStart, boundary) };
+  }
+  return { headers, body: input.slice(bodyStart) };
+}
+
+// 按 boundary 切分子部件；起止边界之间的前言/尾声按 MIME 规范丢弃
+function splitMultipart(buf, text, bodyStart, boundary) {
+  const delimiter = `--${boundary}`;
+  const children = [];
+  let cursor = text.indexOf(delimiter, bodyStart);
+  while (cursor >= 0) {
+    let after = cursor + delimiter.length;
+    if (text.startsWith('--', after)) break; // 结束边界 --boundary--
+    if (text.startsWith('\r\n', after)) after += 2;
+    else if (text.startsWith('\n', after)) after += 1;
+    const next = text.indexOf(delimiter, after);
+    if (next < 0) break;
+    let partEnd = next;
+    if (partEnd >= 2 && text.startsWith('\r\n', partEnd - 2)) partEnd -= 2;
+    else if (partEnd >= 1 && text.startsWith('\n', partEnd - 1)) partEnd -= 1;
+    if (partEnd > after) children.push(parseMimeEntity(buf.slice(after, partEnd)));
+    cursor = next;
+  }
+  return children;
+}
+
+// Content-Transfer-Encoding 解码，输出原始字节
+function decodePartPayload(entity) {
+  const body = entity.body || Buffer.alloc(0);
+  const encoding = mimeHeader(entity.headers, 'content-transfer-encoding').toLowerCase().trim();
+  if (encoding === 'base64') {
+    return Buffer.from(body.toString('latin1').replace(/[^A-Za-z0-9+/=]/g, ''), 'base64');
+  }
+  if (encoding === 'quoted-printable') return decodeQuotedPrintable(body);
+  return body;
+}
+
+// quoted-printable：=XX 十六进制字节 + 软换行（行尾 =）
+function decodeQuotedPrintable(buf) {
+  const text = (Buffer.isBuffer(buf) ? buf : Buffer.from(buf || '')).toString('latin1');
+  const bytes = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '=') {
+      if (text[i + 1] === '\r' && text[i + 2] === '\n') { i += 2; continue; }
+      if (text[i + 1] === '\n') { i += 1; continue; }
+      const hex = text.slice(i + 1, i + 3);
+      if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
+        bytes.push(parseInt(hex, 16));
+        i += 2;
+        continue;
+      }
+      bytes.push(0x3d);
+      continue;
+    }
+    bytes.push(text.charCodeAt(i) & 0xff);
+  }
+  return Buffer.from(bytes);
+}
+
+// 按声明 charset 解码字节；声明编码出现替换字符或不受支持时回退自适应探测
+function decodeBufferWithCharset(buf, charset) {
+  const aliases = { 'gb2312': 'gbk', 'ascii': 'utf-8', 'us-ascii': 'utf-8', 'utf8': 'utf-8' };
+  const cs = aliases[String(charset || '').trim().toLowerCase()] || String(charset || '').trim().toLowerCase();
+  if (cs && typeof TextDecoder === 'function') {
+    try {
+      const text = new TextDecoder(cs, { fatal: false }).decode(buf);
+      if (text && !text.includes('�')) return text;
+    } catch { /* 未知 charset 标签 → 走自适应兜底 */ }
+  }
+  return decodeTextBuffer(buf).text;
+}
+
+// RFC 2047 编码词：=?UTF-8?B?…?= / =?GBK?Q?…?=（常见于中文主题与附件名）
+function decodeMimeWords(value) {
+  const collapsed = String(value || '').replace(/\?=\s+=\?/g, '?==?');
+  return collapsed.replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, (whole, charset, kind, data) => {
+    try {
+      const buf = kind.toLowerCase() === 'b'
+        ? Buffer.from(data, 'base64')
+        : decodeQuotedPrintable(Buffer.from(data.replace(/_/g, ' '), 'latin1'));
+      return decodeBufferWithCharset(buf, charset);
+    } catch { return whole; }
+  });
+}
+
+function sanitizeAttachmentFileName(name) {
+  const cleaned = String(name || '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+    .replace(/^[\s.]+|[\s.]+$/g, '')
+    .slice(0, 120);
+  return cleaned || 'attachment';
+}
+
+function decodeTextPart(entity) {
+  const contentType = mimeHeader(entity.headers, 'content-type');
+  const subtype = (contentType.split(';')[0].trim().split('/')[1] || 'plain').toLowerCase();
+  const charset = mimeParam(contentType, 'charset');
+  let text = decodeBufferWithCharset(decodePartPayload(entity), charset);
+  if (subtype === 'html') text = stripHtml(text);
+  return { subtype, text: text.replace(/\r\n/g, '\n').trim() };
+}
+
+// 叶子部件分流：文本进正文候选；带文件名 / 非文本 / 嵌套邮件 进附件
+function handleMimeLeaf(entity, textParts, attachments) {
+  const contentType = mimeHeader(entity.headers, 'content-type') || 'text/plain';
+  const fullType = contentType.split(';')[0].trim().toLowerCase();
+  const disposition = mimeHeader(entity.headers, 'content-disposition');
+  const filename = decodeMimeWords(mimeParam(disposition, 'filename') || mimeParam(contentType, 'name'));
+
+  if (fullType === 'message/rfc822') {
+    // 嵌套邮件整体存为 .eml，随后作为新邮件源递归进入切片流水线
+    const inner = parseMimeEntity(entity.body || Buffer.alloc(0));
+    const innerSubject = decodeMimeWords(mimeHeader(inner.headers, 'subject'));
+    attachments.push({
+      filename: `${sanitizeAttachmentFileName(innerSubject || 'nested-message')}.eml`,
+      contentType: 'message/rfc822',
+      data: Buffer.from(entity.body || Buffer.alloc(0))
+    });
+    return;
+  }
+
+  // 无文件名的内联 CID 图片（签名/企业 logo 等装饰图）不进附件，避免垃圾任务
+  const inlineDecorative = /inline/i.test(disposition) && !!mimeHeader(entity.headers, 'content-id') && !filename;
+  if ((fullType.startsWith('text/') && !filename) || inlineDecorative) {
+    textParts.push(decodeTextPart(entity));
+    return;
+  }
+
+  const payload = decodePartPayload(entity);
+  if (!payload.length) return;
+  attachments.push({
+    filename: sanitizeAttachmentFileName(filename || `attachment-${attachments.length + 1}.${mimeExtension(fullType)}`),
+    contentType: fullType,
+    data: payload
+  });
+}
+
+// 递归遍历部件树；multipart/alternative 内按 text/plain 优先取一份正文
+function collectMimeParts(entity, textParts, attachments) {
+  if (Array.isArray(entity.children)) {
+    const contentType = mimeHeader(entity.headers, 'content-type').toLowerCase();
+    if (contentType.startsWith('multipart/alternative')) {
+      const alternatives = [];
+      for (const child of entity.children) {
+        const childType = (mimeHeader(child.headers, 'content-type') || 'text/plain').toLowerCase();
+        if (Array.isArray(child.children) || childType.startsWith('multipart/')) {
+          collectMimeParts(child, textParts, attachments);
+        } else if (childType.startsWith('text/') && !mimeParam(mimeHeader(child.headers, 'content-disposition') || mimeHeader(child.headers, 'content-type'), 'filename')) {
+          alternatives.push(child);
+        } else {
+          handleMimeLeaf(child, textParts, attachments);
+        }
+      }
+      const chosen = alternatives.find((child) => (mimeHeader(child.headers, 'content-type') || '').toLowerCase().startsWith('text/plain')) || alternatives[0];
+      if (chosen) textParts.push(decodeTextPart(chosen));
+      return;
+    }
+    for (const child of entity.children) collectMimeParts(child, textParts, attachments);
+    return;
+  }
+  handleMimeLeaf(entity, textParts, attachments);
+}
+
+function pickEmailBody(textParts) {
+  const plain = textParts.filter((part) => part.subtype === 'plain').map((part) => part.text).filter(Boolean).join('\n\n').trim();
+  if (plain) return plain;
+  return textParts.filter((part) => part.subtype !== 'plain').map((part) => part.text).filter(Boolean).join('\n\n').trim();
+}
+
+// 解析整封 .eml：头部元数据 + 正文 + 附件二进制
+function parseEmailMessage(buffer) {
+  const raw = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || '');
+  try {
+    const root = parseMimeEntity(raw);
+    const textParts = [];
+    const attachments = [];
+    collectMimeParts(root, textParts, attachments);
+    return {
+      subject: decodeMimeWords(mimeHeader(root.headers, 'subject')),
+      from: decodeMimeWords(mimeHeader(root.headers, 'from')),
+      to: decodeMimeWords(mimeHeader(root.headers, 'to')),
+      cc: decodeMimeWords(mimeHeader(root.headers, 'cc')),
+      date: mimeHeader(root.headers, 'date'),
+      messageId: mimeHeader(root.headers, 'message-id'),
+      text: pickEmailBody(textParts),
+      attachments
+    };
+  } catch (error) {
+    // 畸形邮件兜底：退回纯文本旧路径，行为不差于 v2.8
+    const decoded = decodeTextBuffer(raw);
+    const simple = parseEmail(decoded.text);
+    return Object.assign({}, simple, { cc: '', messageId: '', attachments: [] });
+  }
+}
+
 function looksLikeGibberish(text) {
   const value = String(text || '');
   if (!value) return false;
@@ -3597,10 +4140,14 @@ function isUnexpectedScriptOrPrivate(ch) {
 }
 
 module.exports = {
+  decodeMimeWords,
+  decodeQuotedPrintable,
   decodeTextBuffer,
   detectDominantLanguage,
   extractTextFromBuffer,
   parseEmail,
+  parseEmailMessage,
+  sanitizeAttachmentFileName,
   stripHtml
 };
 
@@ -4447,6 +4994,9 @@ function createParsePackage(options) {
       : markdown ? [{ page: 1, text: markdown }] : [],
     images: Array.isArray(options.images) ? options.images : [],
     quality,
+    // v2.9.0: 透传解析元数据（邮件主题/发件人/附件清单等），供卡片链接与总结阶段使用。
+    //   只接受纯 JSON 对象（附件二进制不进这里，见 extractTextFromBuffer email 分支）。
+    metadata: options.metadata && typeof options.metadata === 'object' && !Array.isArray(options.metadata) ? options.metadata : {},
     schema_version: '1.1'
   };
 }

@@ -3630,6 +3630,34 @@ function readableTextResult(text, sourceType, decoded = {}) {
 function decodeTextBuffer(buffer) {
   const input = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || '');
   if (input.length === 0) return decodedCandidate('utf-8', '');
+  // v2.9.2: 增强二进制检测——常见二进制文件魔数优先拒收
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  // JPEG: FF D8 FF
+  // PDF: 25 50 44 46
+  // ZIP: 50 4B 03 04 或 50 4B 05 06 或 50 4B 07 08
+  // RAR: 52 61 72 21
+  if (input.length >= 4) {
+    // PNG检测：前8字节完整匹配
+    if (input.length >= 8 && input[0] === 0x89 && input[1] === 0x50 && input[2] === 0x4E && input[3] === 0x47) {
+      return decodedCandidate('binary-rejected', '');
+    }
+    // JPEG检测：FF D8 FF
+    if (input[0] === 0xFF && input[1] === 0xD8 && input[2] === 0xFF) {
+      return decodedCandidate('binary-rejected', '');
+    }
+    // PDF检测：25 50 44 46 (%PDF)
+    if (input[0] === 0x25 && input[1] === 0x50 && input[2] === 0x44 && input[3] === 0x46) {
+      return decodedCandidate('binary-rejected', '');
+    }
+    // ZIP检测：50 4B (PK)
+    if (input[0] === 0x50 && input[1] === 0x4B) {
+      return decodedCandidate('binary-rejected', '');
+    }
+    // RAR检测：52 61 72 21 (Rar!)
+    if (input[0] === 0x52 && input[1] === 0x61 && input[2] === 0x72 && input[3] === 0x21) {
+      return decodedCandidate('binary-rejected', '');
+    }
+  }
   // 文本缓冲区告警：含 NUL 字节的文件几乎可以肯定是二进制（PDF/ZIP/图片等），
   // 即便扩展名是 .md/.txt 也要拒收，避免二进制字节流被当文本送进 AI。
   const nulCount = countByte(input, 0x00);
@@ -3649,11 +3677,26 @@ function decodeTextBuffer(buffer) {
       || decodedCandidate('utf-16be-bom', swapUtf16Bytes(input.slice(2)).toString('utf16le'));
   }
 
+  // v2.9.2: 性能优化——先尝试 UTF-8 快速路径
+  // 对于纯 ASCII 或有效 UTF-8，直接返回不尝试其他编码
+  const utf8Text = input.toString('utf8');
+  const utf8Valid = !utf8Text.includes('\uFFFD') && utf8Text.length > 0;
+  let hasNonAscii = false;
+  for (let i = 0; i < utf8Text.length && i < 1000; i += 1) {
+    if (utf8Text.charCodeAt(i) > 127) { hasNonAscii = true; break; }
+  }
+  // UTF-8 快速路径：有效 UTF-8 + 含非ASCII → 直接返回
+  // v2.9.2: 不再检查ShiftJIS字节特征，因为有效UTF-8本身已经是强信号
+  if (utf8Valid && hasNonAscii) {
+    const score = readabilityScore(utf8Text);
+    if (score > 0.8) return decodedCandidate('utf-8', utf8Text);
+  }
+
   // v2.9.1: gb18030 提到 shift_jis/windows-31j 之前——评分平手时 GB 优先。
   //   真日文文档靠 looksLikeShiftJisBytes 的 +0.35 加分仍会胜出，不受影响；
   //   而 GBK 文档被 ShiftJIS 解成半角片假名是最常见的静默乱码（评分经常打平）。
   const candidates = [
-    decodedCandidate('utf-8', input.toString('utf8')),
+    decodedCandidate('utf-8', utf8Text),
     decodedCandidate('utf-16le', input.toString('utf16le')),
     decodeWithTextDecoder(input, 'utf-16be'),
     decodeWithTextDecoder(input, 'gb18030'),
@@ -3704,6 +3747,20 @@ const DECODE_MIN_CONFIDENCE = -0.15;
 function encodingHeuristicBonus(buffer, encoding, text) {
   const enc = String(encoding || '').toLowerCase();
   const looksSjis = looksLikeShiftJisBytes(buffer);
+
+  // v2.9.2: Shift_JIS 最高优先级——如果字节符合SJIS特征
+  if (looksSjis) {
+    // Shift_JIS / windows-31j 且包含日文字符（假名或汉字）
+    if (enc === 'shift_jis' || enc === 'windows-31j') {
+      if (/[぀-ヿ一-鿿]/.test(text)) return 0.65;  // 强于其他编码
+      return 0.45;  // 即使没有日文字符，字节特征也是强信号
+    }
+    // 其他编码尝试解码SJIS字节流，降低优先级
+    if (enc === 'windows-1252' || enc === 'latin1' || enc === 'gb18030') {
+      return -0.5;
+    }
+  }
+
   // v2.9.1: UTF-8 优先门。旧版仅在「有效 UTF-8 且含 CJK」时加分，导致
   //   越南语/俄语/法语等无 CJK 的合法 UTF-8 文档被 ShiftJIS/GB18030 候选
   //   的伪 CJK 解码反超（UTF-8 三字节序列与 SJIS/GBK 双字节区间高度重叠）。
@@ -3721,7 +3778,6 @@ function encodingHeuristicBonus(buffer, encoding, text) {
     if (enc === 'shift_jis' || enc === 'windows-31j' || enc === 'gb18030' || enc === 'big5' || enc === 'euc-kr') return -0.5;
   }
   if ((enc === 'utf-16le' || enc === 'utf-16be') && !looksLikeUtf16Bytes(buffer)) return -2;
-  if ((enc === 'shift_jis' || enc === 'windows-31j') && looksSjis && hasCjk(text)) return 0.35;
   if ((enc === 'gb18030' || enc === 'big5') && looksSjis) return -0.12;
   // v2.9.1: 韩文 EUC-KR——字节符合 KS X 1001 韩文字区特征且解码后出现
   //   韩文音节、无替换字符 → 强烈倾向 euc-kr；符合该字节特征的缓冲同时
@@ -3744,6 +3800,15 @@ function encodingHeuristicBonus(buffer, encoding, text) {
     const c1 = chars.filter((ch) => { const cp = ch.codePointAt(0); return cp >= 0x80 && cp <= 0x9f; }).length / tn;
     const dig = countMojibakeDigraphs(text) / tn;
     if (c1 > 0.01 || dig > 0.02) return -0.6;
+  }
+  // v2.9.2: 单字节 windows-1252 专有符号（0x80-0x9F 区）强倾向 cp1252
+  //   例如：0x80 = €，0x93/0x94 = ""，0x96 = –，0x97 = —
+  //   这些字节在 GB18030/ShiftJIS/EUC-KR 中都不构成有意义的单字符，只有 cp1252 能正确解码
+  if (enc === 'windows-1252' && !looksSjis) {
+    // 检查是否包含 cp1252 专有符号（€ "' 等 0x80-0x9F 区）
+    if (/[€\u201A\u0192\u201E\u2026\u2020\u2021\u02C6\u2030\u0160\u2039\u0152\u017D\u2018\u2019\u201C\u201D\u2022\u2013\u2014\u0161\u203A\u0153\u017E\u0178]/.test(text)) {
+      return 0.4;
+    }
   }
   if (enc === 'latin1') return -0.2;
   return 0;
@@ -3774,7 +3839,12 @@ function looksLikeEucKrBytes(buffer) {
   }
   // 阈值说明：韩文词间空格使 ASCII 占比通常 >15%，但密集短句可低至 5-7%；
   //   简体中文几乎无空格，otherPairs 条件（<35%）已排除 GB2312 一级汉字区误命中。
-  return hangulPairs >= 3 && otherPairs <= hangulPairs * 0.35 && ascii / len > 0.05;
+  //   v2.9.2: 短文本（仅1-2个韩文对）放宽阈值，避免极短韩文被GB18030反超。
+  if (hangulPairs === 0) return false;
+  // 超短文本：所有双字节对都是韩文音节区，无其他高位字节对 → 高置信度韩文
+  if (hangulPairs <= 2 && otherPairs === 0) return true;
+  // 常规文本：韩文音节区占优，其他字节对 <35%，ASCII 占比合理
+  return hangulPairs >= 2 && otherPairs <= hangulPairs * 0.35;
 }
 
 function highByteRatio(buffer) {
@@ -3851,17 +3921,49 @@ function countMojibakeDigraphs(text) {
 //   \u6CD5\u8BED\u6587\u6863\u91CC\u51E0\u5341\u4E2A \u00E9/\u00E0 \u5C31\u80FD\u628A\u5206\u6570\u6263\u7A7F\uFF08\u5B9E\u6D4B -5.7\uFF09\uFF0C\u5408\u6CD5\u6587\u6863\u88AB\u8BEF\u5224\u4E71\u7801\u4E22\u5F03\u3002
 //   \u65B0\u7248\u5168\u90E8\u6309\u300C\u6BD4\u4F8B\u300D\u6263\u5206\uFF0C\u4E71\u7801\u4FE1\u53F7\u6362\u6210\u771F\u6B63\u7684\u4E09\u4EF6\u5957\uFF1A\u66FF\u6362\u5B57\u7B26 / \u63A7\u5236\u5B57\u7B26\uFF08\u542B
 //   C1 \u533A 80-9F\uFF0CUTF-8 \u7EED\u5B57\u8282\u8BEF\u8BFB\u7684\u5178\u578B\u4EA7\u7269\uFF09/ \u4E71\u7801\u4E8C\u8054\u4F53\u3002
+// v2.9.2: 性能优化版——避免对大文本创建字符数组
 function readabilityScore(text) {
   const value = String(text || '');
   if (!value) return -100;
-  const chars = [...value];
-  const n = chars.length;
-  const replacement = chars.filter((ch) => ch === '\uFFFD').length / n;
-  const controls = chars.filter((ch) => /[\x00-\x08\x0B\x0C\x0E-\x1F\u0080-\u009F]/.test(ch)).length / n;
-  const mojibake = countMojibakeDigraphs(value) / n;
-  const unexpected = chars.filter(isUnexpectedScriptOrPrivate).length / n;
-  const readable = chars.filter(isExpectedReadableChar).length / n;
-  return readable - (replacement * 0.9) - (controls * 1.5) - (mojibake * 0.6) - (unexpected * 0.8);
+  const n = value.length;
+  if (n === 0) return -100;
+
+  // 性能优化：对大文本采样评估而非遍历全部
+  const maxScan = n > 5000 ? Math.min(5000, Math.floor(n * 0.1)) : n;
+  const step = n > maxScan ? Math.floor(n / maxScan) : 1;
+
+  let replacement = 0;
+  let controls = 0;
+  let unexpected = 0;
+  let readable = 0;
+  let scanned = 0;
+
+  for (let i = 0; i < n && scanned < maxScan; i += step) {
+    const ch = value[i];
+    const cp = ch.codePointAt(0);
+    scanned += 1;
+
+    if (ch === '\uFFFD') replacement += 1;
+    else if (cp >= 0x00 && cp <= 0x08 || cp >= 0x0B && cp <= 0x0C || cp >= 0x0E && cp <= 0x1F || cp >= 0x80 && cp <= 0x9F) {
+      controls += 1;
+    }
+    else if (cp >= 0xE000 && cp <= 0xF8FF || cp >= 0xF0000 && cp <= 0xFFFFD || cp >= 0x100000 && cp <= 0x10FFFD) {
+      unexpected += 1;
+    }
+    else {
+      // 简化的可读字符判断：大部分Unicode字符都是可读的
+      readable += 1;
+    }
+  }
+
+  const mojibake = countMojibakeDigraphs(value.slice(0, maxScan));
+  const scale = n / scanned;
+
+  return (readable * scale / n)
+    - ((replacement * scale / n) * 0.9)
+    - ((controls * scale / n) * 1.5)
+    - ((mojibake / n) * 0.6)
+    - ((unexpected * scale / n) * 0.8);
 }
 
 // v2.9.1: 补充韩/俄/阿/泰/印地语识别——sourceLanguage 会作为语言提示影响
@@ -4254,6 +4356,8 @@ function looksLikeGibberish(text) {
   const mojibake = countMojibakeDigraphs(value);
   const unexpected = chars.filter(isUnexpectedScriptOrPrivate).length;
   const readable = chars.filter(isExpectedReadableChar).length;
+  // v2.9.2: 放宽短文本阈值，替换字符密集（>10%）直接判为乱码
+  if (replacement > 0 && replacement / n > 0.1) return true;
   if (n < 80 && controls === 0 && replacement === 0 && unexpected === 0 && readable / n > 0.75) return false;
   return n > 30 && (
     replacement / n > 0.02

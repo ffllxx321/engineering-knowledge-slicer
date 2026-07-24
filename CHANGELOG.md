@@ -1,5 +1,34 @@
 # 工程知识切片 变更记录
 
+## v2.9.2 — 2026-07-24 诊断日志三处线上故障根因修复
+
+依据用户回传的 `diag.log`（2026-07-20 / 23 / 24 三次会话）定位并修复三个独立的真实故障。均为根因修复，不做症状回避。
+
+### 🧩 原子化「知识点归属」契约缺失（主故障，07-24 任务失败）
+- **现象**：`atomization.normalize` 连续多批 `rawAtoms=3/4/3` 却 `keptAtoms=0`、`droppedNoPointAttribution` 等于 rawAtoms，任务最终误报「AI 返回内容不是有效 JSON」。
+- **根因**：归一化靠每个原子的 `content.point_ids` 把原子归属到知识点，多知识点批次（默认每批 3 个）缺归属即整批丢弃；但**所有原子化提示词（基础模板 + 内联拼装）只要求批次级 `coverage.point_ids`，从不要求逐原子的 `content.point_ids`**——契约从未向 AI 声明，AI 自然不输出，于是每个原子都「无归属」被丢光。修复重试轮才提到 `content.point_ids`，但为时已晚且重试又返回了非法 JSON，错误信息被带偏。
+- **修复**：① 原子化内联提示词显式立约——「每个原子的 `content.point_ids` 必须是非空数组，取值只能来自本批知识点，一个原子只归属一个知识点」；② 基础提示词模板 `99-知识原子生成.md` 的强制规则与输出示例同步补上 `content.point_ids`；③ `normalizeAtomBatch` 容错——个别模型把归属写到原子顶层 `point_ids` 时也接受，降低丢弃率。归属正确后证据摘录才会取到对应知识点的证据，不做猜测式顺序分配（避免张冠李戴）。
+
+### 🔌 SSE 路径 `requestMiniMaxStream is not defined`（07-23 六连报错 + 卡死）
+- **现象**：`minimax.stream-fallback {"errorMessage":"requestMiniMaxStream is not defined"}` ×6，每条后跟一次 `ratelimit.backoff`，该文件总结阶段 5 分钟未出结果。
+- **根因**：`requestMiniMaxStream` 定义在 `ai-pipeline` 模块闭包内，却**既未列入该模块 `module.exports`、也未在 `main.js` 顶层 `require` 解构里导入**，插件类 SSE 接线处引用即抛 ReferenceError；该错误又被限流器当成 API 失败计入退避，级联放大卡顿。SSE 默认关闭故长期未暴露，用户一旦开启即触发。
+- **修复**：`ai-pipeline` 导出 `requestMiniMaxStream`，`main.js` 顶层解构补导入。
+
+### ✅ 上传确认「点确认后仍被拒、需确认两次」（07-20/23/24 每次重启后首文件）
+- **现象**：`upload.confirm {"confirmed":true}` 记录后 15–33ms 内 `processTask.failed: 未确认允许上传源文件到外部解析 API`，每个会话第一个文件都得确认两次才成功。
+- **根因**：`config.allowExternalUpload` 在 `getPdfExtractorConfig` 创建配置时即快照（彼时本会话尚未授权，为 false），而 `runEngine` 只读这个快照；确认弹窗虽然设置了会话授权标记，却**从未回写到该快照**——v2.8.1 自以为修好的注释其实没接通。
+- **修复**：`extractDocumentWithApis` 中用户弹窗确认后把 `config.allowExternalUpload = true` 回写，`runEngine` 即时放行。取消 / 未授权分支行为不变。
+
+### 🔀 合并并行编码优化（PR #1，来自 trae/agent）
+- 本版本同时并入另一路并行开发（PR #1）对解码层的增强，与本修复无冲突：`decodeTextBuffer` 增加 PNG/JPEG/PDF/ZIP/RAR 魔数优先拒收与 UTF-8 快速路径；`encodingHeuristicBonus` 增加 Shift_JIS 字节特征加分与 cp1252 专有符号（`€`/`""`/`–` 等 0x80-0x9F）加分；`looksLikeEucKrBytes` 放宽超短韩文阈值；`readabilityScore` 改为大文本采样评估；`looksLikeGibberish` 对替换字符密集（>10%）短文本直接判乱码。
+- 已验证：v2.9.1 既有的 GBK→ShiftJIS 误判防护（`looksLikeShiftJisBytes` 收紧）仍在，上述加分不会对 GBK 文档误触发；合并后 `smoke-encoding`（21 例）与 PR #1 自带 `test-encoding-comprehensive`（37 例）全绿。
+
+### 🧪 测试
+- 新增 `scripts/smoke-v292.js`（22 用例）：SSE 导出/导入双侧校验；`normalizeAtomBatch` 契约位置 / 顶层容错 / 无归属丢弃 / 单点自动归属 / 错误 point_id 五种归属情形 + 诊断打点；`atomizeSummary` 端到端验证 prompt 含 `content.point_ids` 且带归属返回全部入库；`extractDocumentWithApis` 真实闸门——确认后放行、取消拦截、未授权且无确认入口仍拦截（不回归放行）。
+- 全部 8 套烟雾测试通过（6/21/ratelimit/6/9/12/21/22）+ PR #1 的 37 例编码测试通过；`node --check` 通过；bundle 加载冒烟通过（插件类 + 全部原型方法）。
+
+---
+
 ## v2.9.1 — 2026-07-23 编码/乱码根因修复（解码侧修好，而非输出侧拦截）
 
 针对「知识卡片/总结文件出现乱码」问题的系统性修复。原则：**在解码与截断环节就把文本产出正确**，而不是检测到乱码后拒绝输出（那是回避问题）。

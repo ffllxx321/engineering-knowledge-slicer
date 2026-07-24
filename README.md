@@ -1,6 +1,6 @@
 # 工程知识切片（Engineering Knowledge Slicer）
 
-> 当前版本 **v2.9.1**（settingsVersion 17）· Obsidian Desktop 1.5.0+ · MIT
+> 当前版本 **v2.9.2**（settingsVersion 17）· Obsidian Desktop 1.5.0+ · MIT
 
 通过 **MinerU / PaddleOCR + MiniMax M3**，把工程资料（PDF、Word、PPT、图片、邮件等）批量转化为**中文、可追溯、固定目录归档**的 Obsidian 知识卡片。
 
@@ -39,6 +39,7 @@
 │   ├── smoke-diag-fixes.js  # 诊断日志相关修复的回归测试
 │   ├── smoke-email-mime.js  # v2.9 MIME 邮件解析 + 附件提取烟雾测试
 │   ├── smoke-encoding.js    # v2.9.1 编码根因修复回归（21 例）
+│   ├── smoke-v292.js        # v2.9.2 诊断日志三大故障回归（22 例）
 │   ├── paddleocr_extract.py # PaddleOCR CLI 包装（开发辅助，不参与运行）
 │   └── pdf_extract.py       # PDF 元数据提取（开发辅助，不参与运行）
 └── 组件包/
@@ -135,6 +136,7 @@ node scripts/smoke-json-repair.js    # JSON 修复
 node scripts/smoke-diag-fixes.js     # 诊断修复回归
 node scripts/smoke-email-mime.js     # MIME 邮件解析（v2.9）
 node scripts/smoke-encoding.js       # 编码根因修复回归（v2.9.1，21 例）
+node scripts/smoke-v292.js           # 诊断日志故障回归（v2.9.2，22 例）
 ```
 
 ## 诊断与排障

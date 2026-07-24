@@ -34,7 +34,8 @@ const { detectEcosystemPlugins } = require("src/core/ecosystem.js");
 const { cardOutputPath, resolveFixedRoute } = require("src/core/routing.js");
 const { migrateTaskLedgerV3 } = require("src/core/migration.js");
 const { createTaskRecord } = require("src/core/pipeline.js");
-const { requestMiniMaxJson } = require("src/core/ai-pipeline.js");
+// v2.9.2: requestMiniMaxStream 之前漏了导入，SSE 开启时 line ~906 引用直接抛 ReferenceError
+const { requestMiniMaxJson, requestMiniMaxStream } = require("src/core/ai-pipeline.js");
 const { runKnowledgeWorkflow } = require("src/core/workflow.js");
 const { buildCardRecord, cardFileName, renderKnowledgeCard, renderStructuredSummary } = require("src/core/markdown-renderer.js");
 const { groupReviewItems, applyBatchAction } = require("src/core/review-service.js");
@@ -4569,6 +4570,11 @@ async function extractDocumentWithApis(buffer, config = {}) {
         message: '用户取消上传源文件到外部解析器。'
       };
     }
+    // v2.9.2: 弹窗确认 = 用户对本次上传的明确授权。必须把它写回 config.allowExternalUpload，
+    //   因为该字段在 getPdfExtractorConfig 创建配置时就已经快照（彼时本会话尚未授权，值为 false），
+    //   而 runEngine 只读这个快照。不回写会导致"用户点确认后仍被『未确认允许上传』拒绝"，
+    //   每次重启后第一个文件都得确认两次才成功（见 2026-07-20/23/24 诊断日志）。
+    config.allowExternalUpload = true;
   }
 
   if (typeof config.run === 'function') {
@@ -6375,6 +6381,10 @@ async function atomizeSummaryBatch(options, summary, pointIds, batchIndex, batch
     '每个独立且有复用价值的知识点生成一个原子；禁止只描述”召开会议、进行了讨论、应当优化”等空泛内容。',
     '每个原子的 source 必须包含源文件双链、原文定位、逐字证据和父总结双链。',
     `coverage.point_ids 必须完整且只能为：${JSON.stringify(pointIds)}；complete 必须为 true。`,
+    // v2.9.2: 归一化靠 content.point_ids 把原子归属到知识点。此前所有 prompt 只要求 coverage.point_ids（批次级），
+    //   从不要求逐原子的 content.point_ids → 多知识点批次里每个原子都因"无归属"被丢弃（诊断日志
+    //   droppedNoPointAttribution 全等于 rawAtoms），最终误报"AI 返回内容不是有效 JSON"。这里显式立约。
+    `每个原子的 content.point_ids 必须是非空字符串数组，取值只能来自本批知识点 ${JSON.stringify(pointIds)}，表示该原子归属的知识点；一个原子只归属一个知识点，禁止留空、禁止使用本批之外的 point_id。`,
     `这是知识原子化第 ${batchIndex}/${batchTotal} 批；只处理本批知识点，不得重复其他批次。`,
     '标题和正文统一使用简体中文。只返回符合 knowledge-atoms.schema.json 的 JSON。',
     // v1.1.10: 显式列出必须的最外层结构。AI 返回不带 {atoms:[...], coverage:{...}, schema_version:”1.1”}
@@ -6415,7 +6425,10 @@ function normalizeAtomBatch(value, summary, pointIds) {
   let droppedDuplicate = 0;
   let droppedNoPoint = 0;
   for (const atom of value.atoms || []) {
-    const rawPointIds = Array.isArray(atom?.content?.point_ids) ? atom.content.point_ids : [];
+    // v2.9.2: 契约位置是 content.point_ids，但个别模型会把归属写在原子顶层 point_ids；两处都接受，降低丢弃率
+    const rawPointIds = Array.isArray(atom?.content?.point_ids)
+      ? atom.content.point_ids
+      : (Array.isArray(atom?.point_ids) ? atom.point_ids : []);
     const matched = rawPointIds.filter((pointId) => allowed.has(pointId));
     if (rawPointIds.length && !matched.length) { droppedMismatch += 1; continue; }
     const pointId = matched[0] || (pointIds.length === 1 ? pointIds[0] : '');
@@ -6940,10 +6953,12 @@ module.exports = {
   commonBreadcrumbPrefix,
   findProtectedSpans,
   findRoute,
+  normalizeAtomBatch,
   parseJsonPayload,
   profileMarkdown,
   repairJsonText,
   requestMiniMaxJson,
+  requestMiniMaxStream,
   requestWithContract,
   safeSlice,
   splitByHeadings,

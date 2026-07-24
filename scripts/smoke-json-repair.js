@@ -57,6 +57,11 @@ const cases = [
     name: '多个对象层级',
     input: '{"a": {"b": {"c": [1, 2',
     expect: { a: { b: { c: [1, 2] } } }
+  },
+  {
+    name: '外层对象截断且已有内部闭合对象',
+    input: '{"atoms":[{"atom_id":"a1","content":{"point_ids":["p1"]}}],"coverage":{"point_ids":["p1"]',
+    expect: { atoms: [{ atom_id: 'a1', content: { point_ids: ['p1'] } }], coverage: { point_ids: ['p1'] } }
   }
 ];
 

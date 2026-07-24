@@ -6058,8 +6058,10 @@ async function summarizeDocument(options) {
     overlapRatio: options.chunkOverlapRatio,
     coalesceTiny: options.coalesceTinyChunks
   });
-  const partials = [];
-  for (let index = 0; index < chunks.length; index += 1) {
+  const partials = new Array(chunks.length);
+  const concurrency = Math.max(1, Math.min(3, Number(options.summaryConcurrency) || 2));
+  let nextChunkIndex = 0;
+  async function summarizeChunk(index) {
     const chunk = chunks[index];
     // v2.7: 把标题层级面包屑（WeKnora ContextHeader）注入 prompt，让 AI 拿到章节语境
     const chunkContext = chunk.breadcrumb
@@ -6076,7 +6078,7 @@ async function summarizeDocument(options) {
       `coverage.chunk_ids 必须且只能包含 ["${chunk.chunk_id}"]，complete 必须为 true。`,
       '所有面向使用者的内容统一使用简体中文。只返回符合 structured-summary.schema.json 的 JSON。'
     ].filter(Boolean).join('\n\n');
-    partials.push(await requestWithContract({
+    partials[index] = await requestWithContract({
       prompt,
       stage: 'summary-map',
       schema: options.summarySchema,
@@ -6088,8 +6090,16 @@ async function summarizeDocument(options) {
       context: { chunk, chunkIndex: index + 1, chunkTotal: chunks.length },
       normalizeValue: (value) => normalizeSummaryMap(value, options, chunk),
       extraValidation: (value) => exactCoverage(value.coverage, 'chunk_ids', [chunk.chunk_id], '总结分块覆盖不完整')
-    }));
+    });
   }
+  async function summaryWorker() {
+    while (true) {
+      const index = nextChunkIndex++;
+      if (index >= chunks.length) return;
+      await summarizeChunk(index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, () => summaryWorker()));
 
   if (partials.length === 1) return partials[0];
   if (partials.length > Math.max(2, Number(options.reduceBatchSize) || 8)) {
@@ -6415,6 +6425,14 @@ async function atomizeSummaryBatch(options, summary, pointIds, batchIndex, batch
 
 function normalizeAtomBatch(value, summary, pointIds) {
   if (!value || typeof value !== 'object') return value;
+  // MiniMax 偶尔直接返回 atom 数组。包回契约对象，避免有内容却被当成 0 个原子。
+  if (Array.isArray(value)) {
+    value = {
+      atoms: value,
+      coverage: { point_ids: pointIds, complete: true },
+      schema_version: '1.1'
+    };
+  }
   const allowed = new Set(pointIds);
   const points = new Map((summary.key_points || []).map((point) => [point.point_id, point]));
   const evidence = new Map((summary.evidence || []).map((item) => [item.evidence_id, item]));
@@ -6424,16 +6442,39 @@ function normalizeAtomBatch(value, summary, pointIds) {
   let droppedMismatch = 0;
   let droppedDuplicate = 0;
   let droppedNoPoint = 0;
+  const unassigned = [];
   for (const atom of value.atoms || []) {
-    // v2.9.2: 契约位置是 content.point_ids，但个别模型会把归属写在原子顶层 point_ids；两处都接受，降低丢弃率
-    const rawPointIds = Array.isArray(atom?.content?.point_ids)
-      ? atom.content.point_ids
-      : (Array.isArray(atom?.point_ids) ? atom.point_ids : []);
+    const candidatePointIds = [
+      ...(Array.isArray(atom?.content?.point_ids) ? atom.content.point_ids : []),
+      atom?.content?.point_id,
+      ...(Array.isArray(atom?.point_ids) ? atom.point_ids : []),
+      atom?.point_id,
+      ...(Array.isArray(atom?.source?.point_ids) ? atom.source.point_ids : []),
+      atom?.source?.point_id
+    ].filter(Boolean);
+    const rawPointIds = [...new Set(candidatePointIds)];
     const matched = rawPointIds.filter((pointId) => allowed.has(pointId));
     if (rawPointIds.length && !matched.length) { droppedMismatch += 1; continue; }
-    const pointId = matched[0] || (pointIds.length === 1 ? pointIds[0] : '');
-    if (!pointId) { droppedNoPoint += 1; continue; }
+    const pointId = matched[0] || '';
+    if (!pointId) {
+      unassigned.push(atom);
+      continue;
+    }
     if (byPoint.has(pointId)) { droppedDuplicate += 1; continue; }
+    byPoint.set(pointId, atom);
+  }
+
+  // 批量输出最常见的失败形态是“原子数量正确、顺序正确，但漏写 point_ids”。
+  // 只对尚未归属的原子按剩余 point 顺序补齐；显式写错的原子不会进入这里。
+  const remainingPointIds = pointIds.filter((pointId) => !byPoint.has(pointId));
+  if (unassigned.length === remainingPointIds.length) {
+    unassigned.forEach((atom, index) => byPoint.set(remainingPointIds[index], atom));
+  } else if (pointIds.length === 1 && unassigned.length) {
+    byPoint.set(pointIds[0], unassigned[0]);
+  }
+  droppedNoPoint = Math.max(0, unassigned.length - remainingPointIds.length);
+
+  for (const [pointId, atom] of [...byPoint.entries()]) {
     const point = points.get(pointId);
     const evidenceItem = evidence.get(point?.evidence_ids?.[0]) || {};
     byPoint.set(pointId, Object.assign({}, atom, {
@@ -6873,6 +6914,14 @@ function parseJsonPayload(value) {
     try { return JSON.parse(sliced); } catch {}
     // 兜底：尝试补全未闭合的括号/引号
     const repaired = repairJsonText(sliced);
+    if (repaired) {
+      try { return JSON.parse(repaired); } catch {}
+    }
+  }
+  // 外层对象截断时，lastIndexOf('}') 可能只命中内部对象；此前 slice 会把
+  // 未闭合的 atoms/coverage 尾部直接丢掉。对从首个 { 到响应末尾的文本再修一次。
+  if (start >= 0) {
+    const repaired = repairJsonText(text.slice(start));
     if (repaired) {
       try { return JSON.parse(repaired); } catch {}
     }
@@ -7339,6 +7388,7 @@ async function runKnowledgeWorkflow(options) {
     maxChunkChars: options.maxChunkChars,
     chunkOverlapRatio: options.chunkOverlapRatio,
     coalesceTinyChunks: options.coalesceTinyChunks,
+    summaryConcurrency: options.atomizationConcurrency,
     maxRepairAttempts: 2,
     requestJson: options.requestJson,
     requestStream: options.requestStream,

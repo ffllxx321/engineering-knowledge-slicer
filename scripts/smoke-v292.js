@@ -75,12 +75,13 @@ console.log('#64 原子化 content.point_ids 归属');
   r = api.normalizeAtomBatch({ atoms: [atom('a', 'P1', 'top'), atom('b', 'P2', 'top'), atom('c', 'P3', 'top')] }, summary, pointIds);
   assert(r.atoms.length === 3, '顶层 point_ids 兼容：3/3 原子保留');
 
-  // 3) 无归属 + 多知识点批次 → 全部丢弃，并打 droppedNoPointAttribution 诊断
+  // 3) 无归属 + 多知识点批次，但原子数量与知识点数量一致 → 按批次顺序安全补齐
   diagCalls.length = 0;
   r = api.normalizeAtomBatch({ atoms: [atom('a', 'P1', 'none'), atom('b', 'P2', 'none'), atom('c', 'P3', 'none')] }, summary, pointIds);
   const normDiag = diagCalls.find((d) => d.scope === 'atomization.normalize');
-  assert(r.atoms.length === 0, '无归属多知识点批次：0/3 保留（现状行为，需靠 prompt 规避）');
-  assert(!!normDiag && normDiag.payload.droppedNoPointAttribution === 3, '诊断记录 droppedNoPointAttribution=3');
+  assert(r.atoms.length === 3, '无归属多知识点批次：数量一致时按顺序补齐 3/3');
+  assert(r.atoms[0].content.point_ids[0] === 'P1' && r.atoms[2].content.point_ids[0] === 'P3', '顺序补齐到对应知识点');
+  assert(!normDiag || normDiag.payload.droppedNoPointAttribution === 0, '顺序补齐后不再记为无归属丢弃');
 
   // 4) 单知识点批次无归属 → 自动归属（既有兜底不受影响）
   r = api.normalizeAtomBatch({ atoms: [atom('a', 'P1', 'none')] }, { key_points: [summary.key_points[0]], evidence: [summary.evidence[0]] }, ['P1']);

@@ -5,7 +5,8 @@
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs watch",
-    "build": "node esbuild.config.mjs production"
+    "build": "node --check main.js",
+    "test": "node scripts/smoke-split.js && node scripts/smoke-ratelimit.js && node scripts/smoke-json-repair.js && node scripts/smoke-v292.js"
   },
   "keywords": [
     "obsidian",

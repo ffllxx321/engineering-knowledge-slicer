@@ -26,3 +26,8 @@
 | `INTERNAL_UNEXPECTED` | internal | 否 | 导出脱敏诊断信息 |
 
 `AppError` 字段包含 code/category/severity/retryable/stage/taskId/runId/sourcePath/artifactPath/provider/requestId/message/technicalMessage/suggestedAction/details/timestamp/version。不得包含全文、完整 prompt、Authorization、cookie、JWT 或 API key。
+
+`AI_SCHEMA_OUTPUT_INVALID` 是 AI 契约层抛出的内部稳定标记，进入任务账本前会映射为
+`SCHEMA_OUTPUT_INVALID`。字段缺失/额外字段、精确 coverage 失败和最终契约校验失败均走该分类，
+不会再落入 `INTERNAL_UNEXPECTED`。性能 counters 中的 `summaryReduceRequests` 统计首次 reduce、
+JSON repair retry，以及 SSE 失败后的非流式降级调用。

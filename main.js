@@ -506,7 +506,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.cancelRequestedTaskId = '';
     this.taskControllers = new Map();
     this.componentCache = new Map();
-    this.operationCounters = { apiRequests: 0, promptCharacters: 0, bytesRead: 0, bytesWritten: 0, ledgerWrites: 0, artifactWrites: 0, uiFullRenders: 0, uiIncrementalRefreshes: 0 };
+    this.operationCounters = { apiRequests: 0, summaryReduceRequests: 0, promptCharacters: 0, bytesRead: 0, bytesWritten: 0, ledgerWrites: 0, artifactWrites: 0, uiFullRenders: 0, uiIncrementalRefreshes: 0 };
     this.sessionStats = { scanned: 0, processed: 0, written: 0, review: 0, failed: 0, skipped: 0, current: '', lastMessage: '等待开始处理' };
     this.registerView(VIEW_TYPE_SLICER, (leaf) => new SlicerDashboardView(leaf, this));
 
@@ -999,6 +999,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         requestJson: (prompt, context) => this.rateLimiter.run(
           () => {
             this.operationCounters.apiRequests += 1;
+            if (context?.stage === 'summary-reduce') this.operationCounters.summaryReduceRequests += 1;
             this.operationCounters.promptCharacters += String(prompt || '').length;
             return requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest, signal: taskController.signal });
           },
@@ -1008,6 +1009,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           ? (prompt, context, hooks) => this.rateLimiter.run(
             () => {
               this.operationCounters.apiRequests += 1;
+              if (context?.stage === 'summary-reduce') this.operationCounters.summaryReduceRequests += 1;
               this.operationCounters.promptCharacters += String(prompt || '').length;
               return requestMiniMaxStream({ settings: this.settings, prompt, context, signal: taskController.signal, onDelta: hooks && hooks.onDelta, onProgressText: hooks && hooks.onProgressText });
             },
@@ -6624,6 +6626,7 @@ async function summarizeDocument(options) {
     '请合并以下逐块总结，去重但不得删除任何有证据的独立事实、决策、要求、风险、参数、行动项或经验。',
     '保持每个 key_point 到 evidence_id 的可追溯关系。不得补充逐块总结中不存在的事实。',
     `coverage.chunk_ids 必须完整且只能为：${JSON.stringify(chunkIds)}；complete 必须为 true。`,
+    '输出根对象必须直接是 structured summary；若供应商要求使用 item 包裹，item 的值必须是该完整 summary，插件会移除这一层供应商包裹。',
     JSON.stringify(partials, null, 2),
     '所有面向使用者的内容统一使用简体中文。只返回符合 structured-summary.schema.json 的 JSON。'
   ]);
@@ -6638,12 +6641,41 @@ async function summarizeDocument(options) {
       maxRepairAttempts: options.maxRepairAttempts,
       onProgress: options.onProgress,
       context: { chunkIds, partialCount: partials.length },
+      normalizeValue: (value) => normalizeSummaryReduce(value, chunkIds),
       extraValidation: (value) => exactCoverage(value.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整')
     });
   } catch (error) {
     if (error?.code !== 'AI_OUTPUT_TRUNCATED') throw error;
     return mergeStructuredSummaries(partials, chunkIds, options.summarySchema);
   }
+}
+
+function normalizeSummaryReduce(value, requestedChunkIds) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  let result = value;
+  // Some OpenAI-compatible/provider adapters wrap a structured-output item once.
+  // Only unwrap an unambiguous envelope; never discard unknown sibling data.
+  const keys = Object.keys(result);
+  if (keys.length === 1 && keys[0] === 'item' && result.item && typeof result.item === 'object' && !Array.isArray(result.item)) {
+    result = result.item;
+  }
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+  const expected = [...new Set((requestedChunkIds || []).map(String))];
+  const coverage = result.coverage;
+  const actual = Array.isArray(coverage?.chunk_ids) ? coverage.chunk_ids.map(String) : [];
+  const actualSet = new Set(actual);
+  const expectedSet = new Set(expected);
+  const hasUnknown = actual.some((id) => !expectedSet.has(id));
+  const hasDuplicates = actualSet.size !== actual.length;
+  // Coverage is request bookkeeping, not model-authored content. It is safe to
+  // reconstruct only when it is absent or a duplicate-free subset of the exact
+  // validated map chunks supplied to this reduce call.
+  if (expected.length && !hasUnknown && !hasDuplicates && actual.every((id) => expectedSet.has(id))) {
+    result = Object.assign({}, result, {
+      coverage: { chunk_ids: expected, complete: true }
+    });
+  }
+  return result;
 }
 
 function normalizeSummaryMap(value, options, chunk) {
@@ -6762,6 +6794,7 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
         options.typePrompt,
         `这是第 ${round} 轮分层归并。合并以下总结，去重但不得删除任何有证据的独立事实、决策、要求、风险、参数、行动项或经验。`,
         `coverage.chunk_ids 必须完整且只能为：${JSON.stringify(chunkIds)}；complete 必须为 true。`,
+        '输出根对象必须直接是 structured summary；若供应商要求使用 item 包裹，item 的值必须是该完整 summary，插件会移除这一层供应商包裹。',
         JSON.stringify(group, null, 2),
         '只返回符合 structured-summary.schema.json 的 JSON。'
       ]);
@@ -6770,9 +6803,12 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
         stage: 'summary-reduce',
         schema: options.summarySchema,
         requestJson: options.requestJson,
+        requestStream: options.requestStream,
+        streaming: !!options.requestStream,
         maxRepairAttempts: options.maxRepairAttempts,
         onProgress: options.onProgress,
         context: { chunkIds, partialCount: group.length, reduceRound: round },
+        normalizeValue: (value) => normalizeSummaryReduce(value, chunkIds),
         extraValidation: (value) => exactCoverage(value.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整')
       }));
     }
@@ -7059,8 +7095,8 @@ async function requestWithContract(options) {
       }
       break;
     }
-    value = applySchemaConstants(options.schema, value);
     if (typeof options.normalizeValue === 'function') value = options.normalizeValue(value);
+    value = applySchemaConstants(options.schema, value);
     if (value && typeof value === 'object' && Array.isArray(value.evidence)) {
       var fbLocator = value.document_title || '文档内容';
       value.evidence = value.evidence.map(function(item, index) {
@@ -7079,7 +7115,11 @@ async function requestWithContract(options) {
       prompt = buildRepairPrompt(options.prompt, lastErrors, value);
     }
   }
-  throw new Error(lastErrors.join('；') || `${options.stage} 结果不符合契约`);
+  const error = new Error(lastErrors.join('；') || `${options.stage} 结果不符合契约`);
+  error.code = 'AI_SCHEMA_OUTPUT_INVALID';
+  error.stage = options.stage;
+  error.validationErrors = lastErrors.slice();
+  throw error;
 }
 
 function buildRepairPrompt(originalPrompt, errors, previousValue) {
@@ -7543,6 +7583,7 @@ module.exports = {
   findProtectedSpans,
   findRoute,
   normalizeAtomBatch,
+  normalizeSummaryReduce,
   parseJsonPayload,
   parseRetryAfterMs,
   profileMarkdown,
@@ -7891,7 +7932,7 @@ function classifyFailure(input = {}) {
   if (code.includes('TIMEOUT') || /timed? ?out|超时/i.test(message)) return result('TIMEOUT_STAGE_EXCEEDED', 'timeout', true, '处理阶段超时', '可以重试该阶段；若持续发生，请检查网络和超时设置。');
   if (status >= 500 || /ECONNRESET|ENOTFOUND|EAI_AGAIN|network/i.test(`${code} ${message}`)) return result('NETWORK_TRANSIENT_FAILURE', 'network', true, '外部服务暂时不可用', '插件可安全重试该阶段；若持续发生，请测试服务连接。');
   if (/JSON/i.test(code) || /JSON/.test(message)) return result('JSON_PARSE_INVALID_RESPONSE', 'json_parse', false, '服务返回格式无法解析', '重新生成该阶段；若持续发生，请检查提示词与供应商响应。');
-  if (/SCHEMA|必填字段|schema/i.test(`${code} ${message}`)) return result('SCHEMA_OUTPUT_INVALID', 'schema', false, '模型输出未通过结构校验', '重新生成该批次；若持续发生，请检查 Schema 与提示词版本。');
+  if (/SCHEMA|VALIDATION|必填字段|不符合契约|覆盖不完整|(?:^|[；\s])\$\.[\w.[\]-]+ (?:is required|is not allowed|must be)/i.test(`${code} ${message}`)) return result('SCHEMA_OUTPUT_INVALID', 'schema', false, '模型输出未通过结构校验', '重新生成该批次；若持续发生，请检查 Schema 与提示词版本。');
   if (/ENOENT|未找到源文件/.test(`${code} ${message}`)) return result('FILE_NOT_FOUND', 'file', false, '找不到源文件', '确认文件仍在输入目录且未被移动或删除。');
   return result(code && /^[A-Z][A-Z0-9_]+$/.test(code) ? code : 'INTERNAL_UNEXPECTED', 'internal', false, '工程知识切片处理失败', '查看技术详情；修复原因后仅重试失败阶段。');
 }

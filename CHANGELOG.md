@@ -2,6 +2,9 @@
 
 ## Unreleased — 系统可靠性、检查点与可观测性优化
 
+- 修复大型 PDF 的 `summary-reduce` 供应商输出被 `{item: ...}` 单层包裹时触发 `$.coverage is required / $.item is not allowed / 总结分块覆盖不完整`：仅解包无歧义的单键 `item`，不放宽 schema 或 `additionalProperties`。
+- reduce coverage 缺失或为所请求 map chunk 的无重复子集时，从本次已校验的 map 输入确定性重建完整 coverage；含未知 chunk 或重复 ID 时拒绝猜测，执行有界 schema-repair retry。
+- 契约失败携带稳定 `AI_SCHEMA_OUTPUT_INVALID` 内部错误并归类为 `SCHEMA_OUTPUT_INVALID`，新增 `summaryReduceRequests` 计数；reduce 重试/进程恢复继续复用逐 chunk 持久化 map artifact。
 - summary map chunk 独立持久化；reduce 失败重启只重试 reduce。
 - 文件写入采用读回校验、adapter rename transaction、rollback 和 Vault API fallback。
 - 新增 API/prompt/IO/UI counters、供应商独立 limiter、持久服务测试结果。

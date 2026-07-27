@@ -7945,7 +7945,10 @@ function buildCardRecord(options) {
   const atom = options.atom;
   const fingerprint = atomFingerprint(atom);
   const cardId = cardIdentity(options.library, options.sourceHash, fingerprint);
-  const businessDate = formatBusinessDate(options.now, { timeZone: options.businessTimeZone });
+  const suppliedNow = options.now === undefined || options.now === null || options.now === ''
+    ? (typeof options.clock === 'function' ? options.clock() : new Date())
+    : options.now;
+  const businessDate = formatBusinessDate(suppliedNow, { timeZone: options.businessTimeZone });
   const related = (atom.related_candidates || []).map((item) => typeof item === 'string' ? item : item.target).filter(Boolean);
   const relations = (atom.related_candidates || []).filter((item) => item && typeof item === 'object' && item.target).map((item) => ({
     target: item.target,

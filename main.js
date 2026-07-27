@@ -45,6 +45,12 @@ const {
   sanitizeSettingsForPersistence,
   toAppError
 } = require("src/core/reliability.js");
+const {
+  formatBusinessDate,
+  formatOperationalLocalDateTime,
+  preciseIsoInstant,
+  resolveRuntimeTimeZone
+} = require("src/core/time-policy.js");
 
 // v1.1.9 / v1.1.10: 把诊断共享状态挂到 globalThis，让 src/core/ai-pipeline.js 等独立闭包模块也能调用 diag()
 // 历史背景：v1.1.6 起在 src/core/ai-pipeline.js（line 3928-4609）里加了 3 个 diag() 调用
@@ -632,7 +638,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
   async recordServiceTest(service, result) {
     this.settings.serviceTestResults = Object.assign({}, this.settings.serviceTestResults || {}, {
-      [service]: Object.assign({ testedAt: new Date().toISOString() }, result)
+      [service]: Object.assign({ testedAt: preciseIsoInstant() }, result)
     });
     await this.saveSafeSettings();
   }
@@ -994,6 +1000,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         loadAtomBatch: (batch) => this.loadArtifact(current, `atom-batch-${batch.stableBatchId}`),
         saveAtomBatch: (batch, value) => this.persistArtifact(current, `atom-batch-${batch.stableBatchId}`, value),
         versions: runtimeVersions(this.settings),
+        businessTimeZone: resolveRuntimeTimeZone(this.settings.businessTimeZone),
         existingCards,
         existingFingerprints: existingCards.map((card) => card.atom_fingerprint).filter(Boolean),
         validateLabels: (atom) => validateAtomLabels(tagLibrary, atom),
@@ -1278,7 +1285,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           card.Status = '#status/needs_fix';
           card.Validation_Errors = validation.errors;
         }
-        const markdown = renderKnowledgeCard(card);
+        const markdown = renderKnowledgeCard(card, { timeZone: this.settings.businessTimeZone });
         const question = this.isQuestionableCard(card, validation);
         if (question) {
           const draftPath = `${this.settings.draftPath}/${safeCardFileName(card.Title, current.sourceHash)}`;
@@ -1531,7 +1538,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const path = normalizeVaultPath(`${route.output_folder}/${cardFileName(card)}`);
     const existing = this.app.vault.getAbstractFileByPath(path);
     const previous = existing instanceof TFile ? await this.app.vault.read(existing) : null;
-    let markdown = renderKnowledgeCard(card);
+    let markdown = renderKnowledgeCard(card, { timeZone: this.settings.businessTimeZone });
     // v2.9.0: 邮件 ↔ 附件双向链接正文节（frontmatter 结构保持不变）。
     //   附件卡 → 来源邮件；邮件卡 → 关联附件清单。附件文件→卡片方向由
     //   Obsidian 反向链接面板天然提供（二进制文件无法内嵌链接）。
@@ -3269,11 +3276,11 @@ function stat(parent, label, value, onClick) {
   if (onClick) el.addEventListener('click', onClick);
 }
 
-function formatLocalTime(iso) {
-  if (!iso) return '';
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return '';
-  return date.toLocaleString('zh-CN', { hour12: false });
+function formatLocalTime(value) {
+  return formatOperationalLocalDateTime(value, {
+    locale: 'zh-CN',
+    timeZone: resolveRuntimeTimeZone()
+  });
 }
 
 function formatLastUpdate(iso) {
@@ -3580,7 +3587,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 17,
+  settingsVersion: 18,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -3635,6 +3642,8 @@ const DEFAULT_SETTINGS = {
   useEnvKeys: true,
   staleProcessingMinutes: 20,
   targetLanguage: 'zh-CN',
+  // 空值表示跟随 Obsidian / 操作系统运行时本地时区；可配置 IANA 时区以稳定跨设备日期语义。
+  businessTimeZone: '',
   maxExcerptLength: 500,
   pipelineVersion: '1.1.1',
   promptBundleVersion: '1.1',
@@ -3662,7 +3671,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 17;
+  migrated.settingsVersion = 18;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -3726,6 +3735,7 @@ function migrateSettings(stored = {}) {
   if (migrated.useStreamingAi === undefined) migrated.useStreamingAi = DEFAULT_SETTINGS.useStreamingAi;
   if (!Number(migrated.rateLimitBackoffMaxMs)) migrated.rateLimitBackoffMaxMs = DEFAULT_SETTINGS.rateLimitBackoffMaxMs;
   if (!Number(migrated.rateLimitWindowSize)) migrated.rateLimitWindowSize = DEFAULT_SETTINGS.rateLimitWindowSize;
+  migrated.businessTimeZone = String(migrated.businessTimeZone || '');
   return migrated;
 }
 
@@ -5937,12 +5947,78 @@ module.exports = {
 
 },
 /**
+ * @module src/core/time-policy
+ * Central timestamp semantics: precise internal instants, stable local business
+ * dates, and localized operational display. Legacy ISO strings are accepted.
+ */
+"src/core/time-policy.js": function(require, module, exports) {
+const CALENDAR_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+function resolveRuntimeTimeZone(configuredTimeZone = '') {
+  const candidate = String(configuredTimeZone || '').trim();
+  if (candidate) {
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: candidate }).format(new Date(0));
+      return candidate;
+    } catch (_) { /* invalid configuration falls back to runtime local time */ }
+  }
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (_) { return 'UTC'; }
+}
+
+function preciseIsoInstant(value) {
+  const date = value === undefined || value === null || value === '' ? new Date() : new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toISOString();
+}
+
+function formatBusinessDate(value, options = {}) {
+  if (value === undefined || value === null || value === '') return '';
+  const text = String(value).trim();
+  if (CALENDAR_DATE.test(text)) return text;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: resolveRuntimeTimeZone(options.timeZone),
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  });
+  const parts = Object.fromEntries(formatter.formatToParts(date).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function formatOperationalLocalDateTime(value, options = {}) {
+  if (value === undefined || value === null || value === '') return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat(options.locale || 'zh-CN', {
+    timeZone: resolveRuntimeTimeZone(options.timeZone),
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).format(date);
+}
+
+module.exports = {
+  formatBusinessDate,
+  formatOperationalLocalDateTime,
+  preciseIsoInstant,
+  resolveRuntimeTimeZone
+};
+
+},
+/**
  * @module src/core/pipeline
  * 单文件任务流水线的骨架：创建任务记录、驱动 AI 流水线、产出卡片
  * @exports createTaskRecord
  */
 "src/core/pipeline.js": function(require, module, exports) {
 const { runIdentity, sourceIdentity } = require("src/core/identity.js");
+const { preciseIsoInstant } = require("src/core/time-policy.js");
 
 // v1.5 (M-02): 删除 TRANSITIONS / transitionTask / acquireLease / releaseLease /
 //              retryFailedTask / runPipelineTask / artifact / requiredHandler /
@@ -5958,7 +6034,7 @@ function createTaskRecord(options) {
     promptBundleVersion: versions.promptBundleVersion || '1.1',
     schemaVersion: versions.schemaVersion || '1.1'
   });
-  const now = typeof options.now === 'string' ? options.now : (options.now || new Date()).toISOString();
+  const now = preciseIsoInstant(options.now);
   return {
     task_id: sourceId,
     run_id: runId,
@@ -7863,12 +7939,13 @@ module.exports = { WEIGHTS, calculateConfidence, extractedFacts };
  */
 "src/core/markdown-renderer.js": function(require, module, exports) {
 const { atomFingerprint, cardIdentity } = require("src/core/identity.js");
+const { formatBusinessDate } = require("src/core/time-policy.js");
 
 function buildCardRecord(options) {
   const atom = options.atom;
   const fingerprint = atomFingerprint(atom);
   const cardId = cardIdentity(options.library, options.sourceHash, fingerprint);
-  const now = typeof options.now === 'string' ? options.now : (options.now || new Date()).toISOString();
+  const businessDate = formatBusinessDate(options.now, { timeZone: options.businessTimeZone });
   const related = (atom.related_candidates || []).map((item) => typeof item === 'string' ? item : item.target).filter(Boolean);
   const relations = (atom.related_candidates || []).filter((item) => item && typeof item === 'object' && item.target).map((item) => ({
     target: item.target,
@@ -7902,8 +7979,8 @@ function buildCardRecord(options) {
     schema_version: options.versions.schemaVersion,
     pipeline_version: options.versions.pipelineVersion,
     prompt_bundle_version: options.versions.promptBundleVersion,
-    created: now,
-    updated: now,
+    created: businessDate,
+    updated: businessDate,
     content: atom.content || {}
   };
   for (const key of ['Info_Type', 'Event_Type', 'Category', 'TagL1', 'TagL2', 'project', 'client', 'stage']) {
@@ -7913,7 +7990,13 @@ function buildCardRecord(options) {
   return card;
 }
 
-function renderKnowledgeCard(card) {
+function renderKnowledgeCard(card, options = {}) {
+  // Lazy compatibility: legacy ISO frontmatter remains readable in storage and is
+  // normalized only in rendered business fields; no bulk/destructive rewrite occurs.
+  const renderedCard = Object.assign({}, card, {
+    created: formatBusinessDate(card.created, options),
+    updated: formatBusinessDate(card.updated, options)
+  });
   const frontmatterOrder = [
     'title', 'card_id', 'atom_fingerprint', 'card_kind', 'Info_Type', 'Event_Type', 'library', 'folder_type',
     'output_folder', 'project', 'client', 'stage', 'status', 'Category', 'TagL1', 'TagL2', 'created', 'updated',
@@ -7922,8 +8005,8 @@ function renderKnowledgeCard(card) {
   ];
   const lines = ['---'];
   for (const key of frontmatterOrder) {
-    if (!hasValue(card[key]) && !['related', 'aliases', 'tags'].includes(key)) continue;
-    lines.push(`${key}: ${yamlValue(card[key])}`);
+    if (!hasValue(renderedCard[key]) && !['related', 'aliases', 'tags'].includes(key)) continue;
+    lines.push(`${key}: ${yamlValue(renderedCard[key])}`);
   }
   lines.push('---', '', `# ${card.title}`, '');
 
@@ -8469,7 +8552,8 @@ async function runKnowledgeWorkflow(options) {
       sourceHash: options.sourceHash,
       confidence,
       versions: options.versions,
-      now: options.now
+      now: options.now,
+      businessTimeZone: options.businessTimeZone
     });
     card.validation_report = validationReport;
     if (confidence.decision === 'auto_ingest' && !quantityAnomaly) {

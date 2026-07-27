@@ -46,8 +46,16 @@
         "A": { "type": "number", "minimum": 0, "maximum": 1 }
       }
     },
-    "created": { "type": "string" },
-    "updated": { "type": "string" },
+    "created": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}(?:T.*)?$",
+      "description": "New business records use YYYY-MM-DD; legacy ISO date-times remain readable."
+    },
+    "updated": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}(?:T.*)?$",
+      "description": "New business records use YYYY-MM-DD; legacy ISO date-times remain readable."
+    },
     "content": { "type": "object" },
     "schema_version": { "const": "1.1" },
     "pipeline_version": { "type": "string" },

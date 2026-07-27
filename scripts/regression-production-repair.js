@@ -126,7 +126,8 @@ function uiProductionSemantics() {
   assert.strictEqual((source.match(/eks-primary-button/g) || []).length, 1, 'dashboard defines one primary action slot');
   for (const token of ["role: 'tablist'", "role', 'tab'", "role: 'tabpanel'", "'aria-selected'", 'handleTabKey']) assert(source.includes(token), `progressive disclosure semantics: ${token}`);
   assert(source.includes(".filter((task) => task.status === 'failed')"), 'error center excludes old errors on running tasks');
-  assert(source.includes("if (!iso) return ''") && source.includes('safeDisplayText'), 'undefined values are suppressed');
+  assert(source.includes("value === undefined || value === null || value === ''")
+    && source.includes('safeDisplayText'), 'undefined values are suppressed');
   assert(css.includes('@media (max-width: 420px)') && css.includes('overflow-x: hidden') && css.includes('min-width: 0'), 'narrow layout prevents horizontal overflow');
   assert(css.includes(':focus-visible') && source.includes("'aria-live': 'polite'"), 'focus and live-region support remain present');
 }

@@ -149,6 +149,7 @@ node scripts/smoke-v292.js           # 诊断日志故障回归（v2.9.2，22 �
 ## 诊断与排障
 
 - 诊断日志默认写到 vault 之外的 `~/.eks/logs/diag.log`（无法创建时回退到 `.obsidian/plugins/engineering-knowledge-slicer/diag.log`），覆盖切片画像（`splitter.profile`）、切片校验（`splitter.validate`）、AI 请求/限流、密钥指纹等全链路节点，统一脱敏
+- 时间语义：卡片与用户可见持久记录使用本地日历日期 `YYYY-MM-DD`；任务恢复、产物、回滚、服务测试与诊断日志保留内部精确 ISO instant。旧 ISO 卡片按运行时/配置时区惰性显示，不批量改写。详见 [时间戳策略](docs/timestamp-policy.md)。
 - 切片行为异常时先看 `splitter.profile` 确认走了哪条策略（heading / heuristic / legacy）
 - 设置面板「诊断日志」开关可控制采集
 

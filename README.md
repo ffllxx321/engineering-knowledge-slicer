@@ -17,6 +17,9 @@
 - **密钥外部化**：API 密钥读取自 `~/.eks-secrets.json`，避免 OneDrive/iCloud 同步泄露
 - **诊断日志**：全链路脱敏 diag 日志，默认写到 `~/.eks/logs/diag.log`
 - **安全检查点与结构化错误**：阶段产物以 source/pipeline/prompt/schema 指纹校验后复用；错误提供稳定代码、可重试性和建议操作，日志递归脱敏 Header、JWT 和敏感 URL 参数
+- **可取消的外部工作**：取消会中止 MiniMax 排队/JSON/SSE 请求以及 MinerU/PaddleOCR 上传、轮询等待和下载，不再等当前远程阶段自然超时
+- **任务与错误中心**：状态卡可直接筛选，任务支持文件搜索、状态筛选、阶段时间线和折叠详情；错误按稳定代码分组并显示位置与建议操作
+- **增强切片溯源**：在保留旧 `chunk_id` 的同时提供稳定 chunk ID、内容指纹、标题路径、页码范围、token 估算和 overlap 元数据
 - **会话级失败缓存与启动续传（v2.9）**：失败文件在审核工作台显示原因（可重试/移除），重启后自动清空；启动时检测上次中断的任务，可「继续」（断点续传）或「放弃」
 - **多语言编码健壮性（v2.9.1）**：自适应字符集探测覆盖 UTF-8 / GBK / EUC-KR（韩文）/ ShiftJIS / Big5 / windows-1252 / 无 BOM UTF-16；ZIP 文件名识别 EFS 标志与 GBK 回退；所有定长截断做代理对安全校正（emoji / 生僻汉字不切坏）——解码侧把文本产出正确，而非检出乱码后拒绝输出
 
@@ -156,6 +159,7 @@ node scripts/smoke-v292.js           # 诊断日志故障回归（v2.9.2，22 �
 - SSE 流式输出为 POC 状态，MiniMax 接口行为变化时可能回退为整包接收
 - 切分结果自 v2.7 起与旧版不再逐字节一致（按标题边界 + 合并 + 重叠重排），artifact 缓存在任务重跑时自动覆盖
 - 当前仓库尚未建立正式 TypeScript typecheck；生产实现仍是自包含 JavaScript bundle。详见 `docs/optimization-results.md`
+- 成功的 map chunk 尚未独立持久化；阶段级 summary checkpoint 可以恢复，但 reduce 失败仍可能重复 map
 
 ## 优化与诊断文档
 
@@ -164,6 +168,7 @@ node scripts/smoke-v292.js           # 诊断日志故障回归（v2.9.2，22 �
 - [知识切片差距](docs/knowledge-slicing-gap-analysis.md)
 - [错误代码](docs/error-code-reference.md)
 - [优化结果与回滚](docs/optimization-results.md)
+- [Phase 0–5 与完成标准追踪矩阵](docs/requirements-traceability.md)
 
 ## 变更记录
 

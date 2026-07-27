@@ -3,7 +3,7 @@
 ## 仓库已证实具备
 
 - 标题/段落/受保护表格、代码和公式边界切片，面包屑与 overlap。
-- chunk_id、来源 hash、结构化 map/reduce、覆盖校验和失败显式处理。
+- 向后兼容 `chunk_id`，并新增 `stableChunkId`、`contentFingerprint`、`pageStart/pageEnd`、`headingPath`、`tokenEstimate`、overlap 元数据；结构化 map/reduce、覆盖校验和失败显式处理。
 - 稳定 source identity、run identity、card_id、atom fingerprint；批内和历史精确去重。
 - 来源链接、证据、父总结、五维置信度与硬门槛。
 - 可选 typed relations：`supports/contradicts/supersedes/depends_on/implements/related`。
@@ -15,8 +15,8 @@ README 对 WeKnora 的描述来自仓库已有记录；本次未联网重新验�
 
 | 不足 | 证据 | 检索/复用影响 | 最小改进 | 中期方向 |
 |---|---|---|---|---|
-| chunk 页码范围不总是完整 | splitter 以 Markdown offset/heading 为主 | PDF 定位不够精确 | parse package 有页信息时透传 pageStart/pageEnd | 页级局部 OCR 与定位 |
-| chunk fingerprint 未持久化为独立索引 | 阶段 artifact 为整体 | reduce 失败可能重跑成功 map | content fingerprint + chunk sidecar | chunk 级 cache/失败重试 |
+| chunk 页码范围依赖解析器边界 | splitter 已生成 pageStart/pageEnd，当前以 form-feed 映射 | 无页分隔 Markdown 只能定位第 1 页 | 解析 adapter 保留页分隔 | 页级局部 OCR 与定位 |
+| chunk fingerprint 未持久化为独立索引 | chunk 已有 contentFingerprint，阶段 artifact 仍为整体 | reduce 失败可能重跑成功 map | chunk sidecar | chunk 级 cache/失败重试 |
 | 近重复仅精确 fingerprint | `Set(atom_fingerprint)` | 改写后的同义卡可能重复 | 轻量 SimHash/MinHash sidecar | 可选 embedding 混合检索 |
 | 实体缺少统一别名表 | summary 有 entities，未形成 registry | 客户/供应商别名聚合弱 | 可选 entity sidecar | 人工反馈驱动规范化 |
 | 关系未形成反向索引 | 卡片可带 typed relation | 图遍历和影响分析成本高 | Markdown 兼容 JSON sidecar | 图谱导出接口，非图数据库 |

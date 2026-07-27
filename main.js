@@ -289,11 +289,12 @@ function loadSecretsFile() {
 //         - 失败时指数退避：连续失败次数 × intervalMs 上限 backoffMs
 //         - run() 接受 fn，自动 acquire/release + onError 触发 backoff
 class RateLimiter {
-  constructor({ intervalMs = 1000, maxConcurrent = 2, backoffMaxMs = 30_000, windowSize = 10 } = {}) {
+  constructor({ intervalMs = 1000, maxConcurrent = 2, backoffMaxMs = 30_000, windowSize = 10, queueTimeoutMs = 300_000 } = {}) {
     this.intervalMs = intervalMs;
     this.maxConcurrent = maxConcurrent;
     this.backoffMaxMs = backoffMaxMs;
     this.windowSize = windowSize;
+    this.queueTimeoutMs = queueTimeoutMs;
     this.timestamps = []; // 滑动窗口内最近 N 次请求的 timestamp
     this.failures = 0;
     this.waiters = []; // FIFO 等待队列，每项是 { resolve, startedAt }
@@ -316,8 +317,9 @@ class RateLimiter {
     // waiter 自己的定时器会在窗口腾出额度后放行并从队列移除。
   }
 
-  acquire() {
-    return new Promise((resolve) => {
+  acquire(signal) {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(abortError());
       const now = Date.now();
       this._cleanupExpired(now);
       const active = this._activeInWindow(now);
@@ -330,7 +332,20 @@ class RateLimiter {
       // 排队：等下一个"窗口滑过"或最早的请求出窗口
       const earliest = this.timestamps[0] || now;
       const waitMs = Math.max(100, (earliest + this.intervalMs) - now);
-      const waiter = { resolve, startedAt: now, done: false };
+      const waiter = { resolve, reject, startedAt: now, done: false };
+      const cleanup = () => {
+        if (waiter.timer) clearTimeout(waiter.timer);
+        if (waiter.timeoutTimer) clearTimeout(waiter.timeoutTimer);
+        if (signal) signal.removeEventListener('abort', onAbort);
+        const index = this.waiters.indexOf(waiter);
+        if (index >= 0) this.waiters.splice(index, 1);
+      };
+      const onAbort = () => {
+        if (waiter.done) return;
+        waiter.done = true;
+        cleanup();
+        reject(abortError());
+      };
       const tryFire = () => {
         if (waiter.done) return; // 已被 _scheduleNextWaiter 处理
         const t = Date.now();
@@ -338,8 +353,7 @@ class RateLimiter {
         if (this._activeInWindow(t) < this.maxConcurrent) {
           this.timestamps.push(t);
           waiter.done = true;
-          const waiterIndex = this.waiters.indexOf(waiter);
-          if (waiterIndex >= 0) this.waiters.splice(waiterIndex, 1);
+          cleanup();
           resolve();
           return;
         }
@@ -349,6 +363,17 @@ class RateLimiter {
         waiter.timer = setTimeout(tryFire, waitMs2);
       };
       waiter.timer = setTimeout(tryFire, waitMs);
+      if (this.queueTimeoutMs > 0) {
+        waiter.timeoutTimer = setTimeout(() => {
+          if (waiter.done) return;
+          waiter.done = true;
+          cleanup();
+          const error = new Error('请求在限流队列中等待超时');
+          error.code = 'RATE_LIMIT_QUEUE_TIMEOUT';
+          reject(error);
+        }, this.queueTimeoutMs);
+      }
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
       this.waiters.push(waiter);
     });
   }
@@ -370,13 +395,15 @@ class RateLimiter {
     return Math.min(this.backoffMaxMs, this.intervalMs * Math.pow(2, Math.min(this.failures - 1, 10)));
   }
 
-  async run(fn) {
+  async run(fn, options = {}) {
+    const signal = options.signal;
+    if (signal?.aborted) throw abortError();
     const backoff = this.backoffMs();
     if (backoff > 0) {
       try { diag('ratelimit.backoff', { failures: this.failures, backoffMs: backoff }); } catch (_) {}
-      await new Promise((r) => setTimeout(r, backoff));
+      await sleepWithSignal(backoff, signal);
     }
-    await this.acquire();
+    await this.acquire(signal);
     try {
       const result = await fn();
       this.recordSuccess();
@@ -388,6 +415,29 @@ class RateLimiter {
       this.release();
     }
   }
+}
+
+function abortError() {
+  const error = new Error('任务已取消');
+  error.name = 'AbortError';
+  error.code = 'TASK_CANCELLED';
+  return error;
+}
+
+function sleepWithSignal(ms, signal) {
+  if (!ms) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError());
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 const VIEW_TYPE_SLICER = 'engineering-knowledge-slicer-dashboard';
@@ -447,6 +497,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.autoProcessing = false;
     this.pauseRequested = false;
     this.cancelRequestedTaskId = '';
+    this.taskControllers = new Map();
+    this.componentCache = new Map();
     this.sessionStats = { scanned: 0, processed: 0, written: 0, review: 0, failed: 0, skipped: 0, current: '', lastMessage: '等待开始处理' };
     this.registerView(VIEW_TYPE_SLICER, (leaf) => new SlicerDashboardView(leaf, this));
 
@@ -509,6 +561,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   onunload() {
+    for (const controller of this.taskControllers?.values() || []) controller.abort();
+    this.taskControllers?.clear();
     // v1.1.7: 卸载前最后 flush 一次，确保所有诊断日志落盘
     try { forceFlushDiag(); } catch (_) {}
     // v1.6 (M-04): 卸载前 flush pending tasks，避免防抖窗口内的写丢失
@@ -792,8 +846,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
   cancelCurrentTask(taskId) {
     this.cancelRequestedTaskId = taskId;
-    this.sessionStats.lastMessage = '将在当前 API 阶段完成后取消当前任务';
-    new Notice('已请求取消：当前 API 请求完成后停止该任务。');
+    this.taskControllers?.get(taskId)?.abort();
+    this.sessionStats.lastMessage = '正在取消当前任务和等待中的外部请求';
+    new Notice('已请求取消：排队、轮询和当前 AI 请求将立即停止。');
     this.refreshViews();
   }
 
@@ -838,6 +893,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const tasks = await this.loadTasks();
     const current = tasks.find((item) => item.task_id === task.task_id) || task;
     const startedAt = Date.now();
+    const taskController = new AbortController();
+    this.taskControllers.set(current.task_id, taskController);
     try {
       // v1.1.2: 旧任务 / 第三方写入可能留下 source_path 为空的情况，统一兜底成空字符串
       // 防止后续 readBinary / Notice 拼接时出现 'undefined'/'null' 字面。
@@ -868,6 +925,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         const extracted = await extractTextFromBuffer(current.source_path, buffer, {
           pdfExtractor: await this.getPdfExtractorConfig(current)
         });
+        if (taskController.signal.aborted) throw abortError();
         if (extracted.status !== 'ok' || !extracted.parsePackage) throw new Error(extracted.message || '文档解析 API 未返回可用 Markdown');
         parsePackage = extracted.parsePackage;
         // v2.9.0: 邮件附件落盘 + 入队切片。只在首次解析执行；
@@ -916,9 +974,16 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         existingCards,
         existingFingerprints: existingCards.map((card) => card.atom_fingerprint).filter(Boolean),
         validateLabels: (atom) => validateAtomLabels(tagLibrary, atom),
-        requestJson: (prompt, context) => this.rateLimiter.run(() => requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest })),
+        signal: taskController.signal,
+        requestJson: (prompt, context) => this.rateLimiter.run(
+          () => requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest, signal: taskController.signal }),
+          { signal: taskController.signal }
+        ),
         requestStream: this.settings.useStreamingAi
-          ? (prompt, context, hooks) => this.rateLimiter.run(() => requestMiniMaxStream({ settings: this.settings, prompt, context, onDelta: hooks && hooks.onDelta, onProgressText: hooks && hooks.onProgressText }))
+          ? (prompt, context, hooks) => this.rateLimiter.run(
+            () => requestMiniMaxStream({ settings: this.settings, prompt, context, signal: taskController.signal, onDelta: hooks && hooks.onDelta, onProgressText: hooks && hooks.onProgressText }),
+            { signal: taskController.signal }
+          )
           : null,
 
         onProgress: async (progress) => {
@@ -1069,6 +1134,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       });
       new Notice(`${appError.message} · ${appError.suggestedAction}`);
     } finally {
+      this.taskControllers.delete(current.task_id);
       await this.refreshViews();
     }
   }
@@ -1207,7 +1273,16 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const path = normalizeVaultPath(`${this.settings.componentPackPath}/${relativePath}`);
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) throw new Error(`组件包文件不存在：${path}`);
-    return this.app.vault.read(file);
+    const fingerprint = `${file.stat?.mtime || 0}:${file.stat?.size || 0}`;
+    const cached = this.componentCache.get(path);
+    if (cached?.fingerprint === fingerprint) {
+      diag('component.cacheHit', { path });
+      return cached.text;
+    }
+    const text = await this.app.vault.read(file);
+    this.componentCache.set(path, { fingerprint, text });
+    diag('component.cacheMiss', { path });
+    return text;
   }
 
   async loadComponentJson(relativePath) {
@@ -1789,6 +1864,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       confirmUploads: this.settings.confirmUploads !== false,
       timeoutMs: Number(this.settings.pdfExternalTimeoutMs || 300000),
       pollIntervalMs: Number(this.settings.pdfApiPollIntervalMs || 5000),
+      signal: task ? this.taskControllers?.get(task.task_id)?.signal : undefined,
       mineruApiKey: this.settings.pdfMineruApiKey || '',
       mineruApiEndpoint: this.settings.pdfMineruApiEndpoint || 'https://mineru.net/api/v4',
       mineruApiModel: this.settings.pdfMineruApiModel || 'vlm',
@@ -2059,6 +2135,8 @@ class SlicerDashboardView extends ItemView {
     super(leaf);
     this.plugin = plugin;
     this.selectedTaskIds = new Set();
+    this.taskFilter = 'all';
+    this.taskSearch = '';
   }
 
   getViewType() { return VIEW_TYPE_SLICER; }
@@ -2160,10 +2238,10 @@ class SlicerDashboardView extends ItemView {
     button(actions, '打开设置', () => this.plugin.openSettings());
 
     const stats = overview.createDiv('eks-stats');
-    stat(stats, '待处理', counts.pending);
-    stat(stats, '处理中', counts.processing);
-    stat(stats, '异常待审核', counts.needsReview);
-    stat(stats, '失败', counts.failed);
+    stat(stats, '待处理', counts.pending, () => { this.taskFilter = 'queued'; this.render(); });
+    stat(stats, '处理中', counts.processing, () => { this.taskFilter = 'processing'; this.render(); });
+    stat(stats, '异常待审核', counts.needsReview, () => { this.taskFilter = 'needs_review'; this.render(); });
+    stat(stats, '失败', counts.failed, () => { this.taskFilter = 'failed'; this.render(); });
     stat(stats, '已入库卡片', counts.written);
     stat(stats, '已跳过', counts.skipped);
 
@@ -2171,15 +2249,111 @@ class SlicerDashboardView extends ItemView {
     queue.createEl('h3', { text: '处理概览' });
     this.renderQueue(queue, tasks);
 
+    const taskPanel = container.createDiv('eks-panel eks-tasks');
+    taskPanel.createEl('h3', { text: '任务' });
+    this.renderTaskExplorer(taskPanel, tasks);
+
     const review = container.createDiv('eks-panel eks-review');
     review.createEl('h3', { text: '审核工作台（仅异常）' });
     const reviewScroll = review.createDiv('eks-review-scroll');
     await this.renderReview(reviewScroll, tasks);
 
+    const errors = container.createDiv('eks-panel eks-errors');
+    errors.createEl('h3', { text: '错误中心' });
+    this.renderErrorCenter(errors, tasks);
+
     const paths = container.createDiv('eks-paths');
     paths.createSpan({ text: `源文件入口：${this.plugin.settings.bidIntakePath}；${this.plugin.settings.businessIntakePath}` });
     paths.createSpan({ text: `入库输出：${this.plugin.settings.bidOutputPath}；${this.plugin.settings.businessOutputPath}` });
     paths.createSpan({ text: '目录由 folder-map.json 固定映射；Category / TagL1 / TagL2 仅用于 MOC 索引。' });
+  }
+
+  renderTaskExplorer(parent, tasks) {
+    const controls = parent.createDiv('eks-task-controls');
+    const search = controls.createEl('input', {
+      attr: { type: 'search', placeholder: '搜索文件名', 'aria-label': '搜索任务文件名' }
+    });
+    search.value = this.taskSearch;
+    search.addEventListener('change', () => {
+      this.taskSearch = search.value;
+      this.render();
+    });
+    const filter = controls.createEl('select', { attr: { 'aria-label': '按状态筛选任务' } });
+    for (const [value, label] of [['all', '全部状态'], ['queued', '待处理'], ['processing', '处理中'], ['needs_review', '待审核'], ['failed', '失败'], ['written', '已完成']]) {
+      const option = filter.createEl('option', { text: label, attr: { value } });
+      option.selected = this.taskFilter === value;
+    }
+    filter.addEventListener('change', () => { this.taskFilter = filter.value; this.render(); });
+
+    const query = this.taskSearch.trim().toLowerCase();
+    const filtered = tasks.filter((task) => {
+      const statusMatches = this.taskFilter === 'all'
+        || (this.taskFilter === 'processing' ? PROCESSING_STATUSES.has(task.status) : task.status === this.taskFilter);
+      return statusMatches && (!query || String(task.source_path || '').toLowerCase().includes(query));
+    }).slice(0, 100);
+    if (!filtered.length) {
+      parent.createDiv({ cls: 'eks-empty', text: '没有符合当前筛选条件的任务。' });
+      return;
+    }
+    const list = parent.createDiv({ cls: 'eks-task-list', attr: { 'aria-live': 'polite' } });
+    for (const task of filtered) {
+      const details = list.createEl('details', { cls: 'eks-task-detail' });
+      const summary = details.createEl('summary');
+      summary.createSpan({ cls: 'eks-status-text', text: stageLabel(task.status) });
+      summary.createSpan({ cls: 'eks-task-title', text: task.source_path || '(未知文件)' });
+      const meta = details.createDiv('eks-task-detail-grid');
+      const error = task.errors?.at(-1);
+      for (const [label, value] of [
+        ['当前阶段', stageLabel(task.progress?.stage || task.status)],
+        ['已用时间', formatDuration(task.progress?.elapsedMs || 0)],
+        ['重试次数', String(task.retry_count || task.attempt || 0)],
+        ['结果数量', String(task.written_card_ids?.length || 0)],
+        ['最后更新', formatLocalTime(task.updated_at || task.progress?.at || '')],
+        ['错误代码', error?.code || '-']
+      ]) {
+        meta.createDiv({ text: label, cls: 'eks-task-meta' });
+        meta.createDiv({ text: value || '-', cls: 'eks-detail-value' });
+      }
+      const timeline = details.createDiv({ cls: 'eks-timeline', attr: { 'aria-label': '任务阶段时间线' } });
+      const order = ['parsing', 'classification', 'summary-map', 'atomization', 'validating', 'writing', 'complete'];
+      const currentIndex = Math.max(0, order.indexOf(task.progress?.stage || task.status));
+      order.forEach((stage, index) => {
+        timeline.createSpan({
+          cls: `eks-timeline-step ${index < currentIndex ? 'is-complete' : index === currentIndex ? 'is-current' : ''}`,
+          text: `${index < currentIndex ? '✓ ' : index === currentIndex ? '● ' : '○ '}${stageLabel(stage)}`
+        });
+      });
+      const actions = details.createDiv('eks-row-actions');
+      if (task.status === 'failed') button(actions, '重试', () => this.plugin.retryTask(task.task_id));
+      if (PROCESSING_STATUSES.has(task.status)) button(actions, '取消', () => this.plugin.cancelCurrentTask(task.task_id));
+      button(actions, '打开源文件', () => this.plugin.app.workspace.openLinkText(task.source_path, '', false));
+    }
+    if (tasks.length > 100) parent.createDiv({ cls: 'eks-task-meta', text: '为保持界面流畅，当前最多显示 100 项；请使用筛选和搜索缩小范围。' });
+  }
+
+  renderErrorCenter(parent, tasks) {
+    const errors = tasks.flatMap((task) => (task.errors || []).map((error) => ({ task, error })));
+    if (!errors.length) {
+      parent.createDiv({ cls: 'eks-empty', text: '暂无错误。' });
+      return;
+    }
+    const groups = new Map();
+    for (const entry of errors) {
+      const key = entry.error.code || 'INTERNAL_UNEXPECTED';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(entry);
+    }
+    for (const [code, entries] of groups) {
+      const details = parent.createEl('details', { cls: 'eks-error-group' });
+      details.createEl('summary', { text: `${code} · ${entries.length} 项` });
+      for (const { task, error } of entries.slice(0, 20)) {
+        const item = details.createDiv('eks-error-item');
+        item.createEl('strong', { text: error.message || '处理失败' });
+        item.createDiv({ cls: 'eks-task-meta', text: `${task.source_path || '(未知文件)'} · ${stageLabel(error.stage || task.status)}` });
+        item.createDiv({ text: error.suggestedAction || '查看技术详情后重试。' });
+        if (error.technicalMessage) item.createEl('code', { text: error.technicalMessage });
+      }
+    }
   }
 
   async renderContentLegacy(container) {
@@ -2938,10 +3112,13 @@ function button(parent, text, onClick) {
   return el;
 }
 
-function stat(parent, label, value) {
-  const el = parent.createDiv('eks-stat');
+function stat(parent, label, value, onClick) {
+  const el = onClick
+    ? parent.createEl('button', { cls: 'eks-stat eks-stat-button', attr: { 'aria-label': `${label}：${value}，点击筛选` } })
+    : parent.createDiv('eks-stat');
   el.createDiv({ cls: 'eks-stat-value', text: String(value) });
   el.createDiv({ cls: 'eks-stat-label', text: label });
+  if (onClick) el.addEventListener('click', onClick);
 }
 
 function formatLocalTime(iso) {
@@ -4723,7 +4900,8 @@ async function runEngine(engine, buffer, config) {
       requestImpl: config.requestImpl,
       fetchImpl: config.fetchImpl,
       sleep: config.sleep,
-      onProgress: config.onProgress
+      onProgress: config.onProgress,
+      signal: config.signal
     });
   }
   if (engine === 'paddleocr-api') {
@@ -4737,7 +4915,8 @@ async function runEngine(engine, buffer, config) {
       requestImpl: config.requestImpl,
       fetchImpl: config.fetchImpl,
       sleep: config.sleep,
-      onProgress: config.onProgress
+      onProgress: config.onProgress,
+      signal: config.signal
     });
   }
   return { status: 'unavailable', message: `不支持的云端解析器：${engine}` };
@@ -4811,7 +4990,7 @@ async function runMineruApi(buffer, options = {}) {
   const fileName = safeFileName(options.fileName || 'source.pdf');
   const pollIntervalMs = Math.max(500, Number(options.pollIntervalMs) || 5000);
   const maxPolls = Math.max(1, Math.ceil((Number(options.timeoutMs) || 300000) / pollIntervalMs));
-  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const sleep = options.sleep || ((ms) => cancellableDelay(ms, options.signal));
 
   try {
     await emit(options, { stage: 'mineru-api-request', message: 'MinerU：正在申请上传地址' });
@@ -4824,7 +5003,8 @@ async function runMineruApi(buffer, options = {}) {
         language: options.language || 'ch_server',
         enable_table: options.enableTable !== false,
         enable_formula: options.enableFormula !== false
-      })
+      }),
+      signal: options.signal
     });
     const createPayload = await readJson(createResponse, 'MinerU 申请上传地址');
     const batchId = createPayload?.data?.batch_id;
@@ -4832,14 +5012,15 @@ async function runMineruApi(buffer, options = {}) {
     if (!batchId || !uploadUrl) throw new Error(createPayload?.msg || 'MinerU 未返回上传地址或批次 ID。');
 
     await emit(options, { stage: 'mineru-api-upload', message: 'MinerU：正在上传源文件' });
-    const uploadResponse = await fetcher(uploadUrl, { method: 'PUT', body: Buffer.from(buffer || []) });
+    const uploadResponse = await fetcher(uploadUrl, { method: 'PUT', body: Buffer.from(buffer || []), signal: options.signal });
     if (!uploadResponse.ok) throw new Error(`MinerU 文件上传失败（HTTP ${uploadResponse.status}）。`);
 
     for (let attempt = 0; attempt < maxPolls; attempt += 1) {
       if (attempt > 0) await sleep(pollIntervalMs);
       const resultResponse = await fetcher(`${endpoint}/extract-results/batch/${encodeURIComponent(batchId)}`, {
         method: 'GET',
-        headers: { Authorization: headers.Authorization }
+        headers: { Authorization: headers.Authorization },
+        signal: options.signal
       });
       const resultPayload = await readJson(resultResponse, 'MinerU 查询任务');
       const result = resultPayload?.data?.extract_result?.[0];
@@ -4859,7 +5040,7 @@ async function runMineruApi(buffer, options = {}) {
       if (!result.full_zip_url) throw new Error('MinerU 完成任务未返回结果下载地址。');
 
       await emit(options, { stage: 'mineru-api-download', message: 'MinerU：正在下载 Markdown 结果' });
-      const zipResponse = await fetcher(result.full_zip_url, { method: 'GET' });
+      const zipResponse = await fetcher(result.full_zip_url, { method: 'GET', signal: options.signal });
       if (!zipResponse.ok) throw new Error(`MinerU 结果下载失败（HTTP ${zipResponse.status}）。`);
       const zipBuffer = Buffer.from(await zipResponse.arrayBuffer());
       const markdown = extractZipEntryEndingWith(zipBuffer, 'full.md').trim();
@@ -4899,6 +5080,17 @@ async function emit(options, payload) {
   if (typeof options.onProgress === 'function') await options.onProgress(payload);
 }
 
+function cancellableDelay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(Object.assign(new Error('任务已取消'), { name: 'AbortError', code: 'TASK_CANCELLED' }));
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(Object.assign(new Error('任务已取消'), { name: 'AbortError', code: 'TASK_CANCELLED' }));
+    }, { once: true });
+  });
+}
+
 module.exports = { runMineruApi };
 
 },
@@ -4921,7 +5113,7 @@ async function runPaddleOcrApi(buffer, options = {}) {
   const headers = { Authorization: `bearer ${options.apiKey}` };
   const pollIntervalMs = Math.max(500, Number(options.pollIntervalMs) || 5000);
   const maxPolls = Math.max(1, Math.ceil((Number(options.timeoutMs) || 300000) / pollIntervalMs));
-  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const sleep = options.sleep || ((ms) => cancellableDelay(ms, options.signal));
 
   try {
     const optionalPayload = JSON.stringify({
@@ -4937,7 +5129,8 @@ async function runPaddleOcrApi(buffer, options = {}) {
     const createResponse = await fetcher(endpoint, {
       method: 'POST',
       headers: Object.assign({}, headers, upload.headers),
-      body: upload.body
+      body: upload.body,
+      signal: options.signal
     });
     const createPayload = await readJson(createResponse, 'PaddleOCR 提交任务');
     const jobId = createPayload?.data?.jobId;
@@ -4945,7 +5138,7 @@ async function runPaddleOcrApi(buffer, options = {}) {
 
     for (let attempt = 0; attempt < maxPolls; attempt += 1) {
       if (attempt > 0) await sleep(pollIntervalMs);
-      const jobResponse = await fetcher(`${endpoint}/${encodeURIComponent(jobId)}`, { method: 'GET', headers });
+      const jobResponse = await fetcher(`${endpoint}/${encodeURIComponent(jobId)}`, { method: 'GET', headers, signal: options.signal });
       const jobPayload = await readJson(jobResponse, 'PaddleOCR 查询任务');
       const data = jobPayload?.data || {};
       const progress = data.extractProgress || {};
@@ -4964,7 +5157,7 @@ async function runPaddleOcrApi(buffer, options = {}) {
       if (!jsonUrl) throw new Error('PaddleOCR 完成任务未返回 JSONL 下载地址。');
 
       await emit(options, { stage: 'paddleocr-api-download', message: 'PaddleOCR：正在下载 Markdown 结果' });
-      const resultResponse = await fetcher(jsonUrl, { method: 'GET' });
+      const resultResponse = await fetcher(jsonUrl, { method: 'GET', signal: options.signal });
       if (!resultResponse.ok) throw new Error(`PaddleOCR 结果下载失败（HTTP ${resultResponse.status}）。`);
       const text = await resultResponse.text();
       const markdown = parsePaddleJsonl(text);
@@ -5049,6 +5242,17 @@ function unavailable(message) {
 
 async function emit(options, payload) {
   if (typeof options.onProgress === 'function') await options.onProgress(payload);
+}
+
+function cancellableDelay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(Object.assign(new Error('任务已取消'), { name: 'AbortError', code: 'TASK_CANCELLED' }));
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(Object.assign(new Error('任务已取消'), { name: 'AbortError', code: 'TASK_CANCELLED' }));
+    }, { once: true });
+  });
 }
 
 module.exports = { parsePaddleJsonl, runPaddleOcrApi };
@@ -6133,13 +6337,44 @@ function splitMarkdownSections(markdown, options = {}) {
 
   const chunks = coalesceTiny ? coalesceTinyChunks(rawChunks, maxChars) : rawChunks;
   validateChunks(chunks, source, maxChars);
+  const documentFingerprint = sourceFingerprint(source);
+  const pageBreakOffsets = [];
+  for (let offset = source.indexOf('\f'); offset >= 0; offset = source.indexOf('\f', offset + 1)) pageBreakOffsets.push(offset);
 
   return chunks.map((chunk, index) => ({
     chunk_id: `chunk-${String(index + 1).padStart(3, '0')}`,
+    stableChunkId: `chunk-${documentFingerprint}-${String(index + 1).padStart(3, '0')}`,
     markdown: chunk.markdown,
     headings: [...String(chunk.markdown).matchAll(/^#{1,6}\s+(.+)$/gm)].map((match) => match[1].trim()),
-    breadcrumb: chunk.breadcrumb || ''
+    breadcrumb: chunk.breadcrumb || '',
+    headingPath: String(chunk.breadcrumb || '').split('\n').filter(Boolean),
+    pageStart: pageAtOffset(pageBreakOffsets, chunk.start),
+    pageEnd: pageAtOffset(pageBreakOffsets, Math.max(chunk.start, chunk.end - 1)),
+    contentFingerprint: sourceFingerprint(chunk.markdown),
+    tokenEstimate: Math.ceil(chunk.markdown.length / 3),
+    overlap: index > 0 ? Math.max(0, chunks[index - 1].end - chunk.start) : 0
   }));
+}
+
+function sourceFingerprint(value) {
+  let hash = 2166136261;
+  const text = String(value || '');
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function pageAtOffset(pageBreakOffsets, offset) {
+  let low = 0;
+  let high = pageBreakOffsets.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (pageBreakOffsets[middle] < offset) low = middle + 1;
+    else high = middle;
+  }
+  return low + 1;
 }
 
 async function summarizeDocument(options) {
@@ -6694,7 +6929,7 @@ function applySchemaConstants(schema, value) {
   return value;
 }
 
-async function requestMiniMaxJson({ settings, prompt, fetchImpl, context }) {
+async function requestMiniMaxJson({ settings, prompt, fetchImpl, context, signal }) {
   if (!settings || !settings.minimaxApiKey) throw new Error('MiniMax 国内版 API Key 未配置');
   const fetcher = fetchImpl || globalThis.fetch;
   const endpoint = settings.minimaxEndpoint || 'https://api.minimaxi.com/anthropic/v1/messages';
@@ -6703,6 +6938,8 @@ async function requestMiniMaxJson({ settings, prompt, fetchImpl, context }) {
   const controller = typeof AbortController === 'function' ? new AbortController() : null;
   const timeoutMs = Math.max(10000, Number(settings.aiRequestTimeoutMs) || 180000);
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  const abortFromCaller = () => controller?.abort();
+  if (signal) signal.addEventListener('abort', abortFromCaller, { once: true });
   let response;
   try {
     const body = {
@@ -6751,6 +6988,7 @@ async function requestMiniMaxJson({ settings, prompt, fetchImpl, context }) {
     }, settings);
   } catch (error) {
     if (error && error.name === 'AbortError') {
+      if (signal?.aborted) throw abortError();
       diag('minimax.timeout', { endpoint, timeoutMs, stage: context && context.stage });
       throw new Error(`MiniMax 国内版请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
     }
@@ -6763,6 +7001,7 @@ async function requestMiniMaxJson({ settings, prompt, fetchImpl, context }) {
     throw new Error(`MiniMax 国内版请求失败：${sanitizeError(error)}`);
   } finally {
     if (timer) clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', abortFromCaller);
   }
   if (!response.ok) {
     const detail = await safeResponseText(response);
@@ -6883,7 +7122,7 @@ function collectSseTextDeltas(event, state) {
  * 与 requestMiniMaxJson 等价的请求体，但启用 stream:true 并通过 SSE 累积返回。
  * 返回字符串（与 requestMiniMaxJson 的 parseJsonPayload 输入等价）。
  */
-async function requestMiniMaxStream({ settings, prompt, context, onDelta, onProgressText }) {
+async function requestMiniMaxStream({ settings, prompt, context, signal, onDelta, onProgressText }) {
   if (!settings || !settings.minimaxApiKey) throw new Error('MiniMax 国内版 API Key 未配置');
   const endpoint = settings.minimaxEndpoint || 'https://api.minimaxi.com/anthropic/v1/messages';
   const anthropicProtocol = /\/anthropic\/v1\/messages\/?$/i.test(endpoint);
@@ -6917,6 +7156,8 @@ async function requestMiniMaxStream({ settings, prompt, context, onDelta, onProg
   const controller = typeof AbortController === 'function' ? new AbortController() : null;
   const timeoutMs = Math.max(10000, Number(settings.aiRequestTimeoutMs) || 180000);
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  const abortFromCaller = () => controller?.abort();
+  if (signal) signal.addEventListener('abort', abortFromCaller, { once: true });
   try {
     const state = { text: '', toolInputJson: '' };
     await sseJsonRequest(endpoint, {
@@ -6937,11 +7178,13 @@ async function requestMiniMaxStream({ settings, prompt, context, onDelta, onProg
     return finalContent;
   } catch (error) {
     if (error && error.name === 'AbortError') {
+      if (signal?.aborted) throw abortError();
       throw new Error(`MiniMax 流式请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
     }
     throw error;
   } finally {
     if (timer) clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', abortFromCaller);
   }
 }
 
@@ -6969,15 +7212,19 @@ async function fetchWithTransientRetry(fetcher, endpoint, options, settings) {
   let lastError;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let retryAfterMs = 0;
     try {
       const response = await fetcher(endpoint, options);
       if (response.ok || !isTransientHttpStatus(response.status) || attempt === maxAttempts) return response;
+      retryAfterMs = parseRetryAfterMs(response.headers?.get?.('retry-after'));
       await safeResponseText(response);
     } catch (error) {
       if (error?.name === 'AbortError' || attempt === maxAttempts) throw error;
       lastError = error;
     }
-    await sleep(baseMs * (2 ** (attempt - 1)));
+    const exponentialMs = Math.min(30_000, baseMs * (2 ** (attempt - 1)));
+    const jitterMs = Math.round(exponentialMs * (0.85 + Math.random() * 0.3));
+    await sleep(Math.max(retryAfterMs, jitterMs), options.signal);
   }
 
   throw lastError || new Error('MiniMax request failed after retries');
@@ -6989,8 +7236,24 @@ function isTransientHttpStatus(status) {
   return [408, 425, 429, 500, 502, 503, 504, 529].includes(Number(status));
 }
 
-function sleep(ms) {
-  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+function parseRetryAfterMs(value) {
+  if (value === undefined || value === null || value === '') return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, Math.round(seconds * 1000));
+  const date = Date.parse(String(value));
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+}
+
+function sleep(ms, signal) {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(Object.assign(new Error('任务已取消'), { name: 'AbortError', code: 'TASK_CANCELLED' }));
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(Object.assign(new Error('任务已取消'), { name: 'AbortError', code: 'TASK_CANCELLED' }));
+    }, { once: true });
+  });
 }
 
 function parseJsonPayload(value) {
@@ -7095,6 +7358,7 @@ module.exports = {
   findRoute,
   normalizeAtomBatch,
   parseJsonPayload,
+  parseRetryAfterMs,
   profileMarkdown,
   repairJsonText,
   requestMiniMaxJson,
@@ -7628,6 +7892,9 @@ const { buildCardRecord } = require("src/core/markdown-renderer.js");
 const { resolveFixedRoute } = require("src/core/routing.js");
 const { findLinkCandidates, validateRelations } = require("src/core/link-service.js");
 const { buildValidationReport } = require("src/core/reliability.js");
+const workflowDiag = (event, details) => {
+  try { globalThis.__eksDiag?.diag?.(event, details); } catch (_) {}
+};
 
 async function runKnowledgeWorkflow(options) {
   const classification = options.classification || await classifyDocument({
@@ -7692,6 +7959,10 @@ async function runKnowledgeWorkflow(options) {
     const labelsValid = typeof options.validateLabels === 'function' ? options.validateLabels(atom) : true;
     const routeValid = atom.library === classification.library && atom.folder_type === classification.folder_type;
     const duplicate = existingFingerprints.has(fingerprint);
+    // Reserve every fingerprint immediately, including review/rejected atoms. Otherwise
+    // identical atoms later in the same provider response can create duplicate review
+    // items and may both be approved into the same stable file.
+    existingFingerprints.add(fingerprint);
     const confidence = calculateConfidence({
       parsePackage: options.parsePackage,
       classification,
@@ -7725,7 +7996,6 @@ async function runKnowledgeWorkflow(options) {
     card.validation_report = validationReport;
     if (confidence.decision === 'auto_ingest' && !quantityAnomaly) {
       accepted.push(card);
-      existingFingerprints.add(fingerprint);
     } else {
       const reasons = [...confidence.hard_rules, ...(atom.validation_issues || [])];
       if (quantityAnomaly) reasons.push(`短文档数量异常：${pageCount} 页生成 ${(atomResult.atoms || []).length} 张卡片，超过阈值 ${shortDocumentMaxCards}，需整批人工确认`);
@@ -7747,7 +8017,7 @@ async function runKnowledgeWorkflow(options) {
     }
   }
   // v2.8.1: 工作流最终产出诊断——accepted/review 全空时，这条日志直接说明原子在哪一步丢的
-  diag('workflow.result', {
+  workflowDiag('workflow.result', {
     title: summary && summary.document_title,
     summaryKeyPoints: (summary && Array.isArray(summary.key_points)) ? summary.key_points.length : 0,
     atoms: (atomResult && Array.isArray(atomResult.atoms)) ? atomResult.atoms.length : 0,

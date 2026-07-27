@@ -2,6 +2,11 @@
 
 ## Unreleased — 系统可靠性、检查点与可观测性优化
 
+- 修复批内重复原子在首项进入审核时未立即占用 fingerprint、可能形成重复审核卡的问题；新增确定性工作流测试。
+- 有效 classification/summary/atoms 检查点恢复经集成测试证明不会再次调用 provider。
+- 任务 AbortController 贯穿 MiniMax、MinerU、PaddleOCR 的排队、请求、上传、轮询等待和下载；RateLimiter 支持排队取消与超时。
+- 组件包按文件 mtime/size 缓存，切片新增向后兼容的稳定 ID、指纹、标题/页码/token/overlap 元数据。
+- Dashboard 增加状态卡筛选、任务搜索/筛选/时间线、错误代码中心以及键盘焦点和 ARIA 改进。
 - 修复运行时 API 密钥可能随 settings 保存进入 `data.json` 的安全风险；所有设置持久化统一过滤 secret 字段。
 - 阶段 artifact 升级为 v2 envelope，以来源和 pipeline/prompt/schema 版本指纹校验复用；旧 artifact 保持可读，无需用户迁移。
 - 增加稳定 `AppError`、重试分类、深层日志脱敏、阶段性能指标和可复用 `ValidationReport`。

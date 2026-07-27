@@ -2,22 +2,22 @@
 
 ## 仓库与工具链
 
-- 初始提交：`c5a40b4a0a856f014bde074ed3a941903cd75b24`
+- 本次纠正续作初始提交：`49beea8ca2dbb88077057edbeae51e2c3f28bd4e`
 - 初始分支：`main`，与 `origin/main` 同步；工作区干净
-- 形态：Obsidian Desktop 原生 DOM 插件；生产实现是 7,639 行自包含 `main.js` bundle，`src/main.js` 为占位边界
-- Node：v22.22.2；包管理：npm；初始无 lockfile，本次 `npm install --ignore-scripts` 生成 lockfile
+- 形态：Obsidian Desktop 原生 DOM 插件；生产实现是 7,896 行自包含 `main.js` bundle，`src/main.js` 为占位边界
+- Node：v22.22.2；包管理：npm；lockfile 已存在；本次基线使用 `npm ci`
 - ESLint：缺失；TypeScript 源码/typecheck：缺失。没有伪造 typecheck；本次补充 `npm run lint` 作为 JavaScript 语法门
 
 ## 初始验证
 
 | 检查 | 命令 | 初始结果 |
 |---|---|---|
-| 依赖完整性 | `npm install --ignore-scripts` | 通过 |
-| lint | 无既有命令 | 缺失 |
+| 依赖完整性 | `npm ci` | 通过，安装 18 packages |
+| lint | `npm run lint` | 通过；实际是选定 JS 文件的 `node --check`，不是 ESLint |
 | typecheck | 无既有命令 | 缺失 |
-| unit/integration | `npm test` | 通过：6 split + rate limiter + 7 JSON repair + 23 v2.9.2 + 5 reliability |
+| unit/integration | `npm test` | 通过：6 split + rate limiter + 7 JSON repair + 23 v2.9.2 + 5 performance + 9 reliability；初始默认脚本漏跑 21 项 splitter 测试 |
 | build | `npm run build` | 通过（`node --check main.js`） |
-| benchmark | 无既有命令 | 缺失 |
+| benchmark | `npm run benchmark` | 通过；短文档 100 次 2.05ms，结构长文档 100 次 71.67ms，无外部 API |
 
 已有测试覆盖切片、限流、JSON 修复、SSE 接线、原子归属、上传授权、总结并发、重试落盘和滚动备份；不依赖真实付费 API。缺少统一错误、深层脱敏、检查点失效、ValidationReport、路径安全和完整 Obsidian UI 自动化。
 

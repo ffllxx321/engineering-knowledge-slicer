@@ -1,5 +1,17 @@
 # 工程知识切片 变更记录
 
+## Unreleased — 系统可靠性、检查点与可观测性优化
+
+- 修复运行时 API 密钥可能随 settings 保存进入 `data.json` 的安全风险；所有设置持久化统一过滤 secret 字段。
+- 阶段 artifact 升级为 v2 envelope，以来源和 pipeline/prompt/schema 版本指纹校验复用；旧 artifact 保持可读，无需用户迁移。
+- 增加稳定 `AppError`、重试分类、深层日志脱敏、阶段性能指标和可复用 `ValidationReport`。
+- 增加 9 项安全/可靠性回归、lockfile、JavaScript lint 门和不调用付费 API 的 benchmark。
+- 补充优化基线、调用链审计、知识切片差距、UI/UX 规范、错误码和结果/回滚文档。
+
+### 迁移
+
+无需手动迁移或重新处理历史资料。新 artifact 在阶段再次执行时自然写入；历史任务、卡片和配置格式保持兼容。
+
 ## v2.9.3 — 2026-07-27 可靠性修复与流水线并发优化
 
 本版本正式收录 2026-07-24 最新测试日志之后完成的修复，不改变既有产品功能范围。

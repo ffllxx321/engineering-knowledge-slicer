@@ -39,6 +39,12 @@ const { requestMiniMaxJson, requestMiniMaxStream } = require("src/core/ai-pipeli
 const { runKnowledgeWorkflow } = require("src/core/workflow.js");
 const { buildCardRecord, cardFileName, renderKnowledgeCard, renderStructuredSummary } = require("src/core/markdown-renderer.js");
 const { groupReviewItems, applyBatchAction } = require("src/core/review-service.js");
+const {
+  createStageMetric,
+  sanitizeForLog,
+  sanitizeSettingsForPersistence,
+  toAppError
+} = require("src/core/reliability.js");
 
 // v1.1.9 / v1.1.10: 把诊断共享状态挂到 globalThis，让 src/core/ai-pipeline.js 等独立闭包模块也能调用 diag()
 // 历史背景：v1.1.6 起在 src/core/ai-pipeline.js（line 3928-4609）里加了 3 个 diag() 调用
@@ -431,7 +437,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     // v1.3: 注册上传确认桥接，供闭包模块（external-pdf.js）弹上传确认弹窗
     setEksUploadConfirm(this);
     // 密钥注入后再写盘，确保 data.json 不会因为顺序问题而清掉 secrets
-    await this.saveData(this.settings);
+    await this.saveSafeSettings();
     this.rateLimiter = new RateLimiter({
       intervalMs: this.settings.rateLimitMs || 1000,
       maxConcurrent: this.settings.rateLimitMaxConcurrent || 2,
@@ -497,7 +503,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       if (!notified && logPath) {
         new Notice(`工程知识切片 诊断日志已启用：${logPath}\n遇到问题时把该文件内容发给我即可定位。`);
         this.settings.__diagLogNotifiedVersion = '1.1.9';
-        await this.saveData(this.settings);
+        await this.saveSafeSettings();
       }
     } catch (_) { /* 通知失败不能影响插件加载 */ }
   }
@@ -511,7 +517,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async saveSettings() {
-    await this.saveData(this.settings);
+    await this.saveSafeSettings();
   }
 
   async testServiceConnection(service) {
@@ -565,6 +571,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const leaf = leaves[0] || this.app.workspace.getRightLeaf(false);
     await leaf.setViewState({ type: VIEW_TYPE_SLICER, active: true });
     this.app.workspace.revealLeaf(leaf);
+  }
+
+  async saveSafeSettings() {
+    await this.saveData(sanitizeSettingsForPersistence(this.settings));
   }
 
   async refreshViews() {
@@ -998,6 +1008,19 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
       await this.writeTaskLog(current);
       await this.saveTasks(upsertTask(await this.loadTasks(), current));
+      diag('performance.task', createStageMetric({
+        taskId: current.task_id,
+        runId: current.run_id,
+        sourceHash: current.source_hash,
+        stage: 'workflow',
+        stageStartedAt: startedAt,
+        stageCompletedAt: Date.now(),
+        provider: 'minimax',
+        inputCharacters: parsePackage?.markdown?.length || 0,
+        outputCharacters: JSON.stringify(workflow.summary || {}).length,
+        cardsGenerated: workflow.accepted.length,
+        cardsRejected: workflow.review.length
+      }));
       this.sessionStats.processed += 1;
       this.sessionStats.review += workflow.review.length;
       this.sessionStats.written += workflow.accepted.length;
@@ -1014,7 +1037,25 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
       current.status = 'failed';
       current.updated_at = new Date().toISOString();
-      current.errors = [...(current.errors || []), { stage: current.progress?.stage || 'process', message: sanitizeSecret(error.message), at: current.updated_at }];
+      const appError = toAppError(error, {
+        stage: current.progress?.stage || 'process',
+        taskId: current.task_id,
+        runId: current.run_id,
+        sourcePath: current.source_path,
+        version: runtimeVersions(this.settings),
+        diagnosticMode: this.settings.diagnosticMode === true
+      });
+      current.errors = [...(current.errors || []), appError.toJSON()];
+      diag('performance.task', createStageMetric({
+        taskId: current.task_id,
+        runId: current.run_id,
+        sourceHash: current.source_hash,
+        stage: appError.stage,
+        stageStartedAt: startedAt,
+        stageCompletedAt: Date.now(),
+        provider: appError.provider,
+        errorCode: appError.code
+      }));
       await this.writeTaskLog(current);
       await this.saveTasks(upsertTask(await this.loadTasks(), current));
       this.sessionStats.failed += 1;
@@ -1024,9 +1065,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         sourcePath: current.source_path,
         stage: current.progress?.stage,
         errorClass: error && error.constructor ? error.constructor.name : typeof error,
-        errorMessage: String(error && error.message || error)
+        error: sanitizeForLog(appError.toJSON())
       });
-      new Notice(`工程知识切片处理失败（${current.progress?.stage || 'process'}）：${sanitizeSecret(error.message)}`);
+      new Notice(`${appError.message} · ${appError.suggestedAction}`);
     } finally {
       await this.refreshViews();
     }
@@ -1197,12 +1238,31 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     if (!path) return null;
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return null;
-    try { return JSON.parse(await this.app.vault.read(file)); } catch { return null; }
+    try {
+      const parsed = JSON.parse(await this.app.vault.read(file));
+      // v2.10: 旧产物仍按原格式读取；新产物带输入指纹，只有来源与运行时契约
+      // 完全一致才复用，避免 prompt/schema/pipeline 升级后误用旧 AI 结果。
+      if (!parsed || parsed.artifactVersion !== 2 || !Object.hasOwn(parsed, 'payload')) return parsed;
+      if (parsed.inputFingerprint !== this.artifactInputFingerprint(task, name)) {
+        diag('artifact.cacheMiss', { taskId: task.task_id, stage: name, reason: 'fingerprint_changed' });
+        return null;
+      }
+      diag('artifact.cacheHit', { taskId: task.task_id, stage: name });
+      return parsed.payload;
+    } catch { return null; }
   }
 
   async persistArtifact(task, name, value) {
     const path = normalizeVaultPath(`${this.settings.artifactsPath}/${task.run_id}/${name}.json`);
-    await writeFile(this.app, path, JSON.stringify(value, null, 2));
+    const envelope = {
+      artifactVersion: 2,
+      stage: name,
+      inputFingerprint: this.artifactInputFingerprint(task, name),
+      completedAt: new Date().toISOString(),
+      validationState: 'valid',
+      payload: value
+    };
+    await writeFile(this.app, path, JSON.stringify(envelope, null, 2));
     task.artifacts = Object.assign({}, task.artifacts || {}, { [name]: path });
     if (name === 'summary') {
       const markdownPath = normalizeVaultPath(`${this.settings.artifactsPath}/${task.run_id}/summary.md`);
@@ -1212,6 +1272,17 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     task.updated_at = new Date().toISOString();
     await this.saveTasks(upsertTask(await this.loadTasks(), task));
     return path;
+  }
+
+  artifactInputFingerprint(task, name) {
+    const crypto = require('crypto');
+    const versions = runtimeVersions(this.settings);
+    const versionScope = name === 'parsed' ? {} : versions;
+    return crypto.createHash('sha256').update(JSON.stringify({
+      sourceHash: task.source_hash || '',
+      stage: name,
+      versions: versionScope
+    })).digest('hex');
   }
 
   // v2.9.0: 写入二进制附件。writeUnique 只服务 .md（冲突时加 -N.md 后缀），
@@ -1927,7 +1998,7 @@ function setEksUploadConfirm(plugin) {
         session.uploadApprovedThisSession = true;
         if (modal.remember && plugin.settings.pdfAllowExternalUpload !== true) {
           plugin.settings.pdfAllowExternalUpload = true;
-          try { await plugin.saveData(plugin.settings); } catch (_) { /* 持久化失败不影响本次上传 */ }
+          try { await plugin.saveSafeSettings(); } catch (_) { /* 持久化失败不影响本次上传 */ }
         }
       }
       try {
@@ -2371,7 +2442,7 @@ class SlicerSettingTab extends PluginSettingTab {
         .setTooltip('默认关闭：日志写到 ~/.eks/logs/diag.log（vault 之外）。打开后回到 vault 内的 .obsidian/plugins/engineering-knowledge-slicer/diag.log（重启后生效）。')
         .onChange(async (value) => {
           this.plugin.settings.diagLogInVault = !!value;
-          await this.plugin.saveData(this.plugin.settings);
+          await this.plugin.saveSafeSettings();
         }))
       .addButton((button) => button
         .setButtonText('打开诊断日志')
@@ -2485,7 +2556,7 @@ class SlicerSettingTab extends PluginSettingTab {
         .setValue(Boolean(this.plugin.settings.useStreamingAi))
         .onChange(async (value) => {
           this.plugin.settings.useStreamingAi = Boolean(value);
-          await this.plugin.saveData(this.plugin.settings);
+          await this.plugin.saveSafeSettings();
         }));
     connectionTestSetting(containerEl, this.plugin, '测试 MiniMax 连接', 'minimax');
 
@@ -7305,6 +7376,176 @@ module.exports = { buildCardRecord, cardFileName, renderKnowledgeCard, renderStr
 
 },
 /**
+ * @module src/core/reliability
+ * Stable errors, redaction, retry decisions, validation reports and stage metrics.
+ */
+"src/core/reliability.js": function(require, module, exports) {
+const SECRET_KEYS = /^(authorization|proxy-authorization|api[-_]?key|token|jwt|secret|password|cookie|set-cookie)$/i;
+const CREDENTIAL = /(Bearer\s+)[^\s,;]+|((?:sk|key|paddle|gh[pousxr])[-_])[A-Za-z0-9._-]{12,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/gi;
+const SENSITIVE_QUERY = /([?&](?:api_?key|access_?token|token|jwt|secret|signature)=)[^&#\s]+/gi;
+const SECRET_SETTING_KEYS = new Set(['minimaxApiKey', 'pdfMineruApiKey', 'pdfPaddleOcrApiKey']);
+
+class AppError extends Error {
+  constructor(input = {}) {
+    super(String(input.message || '工程知识切片遇到错误'));
+    this.name = 'AppError';
+    this.code = String(input.code || 'INTERNAL_UNEXPECTED');
+    this.category = String(input.category || 'internal');
+    this.severity = String(input.severity || 'error');
+    this.retryable = input.retryable === true;
+    this.stage = String(input.stage || 'process');
+    this.taskId = String(input.taskId || '');
+    this.runId = String(input.runId || '');
+    this.sourcePath = String(input.sourcePath || '');
+    this.artifactPath = String(input.artifactPath || '');
+    this.provider = String(input.provider || '');
+    this.requestId = String(input.requestId || '');
+    this.technicalMessage = redactText(input.technicalMessage || '');
+    this.suggestedAction = String(input.suggestedAction || '查看错误详情并按建议重试；若持续发生，请导出脱敏诊断信息。');
+    this.details = sanitizeForLog(input.details || {});
+    this.timestamp = input.timestamp || new Date().toISOString();
+    this.version = input.version || {};
+    if (input.diagnosticMode === true && input.stack) this.diagnosticStack = redactText(input.stack);
+  }
+  toJSON() {
+    const value = {};
+    for (const key of ['code', 'category', 'severity', 'retryable', 'stage', 'taskId', 'runId', 'sourcePath',
+      'artifactPath', 'provider', 'requestId', 'message', 'technicalMessage', 'suggestedAction', 'details',
+      'timestamp', 'version', 'diagnosticStack']) {
+      if (this[key] !== undefined && this[key] !== '') value[key] = this[key];
+    }
+    return value;
+  }
+}
+
+function toAppError(error, context = {}) {
+  if (error instanceof AppError) return error;
+  const message = redactText(error?.message || error || '未知错误');
+  const status = Number(error?.status || error?.statusCode || 0);
+  const code = String(error?.code || '');
+  const classified = classifyFailure({ status, code, message });
+  return new AppError(Object.assign({}, context, classified, {
+    message: userMessage(classified.category),
+    technicalMessage: message,
+    stack: error?.stack
+  }));
+}
+
+function classifyFailure(input = {}) {
+  const status = Number(input.status || 0);
+  const code = String(input.code || '').toUpperCase();
+  const message = String(input.message || '');
+  if (code === 'TASK_CANCELLED' || /取消/.test(message)) return result('CANCELLED_BY_USER', 'cancelled', false, '任务已取消', '如需继续，请重新将文件加入队列。');
+  if (status === 401 || status === 403 || /鉴权|unauthori[sz]ed|forbidden/i.test(message)) return result('AUTH_PROVIDER_REJECTED', 'auth', false, '外部服务鉴权失败', '请检查服务密钥和账号权限后测试连接。');
+  if (status === 429 || /rate.?limit|限流/i.test(message)) return result('RATE_LIMIT_PROVIDER_BUSY', 'rate_limit', true, '外部服务限流', '稍后重试；插件会遵循 Retry-After 并退避。');
+  if (code.includes('TIMEOUT') || /timed? ?out|超时/i.test(message)) return result('TIMEOUT_STAGE_EXCEEDED', 'timeout', true, '处理阶段超时', '可以重试该阶段；若持续发生，请检查网络和超时设置。');
+  if (status >= 500 || /ECONNRESET|ENOTFOUND|EAI_AGAIN|network/i.test(`${code} ${message}`)) return result('NETWORK_TRANSIENT_FAILURE', 'network', true, '外部服务暂时不可用', '插件可安全重试该阶段；若持续发生，请测试服务连接。');
+  if (/JSON/i.test(code) || /JSON/.test(message)) return result('JSON_PARSE_INVALID_RESPONSE', 'json_parse', false, '服务返回格式无法解析', '重新生成该阶段；若持续发生，请检查提示词与供应商响应。');
+  if (/SCHEMA|必填字段|schema/i.test(`${code} ${message}`)) return result('SCHEMA_OUTPUT_INVALID', 'schema', false, '模型输出未通过结构校验', '重新生成该批次；若持续发生，请检查 Schema 与提示词版本。');
+  if (/ENOENT|未找到源文件/.test(`${code} ${message}`)) return result('FILE_NOT_FOUND', 'file', false, '找不到源文件', '确认文件仍在输入目录且未被移动或删除。');
+  return result(code && /^[A-Z][A-Z0-9_]+$/.test(code) ? code : 'INTERNAL_UNEXPECTED', 'internal', false, '工程知识切片处理失败', '查看技术详情；修复原因后仅重试失败阶段。');
+}
+
+function result(code, category, retryable, message, suggestedAction) {
+  return { code, category, retryable, severity: category === 'cancelled' ? 'info' : 'error', message, suggestedAction };
+}
+
+function userMessage(category) {
+  return ({ auth: '外部服务鉴权失败', rate_limit: '外部服务限流', timeout: '处理阶段超时',
+    network: '外部服务暂时不可用', json_parse: '服务返回格式无法解析', schema: '模型输出未通过结构校验',
+    file: '找不到源文件', cancelled: '任务已取消' })[category] || '工程知识切片处理失败';
+}
+
+function redactText(value) {
+  return String(value || '').replace(CREDENTIAL, (_whole, bearer, prefix) => bearer ? `${bearer}***` : `${prefix || ''}***`)
+    .replace(SENSITIVE_QUERY, '$1***');
+}
+
+function sanitizeForLog(value, seen = new WeakSet()) {
+  if (typeof value === 'string') return redactText(value);
+  if (value === null || value === undefined || typeof value !== 'object') return value;
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+  if (Array.isArray(value)) return value.map((item) => sanitizeForLog(item, seen));
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    out[key] = SECRET_KEYS.test(key) ? '***' : sanitizeForLog(item, seen);
+  }
+  return out;
+}
+
+function sanitizeSettingsForPersistence(settings = {}) {
+  const output = {};
+  for (const [key, value] of Object.entries(settings)) {
+    if (!SECRET_SETTING_KEYS.has(key) && !SECRET_KEYS.test(key)) output[key] = value;
+  }
+  return output;
+}
+
+function computeBackoffMs(attempt, options = {}) {
+  const baseMs = Math.max(1, Number(options.baseMs) || 800);
+  const maxMs = Math.max(baseMs, Number(options.maxMs) || 30000);
+  const jitterRatio = Math.max(0, Math.min(1, Number(options.jitterRatio) || 0));
+  const random = typeof options.random === 'function' ? options.random() : Math.random();
+  const raw = Math.min(maxMs, baseMs * (2 ** Math.max(0, Number(attempt) - 1)));
+  return Math.round(raw * (1 - jitterRatio + (2 * jitterRatio * random)));
+}
+
+function buildValidationReport(input = {}) {
+  const failures = [];
+  if (input.schemaValid === false) failures.push('SCHEMA');
+  if (input.routeValid === false) failures.push('ROUTING');
+  if (input.tagsValid === false) failures.push('TAG');
+  if (input.sourceLinkValid === false) failures.push('SOURCE_LINK');
+  if (input.evidenceFound === false) failures.push('EVIDENCE');
+  if (input.duplicateScore >= 1) failures.push('DUPLICATE');
+  return {
+    schemaValid: input.schemaValid !== false,
+    routeValid: input.routeValid !== false,
+    tagsValid: input.tagsValid !== false,
+    sourceLinkValid: input.sourceLinkValid !== false,
+    parentSummaryValid: input.parentSummaryValid !== false,
+    evidenceFound: input.evidenceFound !== false,
+    evidenceMatchScore: number(input.evidenceMatchScore),
+    numberConsistency: input.numberConsistency !== false,
+    dateConsistency: input.dateConsistency !== false,
+    entityConsistency: input.entityConsistency !== false,
+    atomicityScore: number(input.atomicityScore),
+    duplicateScore: number(input.duplicateScore),
+    hardGateFailures: failures,
+    warnings: Array.isArray(input.warnings) ? input.warnings : [],
+    confidenceComponents: input.confidenceComponents || {},
+    finalDecision: failures.length ? 'review' : (input.finalDecision || 'auto_ingest')
+  };
+}
+
+function createStageMetric(input = {}) {
+  const started = Number(input.stageStartedAt || Date.now());
+  const completed = Number(input.stageCompletedAt || Date.now());
+  return sanitizeForLog({
+    taskId: input.taskId || '', runId: input.runId || '', sourceFingerprint: String(input.sourceHash || '').slice(0, 12),
+    stage: input.stage || '', stageStartedAt: started, stageCompletedAt: completed,
+    stageDurationMs: Math.max(0, completed - started), queueWaitMs: Number(input.queueWaitMs) || 0,
+    attempt: Number(input.attempt) || 1, provider: input.provider || '', requestCount: Number(input.requestCount) || 0,
+    retryCount: Number(input.retryCount) || 0, pollCount: Number(input.pollCount) || 0,
+    inputCharacters: Number(input.inputCharacters) || 0, estimatedInputTokens: Math.ceil((Number(input.inputCharacters) || 0) / 3),
+    outputCharacters: Number(input.outputCharacters) || 0, estimatedOutputTokens: Math.ceil((Number(input.outputCharacters) || 0) / 3),
+    bytesRead: Number(input.bytesRead) || 0, bytesWritten: Number(input.bytesWritten) || 0,
+    cacheHit: input.cacheHit === true, cacheMiss: input.cacheMiss === true,
+    cardsGenerated: Number(input.cardsGenerated) || 0, cardsRejected: Number(input.cardsRejected) || 0,
+    duplicateCardsMerged: Number(input.duplicateCardsMerged) || 0, errorCode: input.errorCode || ''
+  });
+}
+
+function number(value) { return Number.isFinite(Number(value)) ? Number(value) : 0; }
+
+module.exports = {
+  AppError, buildValidationReport, classifyFailure, computeBackoffMs, createStageMetric,
+  redactText, sanitizeForLog, sanitizeSettingsForPersistence, toAppError
+};
+
+},
+/**
  * @module src/core/link-service
  * 卡片间链接建议：基于标签 / Map_Index / 共享实体的双向链接候选
  * @exports findLinkCandidates
@@ -7386,6 +7627,7 @@ const { atomFingerprint } = require("src/core/identity.js");
 const { buildCardRecord } = require("src/core/markdown-renderer.js");
 const { resolveFixedRoute } = require("src/core/routing.js");
 const { findLinkCandidates, validateRelations } = require("src/core/link-service.js");
+const { buildValidationReport } = require("src/core/reliability.js");
 
 async function runKnowledgeWorkflow(options) {
   const classification = options.classification || await classifyDocument({
@@ -7459,6 +7701,19 @@ async function runKnowledgeWorkflow(options) {
       labelsValid,
       duplicate
     });
+    const validationReport = buildValidationReport({
+      schemaValid: true,
+      routeValid,
+      tagsValid: labelsValid,
+      sourceLinkValid: !!atom.source?.source_link,
+      parentSummaryValid: true,
+      evidenceFound: confidence.components?.evidence > 0,
+      evidenceMatchScore: confidence.components?.evidence || 0,
+      atomicityScore: confidence.components?.atom_quality || 0,
+      duplicateScore: duplicate ? 1 : 0,
+      confidenceComponents: confidence.components || {},
+      finalDecision: confidence.decision
+    });
     const card = buildCardRecord({
       atom,
       route,
@@ -7467,6 +7722,7 @@ async function runKnowledgeWorkflow(options) {
       versions: options.versions,
       now: options.now
     });
+    card.validation_report = validationReport;
     if (confidence.decision === 'auto_ingest' && !quantityAnomaly) {
       accepted.push(card);
       existingFingerprints.add(fingerprint);
@@ -7484,6 +7740,7 @@ async function runKnowledgeWorkflow(options) {
         status: 'pending',
         reasons,
         confidence,
+        validationReport,
         atom,
         proposed_card: card
       });

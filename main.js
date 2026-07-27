@@ -756,6 +756,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       reset += 1;
     }
     await this.saveTasks(tasks);
+    // saveTasks 是防抖写盘；autoProcessQueue 会立即从磁盘重读账本。
+    // 重试入口必须先 flush，否则可能仍读到 failed 状态而跳过刚重新入队的任务。
+    await this.flushSaveTasksImmediate();
     this.sessionStats.lastMessage = `已重新入队 ${reset} 个失败任务`;
     if (showNotice) new Notice(`已重新入队 ${reset} 个失败任务，开始自动处理。`);
     await this.refreshViews();
@@ -894,6 +897,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         sourceHash: current.source_hash,
         maxChunkChars: this.settings.aiChunkSize,
         maxPointsPerRequest: this.settings.maxPointsPerRequest,
+        summaryConcurrency: this.settings.summaryConcurrency,
         atomizationConcurrency: this.settings.atomizationConcurrency,
         shortDocumentMaxCards: this.settings.shortDocumentMaxCards,
         chunkOverlapRatio: this.settings.chunkOverlapRatio,
@@ -1485,6 +1489,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     task.errors = [];
     task.updated_at = new Date().toISOString();
     await this.saveTasks(tasks);
+    // processTask 开头会重读账本，确保 queued 状态已对该读取可见。
+    await this.flushSaveTasksImmediate();
     await this.processTask(task);
   }
 
@@ -1567,14 +1573,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this._pendingSaveDirty = false;
     await this.ensureFolders();
     const target = tasksPath(this.settings);
-    // v1.4 (M-11): 写盘前先备份上一版 tasks.json 到 tasks.json.bak.{ts}，
-    //              便于迁移出错或 schema 升级失败时回退。
+    // v1.4 (M-11): 写盘前备份上一版 tasks.json，便于迁移出错时回退。
+    // v2.9.3: 改为单一滚动备份。高频进度落盘若每次创建时间戳文件，
+    //         会在 vault / 同步盘持续制造目录项与同步 IO，而恢复只需要上一版。
     if (this.settings.backupTasksOnSave !== false) {
       try {
         const existing = this.app.vault.getAbstractFileByPath(target);
         if (existing instanceof TFile) {
-          const ts = new Date().toISOString().replace(/[:.]/g, '-');
-          const backupPath = target.replace(/\.json$/i, `.bak.${ts}.json`);
+          const backupPath = target.replace(/\.json$/i, '.bak.json');
           const content = await this.app.vault.read(existing);
           await writeFile(this.app, backupPath, content);
         }
@@ -2647,6 +2653,17 @@ class SlicerSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName('总结并发数')
+      .setDesc('同时执行的逐段总结请求数。默认 2；与原子化并发独立，降低原子化并发不会拖慢总结。')
+      .addDropdown((dropdown) => dropdown
+        .addOption('1', '1（保守）').addOption('2', '2（推荐）').addOption('3', '3（较快）')
+        .setValue(String(this.plugin.settings.summaryConcurrency || 2))
+        .onChange(async (value) => {
+          this.plugin.settings.summaryConcurrency = Number(value);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
       .setName('原子化并发数')
       .setDesc('同时执行的原子化批次数。默认 2；出现 429 时建议调为 1。')
       .addDropdown((dropdown) => dropdown
@@ -3097,6 +3114,7 @@ const DEFAULT_SETTINGS = {
   aiChunkSize: 8000,
   aiMaxChunks: 100,
   maxPointsPerRequest: 3,
+  summaryConcurrency: 2,
   atomizationConcurrency: 2,
   shortDocumentMaxCards: 20,
   // v2.7（借鉴 WeKnora 切片引擎）：相邻切片重叠比例（0–0.5）。
@@ -3178,6 +3196,8 @@ function migrateSettings(stored = {}) {
   if (!migrated.aiChunkSize || Number(migrated.aiChunkSize) === 12000) migrated.aiChunkSize = DEFAULT_SETTINGS.aiChunkSize;
   if (!Number(migrated.maxPointsPerRequest)) migrated.maxPointsPerRequest = DEFAULT_SETTINGS.maxPointsPerRequest;
   migrated.maxPointsPerRequest = Math.max(1, Math.min(3, Math.round(Number(migrated.maxPointsPerRequest))));
+  if (!Number(migrated.summaryConcurrency)) migrated.summaryConcurrency = DEFAULT_SETTINGS.summaryConcurrency;
+  migrated.summaryConcurrency = Math.max(1, Math.min(3, Math.round(Number(migrated.summaryConcurrency))));
   if (!Number(migrated.atomizationConcurrency)) migrated.atomizationConcurrency = DEFAULT_SETTINGS.atomizationConcurrency;
   migrated.atomizationConcurrency = Math.max(1, Math.min(3, Math.round(Number(migrated.atomizationConcurrency))));
   if (!Number(migrated.shortDocumentMaxCards)) migrated.shortDocumentMaxCards = DEFAULT_SETTINGS.shortDocumentMaxCards;
@@ -7388,7 +7408,7 @@ async function runKnowledgeWorkflow(options) {
     maxChunkChars: options.maxChunkChars,
     chunkOverlapRatio: options.chunkOverlapRatio,
     coalesceTinyChunks: options.coalesceTinyChunks,
-    summaryConcurrency: options.atomizationConcurrency,
+    summaryConcurrency: options.summaryConcurrency,
     maxRepairAttempts: 2,
     requestJson: options.requestJson,
     requestStream: options.requestStream,

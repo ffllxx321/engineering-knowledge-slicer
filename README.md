@@ -158,8 +158,8 @@ node scripts/smoke-v292.js           # 诊断日志故障回归（v2.9.2，22 �
 - PaddleOCR 走云端时不支持 OCR 模型参数调整，使用默认 `PaddleOCR-VL-1.6`
 - SSE 流式输出为 POC 状态，MiniMax 接口行为变化时可能回退为整包接收
 - 切分结果自 v2.7 起与旧版不再逐字节一致（按标题边界 + 合并 + 重叠重排），artifact 缓存在任务重跑时自动覆盖
-- 当前仓库尚未建立正式 TypeScript typecheck；生产实现仍是自包含 JavaScript bundle。详见 `docs/optimization-results.md`
-- 成功的 map chunk 尚未独立持久化；阶段级 summary checkpoint 可以恢复，但 reduce 失败仍可能重复 map
+- 生产实现仍是自包含 JavaScript bundle；`npm run typecheck` 对新增 JSDoc 契约执行 strict TypeScript 检查，`npm run build` 在临时目录真实打包并断言不改写生产 bundle。
+- 远端供应商没有公开 cancel endpoint；本地取消会立即停止队列、请求等待和后续轮询。
 
 ## 优化与诊断文档
 
@@ -173,3 +173,7 @@ node scripts/smoke-v292.js           # 诊断日志故障回归（v2.9.2，22 �
 ## 变更记录
 
 见 [CHANGELOG.md](./CHANGELOG.md)
+
+## 质量门禁
+
+依次运行 `npm ci`、`npm run lint`、`npm run typecheck`、`npm test`、`npm run build`、`npm run benchmark`。

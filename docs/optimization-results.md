@@ -33,12 +33,17 @@
 
 无需用户操作。旧 settings、任务数组和 raw artifact 均继续读取；新 artifact 在首次重跑阶段自然写成 v2。旧卡无需迁移或重新处理。若回退旧版本，新 v2 artifact 不会被旧代码识别为原 payload，建议回退前只删除 `_slicer_artifacts` 中目标 run 的中间产物，绝不删除知识卡或源文件。
 
-## 已知限制与未实施
+## 严格 gap closure 补充
 
-- 成功 map chunk 尚未独立缓存；reduce 失败可能重复成功 map。
-- 自动实体 alias registry、跨文档语义 embedding 去重、独立项目 Wiki 尚未交付；保留 typed relation/索引基础。
-- 任务批量多选/虚拟滚动与服务测试最近结果持久化尚未交付。
-- 正式 TypeScript/typecheck 与 source split 未建立；本轮避免高风险 bundle 重写。
+- 成功 map chunk 现按 stable chunk ID 独立持久化，reduce 失败后的重启只重试 reduce。
+- 新增无外部数据库的 token cosine/SimHash 候选、实体 alias registry、reverse/evolution sidecar 和每项目 Wiki。
+- 任务支持多选/批量动作/50 项分页，服务测试结果跨会话持久化。
+- strict JSDoc typecheck 已建立；真实 esbuild 在临时目录运行并断言不改写手工生产 bundle。
+- 写入使用临时文件、读回校验、rename/rollback transaction；不支持 adapter transaction 时使用带读回与恢复的 Vault API fallback。
+
+## 外部验证边界
+
+供应商 remote job cancel endpoint 不存在于当前适配契约；本地 queue/fetch/sleep/polling 已取消。真实付费 API 延迟、费用、OCR 准确率及 Obsidian 真机屏幕阅读器/主题仍需外部环境，因此不做伪造量化。
 
 ## 手动验证与回滚
 

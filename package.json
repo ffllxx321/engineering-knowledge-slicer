@@ -5,9 +5,10 @@
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs watch",
-    "build": "node --check main.js",
-    "lint": "node --check main.js && node --check scripts/smoke-reliability-v210.js && node --check scripts/benchmark-optimization.js",
-    "test": "node scripts/smoke-split.js && node scripts/smoke-splitter-v26.js && node scripts/smoke-ratelimit.js && node scripts/smoke-json-repair.js && node scripts/smoke-v292.js && node scripts/smoke-performance-reliability.js && node scripts/smoke-reliability-v210.js && node scripts/integration-workflow-recovery.js",
+    "build": "node scripts/validate-bundle-build.js",
+    "lint": "node --check main.js && node --check scripts/*.js && node --check src/*.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node scripts/smoke-split.js && node scripts/smoke-splitter-v26.js && node scripts/smoke-ratelimit.js && node scripts/smoke-json-repair.js && node scripts/smoke-v292.js && node scripts/smoke-performance-reliability.js && node scripts/smoke-reliability-v210.js && node scripts/integration-workflow-recovery.js && node scripts/gap-closure-tests.js",
     "benchmark": "node scripts/benchmark-optimization.js"
   },
   "keywords": [

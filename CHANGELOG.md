@@ -2,6 +2,12 @@
 
 ## Unreleased — 系统可靠性、检查点与可观测性优化
 
+- summary map chunk 独立持久化；reduce 失败重启只重试 reduce。
+- 文件写入采用读回校验、adapter rename transaction、rollback 和 Vault API fallback。
+- 新增 API/prompt/IO/UI counters、供应商独立 limiter、持久服务测试结果。
+- 新增 prompt 公共规则组合、SimHash/稀疏语义近重复、实体别名、反向/演化索引及项目聚合页。
+- 任务加入多选、批量动作和分页；新增 DOM/a11y mock、strict JSDoc typecheck 与非破坏性真实 esbuild 验证。
+
 - 修复批内重复原子在首项进入审核时未立即占用 fingerprint、可能形成重复审核卡的问题；新增确定性工作流测试。
 - 有效 classification/summary/atoms 检查点恢复经集成测试证明不会再次调用 provider。
 - 任务 AbortController 贯穿 MiniMax、MinerU、PaddleOCR 的排队、请求、上传、轮询等待和下载；RateLimiter 支持排队取消与超时。

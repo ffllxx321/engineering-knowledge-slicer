@@ -494,11 +494,19 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       backoffMaxMs: Number(this.settings.rateLimitBackoffMaxMs || 30000),
       windowSize: Number(this.settings.rateLimitWindowSize || 10)
     });
+    // Provider queues are intentionally independent: slow OCR polling must never
+    // consume MiniMax capacity, and cancellation is handled by each queue.
+    this.providerLimiters = {
+      minimax: this.rateLimiter,
+      mineru: new RateLimiter({ intervalMs: Number(this.settings.mineruRateLimitMs || 1000), maxConcurrent: Number(this.settings.mineruMaxConcurrent || 2) }),
+      paddleocr: new RateLimiter({ intervalMs: Number(this.settings.paddleOcrRateLimitMs || 1000), maxConcurrent: Number(this.settings.paddleOcrMaxConcurrent || 2) })
+    };
     this.autoProcessing = false;
     this.pauseRequested = false;
     this.cancelRequestedTaskId = '';
     this.taskControllers = new Map();
     this.componentCache = new Map();
+    this.operationCounters = { apiRequests: 0, promptCharacters: 0, bytesRead: 0, bytesWritten: 0, ledgerWrites: 0, artifactWrites: 0, uiFullRenders: 0, uiIncrementalRefreshes: 0 };
     this.sessionStats = { scanned: 0, processed: 0, written: 0, review: 0, failed: 0, skipped: 0, current: '', lastMessage: '等待开始处理' };
     this.registerView(VIEW_TYPE_SLICER, (leaf) => new SlicerDashboardView(leaf, this));
 
@@ -606,6 +614,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         throw new Error(`鉴权失败（HTTP ${response.status}）。${body ? '服务端响应：' + body.slice(0, 200) : ''}`);
       }
       if (service === 'minimax' && !response.ok) throw new Error(`HTTP ${response.status}`);
+      await this.recordServiceTest(service, { ok: true, status: response.status, code: 'OK' });
       new Notice(`${config.label} 连接可用。`);
       return true;
     } catch (error) {
@@ -615,9 +624,17 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         errorMessage: String(error && error.message || error),
         errorStack: String(error && error.stack || '').split('\n').slice(0, 6).join(' | ')
       });
+      await this.recordServiceTest(service, { ok: false, status: Number(error?.status || 0), code: classifyServiceTestError(error), message: sanitizeSecret(error.message) });
       new Notice(`${config.label} 连接失败：${sanitizeSecret(error.message)}`);
       return false;
     }
+  }
+
+  async recordServiceTest(service, result) {
+    this.settings.serviceTestResults = Object.assign({}, this.settings.serviceTestResults || {}, {
+      [service]: Object.assign({ testedAt: new Date().toISOString() }, result)
+    });
+    await this.saveSafeSettings();
   }
 
   async activateView() {
@@ -632,6 +649,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async refreshViews() {
+    this.operationCounters.uiFullRenders += 1;
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_SLICER)) {
       if (leaf.view && leaf.view.render) {
         try {
@@ -648,6 +666,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   // 不写盘、不重渲染整个 dashboard，给 1 秒一次心跳用
   // v1.1.9: 加 try/catch 兜底 + null-safe 迭代，避免心跳触发 "object is not iterable" 把插件炸掉
   refreshProgressOnly(task) {
+    this.operationCounters.uiIncrementalRefreshes += 1;
     try {
       if (!this.app || !this.app.workspace || typeof this.app.workspace.getLeavesOfType !== 'function') return;
       const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SLICER) || [];
@@ -970,18 +989,28 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         shortDocumentMaxCards: this.settings.shortDocumentMaxCards,
         chunkOverlapRatio: this.settings.chunkOverlapRatio,
         coalesceTinyChunks: this.settings.coalesceTinyChunks,
+        loadSummaryMapChunk: (chunk) => this.loadArtifact(current, `summary-map-${chunk.stableChunkId || chunk.chunk_id}`),
+        saveSummaryMapChunk: (chunk, value) => this.persistArtifact(current, `summary-map-${chunk.stableChunkId || chunk.chunk_id}`, value),
         versions: runtimeVersions(this.settings),
         existingCards,
         existingFingerprints: existingCards.map((card) => card.atom_fingerprint).filter(Boolean),
         validateLabels: (atom) => validateAtomLabels(tagLibrary, atom),
         signal: taskController.signal,
         requestJson: (prompt, context) => this.rateLimiter.run(
-          () => requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest, signal: taskController.signal }),
+          () => {
+            this.operationCounters.apiRequests += 1;
+            this.operationCounters.promptCharacters += String(prompt || '').length;
+            return requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest, signal: taskController.signal });
+          },
           { signal: taskController.signal }
         ),
         requestStream: this.settings.useStreamingAi
           ? (prompt, context, hooks) => this.rateLimiter.run(
-            () => requestMiniMaxStream({ settings: this.settings, prompt, context, signal: taskController.signal, onDelta: hooks && hooks.onDelta, onProgressText: hooks && hooks.onProgressText }),
+            () => {
+              this.operationCounters.apiRequests += 1;
+              this.operationCounters.promptCharacters += String(prompt || '').length;
+              return requestMiniMaxStream({ settings: this.settings, prompt, context, signal: taskController.signal, onDelta: hooks && hooks.onDelta, onProgressText: hooks && hooks.onProgressText });
+            },
             { signal: taskController.signal }
           )
           : null,
@@ -1049,6 +1078,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         await this.persistArtifact(current, 'review', { version: '1.1', task_id: current.task_id, items: workflow.review });
         current.review_atom_ids = workflow.review.map((item) => item.atom_id);
       }
+      if (workflow.accepted.length) await this.rebuildKnowledgeIndexes();
       if (!workflow.accepted.length && !workflow.review.length) {
         // v2.8.1: 错误信息带上下文计数，告诉用户去 diag.log 看哪几个事件
         const pointCount = (workflow.summary && Array.isArray(workflow.summary.key_points)) ? workflow.summary.key_points.length : 0;
@@ -1086,6 +1116,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         cardsGenerated: workflow.accepted.length,
         cardsRejected: workflow.review.length
       }));
+      diag('performance.counters', Object.assign({ taskId: current.task_id, runId: current.run_id }, this.operationCounters));
       this.sessionStats.processed += 1;
       this.sessionStats.review += workflow.review.length;
       this.sessionStats.written += workflow.accepted.length;
@@ -1337,7 +1368,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       validationState: 'valid',
       payload: value
     };
-    await writeFile(this.app, path, JSON.stringify(envelope, null, 2));
+    const serialized = JSON.stringify(envelope, null, 2);
+    await writeFile(this.app, path, serialized);
+    this.operationCounters.artifactWrites += 1;
+    this.operationCounters.bytesWritten += Buffer.byteLength(serialized);
     task.artifacts = Object.assign({}, task.artifacts || {}, { [name]: path });
     if (name === 'summary') {
       const markdownPath = normalizeVaultPath(`${this.settings.artifactsPath}/${task.run_id}/summary.md`);
@@ -1464,6 +1498,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         Category: readFrontmatterValue(markdown, 'Category'),
         TagL1: readFrontmatterValue(markdown, 'TagL1'),
         TagL2: readFrontmatterValue(markdown, 'TagL2'),
+        library: readFrontmatterValue(markdown, 'library') || (file.path.startsWith(this.settings.businessOutputPath) ? 'business' : 'bid'),
+        project: readFrontmatterValue(markdown, 'project') || readFrontmatterValue(markdown, 'project_name') || readFrontmatterValue(markdown, 'Project'),
+        entities: parseFrontmatterArray(readFrontmatterValue(markdown, 'entities')),
+        relations: parseFrontmatterArray(readFrontmatterValue(markdown, 'related_candidates')),
         path: file.path,
         text: markdown.slice(0, 3000)
       });
@@ -1502,6 +1540,20 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const path = folderIndexPath(route);
     if (this.app.vault.getAbstractFileByPath(path)) return path;
     return writeFile(this.app, path, createFolderIndexMarkdown(route));
+  }
+
+  async rebuildKnowledgeIndexes() {
+    const cards = await this.loadExistingCards('');
+    const { buildKnowledgeIndex, renderProjectAggregation } = __require('src/core/link-service.js');
+    const index = buildKnowledgeIndex(cards);
+    const indexPath = normalizeVaultPath(`${this.settings.artifactsPath}/knowledge-index.v1.json`);
+    await writeFile(this.app, indexPath, JSON.stringify(index, null, 2));
+    for (const project of index.projects) {
+      const root = project.library === 'business' ? this.settings.businessOutputPath : this.settings.bidOutputPath;
+      const pagePath = normalizeVaultPath(`${root}/_项目/${sanitizeAttachmentFileName(project.name)}.md`);
+      await writeFile(this.app, pagePath, renderProjectAggregation(project));
+    }
+    return index;
   }
 
   async applyReviewGroup(taskId, groupId, action, correction = {}) {
@@ -1734,7 +1786,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         try { diag('tasks.backup.error', { message: String(e && e.message || e) }); } catch (_) {}
       }
     }
-    await writeFile(this.app, target, JSON.stringify(tasks, null, 2));
+    const serialized = JSON.stringify(tasks, null, 2);
+    await writeFile(this.app, target, serialized);
+    this.operationCounters.ledgerWrites += 1;
+    this.operationCounters.bytesWritten += Buffer.byteLength(serialized);
   }
 
   // v1.4 (M-11): 手动把所有 paused 任务重新入队（dashboard 按钮触发）
@@ -1872,7 +1927,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       paddleOcrApiKey: this.settings.pdfPaddleOcrApiKey || '',
       paddleOcrApiEndpoint: this.settings.pdfPaddleOcrApiEndpoint || 'https://paddleocr.aistudio-app.com/api/v2/ocr/jobs',
       paddleOcrApiModel: this.settings.pdfPaddleOcrApiModel || 'PaddleOCR-VL-1.6',
-      requestImpl: obsidianRequest,
+      requestImpl: (url, init) => {
+        const provider = String(url).includes('paddleocr') ? 'paddleocr' : 'mineru';
+        this.operationCounters.apiRequests += 1;
+        return this.providerLimiters[provider].run(() => obsidianRequest(url, init), { signal: task ? this.taskControllers?.get(task.task_id)?.signal : undefined });
+      },
       fileName: task?.source_path?.split('/').pop() || 'source.pdf',
       onProgress: task ? (progress) => this.setTaskProgress(task, progress.message, progress) : undefined
     };
@@ -2137,6 +2196,8 @@ class SlicerDashboardView extends ItemView {
     this.selectedTaskIds = new Set();
     this.taskFilter = 'all';
     this.taskSearch = '';
+    this.taskPage = 0;
+    this.taskPageSize = 50;
   }
 
   getViewType() { return VIEW_TYPE_SLICER; }
@@ -2274,23 +2335,28 @@ class SlicerDashboardView extends ItemView {
       attr: { type: 'search', placeholder: '搜索文件名', 'aria-label': '搜索任务文件名' }
     });
     search.value = this.taskSearch;
-    search.addEventListener('change', () => {
+    search.addEventListener('input', () => {
       this.taskSearch = search.value;
-      this.render();
+      this.taskPage = 0;
+      clearTimeout(this.taskSearchTimer);
+      this.taskSearchTimer = setTimeout(() => this.render(), 150);
     });
     const filter = controls.createEl('select', { attr: { 'aria-label': '按状态筛选任务' } });
     for (const [value, label] of [['all', '全部状态'], ['queued', '待处理'], ['processing', '处理中'], ['needs_review', '待审核'], ['failed', '失败'], ['written', '已完成']]) {
       const option = filter.createEl('option', { text: label, attr: { value } });
       option.selected = this.taskFilter === value;
     }
-    filter.addEventListener('change', () => { this.taskFilter = filter.value; this.render(); });
+    filter.addEventListener('change', () => { this.taskFilter = filter.value; this.taskPage = 0; this.render(); });
 
     const query = this.taskSearch.trim().toLowerCase();
-    const filtered = tasks.filter((task) => {
+    const allFiltered = tasks.filter((task) => {
       const statusMatches = this.taskFilter === 'all'
         || (this.taskFilter === 'processing' ? PROCESSING_STATUSES.has(task.status) : task.status === this.taskFilter);
       return statusMatches && (!query || String(task.source_path || '').toLowerCase().includes(query));
-    }).slice(0, 100);
+    });
+    const maxPage = Math.max(0, Math.ceil(allFiltered.length / this.taskPageSize) - 1);
+    this.taskPage = Math.min(this.taskPage, maxPage);
+    const filtered = allFiltered.slice(this.taskPage * this.taskPageSize, (this.taskPage + 1) * this.taskPageSize);
     if (!filtered.length) {
       parent.createDiv({ cls: 'eks-empty', text: '没有符合当前筛选条件的任务。' });
       return;
@@ -2299,6 +2365,10 @@ class SlicerDashboardView extends ItemView {
     for (const task of filtered) {
       const details = list.createEl('details', { cls: 'eks-task-detail' });
       const summary = details.createEl('summary');
+      const checkbox = summary.createEl('input', { attr: { type: 'checkbox', 'aria-label': `选择任务 ${task.source_path || task.task_id}` } });
+      checkbox.checked = this.selectedTaskIds.has(task.task_id);
+      checkbox.addEventListener('click', (event) => event.stopPropagation());
+      checkbox.addEventListener('change', () => checkbox.checked ? this.selectedTaskIds.add(task.task_id) : this.selectedTaskIds.delete(task.task_id));
       summary.createSpan({ cls: 'eks-status-text', text: stageLabel(task.status) });
       summary.createSpan({ cls: 'eks-task-title', text: task.source_path || '(未知文件)' });
       const meta = details.createDiv('eks-task-detail-grid');
@@ -2328,7 +2398,16 @@ class SlicerDashboardView extends ItemView {
       if (PROCESSING_STATUSES.has(task.status)) button(actions, '取消', () => this.plugin.cancelCurrentTask(task.task_id));
       button(actions, '打开源文件', () => this.plugin.app.workspace.openLinkText(task.source_path, '', false));
     }
-    if (tasks.length > 100) parent.createDiv({ cls: 'eks-task-meta', text: '为保持界面流畅，当前最多显示 100 项；请使用筛选和搜索缩小范围。' });
+    const batch = parent.createDiv('eks-task-controls');
+    button(batch, `选择本页（${filtered.length}）`, () => { for (const task of filtered) this.selectedTaskIds.add(task.task_id); this.render(); });
+    button(batch, `重试所选（${this.selectedTaskIds.size}）`, async () => {
+      for (const id of [...this.selectedTaskIds]) await this.plugin.retryTask(id);
+      this.selectedTaskIds.clear();
+    });
+    button(batch, '取消所选', () => { for (const id of this.selectedTaskIds) this.plugin.cancelCurrentTask(id); });
+    button(batch, '上一页', () => { this.taskPage = Math.max(0, this.taskPage - 1); this.render(); }, this.taskPage === 0);
+    button(batch, '下一页', () => { this.taskPage = Math.min(maxPage, this.taskPage + 1); this.render(); }, this.taskPage >= maxPage);
+    batch.createSpan({ cls: 'eks-task-meta', text: `第 ${this.taskPage + 1}/${maxPage + 1} 页 · 共 ${allFiltered.length} 项` });
   }
 
   renderErrorCenter(parent, tasks) {
@@ -3042,15 +3121,29 @@ async function obsidianRequest(url, init = {}) {
 }
 
 function connectionTestSetting(containerEl, plugin, name, service) {
+  const last = plugin.settings.serviceTestResults?.[service];
+  const description = last
+    ? `${last.ok ? '最近成功' : `最近失败（${last.code || 'UNKNOWN'}）`} · ${formatLocalTime(last.testedAt)}`
+    : '尚未测试';
   new Setting(containerEl)
     .setName(name)
-    .setDesc('验证鉴权和服务端是否可访问；不会上传知识库文件。')
+    .setDesc(`${description}。验证鉴权和服务端是否可访问；不会上传知识库文件。`)
     .addButton((control) => control
       .setButtonText('测试连接')
       .onClick(async () => {
         control.setDisabled(true);
         try { await plugin.testServiceConnection(service); } finally { control.setDisabled(false); }
       }));
+}
+
+function classifyServiceTestError(error) {
+  const status = Number(error?.status || 0);
+  const message = String(error?.message || error || '');
+  if (status === 401 || status === 403 || /鉴权|unauthor/i.test(message)) return 'AUTH_PROVIDER_REJECTED';
+  if (status === 429 || /限流|rate.?limit/i.test(message)) return 'RATE_LIMIT_PROVIDER_BUSY';
+  if (/超时|timeout/i.test(message)) return 'TIMEOUT_STAGE_EXCEEDED';
+  if (/network|ENOTFOUND|ECONN/i.test(message)) return 'NETWORK_TRANSIENT_FAILURE';
+  return 'PROVIDER_SERVICE_UNAVAILABLE';
 }
 
 function serviceConnectionConfig(service, settings) {
@@ -3106,8 +3199,9 @@ function serviceConnectionConfig(service, settings) {
   };
 }
 
-function button(parent, text, onClick) {
-  const el = parent.createEl('button', { text });
+function button(parent, text, onClick, disabled = false) {
+  const el = parent.createEl('button', { text, attr: { type: 'button', disabled: disabled ? 'disabled' : null } });
+  el.disabled = !!disabled;
   el.onclick = onClick;
   return el;
 }
@@ -3156,14 +3250,59 @@ async function ensureFolder(app, folderPath) {
 }
 
 async function writeFile(app, path, content) {
-  await ensureFolder(app, path.split('/').slice(0, -1).join('/'));
-  const existing = app.vault.getAbstractFileByPath(path);
-  if (existing instanceof TFile) {
-    await app.vault.modify(existing, content);
-  } else {
-    await app.vault.create(path, content);
+  const normalized = normalizeVaultPath(path);
+  await ensureFolder(app, normalized.split('/').slice(0, -1).join('/'));
+  const adapter = app.vault.adapter;
+  const expected = String(content);
+  // Obsidian desktop adapters expose write/rename/remove. Use a verified
+  // temp + rollback transaction where available; mobile/custom adapters fall
+  // back to the public Vault API with read-back verification and restoration.
+  if (adapter && typeof adapter.write === 'function' && typeof adapter.rename === 'function' && typeof adapter.remove === 'function') {
+    const nonce = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const temporary = `${normalized}.tmp-${nonce}`;
+    const backup = `${normalized}.rollback-${nonce}`;
+    const existed = typeof adapter.exists === 'function'
+      ? await adapter.exists(normalized)
+      : !!app.vault.getAbstractFileByPath(normalized);
+    let backupCreated = false;
+    try {
+      await adapter.write(temporary, expected);
+      if (typeof adapter.read === 'function' && await adapter.read(temporary) !== expected) throw new Error('临时文件写入校验失败');
+      if (existed) {
+        await adapter.rename(normalized, backup);
+        backupCreated = true;
+      }
+      await adapter.rename(temporary, normalized);
+      if (typeof adapter.read === 'function' && await adapter.read(normalized) !== expected) throw new Error('目标文件提交校验失败');
+      if (backupCreated) await adapter.remove(backup);
+      return normalized;
+    } catch (error) {
+      try { if (typeof adapter.exists !== 'function' || await adapter.exists(temporary)) await adapter.remove(temporary); } catch (_) {}
+      if (backupCreated) {
+        try {
+          if (typeof adapter.exists !== 'function' || await adapter.exists(normalized)) await adapter.remove(normalized);
+          await adapter.rename(backup, normalized);
+        } catch (rollbackError) {
+          error.rollbackError = String(rollbackError?.message || rollbackError);
+        }
+      }
+      throw error;
+    }
   }
-  return path;
+  const existing = app.vault.getAbstractFileByPath(normalized);
+  const previous = existing ? await app.vault.read(existing) : null;
+  try {
+    if (existing) await app.vault.modify(existing, expected);
+    else await app.vault.create(normalized, expected);
+    const committed = app.vault.getAbstractFileByPath(normalized);
+    if (!committed || await app.vault.read(committed) !== expected) throw new Error('兼容写入校验失败');
+  } catch (error) {
+    if (existing && previous !== null) {
+      try { await app.vault.modify(existing, previous); } catch (rollbackError) { error.rollbackError = String(rollbackError?.message || rollbackError); }
+    }
+    throw error;
+  }
+  return normalized;
 }
 
 async function writeUnique(app, targetPath, content) {
@@ -3284,6 +3423,18 @@ function readFrontmatterValue(markdown, key) {
   // 多行（普通换行 → 空格）
   raw = raw.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
   return raw;
+}
+
+function parseFrontmatterArray(value) {
+  if (Array.isArray(value)) return value;
+  const text = String(value || '').trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return text.replace(/^\[|\]$/g, '').split(',').map((item) => item.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+  }
 }
 
 function cardFromMarkdown(markdown) {
@@ -6377,6 +6528,26 @@ function pageAtOffset(pageBreakOffsets, offset) {
   return low + 1;
 }
 
+const COMMON_PROMPT_RULES = Object.freeze([
+  '不得编造输入中不存在的事实；证据不足时使用空值并明确冲突。',
+  '所有面向使用者的内容统一使用简体中文。',
+  '只返回契约要求的 JSON，不输出 Markdown 代码围栏或解释文字。'
+]);
+
+function composePrompt(parts, commonRules = COMMON_PROMPT_RULES) {
+  const seen = new Set();
+  const values = [];
+  for (const part of [...(parts || []), ...(commonRules || [])]) {
+    const text = String(part || '').trim();
+    if (!text) continue;
+    const key = text.replace(/\s+/g, ' ');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    values.push(text);
+  }
+  return values.join('\n\n');
+}
+
 async function summarizeDocument(options) {
   // v2.7: 透传 WeKnora 式切片参数（重叠比例 + 小节合并开关）
   const chunks = splitMarkdownSections(options.parsePackage.markdown, {
@@ -6389,11 +6560,22 @@ async function summarizeDocument(options) {
   let nextChunkIndex = 0;
   async function summarizeChunk(index) {
     const chunk = chunks[index];
+    const cached = typeof options.loadSummaryMapChunk === 'function'
+      ? await options.loadSummaryMapChunk(chunk)
+      : null;
+    if (cached && cached.coverage && exactCoverage(cached.coverage, 'chunk_ids', [chunk.chunk_id], '总结分块覆盖不完整').length === 0) {
+      partials[index] = cached;
+      await emitProgress(options.onProgress, {
+        stage: 'summary-map', chunkIndex: index + 1, chunkTotal: chunks.length,
+        cacheHit: true, message: `复用逐段总结 ${index + 1}/${chunks.length}`
+      });
+      return;
+    }
     // v2.7: 把标题层级面包屑（WeKnora ContextHeader）注入 prompt，让 AI 拿到章节语境
     const chunkContext = chunk.breadcrumb
       ? `当前分块 ${chunk.chunk_id}（${index + 1}/${chunks.length}），所属章节路径：\n${chunk.breadcrumb}`
       : `当前分块 ${chunk.chunk_id}（${index + 1}/${chunks.length}）：`;
-    const prompt = [
+    const prompt = composePrompt([
       options.basePrompt,
       '当前文档类型专用规则：',
       options.typePrompt,
@@ -6403,7 +6585,7 @@ async function summarizeDocument(options) {
       chunk.markdown,
       `coverage.chunk_ids 必须且只能包含 ["${chunk.chunk_id}"]，complete 必须为 true。`,
       '所有面向使用者的内容统一使用简体中文。只返回符合 structured-summary.schema.json 的 JSON。'
-    ].filter(Boolean).join('\n\n');
+    ]);
     partials[index] = await requestWithContract({
       prompt,
       stage: 'summary-map',
@@ -6417,6 +6599,9 @@ async function summarizeDocument(options) {
       normalizeValue: (value) => normalizeSummaryMap(value, options, chunk),
       extraValidation: (value) => exactCoverage(value.coverage, 'chunk_ids', [chunk.chunk_id], '总结分块覆盖不完整')
     });
+    if (typeof options.saveSummaryMapChunk === 'function') {
+      await options.saveSummaryMapChunk(chunk, partials[index]);
+    }
   }
   async function summaryWorker() {
     while (true) {
@@ -6432,7 +6617,7 @@ async function summarizeDocument(options) {
     return reduceSummaryHierarchy(options, partials, Math.max(2, Number(options.reduceBatchSize) || 8));
   }
   const chunkIds = chunks.map((chunk) => chunk.chunk_id);
-  const reducePrompt = [
+  const reducePrompt = composePrompt([
     options.basePrompt,
     '当前文档类型专用规则：',
     options.typePrompt,
@@ -6441,7 +6626,7 @@ async function summarizeDocument(options) {
     `coverage.chunk_ids 必须完整且只能为：${JSON.stringify(chunkIds)}；complete 必须为 true。`,
     JSON.stringify(partials, null, 2),
     '所有面向使用者的内容统一使用简体中文。只返回符合 structured-summary.schema.json 的 JSON。'
-  ].filter(Boolean).join('\n\n');
+  ]);
   try {
     return await requestWithContract({
       prompt: reducePrompt,
@@ -6571,7 +6756,7 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
         continue;
       }
       const chunkIds = [...new Set(group.flatMap((item) => item.coverage.chunk_ids))];
-      const prompt = [
+      const prompt = composePrompt([
         options.basePrompt,
         '当前文档类型专用规则：',
         options.typePrompt,
@@ -6579,7 +6764,7 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
         `coverage.chunk_ids 必须完整且只能为：${JSON.stringify(chunkIds)}；complete 必须为 true。`,
         JSON.stringify(group, null, 2),
         '只返回符合 structured-summary.schema.json 的 JSON。'
-      ].filter(Boolean).join('\n\n');
+      ]);
       next.push(await requestWithContract({
         prompt,
         stage: 'summary-reduce',
@@ -7351,6 +7536,7 @@ module.exports = {
   atomizeSummary,
   buildClassificationPrompt,
   classifyDocument,
+  composePrompt,
   classificationSample,
   coalesceTinyChunks,
   commonBreadcrumbPrefix,
@@ -7824,11 +8010,112 @@ function findLinkCandidates(atom, cards, options = {}) {
   return (cards || []).map((card) => {
     const cardTokens = tokenSet(`${card.title || ''} ${card.text || ''}`);
     let score = intersectionSize(atomTokens, cardTokens) * 2;
+    const semanticScore = cosineSparse(termVector(atomTokens), termVector(cardTokens));
+    score += Math.round(semanticScore * 20);
     if (atom.Category && atom.Category === card.Category) score += 6;
     if (atom.TagL1 && atom.TagL1 === card.TagL1) score += 3;
     if (atom.TagL2 && atom.TagL2 === card.TagL2) score += 2;
     return Object.assign({}, card, { candidate_score: score });
   }).sort((left, right) => right.candidate_score - left.candidate_score || String(left.card_id).localeCompare(String(right.card_id))).slice(0, limit);
+}
+
+function normalizeEntityName(value, aliases = {}) {
+  const normalized = String(value?.name || value || '').normalize('NFKC').trim().toLowerCase().replace(/\s+/g, '');
+  return String(aliases[normalized] || normalized);
+}
+
+function buildKnowledgeIndex(cards, options = {}) {
+  const aliases = Object.assign({}, options.aliases || {});
+  const entities = {};
+  const reverseRelations = {};
+  const evolution = { supersedes: {}, contradictedBy: {} };
+  const projects = new Map();
+  const signatures = [];
+  for (const card of cards || []) {
+    const id = String(card.card_id || '');
+    if (!id) continue;
+    signatures.push({ card_id: id, signature: simHash(`${card.title || ''} ${card.text || ''}`) });
+    for (const entity of card.entities || []) {
+      const canonical = normalizeEntityName(entity, aliases);
+      if (!canonical) continue;
+      if (!entities[canonical]) entities[canonical] = { canonical, aliases: [], card_ids: [] };
+      entities[canonical].card_ids.push(id);
+      const original = String(entity?.name || entity || '').trim();
+      if (original && !entities[canonical].aliases.includes(original)) entities[canonical].aliases.push(original);
+    }
+    for (const relation of card.relations || []) {
+      const target = String(relation.target_card_id || relation.target || '');
+      const type = String(relation.relation || relation.type || 'related');
+      if (!target) continue;
+      if (!reverseRelations[target]) reverseRelations[target] = [];
+      reverseRelations[target].push({ source_card_id: id, relation: type });
+      if (type === 'supersedes') {
+        if (!evolution.supersedes[id]) evolution.supersedes[id] = [];
+        evolution.supersedes[id].push(target);
+      }
+      if (type === 'contradicts') {
+        if (!evolution.contradictedBy[target]) evolution.contradictedBy[target] = [];
+        evolution.contradictedBy[target].push(id);
+      }
+    }
+    const projectName = String(card.project || '').trim();
+    if (projectName) {
+      const key = `${card.library || 'bid'}:${projectName}`;
+      if (!projects.has(key)) projects.set(key, { name: projectName, library: card.library || 'bid', cards: [] });
+      projects.get(key).cards.push({ card_id: id, title: card.title || id, path: card.path || '' });
+    }
+  }
+  for (const value of Object.values(entities)) value.card_ids = [...new Set(value.card_ids)].sort();
+  return {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    aliases,
+    entities,
+    reverseRelations,
+    evolution,
+    semanticSignatures: signatures,
+    projects: [...projects.values()].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
+  };
+}
+
+function renderProjectAggregation(project) {
+  const lines = ['---', `title: ${JSON.stringify(project.name)}`, 'artifact_type: "project-aggregation"', `library: ${JSON.stringify(project.library)}`, 'schema_version: "1"', '---', '', `# ${project.name}`, '', '## 知识卡片', ''];
+  for (const card of project.cards || []) lines.push(`- [[${String(card.path || '').replace(/\.md$/i, '')}|${card.title}]]`);
+  lines.push('', '## 动态聚合', '', '```dataview', `LIST FROM "" WHERE project = ${JSON.stringify(project.name)} OR project_name = ${JSON.stringify(project.name)}`, '```', '');
+  return lines.join('\n');
+}
+
+function simHash(text) {
+  const crypto = require('crypto');
+  const weights = new Int32Array(64);
+  for (const token of tokenSet(text)) {
+    const digest = crypto.createHash('sha256').update(token).digest();
+    for (let bit = 0; bit < 64; bit += 1) weights[bit] += (digest[Math.floor(bit / 8)] & (1 << (bit % 8))) ? 1 : -1;
+  }
+  let result = 0n;
+  for (let bit = 0; bit < 64; bit += 1) if (weights[bit] >= 0) result |= 1n << BigInt(bit);
+  return result.toString(16).padStart(16, '0');
+}
+
+function hammingDistance(left, right) {
+  let value = BigInt(`0x${left || '0'}`) ^ BigInt(`0x${right || '0'}`);
+  let count = 0;
+  while (value) { count += Number(value & 1n); value >>= 1n; }
+  return count;
+}
+
+function termVector(tokens) {
+  const vector = new Map();
+  for (const token of tokens) vector.set(token, (vector.get(token) || 0) + 1);
+  return vector;
+}
+
+function cosineSparse(left, right) {
+  let dot = 0; let leftNorm = 0; let rightNorm = 0;
+  for (const value of left.values()) leftNorm += value * value;
+  for (const value of right.values()) rightNorm += value * value;
+  for (const [key, value] of left) dot += value * (right.get(key) || 0);
+  return leftNorm && rightNorm ? dot / Math.sqrt(leftNorm * rightNorm) : 0;
 }
 
 function validateRelations(relations, candidates) {
@@ -7874,7 +8161,10 @@ function flatten(value) {
   return Object.values(value).map(flatten).join(' ');
 }
 
-module.exports = { RELATION_TYPES, findLinkCandidates, validateRelations };
+module.exports = {
+  RELATION_TYPES, buildKnowledgeIndex, cosineSparse, findLinkCandidates, hammingDistance,
+  normalizeEntityName, renderProjectAggregation, simHash, validateRelations
+};
 
 
 },
@@ -7918,6 +8208,8 @@ async function runKnowledgeWorkflow(options) {
     chunkOverlapRatio: options.chunkOverlapRatio,
     coalesceTinyChunks: options.coalesceTinyChunks,
     summaryConcurrency: options.summaryConcurrency,
+    loadSummaryMapChunk: options.loadSummaryMapChunk,
+    saveSummaryMapChunk: options.saveSummaryMapChunk,
     maxRepairAttempts: 2,
     requestJson: options.requestJson,
     requestStream: options.requestStream,

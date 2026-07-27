@@ -2,6 +2,11 @@
 
 ## Unreleased — 系统可靠性、检查点与可观测性优化
 
+- Dashboard 改为单一状态/下一步主操作、紧凑计数与 Tasks / Review / Errors 键盘可操作 tabs；次要动作、设置和路径渐进披露。运行中状态优先于历史错误，缺失/非法时间不再显示 `undefined`。
+- 原子化进度只计严格校验并已 checkpoint 的批次；首个终止失败会取消同级请求并等待全部 settle，禁止晚到成功日志和 31/31 假完成。
+- 每批使用稳定知识点标识持久化，重启仅请求失败/缺失批次；聚合 atoms 产物仅在每个请求知识点都有有效归属时生成。
+- 仅对缺失的空列表元数据做语义中性的确定性补齐；缺失置信度或已存在的错误类型继续触发严格 schema 与一次有界定向修复。
+- 错误详情记录真实请求、重试、prompt/output 字符与估算 token 计数；新增精确生产故障、并发取消、续传与 DOM/窄栏语义回归。
 - 修复大型 PDF 的 `summary-reduce` 供应商输出被 `{item: ...}` 单层包裹时触发 `$.coverage is required / $.item is not allowed / 总结分块覆盖不完整`：仅解包无歧义的单键 `item`，不放宽 schema 或 `additionalProperties`。
 - reduce coverage 缺失或为所请求 map chunk 的无重复子集时，从本次已校验的 map 输入确定性重建完整 coverage；含未知 chunk 或重复 ID 时拒绝猜测，执行有界 schema-repair retry。
 - 契约失败携带稳定 `AI_SCHEMA_OUTPUT_INVALID` 内部错误并归类为 `SCHEMA_OUTPUT_INVALID`，新增 `summaryReduceRequests` 计数；reduce 重试/进程恢复继续复用逐 chunk 持久化 map artifact。

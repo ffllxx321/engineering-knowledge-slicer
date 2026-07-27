@@ -7,12 +7,133 @@
   flex-direction: column;
   height: 100%;
   max-height: 100%;
-  overflow: hidden;
-  padding: 16px;
+  overflow: auto;
+  overflow-x: hidden;
+  padding: 12px;
+  gap: 10px;
+  min-width: 0;
 }
 
 .workspace-leaf-content[data-type="engineering-knowledge-slicer-dashboard"] .view-content {
   overflow: hidden;
+  min-width: 0;
+}
+
+.eks-view *,
+.eks-view *::before,
+.eks-view *::after {
+  box-sizing: border-box;
+  min-width: 0;
+}
+
+.eks-status {
+  border: 1px solid var(--eks-border);
+  border-radius: var(--radius-m, 6px);
+  padding: 12px;
+  background: var(--background-primary);
+}
+
+.eks-status-line,
+.eks-summary-line,
+.eks-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.eks-status-line {
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.eks-status-line h2 {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.eks-status-badge {
+  border: 1px solid var(--eks-border);
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller, 0.8em);
+  white-space: nowrap;
+}
+
+.eks-primary-action {
+  margin-top: 10px;
+}
+
+.eks-primary-button {
+  width: 100%;
+  min-height: 36px;
+}
+
+.eks-overflow,
+.eks-context {
+  margin-top: 8px;
+  font-size: var(--font-ui-small, 0.9em);
+}
+
+.eks-overflow > summary,
+.eks-context > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 4px 0;
+}
+
+.eks-secondary-actions {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.eks-secondary-actions button {
+  width: 100%;
+}
+
+.eks-summary-line {
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller, 0.8em);
+}
+
+.eks-summary-line span:not(:last-child)::after {
+  content: "·";
+  margin-left: 8px;
+}
+
+.eks-tabs {
+  border-bottom: 1px solid var(--eks-border);
+}
+
+.eks-tabs button {
+  flex: 1 1 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 7px 4px;
+  color: var(--text-muted);
+}
+
+.eks-tabs button[aria-selected="true"] {
+  color: var(--text-normal);
+  border-bottom: 2px solid var(--interactive-accent);
+  font-weight: var(--font-semibold, 600);
+}
+
+.eks-workspace {
+  min-height: 0;
+  overflow: visible;
+}
+
+.eks-context {
+  border-top: 1px solid var(--eks-border);
+  padding-top: 4px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 
 .eks-header,
@@ -243,6 +364,11 @@
   top: 0;
   z-index: 1;
   background: var(--eks-panel);
+  flex-wrap: wrap;
+}
+
+.eks-task-controls select {
+  max-width: 100%;
 }
 
 .eks-task-controls input {
@@ -411,6 +537,33 @@
 
   .eks-row-actions {
     grid-column: 2;
+  }
+}
+
+@media (max-width: 420px) {
+  .eks-view {
+    padding: 8px;
+  }
+
+  .eks-task-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .eks-row-actions {
+    width: 100%;
+  }
+
+  .eks-row-actions button {
+    flex: 1 1 auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .eks-view *,
+  .eks-progress-bar::-webkit-progress-value {
+    scroll-behavior: auto;
+    transition: none;
   }
 }
 

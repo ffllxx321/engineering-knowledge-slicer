@@ -10,6 +10,7 @@
 | QUAL-01 | P1 | validation | `runKnowledgeWorkflow` | 置信度计算结果未形成复用报告 | 审核与写入可能重复推导 | 已修：每卡 `ValidationReport` |
 | PERF-02 | P1 | AI | `classifyDocument` | 仓库实现已构建文档画像/代表片段而非始终全文 | 分类 token 风险已受控 | 保持；回归现有 prompt 调用图 |
 | PERF-03 | P1 | AI | `summarizeDocument` | 长文档 map/reduce；成功 chunk 暂未独立持久化 | reduce 失败时可能重复 map | 部分解决（阶段级 checkpoint）；chunk 级缓存仍是明确缺口 |
+| REL-ATOM-01 | P0 | AI | `atomizeSummary` | `Promise.all` 首错即拒绝，其他批次继续；启动序号误作完成进度；无批次 checkpoint | 晚到日志、心跳早停、31/31 假完成、重跑成功调用、无聚合产物 | 已修：共享取消 + `allSettled`、严格批次 checkpoint、精确归属聚合门禁 |
 | PERF-04 | P1 | polling | MinerU/PaddleOCR loops | 原实现支持超时但 AbortSignal 未全链透传 | 取消等待当前 API 完成 | 已修：task controller 贯穿排队、fetch、sleep、poll、MiniMax/SSE；集成测试证明取消后不再 poll |
 | PERF-05 | P2 | IO | `persistArtifact`/`setTaskProgress` | 每个 artifact 后 load tasks；进度关键点全量 merge | 大账本额外读/序列化 | 已有 500ms 写防抖；本轮保留，避免并发丢更新 |
 | PERF-06 | P2 | config | `loadRuntimeContracts`/`loadTagLibraryText` | 每任务读取相同 schema/prompt/tag/folder-map | 批处理重复 vault IO | 已修：`loadComponentText` 以 path+mtime+size 缓存，修改即失效 |

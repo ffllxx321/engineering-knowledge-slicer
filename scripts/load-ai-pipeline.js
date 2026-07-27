@@ -5,7 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 
-function loadAiPipeline() {
+function loadAiPipeline(options = {}) {
   const code = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf-8');
   const marker = '"src/core/ai-pipeline.js": function(require, module, exports) {';
   const start = code.indexOf(marker);
@@ -27,7 +27,7 @@ function loadAiPipeline() {
   const mod = { exports: {} };
   fn((id) => {
     if (id === 'src/core/schema-validator.js') {
-      return { validateSchema: () => ({ errors: [], warnings: [] }) };
+      return options.schemaValidator || { validateSchema: () => ({ errors: [], warnings: [] }) };
     }
     throw new Error('未预期的 require: ' + id);
   }, mod, mod.exports);

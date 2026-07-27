@@ -506,7 +506,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.cancelRequestedTaskId = '';
     this.taskControllers = new Map();
     this.componentCache = new Map();
-    this.operationCounters = { apiRequests: 0, summaryReduceRequests: 0, promptCharacters: 0, bytesRead: 0, bytesWritten: 0, ledgerWrites: 0, artifactWrites: 0, uiFullRenders: 0, uiIncrementalRefreshes: 0 };
+    this.operationCounters = { apiRequests: 0, aiRetries: 0, summaryReduceRequests: 0, promptCharacters: 0, outputCharacters: 0, bytesRead: 0, bytesWritten: 0, ledgerWrites: 0, artifactWrites: 0, uiFullRenders: 0, uiIncrementalRefreshes: 0 };
     this.sessionStats = { scanned: 0, processed: 0, written: 0, review: 0, failed: 0, skipped: 0, current: '', lastMessage: '等待开始处理' };
     this.registerView(VIEW_TYPE_SLICER, (leaf) => new SlicerDashboardView(leaf, this));
 
@@ -991,29 +991,37 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         coalesceTinyChunks: this.settings.coalesceTinyChunks,
         loadSummaryMapChunk: (chunk) => this.loadArtifact(current, `summary-map-${chunk.stableChunkId || chunk.chunk_id}`),
         saveSummaryMapChunk: (chunk, value) => this.persistArtifact(current, `summary-map-${chunk.stableChunkId || chunk.chunk_id}`, value),
+        loadAtomBatch: (batch) => this.loadArtifact(current, `atom-batch-${batch.stableBatchId}`),
+        saveAtomBatch: (batch, value) => this.persistArtifact(current, `atom-batch-${batch.stableBatchId}`, value),
         versions: runtimeVersions(this.settings),
         existingCards,
         existingFingerprints: existingCards.map((card) => card.atom_fingerprint).filter(Boolean),
         validateLabels: (atom) => validateAtomLabels(tagLibrary, atom),
         signal: taskController.signal,
         requestJson: (prompt, context) => this.rateLimiter.run(
-          () => {
+          async () => {
             this.operationCounters.apiRequests += 1;
+            if (Number(context?.attempt) > 1) this.operationCounters.aiRetries += 1;
             if (context?.stage === 'summary-reduce') this.operationCounters.summaryReduceRequests += 1;
             this.operationCounters.promptCharacters += String(prompt || '').length;
-            return requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest, signal: taskController.signal });
+            const result = await requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest, signal: context?.signal || taskController.signal });
+            this.operationCounters.outputCharacters += typeof result === 'string' ? result.length : JSON.stringify(result || {}).length;
+            return result;
           },
-          { signal: taskController.signal }
+          { signal: context?.signal || taskController.signal }
         ),
         requestStream: this.settings.useStreamingAi
           ? (prompt, context, hooks) => this.rateLimiter.run(
-            () => {
+            async () => {
               this.operationCounters.apiRequests += 1;
+              if (Number(context?.attempt) > 1) this.operationCounters.aiRetries += 1;
               if (context?.stage === 'summary-reduce') this.operationCounters.summaryReduceRequests += 1;
               this.operationCounters.promptCharacters += String(prompt || '').length;
-              return requestMiniMaxStream({ settings: this.settings, prompt, context, signal: taskController.signal, onDelta: hooks && hooks.onDelta, onProgressText: hooks && hooks.onProgressText });
+              const result = await requestMiniMaxStream({ settings: this.settings, prompt, context, signal: context?.signal || taskController.signal, onDelta: hooks && hooks.onDelta, onProgressText: hooks && hooks.onProgressText });
+              this.operationCounters.outputCharacters += typeof result === 'string' ? result.length : JSON.stringify(result || {}).length;
+              return result;
             },
-            { signal: taskController.signal }
+            { signal: context?.signal || taskController.signal }
           )
           : null,
 
@@ -1141,6 +1149,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         runId: current.run_id,
         sourcePath: current.source_path,
         version: runtimeVersions(this.settings),
+        details: {
+          requestCount: this.operationCounters.apiRequests,
+          retryCount: this.operationCounters.aiRetries,
+          inputCharacters: this.operationCounters.promptCharacters,
+          estimatedInputTokens: Math.ceil(this.operationCounters.promptCharacters / 3),
+          outputCharacters: this.operationCounters.outputCharacters,
+          estimatedOutputTokens: Math.ceil(this.operationCounters.outputCharacters / 3)
+        },
         diagnosticMode: this.settings.diagnosticMode === true
       });
       current.errors = [...(current.errors || []), appError.toJSON()];
@@ -2200,6 +2216,7 @@ class SlicerDashboardView extends ItemView {
     this.taskSearch = '';
     this.taskPage = 0;
     this.taskPageSize = 50;
+    this.activeSection = 'tasks';
   }
 
   getViewType() { return VIEW_TYPE_SLICER; }
@@ -2265,70 +2282,103 @@ class SlicerDashboardView extends ItemView {
   async renderContent(container) {
     const tasks = await this.plugin.loadTasks();
     const counts = statusCounts(tasks);
-
-    // v1.4 (M-07): AI 截断 dashboard 顶部 banner
-    const truncatedTasks = tasks.filter((t) => t.truncated === true);
-    if (truncatedTasks.length) {
-      const banner = container.createDiv({ cls: 'eks-banner eks-banner-warning' });
-      banner.createEl('strong', { text: `⚠️ ${truncatedTasks.length} 个任务的 AI 输出被截断（8192 token 上限）。` });
-      banner.createDiv({
-        cls: 'eks-task-meta',
-        text: `部分文档的知识点可能未生成完整。检查后可用「重试失败任务」重新处理。`
-      });
-      const list = banner.createDiv({ cls: 'eks-task-meta' });
-      for (const t of truncatedTasks.slice(0, 5)) {
-        const item = list.createDiv();
-        item.createSpan({ text: `· ${t.source_path}` });
-        if (t.truncated_completed) item.createSpan({ text: ` (已生成 ${t.truncated_completed} 个原子)` });
-      }
-      if (truncatedTasks.length > 5) {
-        list.createDiv({ text: `… 还有 ${truncatedTasks.length - 5} 个` });
-      }
-    }
-
-    const overview = container.createDiv('eks-panel eks-overview');
-    const header = overview.createDiv('eks-header');
-    header.createEl('h3', { text: '总览' });
-    const actions = header.createDiv('eks-actions');
-    button(actions, '扫描并自动处理', () => this.plugin.scanSourceFiles(true));
-    button(actions, '继续自动处理', () => this.plugin.autoProcessQueue(true));
-    button(actions, '重试失败任务', () => this.plugin.retryFailedAndAutoProcess(true));
-    // v1.4 (M-11): 恢复所有 paused 任务（recoverStaleProcessingTasks / 用户暂停 → 重新入队）
-    button(actions, '恢复暂停任务', async () => {
-      const restored = await this.plugin.restorePausedTasks();
-      new Notice(restored > 0 ? `已恢复 ${restored} 个暂停任务到队列` : '当前没有暂停任务');
+    const activeTask = tasks.find((task) => PROCESSING_STATUSES.has(task.status));
+    const state = activeTask ? 'running'
+      : counts.needsReview ? 'review'
+        : counts.failed ? 'error'
+          : counts.pending ? 'ready'
+            : counts.written ? 'success' : 'empty';
+    const status = container.createEl('section', {
+      cls: `eks-status eks-status-${state}`,
+      attr: { 'aria-labelledby': 'eks-status-title', 'aria-live': 'polite', 'data-state': state }
     });
-    button(actions, '打开设置', () => this.plugin.openSettings());
+    const statusLine = status.createDiv('eks-status-line');
+    statusLine.createEl('h2', { text: workflowStateTitle(state), attr: { id: 'eks-status-title' } });
+    statusLine.createSpan({ cls: 'eks-status-badge', text: workflowStateLabel(state) });
+    const activeProgress = activeTask?.progress || {};
+    status.createDiv({
+      cls: 'eks-progress-text',
+      text: safeDisplayText(activeProgress.message || workflowStateMessage(state, counts))
+    });
+    const progressTotal = Number(activeProgress.batchTotal) || Number(activeProgress.chunkTotal) || 0;
+    const progressIndex = Number(activeProgress.batchIndex) || Number(activeProgress.chunkIndex) || 0;
+    if (activeTask && progressTotal > 0) {
+      status.createEl('progress', {
+        cls: 'eks-progress-bar',
+        attr: {
+          max: String(progressTotal), value: String(Math.min(progressIndex, progressTotal)),
+          'aria-label': `${stageLabel(activeProgress.stage || activeTask.status)}：已验证 ${progressIndex}/${progressTotal}`
+        }
+      });
+      status.createDiv({
+        cls: 'eks-task-meta',
+        text: `${stageLabel(activeProgress.stage || activeTask.status)} · 已验证 ${progressIndex}/${progressTotal}${computeEtaText(activeProgress) ? ` · ${computeEtaText(activeProgress)}` : ''}`
+      });
+    }
+    if (activeTask) {
+      status.createDiv({ cls: 'eks-task-title', text: safeDisplayText(activeTask.source_path, '当前文件') });
+      status.createDiv({
+        cls: 'eks-task-meta elapsed',
+        text: `已用时 ${formatDuration(activeProgress.elapsedMs)} · ${formatLastUpdate(activeProgress.at || activeTask.updated_at)}`
+      });
+    }
+    const primary = status.createDiv('eks-primary-action');
+    const primaryAction = workflowPrimaryAction(state, this.plugin, activeTask);
+    button(primary, primaryAction.label, primaryAction.run).addClass('mod-cta', 'eks-primary-button');
+    const more = status.createEl('details', { cls: 'eks-overflow' });
+    more.createEl('summary', { text: '更多操作', attr: { 'aria-label': '展开次要操作' } });
+    const secondary = more.createDiv('eks-secondary-actions');
+    button(secondary, '扫描源文件', () => this.plugin.scanSourceFiles(true));
+    if (activeTask) {
+      button(secondary, '完成当前阶段后暂停', () => this.plugin.pauseProcessing());
+      button(secondary, '取消当前任务', () => this.plugin.cancelCurrentTask(activeTask.task_id));
+    }
+    if (tasks.some((task) => task.status === 'paused')) button(secondary, '恢复暂停任务', () => this.plugin.restorePausedTasks());
+    button(secondary, '打开设置', () => this.plugin.openSettings());
 
-    const stats = overview.createDiv('eks-stats');
-    stat(stats, '待处理', counts.pending, () => { this.taskFilter = 'queued'; this.render(); });
-    stat(stats, '处理中', counts.processing, () => { this.taskFilter = 'processing'; this.render(); });
-    stat(stats, '异常待审核', counts.needsReview, () => { this.taskFilter = 'needs_review'; this.render(); });
-    stat(stats, '失败', counts.failed, () => { this.taskFilter = 'failed'; this.render(); });
-    stat(stats, '已入库卡片', counts.written);
-    stat(stats, '已跳过', counts.skipped);
+    const summary = container.createDiv('eks-summary-line');
+    summary.createSpan({ text: `待处理 ${counts.pending}` });
+    summary.createSpan({ text: `待审核 ${counts.needsReview}` });
+    summary.createSpan({ text: `失败 ${counts.failed}` });
+    summary.createSpan({ text: `已入库 ${counts.written}` });
 
-    const queue = container.createDiv('eks-panel eks-queue');
-    queue.createEl('h3', { text: '处理概览' });
-    this.renderQueue(queue, tasks);
+    const tabs = container.createDiv({ cls: 'eks-tabs', attr: { role: 'tablist', 'aria-label': '工作区' } });
+    const sections = [
+      ['tasks', `任务 ${tasks.length}`],
+      ['review', `审核 ${counts.needsReview}`],
+      ['errors', `错误 ${counts.failed}`]
+    ];
+    for (const [id, label] of sections) {
+      const tab = button(tabs, label, () => { this.activeSection = id; this.render(); });
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('id', `eks-tab-${id}`);
+      tab.setAttribute('aria-controls', `eks-panel-${id}`);
+      tab.setAttribute('aria-selected', String(this.activeSection === id));
+      tab.tabIndex = this.activeSection === id ? 0 : -1;
+      tab.addEventListener('keydown', (event) => this.handleTabKey(event, sections.map(([key]) => key)));
+    }
+    const panel = container.createEl('section', {
+      cls: 'eks-workspace',
+      attr: { id: `eks-panel-${this.activeSection}`, role: 'tabpanel', 'aria-labelledby': `eks-tab-${this.activeSection}`, tabindex: '0' }
+    });
+    if (this.activeSection === 'tasks') this.renderTaskExplorer(panel, tasks);
+    if (this.activeSection === 'review') await this.renderReview(panel, tasks);
+    if (this.activeSection === 'errors') this.renderErrorCenter(panel, tasks);
 
-    const taskPanel = container.createDiv('eks-panel eks-tasks');
-    taskPanel.createEl('h3', { text: '任务' });
-    this.renderTaskExplorer(taskPanel, tasks);
+    const context = container.createEl('details', { cls: 'eks-context' });
+    context.createEl('summary', { text: '路径与规则' });
+    context.createDiv({ text: `源文件：${safeDisplayText(this.plugin.settings.bidIntakePath)}；${safeDisplayText(this.plugin.settings.businessIntakePath)}` });
+    context.createDiv({ text: `输出：${safeDisplayText(this.plugin.settings.bidOutputPath)}；${safeDisplayText(this.plugin.settings.businessOutputPath)}` });
+  }
 
-    const review = container.createDiv('eks-panel eks-review');
-    review.createEl('h3', { text: '审核工作台（仅异常）' });
-    const reviewScroll = review.createDiv('eks-review-scroll');
-    await this.renderReview(reviewScroll, tasks);
-
-    const errors = container.createDiv('eks-panel eks-errors');
-    errors.createEl('h3', { text: '错误中心' });
-    this.renderErrorCenter(errors, tasks);
-
-    const paths = container.createDiv('eks-paths');
-    paths.createSpan({ text: `源文件入口：${this.plugin.settings.bidIntakePath}；${this.plugin.settings.businessIntakePath}` });
-    paths.createSpan({ text: `入库输出：${this.plugin.settings.bidOutputPath}；${this.plugin.settings.businessOutputPath}` });
-    paths.createSpan({ text: '目录由 folder-map.json 固定映射；Category / TagL1 / TagL2 仅用于 MOC 索引。' });
+  handleTabKey(event, ids) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const current = ids.indexOf(this.activeSection);
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? ids.length - 1
+      : (current + (event.key === 'ArrowRight' ? 1 : -1) + ids.length) % ids.length;
+    this.activeSection = ids[next];
+    this.render().then(() => this.containerEl.querySelector(`#eks-tab-${this.activeSection}`)?.focus());
   }
 
   renderTaskExplorer(parent, tasks) {
@@ -2413,7 +2463,9 @@ class SlicerDashboardView extends ItemView {
   }
 
   renderErrorCenter(parent, tasks) {
-    const errors = tasks.flatMap((task) => (task.errors || []).map((error) => ({ task, error })));
+    const errors = tasks
+      .filter((task) => task.status === 'failed')
+      .flatMap((task) => (task.errors || []).slice(-1).map((error) => ({ task, error })));
     if (!errors.length) {
       parent.createDiv({ cls: 'eks-empty', text: '暂无错误。' });
       return;
@@ -3218,9 +3270,54 @@ function stat(parent, label, value, onClick) {
 }
 
 function formatLocalTime(iso) {
+  if (!iso) return '';
   const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return iso;
+  if (Number.isNaN(date.getTime())) return '';
   return date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatLastUpdate(iso) {
+  const value = formatLocalTime(iso);
+  return value ? `最后更新 ${value}` : '尚无更新时间';
+}
+
+function safeDisplayText(value, fallback = '暂无信息') {
+  if (value === undefined || value === null) return fallback;
+  const text = String(value).trim();
+  return !text || /^(undefined|null)$/i.test(text) ? fallback : text;
+}
+
+function workflowStateTitle(state) {
+  return ({ running: '正在处理', review: '需要审核', error: '处理遇到问题', ready: '准备处理', success: '处理完成', empty: '尚无任务' })[state];
+}
+
+function workflowStateLabel(state) {
+  return ({ running: '进行中', review: '待决策', error: '需恢复', ready: '可开始', success: '已完成', empty: '空闲' })[state];
+}
+
+function workflowStateMessage(state, counts) {
+  return ({
+    running: '任务正在运行。',
+    review: `${counts.needsReview} 个任务需要人工决策后才能完成。`,
+    error: `${counts.failed} 个任务失败；成功批次已保存，可从断点重试。`,
+    ready: `${counts.pending} 个任务已排队。`,
+    success: `已入库 ${counts.written} 张卡片。`,
+    empty: '扫描源文件以创建处理任务。'
+  })[state];
+}
+
+function workflowPrimaryAction(state, plugin, activeTask) {
+  if (state === 'running') return { label: '查看当前任务', run: () => {
+    const view = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_SLICER)?.[0]?.view;
+    if (view) { view.activeSection = 'tasks'; view.taskFilter = 'processing'; view.render(); }
+  } };
+  if (state === 'review') return { label: '开始审核', run: () => {
+    const view = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_SLICER)?.[0]?.view;
+    if (view) { view.activeSection = 'review'; view.render(); }
+  } };
+  if (state === 'error') return { label: '从断点重试失败任务', run: () => plugin.retryFailedAndAutoProcess(true) };
+  if (state === 'ready') return { label: '继续处理队列', run: () => plugin.autoProcessQueue(true) };
+  return { label: state === 'success' ? '扫描新文件' : '扫描源文件', run: () => plugin.scanSourceFiles(true) };
 }
 
 function formatDuration(milliseconds) {
@@ -6820,8 +6917,6 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
 
 async function atomizeSummary(options) {
   const pointIds = (options.summary.key_points || []).map((point) => point.point_id);
-  // v1.1.8: 默认拆细到每批 1 个知识点，调用次数 +N-3N 但每批之间能 emit 进度，
-  // 用户不再面对 18 分钟黑屏。可在 settings.maxPointsPerRequest 调高（1-3）恢复。
   const configuredBatchSize = Number(options.maxPointsPerRequest) || 1;
   const batchSize = Math.max(1, Math.min(3, configuredBatchSize));
   const batches = [];
@@ -6831,12 +6926,36 @@ async function atomizeSummary(options) {
   if (!batches.length) batches.push([]);
 
   const results = new Array(batches.length);
-  let truncated = false;
+  let completedBatches = 0;
   let nextBatchIndex = 0;
+  let terminalError = null;
+  const batchController = typeof AbortController === 'function' ? new AbortController() : null;
   const concurrency = Math.max(1, Math.min(3, Number(options.atomizationConcurrency) || 2));
   async function processBatch(index) {
-    if (truncated) return;
+    if (terminalError || batchController?.signal.aborted) return;
     const batchPointIds = batches[index];
+    const stableBatchId = stableAtomBatchId(batchPointIds, index);
+    const descriptor = { index, pointIds: batchPointIds, stableBatchId };
+    const cached = typeof options.loadAtomBatch === 'function' ? await options.loadAtomBatch(descriptor) : null;
+    if (cached) {
+      const normalized = normalizeAtomBatch(cached, options.summary, batchPointIds);
+      const errors = [
+        ...validateSchema(options.atomSchema, normalized).errors,
+        ...exactCoverage(normalized.coverage, 'point_ids', batchPointIds, '知识点覆盖不完整'),
+        ...exactAtomAttribution(normalized.atoms, batchPointIds)
+      ];
+      if (!errors.length) {
+        results[index] = normalized;
+        completedBatches += 1;
+        diag('atomization.batch.cacheHit', { batchIndex: index + 1, batchTotal: batches.length, stableBatchId });
+        await emitProgress(options.onProgress, {
+          stage: 'atomization', batchIndex: completedBatches, batchTotal: batches.length,
+          batchComplete: true, message: `已复用 ${completedBatches}/${batches.length} 个有效原子批次`
+        });
+        return;
+      }
+      diag('atomization.batch.cacheMiss', { batchIndex: index + 1, stableBatchId, reason: 'checkpoint_invalid', errors });
+    }
     const pointSet = new Set(batchPointIds);
     const keyPoints = (options.summary.key_points || []).filter((point) => pointSet.has(point.point_id));
     const evidenceIds = new Set(keyPoints.flatMap((point) => point.evidence_ids || []));
@@ -6845,82 +6964,94 @@ async function atomizeSummary(options) {
       key_points: keyPoints,
       evidence: (options.summary.evidence || []).filter((item) => evidenceIds.has(item.evidence_id))
     });
-    // 每个 batch 开始前 emit 一次（在调用前已知批次信息）
     await emitProgress(options.onProgress, {
       stage: 'atomization',
-      batchIndex: index + 1,
+      batchIndex: completedBatches,
       batchTotal: batches.length,
-      message: `原子化 ${index + 1}/${batches.length} 批（共 ${pointIds.length} 个知识点，每批 ${batchSize} 个）`
+      message: `正在处理第 ${index + 1} 批；已验证 ${completedBatches}/${batches.length} 批`
     });
-    // v1.1.10: AI 输出达到 8192 token 上限（AI_OUTPUT_TRUNCATED）时不再把整个任务炸掉，
-    //   暂时标记 truncated = true，中断剩余批次，将已成功的批次合并成 partial 结果。
-    let batchResult;
     try {
-      batchResult = await atomizeSummaryBatch(options, batchSummary, batchPointIds, index + 1, batches.length);
+      const batchResult = await atomizeSummaryBatch(
+        Object.assign({}, options, { signal: batchController?.signal || options.signal }),
+        batchSummary, batchPointIds, index + 1, batches.length
+      );
+      if (terminalError || batchController?.signal.aborted) return;
+      if (typeof options.saveAtomBatch === 'function') await options.saveAtomBatch(descriptor, batchResult);
+      results[index] = batchResult;
+      completedBatches += 1;
+      diag('atomization.batch', {
+        batchIndex: index + 1, batchTotal: batches.length, completedBatches,
+        requestedPoints: batchPointIds.length,
+        atoms: Array.isArray(batchResult?.atoms) ? batchResult.atoms.length : 0,
+        stableBatchId
+      });
+      await emitProgress(options.onProgress, {
+        stage: 'atomization', batchIndex: completedBatches, batchTotal: batches.length,
+        batchComplete: true, message: `已验证并保存 ${completedBatches}/${batches.length} 个原子批次`
+      });
     } catch (error) {
-      if (error && error.code === 'AI_OUTPUT_TRUNCATED') {
-        truncated = true;
-        if (typeof globalThis.__eksDiag === 'object' && globalThis.__eksDiag.diag) {
-          globalThis.__eksDiag.diag('atomization.truncated', { completed: index, total: batches.length, pointIds: pointIds.length });
-        }
-        return;
+      if (!terminalError && error?.name !== 'AbortError') {
+        terminalError = error;
+        batchController?.abort();
+        diag('atomization.batch.terminal', {
+          batchIndex: index + 1, batchTotal: batches.length, completedBatches,
+          code: error?.code || '', message: String(error?.message || error)
+        });
       }
-      throw error;
     }
-    results[index] = batchResult;
-    // v2.8.1: 每批原子化结果诊断（请求知识点数 vs 产出原子数），空批排障用
-    diag('atomization.batch', {
-      batchIndex: index + 1,
-      batchTotal: batches.length,
-      requestedPoints: batchPointIds.length,
-      atoms: (batchResult && Array.isArray(batchResult.atoms)) ? batchResult.atoms.length : 0
-    });
-    // 每个 batch 完成后 emit 一次（带 batchComplete 标记，触发写盘 + UI 重渲染）
-    await emitProgress(options.onProgress, {
-      stage: 'atomization',
-      batchIndex: index + 1,
-      batchTotal: batches.length,
-      batchComplete: true,
-      message: truncated
-        ? `原子化 ${index + 1}/${batches.length} 批完成（后续批次因 AI 输出截断而跳过）`
-        : `原子化 ${index + 1}/${batches.length} 批完成`
-    });
   }
   async function worker() {
-    while (!truncated) {
+    while (!terminalError && !batchController?.signal.aborted) {
       const index = nextBatchIndex++;
       if (index >= batches.length) return;
       await processBatch(index);
     }
   }
-  await Promise.all(Array.from({ length: Math.min(concurrency, batches.length) }, () => worker()));
+  await Promise.allSettled(Array.from({ length: Math.min(concurrency, batches.length) }, () => worker()));
+  if (terminalError) throw terminalError;
   const completedResults = results.filter(Boolean);
 
-  // v1.1.10: 配合 maxPointsPerRequest + 截断豁免：批次全是空（pointIds 为空）时允许返回空结果。
   if (!completedResults.length) {
     return applySchemaConstants(options.atomSchema, {
       atoms: [],
-      coverage: { point_ids: pointIds, complete: !truncated && completedResults.length === batches.length },
+      coverage: { point_ids: pointIds, complete: completedResults.length === batches.length },
       schema_version: '1.1'
     });
   }
-  if (completedResults.length === 1 && !truncated) return completedResults[0];
+  if (completedResults.length === 1 && batches.length === 1) return completedResults[0];
   const mergedAtoms = completedResults.flatMap((result) => result.atoms || []);
   const merged = applySchemaConstants(options.atomSchema, {
     atoms: mergedAtoms,
-    coverage: { point_ids: pointIds, complete: !truncated && completedResults.length === batches.length },
+    coverage: { point_ids: pointIds, complete: completedResults.length === batches.length },
     schema_version: '1.1'
   });
-  // v1.1.10: 截断情况下跳过严格 schema 校验，避免一次大文档被反复重试；
-  //   改用轻量级校验（每个 atom 至少含 atom_id）以保留尽可能多的可入库卡片。
-  if (truncated) {
-    const validAtoms = mergedAtoms.filter((atom) => atom && atom.atom_id);
-    return Object.assign({}, merged, { atoms: validAtoms, _truncated: true });
-  }
   const validation = validateSchema(options.atomSchema, merged);
-  const errors = [...validation.errors, ...exactCoverage(merged.coverage, 'point_ids', pointIds, '知识点覆盖不完整')];
+  const errors = [
+    ...validation.errors,
+    ...exactCoverage(merged.coverage, 'point_ids', pointIds, '知识点覆盖不完整'),
+    ...exactAtomAttribution(merged.atoms, pointIds)
+  ];
   if (errors.length) throw new Error(errors.join('；'));
   return merged;
+}
+
+function stableAtomBatchId(pointIds, index) {
+  const value = (pointIds || []).map(String).join('|') || `empty-${index}`;
+  let hash = 2166136261;
+  for (const char of value) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+  return `${index + 1}-${(hash >>> 0).toString(16)}`;
+}
+
+function exactAtomAttribution(atoms, pointIds) {
+  const expected = new Set(pointIds || []);
+  const attributed = new Set();
+  for (const atom of atoms || []) {
+    for (const pointId of atom?.content?.point_ids || []) {
+      if (expected.has(pointId)) attributed.add(pointId);
+    }
+  }
+  return [...expected].filter((pointId) => !attributed.has(pointId))
+    .map((pointId) => `知识点 ${pointId} 没有有效归属原子或明确的审核安全结果`);
 }
 
 async function atomizeSummaryBatch(options, summary, pointIds, batchIndex, batchTotal) {
@@ -6957,12 +7088,13 @@ async function atomizeSummaryBatch(options, summary, pointIds, batchIndex, batch
     requestJson: options.requestJson,
     maxRepairAttempts: options.maxRepairAttempts,
     onProgress: options.onProgress,
-    context: { pointIds, batchIndex, batchTotal },
+    context: { pointIds, batchIndex, batchTotal, signal: options.signal },
     normalizeValue: (value) => normalizeAtomBatch(value, summary, pointIds),
     // v2.8.1: 知识点非空但归一化后原子为 0 时，走一次"带校验错误的修复提示词"重试，
     //   而不是静默通过、最后在 writing 阶段才炸"未生成任何可用知识原子"
     extraValidation: (value) => [
       ...exactCoverage(value.coverage, 'point_ids', pointIds, '知识点覆盖不完整'),
+      ...exactAtomAttribution(value.atoms, pointIds),
       ...(pointIds.length && !(Array.isArray(value.atoms) && value.atoms.length)
         ? [`本批 ${pointIds.length} 个知识点（${pointIds.join('、')}）却返回了 0 个可用原子，请为每个知识点至少生成一个符合 schema 的原子，并在 content.point_ids 中准确填写上述 point_id`]
         : [])
@@ -6980,6 +7112,16 @@ function normalizeAtomBatch(value, summary, pointIds) {
       schema_version: '1.1'
     };
   }
+  value = Object.assign({}, value);
+  value.atoms = (value.atoms || []).map((atom) => {
+    if (!atom || typeof atom !== 'object') return atom;
+    const normalized = Object.assign({}, atom);
+    // Missing empty-list metadata is semantically neutral. A present wrong type and
+    // model_confidence remain untouched so strict validation triggers targeted repair.
+    if (!Object.hasOwn(normalized, 'validation_issues')) normalized.validation_issues = [];
+    if (!Object.hasOwn(normalized, 'related_candidates')) normalized.related_candidates = [];
+    return normalized;
+  });
   const allowed = new Set(pointIds);
   const points = new Map((summary.key_points || []).map((point) => [point.point_id, point]));
   const evidence = new Map((summary.evidence || []).map((item) => [item.evidence_id, item]));
@@ -8267,6 +8409,9 @@ async function runKnowledgeWorkflow(options) {
     atomSchema: options.schemas.atoms,
     maxPointsPerRequest: options.maxPointsPerRequest,
     atomizationConcurrency: options.atomizationConcurrency,
+    signal: options.signal,
+    loadAtomBatch: options.loadAtomBatch,
+    saveAtomBatch: options.saveAtomBatch,
     requestJson: options.requestJson,
     onProgress: options.onProgress
   });

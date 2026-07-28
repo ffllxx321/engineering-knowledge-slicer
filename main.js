@@ -2653,7 +2653,6 @@ class SlicerDashboardView extends ItemView {
     button(secondary, '打开设置', () => this.plugin.openSettings());
 
     const summary = container.createDiv('eks-summary-line');
-    summary.createSpan({ text: `待处理队列 ${counts.pending}` });
     summary.createSpan({ text: `待审核 ${reviewCount}` });
     summary.createSpan({ text: `失败 ${counts.failed}` });
     summary.createSpan({ text: `已入库 ${counts.written}` });
@@ -2850,7 +2849,6 @@ class SlicerDashboardView extends ItemView {
 
   renderQueue(parent, tasks) {
     const historical = tasks.filter((task) => ['written', 'skipped', 'unsupported'].includes(task.status)).length;
-    const pending = tasks.filter((task) => task.status === 'queued').length;
     const reviewCount = tasks.reduce((sum, task) => sum + (task.review_atom_ids || []).length, 0);
     const activeTask = tasks.find((task) => PROCESSING_STATUSES.has(task.status));
     const stats = this.plugin.sessionStats || {};
@@ -2890,7 +2888,6 @@ class SlicerDashboardView extends ItemView {
     stat(grid, '本次处理文件', stats.processed || 0);
     stat(grid, '本次已入库卡片', stats.written || 0);
     stat(grid, '异常项', reviewCount);
-    stat(grid, '待自动处理', pending);
     const currentFile = activeTask?.source_path || stats.current;
     if (currentFile) parent.createDiv({ cls: 'eks-task-meta', text: `当前文件：${currentFile}` });
     const actions = parent.createDiv('eks-actions');
@@ -4434,7 +4431,8 @@ async function extractTextFromBuffer(filePath, buffer, options = {}) {
     parserModel: config.mineruApiModel,
     remoteJobId: external.remoteJobId,
     pages: external.pages,
-    images: external.images
+    images: external.images,
+    provenance: external.provenance
   });
 }
 
@@ -5560,6 +5558,7 @@ module.exports = {
  */
 "src/core/mineru-api.js": function(require, module, exports) {
 const { extractZipEntryEndingWith } = require("src/core/zip.js");
+const { normalizeOcrArtifact } = require("src/core/provenance.js");
 
 async function runMineruApi(buffer, options = {}) {
   if (!options.apiKey) return unavailable('未配置 MinerU API Token。');
@@ -5629,6 +5628,21 @@ async function runMineruApi(buffer, options = {}) {
       const zipBuffer = Buffer.from(await zipResponse.arrayBuffer());
       const markdown = extractZipEntryEndingWith(zipBuffer, 'full.md').trim();
       if (!markdown) throw new Error('MinerU 结果 ZIP 中未找到 full.md。');
+      const contentListText = extractZipEntryEndingWith(zipBuffer, 'content_list.json');
+      if (contentListText) {
+        try {
+          const artifact = normalizeOcrArtifact(JSON.parse(contentListText), 'mineru');
+          if (artifact.spans.length) {
+            return {
+              status: 'ok', engine: 'mineru-api-markdown', text: artifact.markdown,
+              pages: artifact.pages, provenance: { version: artifact.provenance_version, spans: artifact.spans }, message: ''
+            };
+          }
+        } catch (error) {
+          emitProvenanceDiag('mineru.provenance', 'structured_result_invalid');
+        }
+      }
+      emitProvenanceDiag('mineru.provenance', 'markdown_only');
       return { status: 'ok', engine: 'mineru-api-markdown', text: markdown, message: '' };
     }
     throw new Error(`MinerU 解析超时（${Math.round(maxPolls * pollIntervalMs / 1000)} 秒）。`);
@@ -5660,6 +5674,10 @@ function unavailable(message) {
   return Promise.resolve({ status: 'unavailable', engine: 'mineru-api', text: '', message });
 }
 
+function emitProvenanceDiag(scope, reason) {
+  try { globalThis.__eksDiag?.diag?.(scope, { count: 1, reason }); } catch (_) {}
+}
+
 async function emit(options, payload) {
   if (typeof options.onProgress === 'function') await options.onProgress(payload);
 }
@@ -5684,6 +5702,8 @@ module.exports = { runMineruApi };
  * @exports runPaddleOcrApi
  */
 "src/core/paddleocr-api.js": function(require, module, exports) {
+const { normalizeOcrArtifact } = require("src/core/provenance.js");
+
 async function runPaddleOcrApi(buffer, options = {}) {
   if (!options.apiKey) return unavailable('未配置 PaddleOCR API Token。');
   const fetcher = options.requestImpl || options.fetchImpl || globalThis.fetch;
@@ -5744,9 +5764,17 @@ async function runPaddleOcrApi(buffer, options = {}) {
       const resultResponse = await fetcher(jsonUrl, { method: 'GET', signal: options.signal });
       if (!resultResponse.ok) throw new Error(`PaddleOCR 结果下载失败（HTTP ${resultResponse.status}）。`);
       const text = await resultResponse.text();
-      const markdown = parsePaddleJsonl(text);
+      const parsedArtifact = parsePaddleArtifact(text);
+      const markdown = parsedArtifact.markdown || parsePaddleJsonl(text);
       if (!markdown) throw new Error('PaddleOCR 结果中没有可用的 Markdown。');
-      return { status: 'ok', engine: 'paddleocr-api-markdown', text: markdown, message: '' };
+      return {
+        status: 'ok', engine: 'paddleocr-api-markdown', text: markdown,
+        ...(parsedArtifact.spans.length ? {
+          pages: parsedArtifact.pages,
+          provenance: { version: parsedArtifact.provenance_version, spans: parsedArtifact.spans }
+        } : {}),
+        message: ''
+      };
     }
     throw new Error(`PaddleOCR 解析超时（${Math.round(maxPolls * pollIntervalMs / 1000)} 秒）。`);
   } catch (error) {
@@ -5803,6 +5831,22 @@ function parsePaddleJsonl(value) {
   return pages.join('\n\n').trim();
 }
 
+function parsePaddleArtifact(value) {
+  const pages = [];
+  for (const line of String(value || '').split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const parsed = JSON.parse(line);
+    for (const result of parsed?.result?.layoutParsingResults || []) {
+      pages.push(Object.assign({}, result?.prunedResult || result, {
+        page: result?.page ?? result?.page_no ?? result?.page_index + 1
+      }));
+    }
+  }
+  const artifact = normalizeOcrArtifact(pages, 'paddle');
+  if (!artifact.spans.length) emitProvenanceDiag('paddle.provenance', 'markdown_only');
+  return artifact;
+}
+
 async function readJson(response, operation) {
   if (!response || !response.ok) throw new Error(`${operation}失败（HTTP ${response?.status || 0}）。`);
   return response.json();
@@ -5824,6 +5868,10 @@ function unavailable(message) {
   return Promise.resolve({ status: 'unavailable', engine: 'paddleocr-api', text: '', message });
 }
 
+function emitProvenanceDiag(scope, reason) {
+  try { globalThis.__eksDiag?.diag?.(scope, { count: 1, reason }); } catch (_) {}
+}
+
 async function emit(options, payload) {
   if (typeof options.onProgress === 'function') await options.onProgress(payload);
 }
@@ -5839,7 +5887,7 @@ function cancellableDelay(ms, signal) {
   });
 }
 
-module.exports = { parsePaddleJsonl, runPaddleOcrApi };
+module.exports = { parsePaddleArtifact, parsePaddleJsonl, runPaddleOcrApi };
 
 },
 /**
@@ -6108,6 +6156,243 @@ module.exports = {
 
 },
 /**
+ * @module src/core/provenance
+ * Stable OCR provenance normalization and fail-closed evidence resolution.
+ */
+"src/core/provenance.js": function(require, module, exports) {
+const crypto = require("crypto");
+
+function normalizeOcrArtifact(input, engine) {
+  const collected = Array.isArray(input) ? input : collectPages(input);
+  const rawPages = groupFlatPageBlocks(collected);
+  const pages = [];
+  const spans = [];
+  const markdownParts = [];
+  let offset = 0;
+  for (let pageIndex = 0; pageIndex < rawPages.length; pageIndex += 1) {
+    const rawPage = rawPages[pageIndex] || {};
+    const explicitPage = positiveInteger(rawPage.page ?? rawPage.page_no ?? rawPage.page_number ?? rawPage.page_idx + 1);
+    const page = explicitPage || pageIndex + 1;
+    const rawBlocks = collectBlocks(rawPage);
+    const pageSpans = rawBlocks.length ? rawBlocks : [{ text: rawPage.text ?? rawPage.markdown?.text ?? rawPage.markdown ?? '' }];
+    const marker = `<!-- eks-page:${page} -->\n`;
+    markdownParts.push(marker);
+    offset += marker.length;
+    const pageStart = offset;
+    for (let blockIndex = 0; blockIndex < pageSpans.length; blockIndex += 1) {
+      const raw = pageSpans[blockIndex] || {};
+      const text = cleanOcrText(raw.text ?? raw.content ?? raw.block_content ?? raw.transcription ?? raw.rec_text ?? '');
+      if (!text) continue;
+      const separator = spans.length && offset > pageStart ? '\n\n' : '';
+      if (separator) { markdownParts.push(separator); offset += separator.length; }
+      const start = offset;
+      markdownParts.push(text);
+      offset += text.length;
+      const bbox = normalizeBbox(raw.bbox ?? raw.box ?? raw.block_bbox ?? raw.coordinate ?? raw.poly ?? raw.polygon);
+      const blockId = stableOptionalId(raw.block_id ?? raw.blockId ?? raw.id);
+      const lineId = stableOptionalId(raw.line_id ?? raw.lineId ?? raw.line_no ?? raw.line_idx);
+      spans.push({
+        span_id: `${engine}:p${page}:${blockId || `s${blockIndex + 1}`}${lineId ? `:${lineId}` : ''}`,
+        page,
+        ...(blockId ? { block_id: blockId } : {}),
+        ...(lineId ? { line_id: lineId } : {}),
+        ...(bbox ? { bbox } : {}),
+        start,
+        end: offset,
+        text,
+        text_hash: hashText(normalizeText(text))
+      });
+    }
+    const pageText = markdownParts.join('').slice(pageStart, offset);
+    pages.push({ page, text: pageText, span_ids: spans.filter((span) => span.page === page).map((span) => span.span_id) });
+    markdownParts.push('\n\n');
+    offset += 2;
+  }
+  return { markdown: markdownParts.join('').trimEnd(), pages, spans, provenance_version: '1.0' };
+}
+
+function groupFlatPageBlocks(items) {
+  if (!Array.isArray(items) || !items.length) return [];
+  const looksFlat = items.every((item) =>
+    item && typeof item === 'object'
+    && !collectBlocks(item).length
+    && (item.page_idx !== undefined || item.page !== undefined || item.page_no !== undefined));
+  if (!looksFlat) return items;
+  const grouped = new Map();
+  for (const item of items) {
+    const page = positiveInteger(item.page ?? item.page_no ?? Number(item.page_idx) + 1);
+    const key = page || grouped.size + 1;
+    if (!grouped.has(key)) grouped.set(key, { page: key, blocks: [] });
+    grouped.get(key).blocks.push(item);
+  }
+  return [...grouped.values()];
+}
+
+function collectPages(value) {
+  if (!value || typeof value !== 'object') return [];
+  for (const key of ['pages', 'page_results', 'pageResults', 'layoutParsingResults', 'layout_parsing_results', 'results']) {
+    if (Array.isArray(value[key])) return value[key];
+  }
+  if (value.result) return collectPages(value.result);
+  return [];
+}
+
+function collectBlocks(page) {
+  for (const key of ['blocks', 'lines', 'parsing_res_list', 'layout_blocks', 'layoutBlocks', 'ocr_results', 'ocrResults']) {
+    if (Array.isArray(page?.[key])) return page[key].flatMap((item) => Array.isArray(item?.lines) ? item.lines.map((line) => Object.assign({}, item, line)) : [item]);
+  }
+  const pruned = page?.prunedResult || page?.pruned_result || page?.res || page?.result;
+  if (pruned && pruned !== page) return collectBlocks(pruned);
+  if (Array.isArray(page?.rec_texts)) {
+    return page.rec_texts.map((text, index) => ({
+      text,
+      bbox: page.rec_boxes?.[index] || page.dt_polys?.[index],
+      line_id: index + 1,
+      block_id: 'ocr'
+    }));
+  }
+  return [];
+}
+
+function normalizeLegacyArtifact(markdown, pages, parser) {
+  const text = String(markdown || '');
+  const supplied = Array.isArray(pages) ? pages : [];
+  if (supplied.length && supplied.some((page) => positiveInteger(page?.page) && typeof page?.text === 'string')) {
+    return normalizeOcrArtifact(supplied, parser || 'ocr');
+  }
+  return {
+    markdown: text,
+    pages: [],
+    spans: text ? [{ span_id: `${parser || 'ocr'}:text`, start: 0, end: text.length, text, text_hash: hashText(normalizeText(text)) }] : [],
+    provenance_version: '1.0'
+  };
+}
+
+function resolveEvidence(parsePackage, quote, hint = {}) {
+  const normalizedQuote = normalizeText(quote);
+  if (!normalizedQuote) return failed('empty_quote');
+  const markdown = String(parsePackage?.markdown || '');
+  const spans = Array.isArray(parsePackage?.provenance?.spans) ? parsePackage.provenance.spans : [];
+  const candidates = [];
+  for (const span of spans) {
+    const normalizedSpan = normalizeWithMap(span.text ?? markdown.slice(span.start, span.end));
+    for (const local of allIndexes(normalizedSpan.text, normalizedQuote)) {
+      const rawLocalStart = normalizedSpan.map[local] ?? 0;
+      const rawLocalEnd = (normalizedSpan.map[local + normalizedQuote.length - 1] ?? rawLocalStart) + 1;
+      candidates.push({
+        span,
+        start: Number(span.start || 0) + rawLocalStart,
+        end: Number(span.start || 0) + rawLocalEnd
+      });
+    }
+  }
+  if (!candidates.length) {
+    const normalizedDocument = normalizeWithMap(markdown);
+    for (const local of allIndexes(normalizedDocument.text, normalizedQuote)) {
+      const start = normalizedDocument.map[local] ?? 0;
+      const end = (normalizedDocument.map[local + normalizedQuote.length - 1] ?? start) + 1;
+      candidates.push({ span: {}, start, end });
+    }
+  }
+  const bounded = candidates.filter((candidate) =>
+    (!positiveInteger(hint.page) || candidate.span.page === positiveInteger(hint.page))
+    && (!Number.isFinite(hint.start) || candidate.start >= hint.start)
+    && (!Number.isFinite(hint.end) || candidate.start < hint.end));
+  const pool = bounded.length ? bounded : candidates;
+  if (!pool.length) return failed('quote_not_found');
+  const occurrence = Math.max(1, positiveInteger(hint.occurrence) || 1);
+  if (pool.length > 1 && !Number.isFinite(hint.start) && !positiveInteger(hint.page) && !positiveInteger(hint.occurrence)) {
+    return failed('ambiguous_quote', pool.length);
+  }
+  const match = pool[Math.min(occurrence - 1, pool.length - 1)];
+  const page = positiveInteger(match.span.page);
+  const locator = {
+    version: '1.0',
+    kind: page && match.span.bbox ? 'ocr-region' : page ? 'ocr-page-span' : 'ocr-text-span',
+    precision: page && match.span.bbox ? 'region' : page ? 'page+text' : 'parsed-text',
+    quote_hash: hashText(normalizedQuote),
+    occurrence,
+    text_start: match.start,
+    text_end: match.end,
+    ...(page ? { page } : {}),
+    ...(match.span.span_id ? { span_id: match.span.span_id } : {}),
+    ...(match.span.block_id ? { block_id: match.span.block_id } : {}),
+    ...(match.span.line_id ? { line_id: match.span.line_id } : {}),
+    ...(match.span.bbox ? { bbox: match.span.bbox } : {})
+  };
+  return { ok: true, locator, label: locatorLabel(locator), matches: pool.length };
+}
+
+function verifyLocator(parsePackage, quote, locator) {
+  if (!locator || typeof locator !== 'object') return failed('locator_missing');
+  if (locator.quote_hash !== hashText(normalizeText(quote))) return failed('quote_hash_mismatch');
+  const result = resolveEvidence(parsePackage, quote, {
+    page: locator.page,
+    start: Number(locator.text_start),
+    end: Number(locator.text_end),
+    occurrence: locator.occurrence
+  });
+  if (!result.ok) return result;
+  if (result.locator.text_start !== Number(locator.text_start) || result.locator.text_end !== Number(locator.text_end)) {
+    return failed('text_span_mismatch');
+  }
+  if (locator.page && result.locator.page !== locator.page) return failed('page_mismatch');
+  if (locator.bbox && JSON.stringify(result.locator.bbox) !== JSON.stringify(locator.bbox)) return failed('bbox_mismatch');
+  return result;
+}
+
+function locatorLabel(locator) {
+  const parts = [];
+  if (locator.page) parts.push(`第 ${locator.page} 页`);
+  if (locator.block_id) parts.push(`块 ${locator.block_id}`);
+  if (locator.line_id) parts.push(`行 ${locator.line_id}`);
+  if (!locator.page) parts.push(`解析文本字符 ${locator.text_start}-${locator.text_end}`);
+  const precision = ({ region: '区域级', 'page+text': '页内文本级', 'parsed-text': '解析文本级' })[locator.precision] || '未知精度';
+  return `${parts.join(' · ')}（${precision}）`;
+}
+
+function normalizeWithMap(value) {
+  const source = String(value || '');
+  let text = '';
+  const map = [];
+  let pendingSpace = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const normalized = source[index].normalize('NFKC');
+    for (const char of normalized) {
+      if (/\s/u.test(char)) { pendingSpace = text.length > 0; continue; }
+      if (pendingSpace) { text += ' '; map.push(index); pendingSpace = false; }
+      text += char;
+      map.push(index);
+    }
+  }
+  return { text: text.trim(), map };
+}
+
+function normalizeText(value) { return String(value || '').normalize('NFKC').replace(/\s+/gu, ' ').trim(); }
+function allIndexes(haystack, needle) {
+  const out = [];
+  for (let at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + 1)) out.push(at);
+  return out;
+}
+function hashText(value) { return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 16); }
+function positiveInteger(value) { const number = Number(value); return Number.isInteger(number) && number > 0 ? number : 0; }
+function stableOptionalId(value, fallback = '') { return value === undefined || value === null || value === '' ? fallback : String(value); }
+function cleanOcrText(value) { return String(value || '').replace(/\r\n?/g, '\n').trim(); }
+function normalizeBbox(value) {
+  if (!Array.isArray(value) || !value.length) return null;
+  const flat = value.flat(Infinity).map(Number);
+  if (flat.length < 4 || flat.some((number) => !Number.isFinite(number))) return null;
+  return flat;
+}
+function failed(reason, matches = 0) { return { ok: false, reason, matches }; }
+
+module.exports = {
+  hashText, locatorLabel, normalizeLegacyArtifact, normalizeOcrArtifact, normalizeText,
+  resolveEvidence, verifyLocator
+};
+
+},
+/**
  * @module src/core/document-parser
  * 文档解析计划 / 解析包产出：根据文件类型选 OCR / 直读 / 拆分
  * @exports documentPlan
@@ -6115,6 +6400,7 @@ module.exports = {
  */
 "src/core/document-parser.js": function(require, module, exports) {
 const crypto = require("crypto");
+const { normalizeLegacyArtifact } = require("src/core/provenance.js");
 
 const MAX_MINERU_FILE_BYTES = 200 * 1024 * 1024;
 
@@ -6140,7 +6426,11 @@ function plan(sourceType, mode, engines = []) {
 }
 
 function createParsePackage(options) {
-  const markdown = String(options.markdown || '').trim();
+  const isOcr = /^mineru-api|^paddleocr-api/.test(String(options.parser || ''));
+  const artifact = options.provenance && Array.isArray(options.provenance.spans)
+    ? { markdown: String(options.markdown || ''), pages: options.pages || [], spans: options.provenance.spans, provenance_version: options.provenance.version || '1.0' }
+    : isOcr ? normalizeLegacyArtifact(options.markdown, options.pages, normalizeParser(options.parser)) : null;
+  const markdown = String(artifact?.markdown ?? options.markdown ?? '').trim();
   const quality = markdownQuality(markdown);
   return {
     source_path: String(options.sourcePath || '').replace(/\\/g, '/'),
@@ -6151,9 +6441,10 @@ function createParsePackage(options) {
     remote_job_id: options.remoteJobId || '',
     language: options.language || 'unknown',
     markdown,
-    pages: Array.isArray(options.pages) && options.pages.length
-      ? options.pages
-      : markdown ? [{ page: 1, text: markdown }] : [],
+    pages: Array.isArray(artifact?.pages) && artifact.pages.length
+      ? artifact.pages
+      : Array.isArray(options.pages) ? options.pages : [],
+    ...(artifact ? { provenance: { version: artifact.provenance_version || '1.0', spans: artifact.spans || [] } } : {}),
     images: Array.isArray(options.images) ? options.images : [],
     quality,
     // v2.9.0: 透传解析元数据（邮件主题/发件人/附件清单等），供卡片链接与总结阶段使用。
@@ -6484,6 +6775,7 @@ module.exports = { validateSchema };
  */
 "src/core/ai-pipeline.js": function(require, module, exports) {
 const { validateSchema } = require("src/core/schema-validator.js");
+const { resolveEvidence, verifyLocator } = require("src/core/provenance.js");
 
 // v1.1.9: ai-pipeline.js 是独立 bundle 模块闭包，main.js 里的本地 function diag 对它不可见。
 // 通过 globalThis.__eksDiag 委托到唯一的诊断入口，确保 minimax.timeout/transport/http 等
@@ -6991,19 +7283,27 @@ function splitMarkdownSections(markdown, options = {}) {
   const pageBreakOffsets = [];
   for (let offset = source.indexOf('\f'); offset >= 0; offset = source.indexOf('\f', offset + 1)) pageBreakOffsets.push(offset);
 
-  return chunks.map((chunk, index) => ({
+  const provenanceSpans = Array.isArray(options.provenance?.spans) ? options.provenance.spans : [];
+  return chunks.map((chunk, index) => {
+    const overlapping = provenanceSpans.filter((span) => Number(span.end) > chunk.start && Number(span.start) < chunk.end);
+    const pages = [...new Set(overlapping.map((span) => Number(span.page)).filter((page) => Number.isInteger(page) && page > 0))];
+    return ({
     chunk_id: `chunk-${String(index + 1).padStart(3, '0')}`,
     stableChunkId: `chunk-${documentFingerprint}-${String(index + 1).padStart(3, '0')}`,
     markdown: chunk.markdown,
     headings: [...String(chunk.markdown).matchAll(/^#{1,6}\s+(.+)$/gm)].map((match) => match[1].trim()),
     breadcrumb: chunk.breadcrumb || '',
     headingPath: String(chunk.breadcrumb || '').split('\n').filter(Boolean),
-    pageStart: pageAtOffset(pageBreakOffsets, chunk.start),
-    pageEnd: pageAtOffset(pageBreakOffsets, Math.max(chunk.start, chunk.end - 1)),
+    sourceStart: chunk.start,
+    sourceEnd: chunk.end,
+    pageStart: pages.length ? Math.min(...pages) : (pageBreakOffsets.length ? pageAtOffset(pageBreakOffsets, chunk.start) : undefined),
+    pageEnd: pages.length ? Math.max(...pages) : (pageBreakOffsets.length ? pageAtOffset(pageBreakOffsets, Math.max(chunk.start, chunk.end - 1)) : undefined),
+    provenanceSpanIds: overlapping.map((span) => span.span_id).filter(Boolean),
     contentFingerprint: sourceFingerprint(chunk.markdown),
     tokenEstimate: Math.ceil(chunk.markdown.length / 3),
     overlap: index > 0 ? Math.max(0, chunks[index - 1].end - chunk.start) : 0
-  }));
+  });
+  });
 }
 
 function sourceFingerprint(value) {
@@ -7052,7 +7352,8 @@ async function summarizeDocument(options) {
   const chunks = splitMarkdownSections(options.parsePackage.markdown, {
     maxChars: options.maxChunkChars,
     overlapRatio: options.chunkOverlapRatio,
-    coalesceTiny: options.coalesceTinyChunks
+    coalesceTiny: options.coalesceTinyChunks,
+    provenance: options.parsePackage.provenance
   });
   const partials = new Array(chunks.length);
   const concurrency = Math.max(1, Math.min(3, Number(options.summaryConcurrency) || 2));
@@ -7138,7 +7439,7 @@ async function summarizeDocument(options) {
       maxRepairAttempts: options.maxRepairAttempts,
       onProgress: options.onProgress,
       context: { chunkIds, partialCount: partials.length },
-      normalizeValue: (value) => normalizeSummaryReduce(value, chunkIds),
+      normalizeValue: (value) => normalizeSummaryReduce(value, chunkIds, options.parsePackage),
       extraValidation: (value) => exactCoverage(value.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整')
     });
   } catch (error) {
@@ -7147,7 +7448,7 @@ async function summarizeDocument(options) {
   }
 }
 
-function normalizeSummaryReduce(value, requestedChunkIds) {
+function normalizeSummaryReduce(value, requestedChunkIds, parsePackage) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   let result = value;
   // Some OpenAI-compatible/provider adapters wrap a structured-output item once.
@@ -7170,6 +7471,26 @@ function normalizeSummaryReduce(value, requestedChunkIds) {
   if (expected.length && !hasUnknown && !hasDuplicates && actual.every((id) => expectedSet.has(id))) {
     result = Object.assign({}, result, {
       coverage: { chunk_ids: expected, complete: true }
+    });
+  }
+  if (/^(mineru-api|paddleocr-api)$/.test(String(parsePackage?.parser || '')) && Array.isArray(result.evidence)) {
+    result = Object.assign({}, result, {
+      evidence: result.evidence.map((item) => {
+        if (!item || typeof item !== 'object') return item;
+        const resolved = item.provenance
+          ? verifyLocator(parsePackage, item.quote, item.provenance)
+          : resolveEvidence(parsePackage, item.quote);
+        if (!resolved.ok) {
+          diag('provenance.resolve', { ok: false, count: 1, reason: resolved.reason, stage: 'summary-reduce' });
+          return Object.assign({}, item, { locator: '', provenance_resolution: { ok: false, reason: resolved.reason } });
+        }
+        return Object.assign({}, item, {
+          locator: resolved.label,
+          provenance: resolved.locator,
+          source_page: resolved.locator.page || '',
+          locator_precision: resolved.locator.precision
+        });
+      })
     });
   }
   return result;
@@ -7196,11 +7517,29 @@ function normalizeSummaryMap(value, options, chunk) {
     var fallbackQuote = safeSlice(String(chunk.markdown || ''), 0, 200).replace(/\n/g, ' ').trim() || fallbackLocator;
     result.evidence = result.evidence.map(function(item, index) {
       if (!item || typeof item !== 'object') return item;
-      return Object.assign({}, item, {
+      var normalized = Object.assign({}, item, {
         evidence_id: item.evidence_id || ('evidence-' + (index + 1)),
         locator: item.locator || fallbackLocator,
         quote: item.quote || fallbackQuote
       });
+      if (/^(mineru-api|paddleocr-api)$/.test(String(options.parsePackage?.parser || ''))) {
+        var resolved = resolveEvidence(options.parsePackage, normalized.quote, {
+          start: chunk.sourceStart,
+          end: chunk.sourceEnd,
+          page: chunk.pageStart === chunk.pageEnd ? chunk.pageStart : undefined
+        });
+        if (resolved.ok) {
+          normalized.locator = resolved.label;
+          normalized.provenance = resolved.locator;
+          normalized.source_page = resolved.locator.page || '';
+          normalized.locator_precision = resolved.locator.precision;
+        } else {
+          normalized.locator = '';
+          normalized.provenance_resolution = { ok: false, reason: resolved.reason };
+          diag('provenance.resolve', { ok: false, count: 1, reason: resolved.reason, stage: 'summary-map' });
+        }
+      }
+      return normalized;
     });
   }
   return result;
@@ -7305,7 +7644,7 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
         maxRepairAttempts: options.maxRepairAttempts,
         onProgress: options.onProgress,
         context: { chunkIds, partialCount: group.length, reduceRound: round },
-        normalizeValue: (value) => normalizeSummaryReduce(value, chunkIds),
+        normalizeValue: (value) => normalizeSummaryReduce(value, chunkIds, options.parsePackage),
         extraValidation: (value) => exactCoverage(value.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整')
       }));
     }
@@ -7571,6 +7910,9 @@ function normalizeAtomBatch(value, summary, pointIds) {
       source: Object.assign({}, atom.source || {}, {
         source_link: '[[source]]',
         source_locator: evidenceItem.locator || pointId,
+        source_page: evidenceItem.source_page || evidenceItem.provenance?.page || '',
+        source_provenance: evidenceItem.provenance || null,
+        locator_precision: evidenceItem.locator_precision || evidenceItem.provenance?.precision || '',
         evidence_quote: evidenceItem.quote || point?.content || '',
         parent_summary: '[[summary]]'
       })
@@ -8165,7 +8507,8 @@ function calculateConfidence(input) {
   const hasSourceLink = Boolean(String(source.source_link || '').trim());
   const hasLocator = Boolean(String(source.source_locator || '').trim());
   const hasParent = Boolean(String(source.parent_summary || '').trim());
-  const quoteFound = Boolean(evidenceQuote) && parseMarkdown.includes(evidenceQuote);
+  const provenanceVerified = source.provenance_verified !== false;
+  const quoteFound = Boolean(evidenceQuote) && provenanceVerified && parseMarkdown.includes(evidenceQuote);
   const numbersGrounded = extractedFacts(atomText).every((item) => evidenceQuote.includes(item) || parseMarkdown.includes(item));
   const E = clamp((hasLocator ? 0.2 : 0) + (hasSourceLink ? 0.1 : 0) + (hasParent ? 0.1 : 0) + (quoteFound ? 0.4 : 0) + (numbersGrounded ? 0.2 : 0));
 
@@ -8236,7 +8579,7 @@ function isVague(text) {
 }
 
 function normalizeText(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
+  return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
 }
 
 function clamp(value) {
@@ -8293,8 +8636,10 @@ function buildCardRecord(options) {
     source_file: sourceFile,
     source_link: sourceLink,
     source_hash: options.sourceHash,
-    source_page: atom.source && atom.source.source_locator || '',
+    source_page: atom.source && atom.source.source_page || '',
     source_locator: atom.source && atom.source.source_locator || '',
+    source_provenance: atom.source && atom.source.source_provenance || null,
+    locator_precision: atom.source && atom.source.locator_precision || '',
     evidence_quote: atom.source && atom.source.evidence_quote || '',
     parent_summary: atom.source && atom.source.parent_summary || '',
     related,
@@ -8327,7 +8672,7 @@ function renderKnowledgeCard(card, options = {}) {
   const frontmatterOrder = [
     'title', 'card_id', 'atom_fingerprint', 'card_kind', 'Info_Type', 'Event_Type', 'library', 'folder_type',
     'output_folder', 'project', 'client', 'stage', 'status', 'Category', 'TagL1', 'TagL2', 'created', 'updated',
-    'source_file', 'source_link', 'source_hash', 'source_page', 'parent_summary', 'supersedes', 'superseded_by',
+    'source_file', 'source_link', 'source_hash', 'source_page', 'source_locator', 'source_provenance', 'locator_precision', 'parent_summary', 'supersedes', 'superseded_by',
     'related', 'aliases', 'tags', 'confidence', 'confidence_components', 'schema_version', 'pipeline_version', 'prompt_bundle_version'
   ];
   const lines = ['---'];
@@ -8342,9 +8687,11 @@ function renderKnowledgeCard(card, options = {}) {
 
   optionalSection(lines, '来源证据', [
     `- 来源文件：${card.source_link}`,
+    card.source_page ? `- 来源页：${card.source_page}` : '',
     `- 证据位置：${card.source_locator || card.source_page}`,
+    card.locator_precision ? `- 定位精度：${card.locator_precision}` : '',
     `- 原文摘录：${card.evidence_quote}`
-  ]);
+  ].filter(Boolean));
   optionalSection(lines, '关联知识', [
     `- 上游总结：${card.parent_summary}`,
     ...(Array.isArray(card.content && card.content.semantic_links) ? card.content.semantic_links : []).map((relation) => `- ${relation.relation || 'related'} ${relation.target || relation.target_card_id || ''}`),
@@ -8775,6 +9122,7 @@ const { buildCardRecord } = require("src/core/markdown-renderer.js");
 const { resolveFixedRoute } = require("src/core/routing.js");
 const { findLinkCandidates, validateRelations } = require("src/core/link-service.js");
 const { buildValidationReport } = require("src/core/reliability.js");
+const { verifyLocator } = require("src/core/provenance.js");
 const workflowDiag = (event, details) => {
   try { globalThis.__eksDiag?.diag?.(event, details); } catch (_) {}
 };
@@ -8838,10 +9186,23 @@ async function runKnowledgeWorkflow(options) {
     : Number(options.parsePackage.total_pages || options.parsePackage.page_count || 0);
   const shortDocumentMaxCards = Math.max(5, Number(options.shortDocumentMaxCards) || 20);
   const quantityAnomaly = pageCount > 0 && pageCount <= 3 && (atomResult.atoms || []).length > shortDocumentMaxCards;
+  const provenanceDiagnostics = {};
   for (const atom of atomResult.atoms || []) {
     atom.source = Object.assign({}, atom.source || {}, {
       source_link: `[[${options.parsePackage.source_path}]]`
     });
+    if (/^(mineru-api|paddleocr-api)$/.test(String(options.parsePackage?.parser || ''))) {
+      const verified = verifyLocator(options.parsePackage, atom.source.evidence_quote, atom.source.source_provenance);
+      atom.source.provenance_verified = verified.ok;
+      if (!verified.ok) {
+        atom.source.source_locator = '';
+        provenanceDiagnostics[verified.reason] = (provenanceDiagnostics[verified.reason] || 0) + 1;
+      } else {
+        atom.source.source_locator = verified.label;
+        atom.source.source_page = verified.locator.page || '';
+        atom.source.locator_precision = verified.locator.precision;
+      }
+    }
     reconcileAtomLinks(atom, linkCandidates);
     const fingerprint = atomFingerprint(atom);
     const labelsValid = typeof options.validateLabels === 'function' ? options.validateLabels(atom) : true;
@@ -8904,6 +9265,12 @@ async function runKnowledgeWorkflow(options) {
         proposed_card: card
       });
     }
+  }
+  if (Object.keys(provenanceDiagnostics).length) {
+    workflowDiag('provenance.validation', {
+      failed: Object.values(provenanceDiagnostics).reduce((sum, count) => sum + count, 0),
+      reasons: provenanceDiagnostics
+    });
   }
   // v2.8.1: 工作流最终产出诊断——accepted/review 全空时，这条日志直接说明原子在哪一步丢的
   workflowDiag('workflow.result', {

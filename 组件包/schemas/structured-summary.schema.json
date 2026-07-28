@@ -32,7 +32,11 @@
         "properties": {
           "evidence_id": { "type": "string" },
           "locator": { "type": "string" },
-          "quote": { "type": "string" }
+          "quote": { "type": "string" },
+          "source_page": { "type": ["integer", "string"] },
+          "locator_precision": { "type": "string" },
+          "provenance": { "type": "object" },
+          "provenance_resolution": { "type": "object" }
         }
       }
     },

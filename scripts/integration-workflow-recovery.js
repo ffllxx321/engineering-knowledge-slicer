@@ -41,7 +41,8 @@ const workflow = loadBundleModule('src/core/workflow.js', {
     })
   },
   'src/core/link-service.js': linkService,
-  'src/core/reliability.js': reliability
+  'src/core/reliability.js': reliability,
+  'src/core/provenance.js': { verifyLocator: () => ({ ok: true, locator: {}, label: '' }) }
 });
 
 const classification = {
@@ -95,7 +96,8 @@ async function main() {
     .map((card) => card.atom_fingerprint)).size, 1);
 
   const mineru = loadBundleModule('src/core/mineru-api.js', {
-    'src/core/zip.js': { extractZipEntryEndingWith: () => '' }
+    'src/core/zip.js': { extractZipEntryEndingWith: () => '' },
+    'src/core/provenance.js': { normalizeOcrArtifact: () => ({ spans: [] }) }
   });
   const controller = new AbortController();
   let parserCalls = 0;

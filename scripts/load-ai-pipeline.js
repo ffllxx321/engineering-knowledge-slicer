@@ -4,6 +4,8 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const { loadBundleModule } = require('./load-bundle-module.js');
 
 function loadAiPipeline(options = {}) {
   const code = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf-8');
@@ -28,6 +30,9 @@ function loadAiPipeline(options = {}) {
   fn((id) => {
     if (id === 'src/core/schema-validator.js') {
       return options.schemaValidator || { validateSchema: () => ({ errors: [], warnings: [] }) };
+    }
+    if (id === 'src/core/provenance.js') {
+      return loadBundleModule(id, { crypto });
     }
     throw new Error('未预期的 require: ' + id);
   }, mod, mod.exports);

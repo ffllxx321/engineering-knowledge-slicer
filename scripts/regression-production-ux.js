@@ -37,6 +37,10 @@ assert.strictEqual(review.isApprovalEligible(items[38]), false);
 
 const renderContent = source.slice(source.indexOf('async renderContent(container,'), source.indexOf('async renderContentLegacy(container)'));
 assert.strictEqual((renderContent.match(/createEl\('progress'/g) || []).length, 1);
+const lowerSummary = renderContent.slice(renderContent.indexOf("const summary = container.createDiv('eks-summary-line')"), renderContent.indexOf("const tabs = container.createDiv"));
+assert.strictEqual((lowerSummary.match(/待处理队列/g) || []).length, 0, 'authoritative upper queue position must not be duplicated in the lower summary');
+const compactQueue = source.slice(source.indexOf('renderQueue(parent, tasks)'), source.indexOf('renderQueueLegacy(parent, tasks)'));
+assert(!compactQueue.includes("'待自动处理'"), 'compact summary must not duplicate queue state');
 assert(source.includes("text: '技术详情'") && source.includes('JSON.stringify({'));
 assert(source.includes('pageSize = 20') && source.includes("role: 'listitem'"));
 assert(css.includes('.eks-review-exception-item') && css.includes('gap: 12px') && css.includes(':focus-within'));

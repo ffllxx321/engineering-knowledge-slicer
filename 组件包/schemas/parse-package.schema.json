@@ -20,7 +20,33 @@
         "required": ["page", "text"],
         "properties": {
           "page": { "type": "integer", "minimum": 1 },
-          "text": { "type": "string" }
+          "text": { "type": "string" },
+          "span_ids": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["version", "spans"],
+      "properties": {
+        "version": { "type": "string" },
+        "spans": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["span_id", "start", "end", "text", "text_hash"],
+            "properties": {
+              "span_id": { "type": "string" },
+              "page": { "type": "integer", "minimum": 1 },
+              "block_id": { "type": "string" },
+              "line_id": { "type": "string" },
+              "bbox": { "type": "array", "items": { "type": "number" }, "minItems": 4 },
+              "start": { "type": "integer", "minimum": 0 },
+              "end": { "type": "integer", "minimum": 0 },
+              "text": { "type": "string" },
+              "text_hash": { "type": "string" }
+            }
+          }
         }
       }
     },

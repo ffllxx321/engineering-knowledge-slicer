@@ -96,6 +96,22 @@ def append_markdown_value(value, parts):
             append_markdown_value(value.get(key))
 
 
+def json_value(value):
+    if callable(value):
+        value = value()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): json_value(item) for key, item in value.items()}
+    if hasattr(value, "tolist"):
+        return json_value(value.tolist())
+    if hasattr(value, "__dict__"):
+        return json_value(vars(value))
+    return str(value)
+
+
 def run_python_api(pdf_path):
     if not is_python_api_available():
         return {
@@ -118,18 +134,22 @@ def run_python_api(pdf_path):
         pipeline = PPStructureV3()
         results = pipeline.predict(input=pdf_path)
         parts = []
-        for result in results:
+        pages = []
+        for page_index, result in enumerate(results):
             append_markdown_value(getattr(result, "markdown", None), parts)
             if hasattr(result, "json"):
                 append_markdown_value(getattr(result, "json", None), parts)
             if isinstance(result, dict):
                 append_markdown_value(result.get("markdown"), parts)
+            structured = json_value(getattr(result, "json", result))
+            pages.append({"page": page_index + 1, "result": structured})
         text = "\n\n".join(part for part in parts if str(part).strip())
         if text.strip():
             return {
                 "status": "ok",
                 "engine": "paddleocr-markdown",
                 "text": text,
+                "pages": pages,
                 "message": "",
             }
         return {

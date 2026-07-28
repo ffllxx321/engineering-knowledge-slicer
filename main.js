@@ -39,6 +39,13 @@ const { requestMiniMaxJson, requestMiniMaxStream } = require("src/core/ai-pipeli
 const { runKnowledgeWorkflow } = require("src/core/workflow.js");
 const { buildCardRecord, cardFileName, renderKnowledgeCard, renderStructuredSummary } = require("src/core/markdown-renderer.js");
 const { groupReviewItems, applyBatchAction, isApprovalEligible, reviewSelection } = require("src/core/review-service.js");
+const {
+  consumeSelectedRegeneration,
+  createSelectedRegenerationPlan,
+  mergeSelectedRegenerationResult,
+  markManualPending,
+  archiveRejected
+} = require("src/core/selected-regeneration.js");
 const { explainIssue, pipelineProgress, queuePosition } = require("src/core/production-ux.js");
 const {
   createStageMetric,
@@ -950,8 +957,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       current.source_path = normalizePathForCompare(current.source_path || '');
       this.sessionStats.current = current.source_path;
       current.errors = [];
-      current.review_atom_ids = [];
-      current.written_card_ids = [];
+      current.review_atom_ids = current.review_atom_ids || [];
+      current.written_card_ids = current.written_card_ids || [];
       await this.setTaskProgress(current, '准备处理源文件', { stage: 'start', startedAt: new Date(startedAt).toISOString() });
       if (!current.source_path) throw new Error('源文件路径为空，请在扫描源文件后重试。');
       if (!isProcessableSource(current.source_path)) {
@@ -995,7 +1002,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const contracts = await this.loadRuntimeContracts();
       const tagLibraryText = await this.loadTagLibraryText();
       const tagLibrary = parseTagLibrary(tagLibraryText);
-      const existingCards = await this.loadExistingCards(current.source_hash);
+      // Atom regeneration must see cards already written for this source. Otherwise a
+      // recovery run can write the same approved card again.
+      const existingCards = await this.loadExistingCards(current.regeneration_mode ? '' : current.source_hash);
       // v1.1.8: 启动心跳，1 秒一次更新已用时 / 进度条，避免 18 分钟黑屏
       const heartbeat = startProgressHeartbeat(this, current, startedAt);
       diag('heartbeat.start', { sourcePath: current.source_path, intervalMs: 1000 });
@@ -1128,6 +1137,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
 
       current.status = workflow.review.length ? 'needs_review' : 'written';
+      delete current.regeneration_mode;
       current.updated_at = new Date().toISOString();
       current.progress = {
         stage: 'complete',
@@ -1617,7 +1627,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     if (action === 'regenerate_group') {
       delete task.artifacts.atoms;
       delete task.artifacts.review;
+      for (const name of Object.keys(task.artifacts || {})) {
+        if (name.startsWith('atom-batch-')) delete task.artifacts[name];
+      }
       task.review_atom_ids = [];
+      task.regeneration_mode = 'whole_file_atoms';
       task.status = 'queued';
       task.updated_at = new Date().toISOString();
       await this.saveTasks(upsertTask(tasks, task));
@@ -1637,9 +1651,16 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const unresolved = [];
     for (const item of changed) {
       if (item.status === 'discarded') continue;
-      if (item.status === 'corrected' && !validateAtomLabels(tagLibrary, item.atom)) {
+      if (item.status === 'corrected') {
         item.status = 'pending';
-        item.reasons = ['批量修正后仍未通过标签字典校验'];
+        if (!validateAtomLabels(tagLibrary, item.atom)) {
+          item.reasons = ['批量修正后仍未通过标签字典校验'];
+        }
+        unresolved.push(item);
+        continue;
+      }
+      if (!isApprovalEligible(item)) {
+        item.status = 'pending';
         unresolved.push(item);
         continue;
       }
@@ -1679,10 +1700,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const selected = new Set(atomIds || []);
     const chosen = group.items.filter((item) => selected.has(item.atom_id));
     if (!chosen.length) throw new Error('请先选择至少一项');
+    if (action === 'regenerate_selected') {
+      return this.regenerateSelectedReview(task, artifact, chosen);
+    }
     if (action === 'approve_selected') {
       const blocked = chosen.filter((item) => !isApprovalEligible(item));
       if (blocked.length) throw new Error(`所选内容中有 ${blocked.length} 项未通过必要检查，不能批准`);
       const folderMap = (await this.loadRuntimeContracts()).folderMap;
+      const existingIds = new Set((await this.loadExistingCards('')).map((card) => card.card_id));
       for (const item of chosen) {
         const route = resolveFixedRoute(folderMap, item.atom);
         const card = Object.assign({}, item.proposed_card, {
@@ -1694,29 +1719,26 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           output_folder: route.output_folder,
           status: 'confirmed'
         });
-        await this.writeAcceptedCard(task, card, route);
+        if (!existingIds.has(card.card_id)) await this.writeAcceptedCard(task, card, route);
         task.written_card_ids = task.written_card_ids || [];
         if (!task.written_card_ids.includes(card.card_id)) task.written_card_ids.push(card.card_id);
       }
     } else if (!['regenerate_selected', 'reject_selected', 'manual_selected'].includes(action)) {
       throw new Error(`不支持的审核操作：${action}`);
     }
-    if (action === 'regenerate_selected') {
-      for (const item of chosen) item.status = 'regenerate_requested';
-    }
+    const now = new Date().toISOString();
     if (action === 'manual_selected') {
-      for (const item of chosen) item.status = 'manual_pending';
+      Object.assign(artifact, markManualPending(artifact, chosen.map((item) => item.atom_id), now));
+    } else if (action === 'reject_selected') {
+      Object.assign(artifact, archiveRejected(artifact, chosen.map((item) => item.atom_id), now));
+    } else {
+      const handled = new Set(chosen.map((item) => item.atom_id));
+      artifact.handled = [...(artifact.handled || []), ...chosen.map((item) => Object.assign({}, item, {
+        review_action: action,
+        review_action_at: now
+      }))];
+      artifact.items = artifact.items.filter((item) => !handled.has(item.atom_id));
     }
-    const handled = new Set(['approve_selected', 'reject_selected'].includes(action)
-      ? chosen.map((item) => item.atom_id) : []);
-    artifact.handled = [...(artifact.handled || []), ...chosen.map((item) => Object.assign({}, item, {
-      review_action: action,
-      review_action_at: new Date().toISOString()
-    }))];
-    artifact.items = artifact.items.filter((item) => !handled.has(item.atom_id));
-    artifact.action_requests = [...(artifact.action_requests || []), ...chosen
-      .filter(() => ['regenerate_selected', 'manual_selected'].includes(action))
-      .map((item) => ({ atom_id: item.atom_id, action, requested_at: new Date().toISOString() }))];
     await this.persistArtifact(task, 'review', artifact);
     task.review_atom_ids = artifact.items.map((item) => item.atom_id);
     task.status = artifact.items.length ? 'needs_review' : 'written';
@@ -1724,9 +1746,113 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     await this.saveTasks(upsertTask(await this.loadTasks(), task));
     new Notice(action === 'approve_selected'
       ? `部分批准完成：已入库 ${chosen.length} 项，仍待处理 ${artifact.items.length} 项`
-      : `已处理 ${chosen.length} 项，仍待处理 ${artifact.items.length} 项`);
+      : action === 'manual_selected'
+        ? `已将 ${chosen.length} 项标记为等待人工处理；它们仍保留在待处理列表`
+        : `已拒绝并归档 ${chosen.length} 项，仍待处理 ${artifact.items.length} 项`);
     await this.refreshViews();
-    return { handled: chosen.length, remaining: artifact.items.length };
+    return {
+      handled: action === 'manual_selected' ? 0 : chosen.length,
+      pending: action === 'manual_selected' ? chosen.length : 0,
+      remaining: artifact.items.length
+    };
+  }
+
+  async regenerateSelectedReview(task, artifact, chosen) {
+    const summary = await this.loadArtifact(task, 'summary');
+    const atomResult = await this.loadArtifact(task, 'atoms');
+    const classification = await this.loadArtifact(task, 'classification');
+    const parsePackage = await this.loadArtifact(task, 'parsed');
+    if (!summary || !atomResult || !classification || !parsePackage) {
+      throw new Error('缺少原始总结、知识原子或分类检查点，无法安全地只重新生成所选内容。请使用“仅重做知识原子”重做整个文件。');
+    }
+    const plan = createSelectedRegenerationPlan({
+      taskId: task.task_id,
+      reviewItems: artifact.items,
+      allAtoms: atomResult.atoms,
+      selectedAtomIds: chosen.map((item) => item.atom_id),
+      summary
+    });
+    const checkpointName = `selected-regeneration-${plan.request_id}`;
+    const now = new Date().toISOString();
+    artifact.regeneration_requests = [
+      ...(artifact.regeneration_requests || []).filter((item) => item.request_id !== plan.request_id),
+      {
+        request_id: plan.request_id,
+        action: 'regenerate_selected',
+        atom_ids: plan.atom_ids,
+        point_ids: plan.point_ids,
+        status: 'running',
+        requested_at: now
+      }
+    ];
+    await this.persistArtifact(task, 'review', artifact);
+
+    const consumed = await consumeSelectedRegeneration({
+      loadCheckpoint: () => this.loadArtifact(task, checkpointName),
+      saveCheckpoint: (value) => this.persistArtifact(task, checkpointName, value),
+      loadExistingCardIds: async () => (await this.loadExistingCards('')).map((card) => card.card_id),
+      writeCard: (card, route) => this.writeAcceptedCard(task, card, route),
+      generate: async () => {
+        const contracts = await this.loadRuntimeContracts();
+        const tagLibrary = parseTagLibrary(await this.loadTagLibraryText());
+        const existingCards = await this.loadExistingCards('');
+        const selectedIds = new Set(plan.atom_ids);
+        const untouchedReviewFingerprints = (artifact.items || [])
+          .filter((item) => !selectedIds.has(item.atom_id))
+          .map((item) => item.proposed_card?.atom_fingerprint)
+          .filter(Boolean);
+        return runKnowledgeWorkflow({
+          parsePackage,
+          folderMap: contracts.folderMap,
+          schemas: contracts.schemas,
+          prompts: contracts.prompts,
+          classification,
+          summary: plan.selected_summary,
+          loadTypePrompt: (route) => this.loadComponentText(route.prompt),
+          sourceHash: task.source_hash,
+          maxPointsPerRequest: this.settings.maxPointsPerRequest,
+          atomizationConcurrency: this.settings.atomizationConcurrency,
+          shortDocumentMaxCards: this.settings.shortDocumentMaxCards,
+          loadAtomBatch: (batch) => this.loadArtifact(task, `${checkpointName}-batch-${batch.stableBatchId}`),
+          saveAtomBatch: (batch, value) => this.persistArtifact(task, `${checkpointName}-batch-${batch.stableBatchId}`, value),
+          versions: runtimeVersions(this.settings),
+          businessTimeZone: resolveRuntimeTimeZone(this.settings.businessTimeZone),
+          existingCards,
+          existingFingerprints: [
+            ...existingCards.map((card) => card.atom_fingerprint).filter(Boolean),
+            ...untouchedReviewFingerprints
+          ],
+          validateLabels: (atom) => validateAtomLabels(tagLibrary, atom),
+          requestJson: (prompt, context) => this.rateLimiter.run(
+            () => requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest }),
+            {}
+          )
+        });
+      }
+    });
+    const result = consumed.result;
+    const replaced = new Set(plan.atom_ids);
+    const mergedAtomResult = Object.assign({}, atomResult, {
+      atoms: [
+        ...(atomResult.atoms || []).filter((atom) => !replaced.has(atom.atom_id)),
+        ...(result.atomResult?.atoms || [])
+      ]
+    });
+    await this.persistArtifact(task, 'atoms', mergedAtomResult);
+    for (const card of result.accepted || []) {
+      task.written_card_ids = task.written_card_ids || [];
+      if (!task.written_card_ids.includes(card.card_id)) task.written_card_ids.push(card.card_id);
+    }
+    const merged = mergeSelectedRegenerationResult(artifact, plan, result, new Date().toISOString());
+    await this.persistArtifact(task, 'review', merged);
+    task.review_atom_ids = merged.items.map((item) => item.atom_id);
+    task.status = merged.items.length ? 'needs_review' : 'written';
+    task.updated_at = new Date().toISOString();
+    await this.saveTasks(upsertTask(await this.loadTasks(), task));
+    if (consumed.written.length) await this.rebuildKnowledgeIndexes();
+    new Notice(`所选内容已重新生成：新入库 ${consumed.written.length} 项，仍待处理 ${merged.items.length} 项`);
+    await this.refreshViews();
+    return { handled: chosen.length, remaining: merged.items.length, requestId: plan.request_id };
   }
 
   async approveDraft(taskId, draftPath) {
@@ -2188,6 +2314,11 @@ class ReviewExceptionModal extends Modal {
     actions.createEl('button', { text: '重新生成所选' }).addEventListener('click', () => runAction('regenerate_selected'));
     actions.createEl('button', { text: '拒绝所选' }).addEventListener('click', () => runAction('reject_selected'));
     actions.createEl('button', { text: '转人工处理' }).addEventListener('click', () => runAction('manual_selected'));
+    actions.createEl('button', { text: '无法精确重生成？重做整个文件知识原子' }).addEventListener('click', async () => {
+      if (!window.confirm('这会重新生成整个文件的知识原子；已有已批准卡片不会重复写入。确认继续？')) return;
+      try { await this.handlers.onWholeRegenerate?.(); this.close(); }
+      catch (error) { new Notice(`整文件知识原子重生成失败：${error.message}`); }
+    });
     actions.createEl('button', { text: '打开源文档', cls: 'mod-cta' }).addEventListener('click', async () => {
       if (!this.sourcePath) { new Notice('源文档路径未知'); return; }
       const file = this.app.vault.getAbstractFileByPath(this.sourcePath);
@@ -2817,7 +2948,8 @@ class SlicerDashboardView extends ItemView {
         const eligibleCount = group.items.filter(isApprovalEligible).length;
         button(actions, `查看并处理（可批准 ${eligibleCount}）`, () => {
           new ReviewExceptionModal(this.app, group, task.source_path, {
-            onAction: (ids, action) => this.plugin.applyReviewSelection(task.task_id, group.group_id, ids, action)
+            onAction: (ids, action) => this.plugin.applyReviewSelection(task.task_id, group.group_id, ids, action),
+            onWholeRegenerate: () => this.plugin.applyReviewGroup(task.task_id, group.group_id, 'regenerate_group')
           }).open();
         });
         button(actions, '批量修正标签', async () => {
@@ -8821,6 +8953,143 @@ function queuePosition(task, tasks = []) {
 }
 
 module.exports = { explainIssue, pipelineProgress, queuePosition };
+
+},
+/**
+ * @module src/core/selected-regeneration
+ * Pure state transitions for safe, resumable regeneration of attributed review atoms.
+ */
+"src/core/selected-regeneration.js": function(require, module, exports) {
+function pointIdsOf(item) {
+  return [...new Set((item?.atom?.content?.point_ids || []).map(String).filter(Boolean))].sort();
+}
+
+function requestId(taskId, atomIds, pointIds) {
+  const value = `${taskId}|${[...atomIds].sort().join('|')}|${[...pointIds].sort().join('|')}`;
+  let hash = 2166136261;
+  for (const char of value) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+  return `selected-${(hash >>> 0).toString(16)}`;
+}
+
+function createSelectedRegenerationPlan({ taskId, reviewItems, allAtoms, selectedAtomIds, summary }) {
+  const selected = new Set(selectedAtomIds || []);
+  const chosen = (reviewItems || []).filter((item) => selected.has(item.atom_id));
+  if (!chosen.length) throw new Error('请先选择至少一项');
+  const missing = chosen.filter((item) => !pointIdsOf(item).length);
+  if (missing.length) {
+    throw new Error('所选内容缺少知识点归属，无法安全地只重新生成这些内容。请使用“仅重做知识原子”重做整个文件。');
+  }
+  const pointIds = [...new Set(chosen.flatMap(pointIdsOf))].sort();
+  const pointSet = new Set(pointIds);
+  const affectedAtoms = (allAtoms || []).filter((atom) =>
+    (atom?.content?.point_ids || []).some((id) => pointSet.has(String(id))));
+  const outside = affectedAtoms.filter((atom) => !selected.has(atom.atom_id));
+  if (outside.length) {
+    throw new Error('所选知识点还关联到未选或已入库内容，无法在不影响它们的情况下单独重新生成。请使用“仅重做知识原子”重做整个文件。');
+  }
+  const keyPoints = (summary?.key_points || []).filter((point) => pointSet.has(String(point.point_id)));
+  if (keyPoints.length !== pointIds.length) {
+    throw new Error('总结中的知识点归属已不完整，无法安全地只重新生成所选内容。请使用“仅重做知识原子”重做整个文件。');
+  }
+  const evidenceIds = new Set(keyPoints.flatMap((point) => point.evidence_ids || []));
+  const selectedSummary = Object.assign({}, summary, {
+    executive_summary: keyPoints.map((point) => point.content).join('；'),
+    key_points: keyPoints,
+    evidence: (summary?.evidence || []).filter((item) => evidenceIds.has(item.evidence_id)),
+    coverage: Object.assign({}, summary?.coverage || {}, { point_ids: pointIds, complete: true })
+  });
+  return {
+    request_id: requestId(taskId, chosen.map((item) => item.atom_id), pointIds),
+    atom_ids: chosen.map((item) => item.atom_id).sort(),
+    point_ids: pointIds,
+    selected_summary: selectedSummary
+  };
+}
+
+function mergeSelectedRegenerationResult(artifact, plan, result, now) {
+  const selected = new Set(plan.atom_ids);
+  const untouched = (artifact.items || []).filter((item) => !selected.has(item.atom_id));
+  const regenerated = (result.review || []).map((item) => Object.assign({}, item, {
+    regeneration_request_id: plan.request_id
+  }));
+  const audit = {
+    request_id: plan.request_id,
+    action: 'regenerate_selected',
+    atom_ids: plan.atom_ids,
+    point_ids: plan.point_ids,
+    status: 'completed',
+    accepted_card_ids: (result.accepted || []).map((card) => card.card_id),
+    review_atom_ids: regenerated.map((item) => item.atom_id),
+    completed_at: now
+  };
+  return Object.assign({}, artifact, {
+    items: [...untouched, ...regenerated],
+    regeneration_requests: [
+      ...(artifact.regeneration_requests || []).filter((item) => item.request_id !== plan.request_id),
+      audit
+    ],
+    handled: [...(artifact.handled || []), ...(artifact.items || [])
+      .filter((item) => selected.has(item.atom_id))
+      .map((item) => Object.assign({}, item, {
+        review_action: 'regenerate_selected',
+        review_action_at: now,
+        regeneration_request_id: plan.request_id
+      }))]
+  });
+}
+
+function markManualPending(artifact, atomIds, now) {
+  const selected = new Set(atomIds || []);
+  return Object.assign({}, artifact, {
+    items: (artifact.items || []).map((item) => selected.has(item.atom_id)
+      ? Object.assign({}, item, { status: 'manual_pending', manual_requested_at: now })
+      : item),
+    manual_requests: [
+      ...(artifact.manual_requests || []),
+      ...(artifact.items || []).filter((item) => selected.has(item.atom_id))
+        .map((item) => ({ atom_id: item.atom_id, status: 'pending', requested_at: now }))
+    ]
+  });
+}
+
+function archiveRejected(artifact, atomIds, now) {
+  const selected = new Set(atomIds || []);
+  const rejected = (artifact.items || []).filter((item) => selected.has(item.atom_id));
+  return Object.assign({}, artifact, {
+    items: (artifact.items || []).filter((item) => !selected.has(item.atom_id)),
+    rejected: [...(artifact.rejected || []), ...rejected.map((item) => Object.assign({}, item, {
+      review_action: 'reject_selected',
+      review_action_at: now
+    }))]
+  });
+}
+
+async function consumeSelectedRegeneration(options) {
+  let result = await options.loadCheckpoint();
+  if (!result) {
+    result = await options.generate();
+    await options.saveCheckpoint(result);
+  }
+  const existingIds = new Set(await options.loadExistingCardIds());
+  const written = [];
+  for (const card of result.accepted || []) {
+    if (!existingIds.has(card.card_id)) {
+      await options.writeCard(card, result.route);
+      existingIds.add(card.card_id);
+      written.push(card.card_id);
+    }
+  }
+  return { result, written };
+}
+
+module.exports = {
+  archiveRejected,
+  consumeSelectedRegeneration,
+  createSelectedRegenerationPlan,
+  markManualPending,
+  mergeSelectedRegenerationResult,
+  pointIdsOf
+};
 
 },
 /**

@@ -38,7 +38,8 @@ const { createTaskRecord } = require("src/core/pipeline.js");
 const { requestMiniMaxJson, requestMiniMaxStream } = require("src/core/ai-pipeline.js");
 const { runKnowledgeWorkflow } = require("src/core/workflow.js");
 const { buildCardRecord, cardFileName, renderKnowledgeCard, renderStructuredSummary } = require("src/core/markdown-renderer.js");
-const { groupReviewItems, applyBatchAction } = require("src/core/review-service.js");
+const { groupReviewItems, applyBatchAction, isApprovalEligible, reviewSelection } = require("src/core/review-service.js");
+const { explainIssue, pipelineProgress, queuePosition } = require("src/core/production-ux.js");
 const {
   createStageMetric,
   sanitizeForLog,
@@ -807,6 +808,28 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         resumed = true;
       }
       if (resumed) await this.saveTasks(resumable);
+      // A queue run is a stable file-level cohort. Its denominator never shrinks as
+      // files finish; retry/resume retains the original ordinal whenever possible.
+      const queued = resumable.filter((task) => task.status === 'queued');
+      const continuingRun = queued.find((task) => task.queue_run_id && Number(task.queue_total) > 0);
+      const queueRunId = continuingRun?.queue_run_id || `queue-${Date.now().toString(36)}`;
+      const existingTotal = Number(continuingRun?.queue_total) || 0;
+      const existingMaxOrder = Math.max(0, ...queued
+        .filter((task) => task.queue_run_id === queueRunId)
+        .map((task) => Number(task.queue_order) || 0));
+      let nextOrder = existingMaxOrder + 1;
+      const newCount = queued.filter((task) => task.queue_run_id !== queueRunId).length;
+      const total = Math.max(existingTotal, existingMaxOrder + newCount);
+      for (const task of queued) {
+        if (task.queue_run_id === queueRunId && Number(task.queue_order) > 0) continue;
+        task.queue_run_id = queueRunId;
+        task.queue_order = nextOrder++;
+        task.queue_total = total;
+      }
+      if (queued.length) {
+        await this.saveTasks(resumable);
+        await this.flushSaveTasksImmediate();
+      }
       this.sessionStats.lastMessage = '正在自动处理队列';
       while (!this.pauseRequested) {
         const tasks = await this.recoverStaleProcessingTasks(await this.loadTasks());
@@ -1039,6 +1062,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           // 其他进度回调走轻量级 refreshProgressOnly（只刷进度条 DOM + 已用时文本）
           const isKeyPoint = progress.batchComplete || progress.stage !== current.progress?.stage;
           const merged = Object.assign({}, progress, { elapsedMs: Date.now() - startedAt });
+          merged.completedWork = pipelineProgress(current, merged).completedWork;
           current.progress = merged;
           if (isKeyPoint) {
             await this.setTaskProgress(current, progress.message, merged);
@@ -1644,6 +1668,67 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     await this.refreshViews();
   }
 
+  async applyReviewSelection(taskId, groupId, atomIds, action) {
+    const tasks = await this.loadTasks();
+    const task = tasks.find((item) => item.task_id === taskId);
+    if (!task) throw new Error('未找到审核任务');
+    const artifact = await this.loadArtifact(task, 'review');
+    if (!artifact) throw new Error('未找到审核产物');
+    const group = groupReviewItems(artifact.items).find((item) => item.group_id === groupId);
+    if (!group) throw new Error('未找到审核分组');
+    const selected = new Set(atomIds || []);
+    const chosen = group.items.filter((item) => selected.has(item.atom_id));
+    if (!chosen.length) throw new Error('请先选择至少一项');
+    if (action === 'approve_selected') {
+      const blocked = chosen.filter((item) => !isApprovalEligible(item));
+      if (blocked.length) throw new Error(`所选内容中有 ${blocked.length} 项未通过必要检查，不能批准`);
+      const folderMap = (await this.loadRuntimeContracts()).folderMap;
+      for (const item of chosen) {
+        const route = resolveFixedRoute(folderMap, item.atom);
+        const card = Object.assign({}, item.proposed_card, {
+          Category: item.atom?.Category,
+          TagL1: item.atom?.TagL1,
+          TagL2: item.atom?.TagL2,
+          Info_Type: item.atom?.Info_Type,
+          Event_Type: item.atom?.Event_Type,
+          output_folder: route.output_folder,
+          status: 'confirmed'
+        });
+        await this.writeAcceptedCard(task, card, route);
+        task.written_card_ids = task.written_card_ids || [];
+        if (!task.written_card_ids.includes(card.card_id)) task.written_card_ids.push(card.card_id);
+      }
+    } else if (!['regenerate_selected', 'reject_selected', 'manual_selected'].includes(action)) {
+      throw new Error(`不支持的审核操作：${action}`);
+    }
+    if (action === 'regenerate_selected') {
+      for (const item of chosen) item.status = 'regenerate_requested';
+    }
+    if (action === 'manual_selected') {
+      for (const item of chosen) item.status = 'manual_pending';
+    }
+    const handled = new Set(['approve_selected', 'reject_selected'].includes(action)
+      ? chosen.map((item) => item.atom_id) : []);
+    artifact.handled = [...(artifact.handled || []), ...chosen.map((item) => Object.assign({}, item, {
+      review_action: action,
+      review_action_at: new Date().toISOString()
+    }))];
+    artifact.items = artifact.items.filter((item) => !handled.has(item.atom_id));
+    artifact.action_requests = [...(artifact.action_requests || []), ...chosen
+      .filter(() => ['regenerate_selected', 'manual_selected'].includes(action))
+      .map((item) => ({ atom_id: item.atom_id, action, requested_at: new Date().toISOString() }))];
+    await this.persistArtifact(task, 'review', artifact);
+    task.review_atom_ids = artifact.items.map((item) => item.atom_id);
+    task.status = artifact.items.length ? 'needs_review' : 'written';
+    task.updated_at = new Date().toISOString();
+    await this.saveTasks(upsertTask(await this.loadTasks(), task));
+    new Notice(action === 'approve_selected'
+      ? `部分批准完成：已入库 ${chosen.length} 项，仍待处理 ${artifact.items.length} 项`
+      : `已处理 ${chosen.length} 项，仍待处理 ${artifact.items.length} 项`);
+    await this.refreshViews();
+    return { handled: chosen.length, remaining: artifact.items.length };
+  }
+
   async approveDraft(taskId, draftPath) {
     const file = this.app.vault.getAbstractFileByPath(draftPath);
     if (!(file instanceof TFile)) throw new Error(`未找到草稿：${draftPath}`);
@@ -1881,10 +1966,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   async setTaskProgress(task, message, details = {}) {
     const now = new Date().toISOString();
     task.updated_at = now;
-    task.progress = Object.assign({}, details, {
+    const nextProgress = Object.assign({}, details, {
       message,
       at: now
     });
+    nextProgress.completedWork = pipelineProgress(task, nextProgress).completedWork;
+    task.progress = nextProgress;
     this.sessionStats.current = task.source_path;
     this.sessionStats.lastMessage = message;
     await this.saveTasks(upsertTask(await this.loadTasks(), task));
@@ -1990,51 +2077,69 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 };
 
-// v1.2: 审核工作台的"查看异常详情"按钮打开的 Modal —— 把整组的异常原子一一展开成可滚动列表，
-// 每条显示标题、ID、原因、可信度和摘要，方便人工逐条确认。注意只读，不在这里改数据。
+// 审核弹窗：业务语言摘要 + 可访问的分页选择；原始诊断在技术详情中完整保留。
 class ReviewExceptionModal extends Modal {
-  constructor(app, group, sourcePath) {
+  constructor(app, group, sourcePath, handlers = {}) {
     super(app);
     this.group = group;
     this.sourcePath = sourcePath;
+    this.handlers = handlers;
+    this.selectedIds = new Set();
+    this.filter = 'all';
+    this.page = 0;
+    this.pageSize = 20;
   }
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass('eks-review-exception-modal');
-    contentEl.createEl('h2', { text: `异常详情 · ${this.group.label}` });
+    contentEl.createEl('h2', { text: '需要确认的内容' });
+    const selection = reviewSelection(this.group.items, this.selectedIds);
     contentEl.createDiv({
-      cls: 'eks-task-meta',
-      text: `共 ${this.group.items.length} 项 · 源文档：${this.sourcePath || '(未知)'}`
+      cls: 'eks-exception-summary',
+      text: `共 ${selection.total} 项 · 可批准 ${selection.eligible} 项 · 需处理 ${selection.total - selection.eligible} 项`
     });
     contentEl.createDiv({
       cls: 'eks-task-meta',
-      text: `类别：${this.group.library || '未知库'} · ${this.group.folder_type || '未知目录'}`
+      text: `源文档：${this.sourcePath || '(未知)'}`
     });
-    if (this.group.reasons && this.group.reasons.length) {
-      contentEl.createDiv({
-        cls: 'eks-task-meta',
-        text: `整组原因：${this.group.reasons.join('；')}`
-      });
+    const controls = contentEl.createDiv({ cls: 'eks-exception-controls' });
+    const filter = controls.createEl('select', { attr: { 'aria-label': '筛选待确认内容' } });
+    for (const [value, label] of [['all', '全部'], ['eligible', '可批准'], ['blocked', '需处理']]) {
+      const option = filter.createEl('option', { text: label, attr: { value } });
+      option.selected = this.filter === value;
     }
-
-    const list = contentEl.createDiv({ cls: 'eks-review-exception-list' });
-    for (let index = 0; index < this.group.items.length; index += 1) {
-      const item = this.group.items[index];
-      const block = list.createDiv({ cls: 'eks-review-exception-item' });
+    filter.addEventListener('change', () => { this.filter = filter.value; this.page = 0; this.onOpen(); });
+    const selectEligible = controls.createEl('button', { text: `全选可批准项（${selection.eligible}）` });
+    selectEligible.addEventListener('click', () => {
+      for (const id of selection.eligibleIds) this.selectedIds.add(id);
+      this.onOpen();
+    });
+    controls.createSpan({ cls: 'eks-selection-count', text: `已选择 ${selection.selected} 项` });
+    const visible = this.group.items.filter((item) =>
+      this.filter === 'all' || (this.filter === 'eligible' ? isApprovalEligible(item) : !isApprovalEligible(item)));
+    const pageCount = Math.max(1, Math.ceil(visible.length / this.pageSize));
+    this.page = Math.min(this.page, pageCount - 1);
+    const pageItems = visible.slice(this.page * this.pageSize, (this.page + 1) * this.pageSize);
+    const list = contentEl.createDiv({ cls: 'eks-review-exception-list', attr: { role: 'list', 'aria-label': '待确认内容列表' } });
+    for (let index = 0; index < pageItems.length; index += 1) {
+      const item = pageItems[index];
+      const explanation = explainIssue(item);
+      const block = list.createDiv({ cls: 'eks-review-exception-item', attr: { role: 'listitem' } });
       const head = block.createDiv({ cls: 'eks-review-exception-head' });
-      head.createSpan({ text: `${index + 1}. `, cls: 'eks-review-exception-index' });
-      head.createEl('strong', { text: item.atom?.title || item.atom_id || '(无标题)' });
-      if (item.atom_id) {
-        head.createSpan({ text: ` · ${item.atom_id}`, cls: 'eks-task-meta' });
-      }
-      const reasons = (item.reasons || []).join('；');
-      if (reasons) block.createDiv({ cls: 'eks-task-meta', text: `原因：${reasons}` });
-      const score = Number(item.confidence?.score || 0);
-      block.createDiv({
-        cls: 'eks-task-meta',
-        text: `可信度：${score.toFixed(2)} (${item.confidence?.decision || 'unknown'})`
+      const checkbox = head.createEl('input', { attr: { type: 'checkbox', 'aria-label': `选择 ${item.atom?.title || item.atom_id}` } });
+      checkbox.checked = this.selectedIds.has(item.atom_id);
+      checkbox.addEventListener('change', () => {
+        checkbox.checked ? this.selectedIds.add(item.atom_id) : this.selectedIds.delete(item.atom_id);
+        this.onOpen();
       });
+      const title = head.createDiv('eks-exception-title');
+      title.createEl('strong', { text: item.atom?.title || '未命名内容' });
+      title.createSpan({ cls: `eks-eligibility ${isApprovalEligible(item) ? 'is-eligible' : 'is-blocked'}`, text: isApprovalEligible(item) ? '可批准' : '需处理' });
+      block.createEl('h3', { text: explanation.kind });
+      block.createDiv({ cls: 'eks-exception-fact', text: `发生了什么：${explanation.happened}` });
+      block.createDiv({ cls: 'eks-exception-fact', text: `影响：${explanation.effect}` });
+      block.createDiv({ cls: 'eks-exception-action', text: `建议：${explanation.action}` });
       const summary = String(
         item.atom?.content?.summary
         || item.atom?.content?.executive_summary
@@ -2045,9 +2150,44 @@ class ReviewExceptionModal extends Modal {
         const preview = summary.length > 240 ? `${summary.slice(0, 240)}…` : summary;
         block.createDiv({ cls: 'eks-task-meta', text: `摘要：${preview}` });
       }
+      const technical = block.createEl('details', { cls: 'eks-technical-details' });
+      technical.createEl('summary', { text: '技术详情' });
+      technical.createEl('pre', { text: JSON.stringify({
+        atom_id: item.atom_id,
+        reasons: item.reasons,
+        confidence: item.confidence,
+        validationReport: item.validationReport || item.validation_report,
+        status: item.status,
+        atom: item.atom,
+        proposed_card: item.proposed_card
+      }, null, 2) });
     }
 
+    const pager = contentEl.createDiv({ cls: 'eks-exception-pager' });
+    const previous = pager.createEl('button', { text: '上一页' }); previous.disabled = this.page === 0;
+    previous.addEventListener('click', () => { this.page -= 1; this.onOpen(); });
+    pager.createSpan({ text: `第 ${this.page + 1}/${pageCount} 页 · 每页最多 ${this.pageSize} 项` });
+    const next = pager.createEl('button', { text: '下一页' }); next.disabled = this.page >= pageCount - 1;
+    next.addEventListener('click', () => { this.page += 1; this.onOpen(); });
     const actions = contentEl.createDiv({ cls: 'eks-review-exception-actions' });
+    const runAction = async (action) => {
+      const current = reviewSelection(this.group.items, this.selectedIds);
+      if (!current.selected) { new Notice('请先选择至少一项'); return; }
+      if (action === 'approve_selected' && current.selectedIneligible) {
+        new Notice(`有 ${current.selectedIneligible} 项未通过必要检查，不能批准`);
+        return;
+      }
+      const message = action === 'approve_selected'
+        ? `将批准 ${current.selectedEligible} 项，其余 ${current.total - current.selectedEligible} 项继续留待处理。确认继续？`
+        : `确认处理所选 ${current.selected} 项？`;
+      if (!window.confirm(message)) return;
+      try { await this.handlers.onAction?.([...this.selectedIds], action); this.close(); }
+      catch (error) { new Notice(`操作失败：${error.message}`); }
+    };
+    actions.createEl('button', { text: '批准所选可批准项', cls: 'mod-cta' }).addEventListener('click', () => runAction('approve_selected'));
+    actions.createEl('button', { text: '重新生成所选' }).addEventListener('click', () => runAction('regenerate_selected'));
+    actions.createEl('button', { text: '拒绝所选' }).addEventListener('click', () => runAction('reject_selected'));
+    actions.createEl('button', { text: '转人工处理' }).addEventListener('click', () => runAction('manual_selected'));
     actions.createEl('button', { text: '打开源文档', cls: 'mod-cta' }).addEventListener('click', async () => {
       if (!this.sourcePath) { new Notice('源文档路径未知'); return; }
       const file = this.app.vault.getAbstractFileByPath(this.sourcePath);
@@ -2255,19 +2395,12 @@ class SlicerDashboardView extends ItemView {
     if (!task || !task.progress) return;
     const root = this.containerEl;
     // 更新进度条
-    const bar = root.querySelector('.eks-progress-bar');
+    const bar = root.querySelector('.eks-overall-progress');
     if (bar) {
-      const batchIndex = Number(task.progress.batchIndex) || 0;
-      const batchTotal = Number(task.progress.batchTotal) || 0;
-      const chunkIndex = Number(task.progress.chunkIndex) || 0;
-      const chunkTotal = Number(task.progress.chunkTotal) || 0;
-      if (batchTotal > 0) {
-        bar.max = String(batchTotal);
-        bar.value = String(batchIndex);
-      } else if (chunkTotal > 0) {
-        bar.max = String(chunkTotal);
-        bar.value = String(chunkIndex);
-      }
+      const position = queuePosition(task);
+      const work = pipelineProgress(task, task.progress).completedWork;
+      bar.max = '100';
+      bar.value = String(position.total > 0 ? ((position.ordinal - 1) + work / 100) / position.total * 100 : work);
     }
     // 更新已用时文本
     const elapsedEl = root.querySelector('.eks-task-meta.elapsed');
@@ -2303,25 +2436,21 @@ class SlicerDashboardView extends ItemView {
     statusLine.createEl('h2', { text: workflowStateTitle(state), attr: { id: 'eks-status-title' } });
     statusLine.createSpan({ cls: 'eks-status-badge', text: workflowStateLabel(state) });
     const activeProgress = activeTask?.progress || {};
+    const position = queuePosition(activeTask, tasks);
+    const taskProgress = pipelineProgress(activeTask, activeProgress);
+    const overallPercent = activeTask && position.total > 0
+      ? Math.min(99.9, ((position.ordinal - 1) + taskProgress.completedWork / 100) / position.total * 100)
+      : (tasks.length && tasks.every((task) => ['written', 'needs_review', 'skipped', 'unsupported', 'cancelled'].includes(task.status)) ? 100 : 0);
+    status.createDiv({ cls: 'eks-queue-position', text: activeTask ? position.label : (overallPercent === 100 ? '处理队列 已完成' : '处理队列 空闲') });
     status.createDiv({
       cls: 'eks-progress-text',
       text: safeDisplayText(activeProgress.message || workflowStateMessage(state, counts))
     });
-    const progressTotal = Number(activeProgress.batchTotal) || Number(activeProgress.chunkTotal) || 0;
-    const progressIndex = Number(activeProgress.batchIndex) || Number(activeProgress.chunkIndex) || 0;
-    if (activeTask && progressTotal > 0) {
-      status.createEl('progress', {
-        cls: 'eks-progress-bar',
-        attr: {
-          max: String(progressTotal), value: String(Math.min(progressIndex, progressTotal)),
-          'aria-label': `${stageLabel(activeProgress.stage || activeTask.status)}：已验证 ${progressIndex}/${progressTotal}`
-        }
-      });
-      status.createDiv({
-        cls: 'eks-task-meta',
-        text: `${stageLabel(activeProgress.stage || activeTask.status)} · 已验证 ${progressIndex}/${progressTotal}${computeEtaText(activeProgress) ? ` · ${computeEtaText(activeProgress)}` : ''}`
-      });
-    }
+    status.createEl('progress', {
+      cls: 'eks-progress-bar eks-overall-progress',
+      attr: { max: '100', value: String(overallPercent), 'aria-label': `整批处理总进度 ${Math.floor(overallPercent)}%` }
+    });
+    status.createDiv({ cls: 'eks-task-meta', text: `当前阶段：${stageLabel(activeProgress.stage || activeTask?.status || state)}${activeTask ? ` · 总进度 ${Math.floor(overallPercent)}%` : ''}` });
     if (activeTask) {
       status.createDiv({ cls: 'eks-task-title', text: safeDisplayText(activeTask.source_path, '当前文件') });
       status.createDiv({
@@ -2344,7 +2473,7 @@ class SlicerDashboardView extends ItemView {
     button(secondary, '打开设置', () => this.plugin.openSettings());
 
     const summary = container.createDiv('eks-summary-line');
-    summary.createSpan({ text: `待处理 ${counts.pending}` });
+    summary.createSpan({ text: `待处理队列 ${counts.pending}` });
     summary.createSpan({ text: `待审核 ${counts.needsReview}` });
     summary.createSpan({ text: `失败 ${counts.failed}` });
     summary.createSpan({ text: `已入库 ${counts.written}` });
@@ -2401,7 +2530,7 @@ class SlicerDashboardView extends ItemView {
       this.taskSearchTimer = setTimeout(() => this.render(), 150);
     });
     const filter = controls.createEl('select', { attr: { 'aria-label': '按状态筛选任务' } });
-    for (const [value, label] of [['all', '全部状态'], ['queued', '待处理'], ['processing', '处理中'], ['needs_review', '待审核'], ['failed', '失败'], ['written', '已完成']]) {
+    for (const [value, label] of [['all', '全部状态'], ['queued', '待处理队列'], ['processing', '处理中'], ['needs_review', '待审核'], ['failed', '失败'], ['written', '已完成']]) {
       const option = filter.createEl('option', { text: label, attr: { value } });
       option.selected = this.taskFilter === value;
     }
@@ -2485,14 +2614,20 @@ class SlicerDashboardView extends ItemView {
     }
     for (const [code, entries] of groups) {
       const details = parent.createEl('details', { cls: 'eks-error-group' });
-      details.createEl('summary', { text: `${code} · ${entries.length} 项` });
+      const groupText = explainIssue(entries[0]?.error);
+      details.createEl('summary', { text: `${groupText.kind} · ${entries.length} 项` });
       for (const { task, error } of entries.slice(0, 20)) {
         const item = details.createDiv('eks-error-item');
-        item.createEl('strong', { text: error.message || '处理失败' });
+        const explanation = explainIssue(error);
+        item.createEl('strong', { text: explanation.happened });
         item.createDiv({ cls: 'eks-task-meta', text: `${task.source_path || '(未知文件)'} · ${stageLabel(error.stage || task.status)}` });
-        item.createDiv({ text: error.suggestedAction || '查看技术详情后重试。' });
-        if (error.technicalMessage) item.createEl('code', { text: error.technicalMessage });
+        item.createDiv({ text: `影响：${explanation.effect}` });
+        item.createDiv({ text: `建议：${error.suggestedAction || explanation.action}` });
+        const technical = item.createEl('details', { cls: 'eks-technical-details' });
+        technical.createEl('summary', { text: '技术详情' });
+        technical.createEl('pre', { text: JSON.stringify({ code, task_id: task.task_id, run_id: task.run_id, error }, null, 2) });
       }
+      if (entries.length > 20) details.createDiv({ cls: 'eks-task-meta', text: `当前显示前 20 项，其余 ${entries.length - 20} 项可通过任务筛选查看。` });
     }
   }
 
@@ -2643,10 +2778,15 @@ class SlicerDashboardView extends ItemView {
         const item = block.createDiv('eks-failed-item');
         item.createEl('strong', { text: task.source_path || '(未知文件)' });
         const lastError = Array.isArray(task.errors) && task.errors.length ? task.errors.at(-1) : null;
+        const explanation = explainIssue(lastError || {});
         item.createDiv({
           cls: 'eks-task-meta',
-          text: `失败阶段：${stageLabel(lastError?.stage || task.progress?.stage || 'process')} · 原因：${lastError?.message || '未知错误'}`
+          text: `${explanation.happened} ${explanation.effect}`
         });
+        item.createDiv({ cls: 'eks-review-reason', text: `建议：${lastError?.suggestedAction || explanation.action}` });
+        const technical = item.createEl('details', { cls: 'eks-technical-details' });
+        technical.createEl('summary', { text: '技术详情' });
+        technical.createEl('pre', { text: JSON.stringify({ task_id: task.task_id, run_id: task.run_id, stage: lastError?.stage || task.progress?.stage, error: lastError }, null, 2) });
         const actions = item.createDiv('eks-actions');
         button(actions, '重试', () => this.plugin.retryTask(task.task_id));
         button(actions, '移除', () => this.plugin.dismissTask(task.task_id));
@@ -2665,15 +2805,21 @@ class SlicerDashboardView extends ItemView {
       for (const group of groupReviewItems(artifact.items)) {
         const block = parent.createDiv('eks-review-group');
         const header = block.createDiv('eks-review-group-header');
-        header.createEl('h4', { text: `${group.label}（${group.items.length} 项）` });
+        header.createEl('h4', { text: `待确认内容（${group.items.length} 项）` });
         const scores = group.items.map((item) => Number(item.confidence?.score || 0));
         const average = scores.length ? scores.reduce((sum, value) => sum + value, 0) / scores.length : 0;
         block.createDiv({ cls: 'eks-task-meta', text: `${task.source_path} · 平均可信度 ${average.toFixed(2)}` });
-        block.createDiv({ cls: 'eks-review-reason', text: `原因：${group.reasons.join('；') || '可信度未达到自动入库阈值'}` });
+        const groupExplanation = explainIssue({ reasons: group.reasons });
+        block.createDiv({ cls: 'eks-review-reason', text: `${groupExplanation.kind}：${groupExplanation.happened}` });
         const samples = group.items.slice(0, 3).map((item) => item.atom?.title).filter(Boolean);
         if (samples.length) block.createDiv({ cls: 'eks-task-meta', text: `示例：${samples.join('；')}${group.items.length > 3 ? '…' : ''}` });
         const actions = block.createDiv('eks-actions');
-        button(actions, '整组批准入库', () => this.plugin.applyReviewGroup(task.task_id, group.group_id, 'approve_group'));
+        const eligibleCount = group.items.filter(isApprovalEligible).length;
+        button(actions, `查看并处理（可批准 ${eligibleCount}）`, () => {
+          new ReviewExceptionModal(this.app, group, task.source_path, {
+            onAction: (ids, action) => this.plugin.applyReviewSelection(task.task_id, group.group_id, ids, action)
+          }).open();
+        });
         button(actions, '批量修正标签', async () => {
           // v1.4 (M-05): prompt 文案明确白名单，避免用户误以为能改任意字段
           const initial = '{"Category":"","TagL1":"","TagL2":""}';
@@ -2688,10 +2834,6 @@ class SlicerDashboardView extends ItemView {
         });
         button(actions, '仅重做知识原子', () => this.plugin.applyReviewGroup(task.task_id, group.group_id, 'regenerate_group'));
         button(actions, '整组丢弃', () => this.plugin.applyReviewGroup(task.task_id, group.group_id, 'discard_group'));
-        // v1.2: 把该组所有异常原子展开到一个 Modal，方便人工逐条确认（标题/原因/可信度/摘要）
-        button(actions, '查看异常详情', () => {
-          new ReviewExceptionModal(this.app, group, task.source_path).open();
-        });
       }
     }
   }
@@ -8621,6 +8763,67 @@ module.exports = { runKnowledgeWorkflow };
 
 },
 /**
+ * @module src/core/production-ux
+ * Human explanations and stable, durable pipeline progress.
+ */
+"src/core/production-ux.js": function(require, module, exports) {
+const CAUSES = [
+  { test: /evidence|证据.*(?:定位|缺失|找不到)|locator/i, kind: '证据位置缺失', happened: '系统没有在原文中找到足够明确的依据位置。', effect: '这条内容暂时不能可靠地追溯到源文档。', action: '请对照原文补充页码或原文摘录，再交由人工确认。' },
+  { test: /schema|结构校验|字段.*(?:无效|缺失)|validation/i, kind: '内容格式不完整', happened: '生成结果缺少必要信息，或信息格式不符合要求。', effect: '直接入库可能造成字段缺失或后续检索异常。', action: '建议重新生成；仍失败时请人工补齐必填信息。' },
+  { test: /数量异常|threshold|超过阈值|过多|过少/i, kind: '数量需要确认', happened: '本次生成的内容数量明显高于或低于通常范围。', effect: '可能存在过度拆分、遗漏或重复内容。', action: '请抽查原文与条目数量；确认合理后可批准符合条件的条目。' },
+  { test: /provider|供应商|MiniMax|MinerU|Paddle|HTTP|response|响应/i, kind: '外部服务返回异常', happened: '外部处理服务没有返回可直接使用的结果。', effect: '当前文件或条目尚未完成处理。', action: '稍后重试；若反复发生，请检查服务连接和账号状态。' },
+  { test: /upload|上传|consent|授权|保密审批/i, kind: '尚未确认上传', happened: '系统还没有获得把该文件交给云端解析服务的确认。', effect: '文件没有上传，处理也没有继续。', action: '确认文件符合保密要求后重新处理，并在提示中选择是否允许上传。' },
+  { test: /标签|目录|分类/i, kind: '分类信息需要确认', happened: '系统无法把内容可靠地放入现有分类。', effect: '直接入库可能进入错误目录，影响查找。', action: '请选择正确分类或标签后再批准。' },
+  { test: /重复|duplicate/i, kind: '可能已有相同内容', happened: '系统发现知识库中可能已经存在相同或非常相近的内容。', effect: '直接入库可能产生重复卡片。', action: '请对比已有内容，选择保留、合并或拒绝。' }
+];
+
+function explainIssue(value) {
+  const reasons = Array.isArray(value?.reasons)
+    ? value.reasons
+    : [value?.message, value?.technicalMessage, value?.code, value?.category, value?.provider, value];
+  const raw = reasons.map(String).filter(Boolean);
+  const joined = raw.join('；');
+  const known = CAUSES.find((cause) => cause.test.test(joined));
+  const fallback = {
+    kind: '需要人工确认',
+    happened: '这条内容没有通过自动检查。',
+    effect: '在确认之前不会自动入库，已有可靠内容不受影响。',
+    action: '请对照原文检查；可选择重新生成、拒绝或转为人工处理。'
+  };
+  return Object.assign({}, known || fallback, { technical: value, raw });
+}
+
+const STAGE_BASE = { start: 0, parsing: 8, classification: 22, classifying: 22, 'summary-map': 32,
+  summarizing: 32, atomization: 58, atomizing: 58, validating: 82, writing: 90, complete: 100 };
+const STAGE_SPAN = { parsing: 14, classification: 10, classifying: 10, 'summary-map': 26,
+  summarizing: 26, atomization: 24, atomizing: 24, validating: 8, writing: 9 };
+function pipelineProgress(task, progress = task?.progress || {}) {
+  const stage = progress.stage || task?.status || 'start';
+  const total = Number(progress.batchTotal) || Number(progress.chunkTotal) || Number(progress.totalPages) || 0;
+  const done = Number(progress.batchIndex) || Number(progress.chunkIndex) || Number(progress.extractedPages) || 0;
+  const fraction = total > 0 ? Math.max(0, Math.min(1, done / total)) : 0;
+  const calculated = (STAGE_BASE[stage] || 0) + (STAGE_SPAN[stage] || 0) * fraction;
+  const previous = Number(progress.completedWork ?? task?.progress?.completedWork) || 0;
+  const durable = ['written', 'needs_review'].includes(task?.status) && stage === 'complete';
+  return { completedWork: durable ? 100 : Math.min(99, Math.max(previous, calculated)), durable };
+}
+
+function queuePosition(task, tasks = []) {
+  if (!task) return { ordinal: 0, total: 0, label: '处理队列 0/0' };
+  let ordinal = Number(task.queue_order) || 0;
+  let total = Number(task.queue_total) || 0;
+  if (!ordinal || !total) {
+    const ordered = [...tasks].sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
+    ordinal = Math.max(1, ordered.findIndex((item) => item.task_id === task.task_id) + 1);
+    total = ordered.length;
+  }
+  return { ordinal, total, label: `处理队列 ${ordinal}/${total}` };
+}
+
+module.exports = { explainIssue, pipelineProgress, queuePosition };
+
+},
+/**
  * @module src/core/review-service
  * 审核面板服务：按文件夹 / 状态 / 标签分组 + 批量审批
  * @exports groupReviewItems
@@ -8695,6 +8898,29 @@ function applyBatchAction(items, action, correction = {}) {
   });
 }
 
+function isApprovalEligible(item) {
+  if (!item || !['pending', 'corrected', 'passed', undefined].includes(item.status)) return false;
+  if (item.eligible === false || item.ineligible === true) return false;
+  const hardFailures = item.validationReport?.hardGateFailures || item.validation_report?.hardGateFailures || [];
+  if (hardFailures.length) return false;
+  const reasons = (item.reasons || []).join('；');
+  return !/schema|结构校验|必填字段|证据.*(?:缺失|找不到)|locator missing|标签字典校验未通过|目录与.*不一致|重复/i.test(reasons);
+}
+
+function reviewSelection(items, selectedIds) {
+  const selected = new Set(selectedIds || []);
+  const eligible = (items || []).filter(isApprovalEligible);
+  const chosen = (items || []).filter((item) => selected.has(item.atom_id));
+  return {
+    total: (items || []).length,
+    selected: chosen.length,
+    eligible: eligible.length,
+    selectedEligible: chosen.filter(isApprovalEligible).length,
+    selectedIneligible: chosen.filter((item) => !isApprovalEligible(item)).length,
+    eligibleIds: eligible.map((item) => item.atom_id)
+  };
+}
+
 function pendingReviewItems(reviewArtifacts) {
   return (reviewArtifacts || []).flatMap((artifact) => artifact.items || []).filter((item) => item.status === 'pending' || item.status === 'corrected');
 }
@@ -8709,7 +8935,7 @@ function hashCode(value) {
   return Math.abs(hash).toString(36);
 }
 
-module.exports = { applyBatchAction, groupReviewItems, pendingReviewItems };
+module.exports = { applyBatchAction, groupReviewItems, pendingReviewItems, isApprovalEligible, reviewSelection };
 
 
 }

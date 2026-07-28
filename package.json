@@ -8,7 +8,7 @@
     "build": "node scripts/validate-bundle-build.js",
     "lint": "node --check main.js && node --check scripts/*.js && node --check src/*.js",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node scripts/smoke-timestamp-policy.js && node scripts/smoke-split.js && node scripts/smoke-splitter-v26.js && node scripts/smoke-ratelimit.js && node scripts/smoke-json-repair.js && node scripts/smoke-v292.js && node scripts/smoke-performance-reliability.js && node scripts/smoke-reliability-v210.js && node scripts/smoke-summary-reduce-recovery.js && node scripts/integration-workflow-recovery.js && node scripts/gap-closure-tests.js && node scripts/regression-production-repair.js",
+    "test": "node scripts/smoke-timestamp-policy.js && node scripts/smoke-split.js && node scripts/smoke-splitter-v26.js && node scripts/smoke-ratelimit.js && node scripts/smoke-json-repair.js && node scripts/smoke-v292.js && node scripts/smoke-performance-reliability.js && node scripts/smoke-reliability-v210.js && node scripts/smoke-summary-reduce-recovery.js && node scripts/integration-workflow-recovery.js && node scripts/gap-closure-tests.js && node scripts/regression-production-repair.js && node scripts/regression-production-ux.js",
     "benchmark": "node scripts/benchmark-optimization.js"
   },
   "keywords": [

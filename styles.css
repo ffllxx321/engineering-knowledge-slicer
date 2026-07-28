@@ -194,6 +194,13 @@
   overflow-wrap: anywhere;
 }
 
+.eks-queue-position {
+  margin: 6px 0 2px;
+  color: var(--text-normal);
+  font-size: 1.05em;
+  font-weight: var(--font-semibold, 600);
+}
+
 /* v1.1.8: HTML5 进度条，跨 Obsidian 主题可读 */
 .eks-progress-bar {
   width: 100%;
@@ -475,6 +482,123 @@
   padding: 10px 0 12px;
 }
 
+.eks-review-exception-modal {
+  width: min(680px, calc(100vw - 24px));
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+.eks-review-exception-modal h2 {
+  margin-bottom: 6px;
+}
+
+.eks-exception-summary {
+  margin: 4px 0 10px;
+  font-weight: var(--font-semibold, 600);
+  overflow-wrap: anywhere;
+}
+
+.eks-exception-controls,
+.eks-exception-pager,
+.eks-review-exception-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.eks-selection-count {
+  color: var(--text-accent);
+  font-weight: var(--font-semibold, 600);
+}
+
+.eks-review-exception-list {
+  display: grid;
+  gap: 12px;
+  max-height: min(58vh, 620px);
+  overflow-y: auto;
+  padding: 2px 4px 2px 2px;
+}
+
+.eks-review-exception-item {
+  border: 1px solid var(--eks-border, var(--background-modifier-border));
+  border-radius: var(--radius-m, 6px);
+  background: var(--background-primary);
+  padding: 12px;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.eks-review-exception-item:focus-within {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px var(--background-modifier-border-focus);
+}
+
+.eks-review-exception-head {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+}
+
+.eks-exception-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.eks-review-exception-item h3 {
+  margin: 10px 0 6px;
+  font-size: 1em;
+}
+
+.eks-exception-fact,
+.eks-exception-action {
+  margin-top: 5px;
+  line-height: 1.5;
+}
+
+.eks-exception-action {
+  color: var(--text-accent);
+}
+
+.eks-eligibility {
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: var(--font-ui-smaller, 0.8em);
+  white-space: nowrap;
+}
+
+.eks-eligibility.is-eligible {
+  color: var(--text-success);
+  background: rgba(var(--color-green-rgb), 0.12);
+}
+
+.eks-eligibility.is-blocked {
+  color: var(--text-warning);
+  background: rgba(var(--color-orange-rgb), 0.12);
+}
+
+.eks-technical-details {
+  margin-top: 8px;
+}
+
+.eks-technical-details > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.eks-technical-details pre {
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--font-ui-smaller, 0.8em);
+}
+
 .eks-review-group:first-child {
   border-top: 0;
   padding-top: 0;
@@ -556,6 +680,15 @@
 
   .eks-row-actions button {
     flex: 1 1 auto;
+  }
+
+  .eks-review-exception-item {
+    padding: 10px;
+  }
+
+  .eks-review-exception-actions button,
+  .eks-exception-controls button {
+    flex: 1 1 100%;
   }
 }
 

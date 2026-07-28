@@ -51,6 +51,9 @@ assert(second.locator.text_start > 0);
 
 const normalized = provenance.normalizeLegacyArtifact('全角ＡＢＣ　 施工', [], 'paddleocr-api');
 assert(provenance.resolveEvidence(pkg(normalized), '全角ABC 施工').ok, 'NFKC and whitespace differences must resolve');
+const exact = provenance.resolveEvidence(pkg(normalized), '全角ABC 施工');
+assert.strictEqual(normalized.markdown.slice(exact.locator.text_start, exact.locator.text_end), '全角ＡＢＣ　 施工',
+  'resolved offsets retain the exact extractive OCR spelling');
 
 const twoPages = provenance.normalizeOcrArtifact([
   { page: 1, blocks: [{ block_id: 'p1', text: '甲'.repeat(120) }] },

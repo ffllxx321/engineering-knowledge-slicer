@@ -107,6 +107,63 @@ async function testUnsafeCoverageGetsOneBoundedRepairAndResumeSkipsMaps() {
   assert.strictEqual(reduceCalls, 1);
 }
 
+async function testProduction8192HierarchyAndReduceCheckpointResume() {
+  const { api, diagCalls } = loadAiPipeline();
+  const cache = new Map();
+  const reduceCache = new Map();
+  const markdown = Array.from({ length: 26 }, (_, index) =>
+    `# 第 ${index + 1} 节\n${String.fromCharCode(0x4e00 + index).repeat(520)}`
+  ).join('\n');
+  let mapCalls = 0;
+  const mappedChunkIds = new Set();
+  let reduceCalls = 0;
+  let failAfter = 3;
+  const base = options(async (_prompt, context) => {
+    if (context.stage === 'summary-map') {
+      mapCalls += 1;
+      mappedChunkIds.add(context.chunk.chunk_id);
+      return summary([context.chunk.chunk_id], {
+        executive_summary: `分块 ${context.chunk.chunk_id}`,
+        key_points: [{ point_id: 'P1', content: context.chunk.chunk_id, evidence_ids: ['E1'] }],
+        evidence: [{ evidence_id: 'E1', locator: context.chunk.chunk_id, quote: context.chunk.markdown.slice(0, 20) }]
+      });
+    }
+    reduceCalls += 1;
+    if (reduceCalls === failAfter) throw new Error('deterministic interrupted reduce');
+    return summary(context.chunkIds);
+  }, cache);
+  Object.assign(base, {
+    parsePackage: { source_name: '生产 8192 故障', markdown },
+    maxChunkChars: 600,
+    reduceInputBudgetChars: 7000,
+    reduceBatchSize: 8,
+    loadSummaryReduceChunk: ({ stableReduceId }) => reduceCache.get(stableReduceId),
+    saveSummaryReduceChunk: ({ stableReduceId }, value) => reduceCache.set(stableReduceId, value)
+  });
+  await assert.rejects(api.summarizeDocument(base), /interrupted reduce/);
+  assert.strictEqual(mappedChunkIds.size, 26, 'fixture reproduces the production 26-map reduce shape');
+  assert(reduceCache.size > 0, 'completed reduce groups are checkpointed before a later group fails');
+  const mapsAfterFailure = mapCalls;
+  const checkpointsAfterFailure = reduceCache.size;
+  reduceCalls = 0;
+  failAfter = -1;
+  base.requestJson = async (_prompt, context) => {
+    assert.strictEqual(context.stage, 'summary-reduce', 'all 26 successful maps must be reused');
+    reduceCalls += 1;
+    const error = new Error('MiniMax output exactly reached 8192 tokens');
+    error.code = 'AI_OUTPUT_TRUNCATED';
+    throw error;
+  };
+  const recovered = await api.summarizeDocument(base);
+  assert.strictEqual(mapCalls, mapsAfterFailure);
+  assert(reduceCache.size >= checkpointsAfterFailure);
+  assert.strictEqual(recovered.coverage.complete, true);
+  assert.strictEqual(recovered.coverage.chunk_ids.length, mappedChunkIds.size, 'lossless fallback preserves exact complete source coverage');
+  assert.deepStrictEqual(new Set(recovered.coverage.chunk_ids), mappedChunkIds);
+  assert(diagCalls.some(({ scope }) => scope === 'summary.reduce.plan'));
+  assert(diagCalls.some(({ scope }) => scope === 'summary.reduce.truncationRecovered'));
+}
+
 function testErrorClassificationAndCounters() {
   const reliability = loadBundleModule('src/core/reliability.js');
   const classified = reliability.classifyFailure({
@@ -127,6 +184,7 @@ async function main() {
   await testExactProductionWrapperSignature();
   await testIncompleteCoverageReconstructedFromRequestedMaps();
   await testUnsafeCoverageGetsOneBoundedRepairAndResumeSkipsMaps();
+  await testProduction8192HierarchyAndReduceCheckpointResume();
   testErrorClassificationAndCounters();
   console.log('summary reduce recovery: 15 assertions passed');
 }

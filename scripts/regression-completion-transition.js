@@ -114,4 +114,25 @@ assert(!transitionBody.includes('revealLeaf') && !transitionBody.includes('activ
 assert(main.includes("diag('completion.ui.transition'"),
   'completion transition emits non-sensitive task/run/count/outcome diagnostics');
 
+// Exact terminal-failure path: durable error + ledger flush precede a one-shot
+// Errors-tab transition, and a restored dashboard opens the matching detail.
+const failedBlock = main.slice(
+  main.indexOf("current.status = 'failed';"),
+  main.indexOf('this.sessionStats.failed += 1', main.indexOf("current.status = 'failed';"))
+);
+const errorArtifactAt = failedBlock.indexOf("persistArtifact(current, 'error'");
+const failedSaveAt = failedBlock.indexOf('await this.saveTasks');
+const failedFlushAt = failedBlock.indexOf('await this.flushSaveTasksImmediate()');
+const failedTransitionAt = failedBlock.indexOf('await this.transitionFailureUi');
+assert(errorArtifactAt >= 0 && failedSaveAt > errorArtifactAt && failedFlushAt > failedSaveAt && failedTransitionAt > failedFlushAt,
+  'failure navigation runs only after the error artifact and failed ledger are durable');
+assert(main.includes('if (view._terminalTransitionKey === transitionKey) continue;'),
+  'each dashboard consumes a terminal failure transition once');
+assert(main.includes("view.activeSection = 'errors';") && main.includes('view.expandedErrorTaskId = taskId;'),
+  'failure transition selects Errors and targets its detail');
+assert(main.includes("diag('startup.failedRestored'") && !main.includes("diag('startup.failedCleared'"),
+  'failed tasks survive restart and remain diagnosable');
+assert(main.includes("if (!this._hasRendered && counts.failed > 0)") && main.includes('details.open = true'),
+  'a newly opened/restored dashboard selects Errors and expands the terminal task');
+
 console.log('completion transition regressions passed');

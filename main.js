@@ -1038,6 +1038,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         coalesceTinyChunks: this.settings.coalesceTinyChunks,
         loadSummaryMapChunk: (chunk) => this.loadArtifact(current, `summary-map-${chunk.stableChunkId || chunk.chunk_id}`),
         saveSummaryMapChunk: (chunk, value) => this.persistArtifact(current, `summary-map-${chunk.stableChunkId || chunk.chunk_id}`, value),
+        loadSummaryReduceChunk: (checkpoint) => this.loadArtifact(current, `summary-reduce-${checkpoint.stableReduceId}`),
+        saveSummaryReduceChunk: (checkpoint, value) => this.persistArtifact(current, `summary-reduce-${checkpoint.stableReduceId}`, value),
         loadAtomBatch: (batch) => this.loadArtifact(current, `atom-batch-${batch.stableBatchId}`),
         saveAtomBatch: (batch, value) => this.persistArtifact(current, `atom-batch-${batch.stableBatchId}`, value),
         versions: runtimeVersions(this.settings),
@@ -1225,14 +1227,22 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         provider: appError.provider,
         errorCode: appError.code
       }));
+      const failedStage = appError.stage;
+      current.progress = null;
       await this.writeTaskLog(current);
+      await this.persistArtifact(current, 'error', appError.toJSON());
       await this.saveTasks(upsertTask(await this.loadTasks(), current));
+      // Failure is terminal only after both the error artifact and ledger are durable.
+      // From this point stale heartbeats/progress callbacks must be ignored.
+      this._terminalTaskIds.add(current.task_id);
+      await this.flushSaveTasksImmediate();
+      await this.transitionFailureUi(current.task_id);
       this.sessionStats.failed += 1;
       this.sessionStats.lastMessage = `处理失败：${current.source_path}`;
       // v1.1.6: 诊断日志 + 更明确的 Notice（带阶段名），避免错误被截图渲染误导
       diag('processTask.failed', {
         sourcePath: current.source_path,
-        stage: current.progress?.stage,
+        stage: failedStage,
         errorClass: error && error.constructor ? error.constructor.name : typeof error,
         error: sanitizeForLog(appError.toJSON())
       });
@@ -1269,6 +1279,27 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       new Notice(`处理完成：${snapshot.reviewCount} 项待审核，已在插件控制台的审核区显示。`);
     }
     return snapshot;
+  }
+
+  async transitionFailureUi(taskId) {
+    const tasks = await this.loadTasks();
+    const failed = tasks.find((task) => task.task_id === taskId && task.status === 'failed');
+    if (!failed) return null;
+    const transitionKey = `${taskId}:${failed.updated_at || ''}`;
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SLICER) || [];
+    let transitioned = 0;
+    for (const leaf of leaves) {
+      const view = leaf?.view;
+      if (!view || typeof view.render !== 'function') continue;
+      if (view._terminalTransitionKey === transitionKey) continue;
+      view._terminalTransitionKey = transitionKey;
+      view.activeSection = 'errors';
+      view.expandedErrorTaskId = taskId;
+      await view.render();
+      transitioned += 1;
+    }
+    diag('failure.ui.transition', { taskId, runId: failed.run_id || '', transitioned });
+    return failed;
   }
 
   async processTaskLegacy(task) {
@@ -2095,12 +2126,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const tasks = await this.loadTasks();
     const failedTasks = tasks.filter((task) => task.status === 'failed');
     if (failedTasks.length) {
-      const failedIds = new Set(failedTasks.map((task) => task.task_id));
-      await this.saveTasks(tasks.filter((task) => !failedIds.has(task.task_id)));
-      diag('startup.failedCleared', {
+      for (const task of failedTasks) this._terminalTaskIds.add(task.task_id);
+      diag('startup.failedRestored', {
         count: failedTasks.length,
         files: failedTasks.slice(0, 10).map((task) => task.source_path)
       });
+      await this.transitionFailureUi(failedTasks.at(-1).task_id);
     }
     const interrupted = tasks.filter((task) => PROCESSING_STATUSES.has(task.status)
       || task.status === 'parsed' || task.status === 'queued');
@@ -2601,6 +2632,10 @@ class SlicerDashboardView extends ItemView {
     const counts = statusCounts(tasks);
     const reviewCount = pendingReviewCount(tasks);
     if (!this._hasRendered && reviewCount > 0) this.activeSection = 'review';
+    if (!this._hasRendered && counts.failed > 0) {
+      this.activeSection = 'errors';
+      this.expandedErrorTaskId = tasks.filter((task) => task.status === 'failed').at(-1)?.task_id || '';
+    }
     this._hasRendered = true;
     const activeTask = tasks.find((task) => PROCESSING_STATUSES.has(task.status));
     const state = activeTask ? 'running'
@@ -2793,10 +2828,15 @@ class SlicerDashboardView extends ItemView {
     }
     for (const [code, entries] of groups) {
       const details = parent.createEl('details', { cls: 'eks-error-group' });
+      if (entries.some((entry) => entry.task.task_id === this.expandedErrorTaskId)) details.open = true;
       const groupText = explainIssue(entries[0]?.error);
       details.createEl('summary', { text: `${groupText.kind} · ${entries.length} 项` });
       for (const { task, error } of entries.slice(0, 20)) {
         const item = details.createDiv('eks-error-item');
+        if (task.task_id === this.expandedErrorTaskId) {
+          item.addClass('is-terminal-target');
+          item.setAttribute('data-task-id', task.task_id);
+        }
         const explanation = explainIssue(error);
         item.createEl('strong', { text: explanation.happened });
         item.createDiv({ cls: 'eks-task-meta', text: `${task.source_path || '(未知文件)'} · ${stageLabel(error.stage || task.status)}` });
@@ -7412,40 +7452,9 @@ async function summarizeDocument(options) {
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, () => summaryWorker()));
 
+  provenanceFailureSummary(partials, 'summary-map');
   if (partials.length === 1) return partials[0];
-  if (partials.length > Math.max(2, Number(options.reduceBatchSize) || 8)) {
-    return reduceSummaryHierarchy(options, partials, Math.max(2, Number(options.reduceBatchSize) || 8));
-  }
-  const chunkIds = chunks.map((chunk) => chunk.chunk_id);
-  const reducePrompt = composePrompt([
-    options.basePrompt,
-    '当前文档类型专用规则：',
-    options.typePrompt,
-    '请合并以下逐块总结，去重但不得删除任何有证据的独立事实、决策、要求、风险、参数、行动项或经验。',
-    '保持每个 key_point 到 evidence_id 的可追溯关系。不得补充逐块总结中不存在的事实。',
-    `coverage.chunk_ids 必须完整且只能为：${JSON.stringify(chunkIds)}；complete 必须为 true。`,
-    '输出根对象必须直接是 structured summary；若供应商要求使用 item 包裹，item 的值必须是该完整 summary，插件会移除这一层供应商包裹。',
-    JSON.stringify(partials, null, 2),
-    '所有面向使用者的内容统一使用简体中文。只返回符合 structured-summary.schema.json 的 JSON。'
-  ]);
-  try {
-    return await requestWithContract({
-      prompt: reducePrompt,
-      stage: 'summary-reduce',
-      schema: options.summarySchema,
-      requestJson: options.requestJson,
-      requestStream: options.requestStream,
-      streaming: !!options.requestStream,
-      maxRepairAttempts: options.maxRepairAttempts,
-      onProgress: options.onProgress,
-      context: { chunkIds, partialCount: partials.length },
-      normalizeValue: (value) => normalizeSummaryReduce(value, chunkIds, options.parsePackage),
-      extraValidation: (value) => exactCoverage(value.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整')
-    });
-  } catch (error) {
-    if (error?.code !== 'AI_OUTPUT_TRUNCATED') throw error;
-    return mergeStructuredSummaries(partials, chunkIds, options.summarySchema);
-  }
+  return reduceSummaryHierarchy(options, partials, Math.max(2, Number(options.reduceBatchSize) || 8));
 }
 
 function normalizeSummaryReduce(value, requestedChunkIds, parsePackage) {
@@ -7481,10 +7490,10 @@ function normalizeSummaryReduce(value, requestedChunkIds, parsePackage) {
           ? verifyLocator(parsePackage, item.quote, item.provenance)
           : resolveEvidence(parsePackage, item.quote);
         if (!resolved.ok) {
-          diag('provenance.resolve', { ok: false, count: 1, reason: resolved.reason, stage: 'summary-reduce' });
           return Object.assign({}, item, { locator: '', provenance_resolution: { ok: false, reason: resolved.reason } });
         }
         return Object.assign({}, item, {
+          quote: exactEvidenceQuote(parsePackage, resolved, item.quote),
           locator: resolved.label,
           provenance: resolved.locator,
           source_page: resolved.locator.page || '',
@@ -7529,6 +7538,7 @@ function normalizeSummaryMap(value, options, chunk) {
           page: chunk.pageStart === chunk.pageEnd ? chunk.pageStart : undefined
         });
         if (resolved.ok) {
+          normalized.quote = exactEvidenceQuote(options.parsePackage, resolved, normalized.quote);
           normalized.locator = resolved.label;
           normalized.provenance = resolved.locator;
           normalized.source_page = resolved.locator.page || '';
@@ -7536,7 +7546,6 @@ function normalizeSummaryMap(value, options, chunk) {
         } else {
           normalized.locator = '';
           normalized.provenance_resolution = { ok: false, reason: resolved.reason };
-          diag('provenance.resolve', { ok: false, count: 1, reason: resolved.reason, stage: 'summary-map' });
         }
       }
       return normalized;
@@ -7612,18 +7621,99 @@ function mergeStructuredSummaries(partials, chunkIds, schema) {
   return merged;
 }
 
+function exactEvidenceQuote(parsePackage, resolved, fallback) {
+  const start = Number(resolved?.locator?.text_start);
+  const end = Number(resolved?.locator?.text_end);
+  const markdown = String(parsePackage?.markdown || '');
+  return Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end > start && end <= markdown.length
+    ? markdown.slice(start, end)
+    : fallback;
+}
+
+function provenanceFailureSummary(summaries, stage) {
+  const reasons = {};
+  let checked = 0;
+  for (const summary of summaries || []) {
+    for (const item of summary?.evidence || []) {
+      checked += 1;
+      const reason = item?.provenance_resolution?.reason;
+      if (reason) reasons[reason] = (reasons[reason] || 0) + 1;
+    }
+  }
+  const failed = Object.values(reasons).reduce((sum, count) => sum + count, 0);
+  diag('provenance.aggregate', { stage, checked, resolved: checked - failed, failed, reasons });
+}
+
+function summarySize(summary) {
+  return JSON.stringify(summary || {}).length;
+}
+
+function budgetedReduceGroups(level, maxInputChars, maxItems) {
+  const groups = [];
+  let group = [];
+  let used = 0;
+  for (const item of level) {
+    const size = summarySize(item);
+    if (group.length && (group.length >= maxItems || used + size > maxInputChars)) {
+      groups.push(group);
+      group = [];
+      used = 0;
+    }
+    group.push(item);
+    used += size;
+  }
+  if (group.length) groups.push(group);
+  return groups;
+}
+
+function stableReduceId(round, chunkIds, group) {
+  return `r${round}-${sourceFingerprint(JSON.stringify({
+    chunkIds,
+    content: group.map((item) => sourceFingerprint(JSON.stringify(item)))
+  }))}`;
+}
+
 async function reduceSummaryHierarchy(options, initial, batchSize) {
   let level = initial;
   let round = 1;
+  const maxInputChars = Math.max(6000, Number(options.reduceInputBudgetChars) || 18000);
+  const maxItems = Math.max(2, Math.min(batchSize, Number(options.reduceBatchSize) || batchSize));
   while (level.length > 1) {
     const next = [];
-    for (let offset = 0; offset < level.length; offset += batchSize) {
-      const group = level.slice(offset, offset + batchSize);
+    const groups = budgetedReduceGroups(level, maxInputChars, maxItems);
+    diag('summary.reduce.plan', {
+      round, inputs: level.length, groups: groups.length, maxInputChars, maxItems,
+      groupCharacters: groups.map((group) => group.reduce((sum, item) => sum + summarySize(item), 0))
+    });
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+      const group = groups[groupIndex];
       if (group.length === 1) {
         next.push(group[0]);
         continue;
       }
       const chunkIds = [...new Set(group.flatMap((item) => item.coverage.chunk_ids))];
+      const checkpoint = {
+        stableReduceId: stableReduceId(round, chunkIds, group),
+        round,
+        groupIndex,
+        chunkIds
+      };
+      const cached = typeof options.loadSummaryReduceChunk === 'function'
+        ? await options.loadSummaryReduceChunk(checkpoint)
+        : null;
+      if (cached) {
+        const normalized = normalizeSummaryReduce(cached, chunkIds, options.parsePackage);
+        const cachedErrors = [
+          ...validateSchema(options.summarySchema, normalized).errors,
+          ...exactCoverage(normalized.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整')
+        ];
+        if (!cachedErrors.length) {
+          next.push(normalized);
+          diag('summary.reduce.cacheHit', { round, groupIndex, stableReduceId: checkpoint.stableReduceId, chunks: chunkIds.length });
+          continue;
+        }
+        diag('summary.reduce.cacheMiss', { round, groupIndex, stableReduceId: checkpoint.stableReduceId, reason: 'checkpoint_invalid' });
+      }
       const prompt = composePrompt([
         options.basePrompt,
         '当前文档类型专用规则：',
@@ -7634,23 +7724,53 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
         JSON.stringify(group, null, 2),
         '只返回符合 structured-summary.schema.json 的 JSON。'
       ]);
-      next.push(await requestWithContract({
-        prompt,
-        stage: 'summary-reduce',
-        schema: options.summarySchema,
-        requestJson: options.requestJson,
-        requestStream: options.requestStream,
-        streaming: !!options.requestStream,
-        maxRepairAttempts: options.maxRepairAttempts,
-        onProgress: options.onProgress,
-        context: { chunkIds, partialCount: group.length, reduceRound: round },
-        normalizeValue: (value) => normalizeSummaryReduce(value, chunkIds, options.parsePackage),
-        extraValidation: (value) => exactCoverage(value.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整')
-      }));
+      let reduced;
+      try {
+        reduced = await requestWithContract({
+          prompt,
+          stage: 'summary-reduce',
+          schema: options.summarySchema,
+          requestJson: options.requestJson,
+          requestStream: options.requestStream,
+          streaming: !!options.requestStream,
+          maxRepairAttempts: options.maxRepairAttempts,
+          onProgress: options.onProgress,
+          context: { chunkIds, partialCount: group.length, reduceRound: round, reduceGroup: groupIndex + 1, reduceGroupTotal: groups.length },
+          normalizeValue: (value) => normalizeSummaryReduce(value, chunkIds, options.parsePackage),
+          extraValidation: (value) => exactCoverage(value.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整')
+        });
+      } catch (error) {
+        if (error?.code !== 'AI_OUTPUT_TRUNCATED') throw error;
+        reduced = mergeStructuredSummaries(group, chunkIds, options.summarySchema);
+        diag('summary.reduce.truncationRecovered', {
+          round, groupIndex, stableReduceId: checkpoint.stableReduceId, chunks: chunkIds.length,
+          inputCharacters: group.reduce((sum, item) => sum + summarySize(item), 0)
+        });
+      }
+      if (typeof options.saveSummaryReduceChunk === 'function') {
+        await options.saveSummaryReduceChunk(checkpoint, reduced);
+      }
+      next.push(reduced);
     }
-    level = next;
+    // If every budget group was a singleton, force a lossless local pair merge so
+    // the hierarchy always converges without sending an oversized provider request.
+    if (next.length === level.length) {
+      const forced = [];
+      for (let index = 0; index < next.length; index += 2) {
+        const pair = next.slice(index, index + 2);
+        forced.push(pair.length === 1 ? pair[0] : mergeStructuredSummaries(
+          pair,
+          [...new Set(pair.flatMap((item) => item.coverage.chunk_ids))],
+          options.summarySchema
+        ));
+      }
+      level = forced;
+    } else {
+      level = next;
+    }
     round += 1;
   }
+  provenanceFailureSummary(level, 'summary-final');
   return level[0];
 }
 
@@ -9151,6 +9271,8 @@ async function runKnowledgeWorkflow(options) {
     summaryConcurrency: options.summaryConcurrency,
     loadSummaryMapChunk: options.loadSummaryMapChunk,
     saveSummaryMapChunk: options.saveSummaryMapChunk,
+    loadSummaryReduceChunk: options.loadSummaryReduceChunk,
+    saveSummaryReduceChunk: options.saveSummaryReduceChunk,
     maxRepairAttempts: 2,
     requestJson: options.requestJson,
     requestStream: options.requestStream,

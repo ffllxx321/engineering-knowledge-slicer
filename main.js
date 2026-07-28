@@ -48,6 +48,11 @@ const {
 } = require("src/core/selected-regeneration.js");
 const { explainIssue, pipelineProgress, queuePosition } = require("src/core/production-ux.js");
 const {
+  completionUiSnapshot,
+  pendingReviewCount,
+  shouldAcceptIncrementalProgress
+} = require("src/core/completion-ui.js");
+const {
   createStageMetric,
   sanitizeForLog,
   sanitizeSettingsForPersistence,
@@ -229,6 +234,7 @@ function startProgressHeartbeat(plugin, task, startedAt) {
   return setInterval(() => {
     try {
       if (!task || !plugin) return;
+      if (!shouldAcceptIncrementalProgress(task, plugin._terminalTaskIds)) return;
       task.progress = task.progress || {};
       task.progress.elapsedMs = Date.now() - startedAt;
       task.progress.at = new Date().toISOString();
@@ -519,6 +525,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.pauseRequested = false;
     this.cancelRequestedTaskId = '';
     this.taskControllers = new Map();
+    this._terminalTaskIds = new Set();
     this.componentCache = new Map();
     this.operationCounters = { apiRequests: 0, aiRetries: 0, summaryReduceRequests: 0, promptCharacters: 0, outputCharacters: 0, bytesRead: 0, bytesWritten: 0, ledgerWrites: 0, artifactWrites: 0, uiFullRenders: 0, uiIncrementalRefreshes: 0 };
     this.sessionStats = { scanned: 0, processed: 0, written: 0, review: 0, failed: 0, skipped: 0, current: '', lastMessage: '等待开始处理' };
@@ -682,6 +689,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   refreshProgressOnly(task) {
     this.operationCounters.uiIncrementalRefreshes += 1;
     try {
+      if (!shouldAcceptIncrementalProgress(task, this._terminalTaskIds)) return;
       if (!this.app || !this.app.workspace || typeof this.app.workspace.getLeavesOfType !== 'function') return;
       const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SLICER) || [];
       for (const leaf of leaves) {
@@ -947,6 +955,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   async processTask(task) {
     const tasks = await this.loadTasks();
     const current = tasks.find((item) => item.task_id === task.task_id) || task;
+    this._terminalTaskIds.delete(current.task_id);
     const startedAt = Date.now();
     const taskController = new AbortController();
     this.taskControllers.set(current.task_id, taskController);
@@ -1154,6 +1163,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
       await this.writeTaskLog(current);
       await this.saveTasks(upsertTask(await this.loadTasks(), current));
+      // Terminal state is a commit boundary: the review artifact is already durable,
+      // and the ledger must become durable before any view reads it.
+      this._terminalTaskIds.add(current.task_id);
+      await this.flushSaveTasksImmediate();
+      await this.transitionCompletionUi(current.task_id);
       diag('performance.task', createStageMetric({
         taskId: current.task_id,
         runId: current.run_id,
@@ -1227,6 +1241,34 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       this.taskControllers.delete(current.task_id);
       await this.refreshViews();
     }
+  }
+
+  async transitionCompletionUi(taskId) {
+    const tasks = await this.loadTasks();
+    const snapshot = completionUiSnapshot(tasks, taskId);
+    let outcome = 'no-dashboard';
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SLICER) || [];
+    for (const leaf of leaves) {
+      const view = leaf?.view;
+      if (!view || typeof view.render !== 'function') continue;
+      if (snapshot.reviewCount > 0) view.activeSection = 'review';
+      await view.render();
+      outcome = snapshot.reviewCount > 0 ? 'review-visible' : (snapshot.activeTask ? 'queue-continuing' : 'completed');
+    }
+    diag('completion.ui.transition', {
+      taskId,
+      runId: snapshot.runId,
+      taskCount: snapshot.taskCount,
+      queuedCount: snapshot.queuedCount,
+      activeCount: snapshot.activeCount,
+      reviewCount: snapshot.reviewCount,
+      overallPercent: snapshot.overallPercent,
+      outcome
+    });
+    if (snapshot.reviewCount > 0) {
+      new Notice(`处理完成：${snapshot.reviewCount} 项待审核，已在插件控制台的审核区显示。`);
+    }
+    return snapshot;
   }
 
   async processTaskLegacy(task) {
@@ -2506,12 +2548,15 @@ class SlicerDashboardView extends ItemView {
   }
 
   async render() {
+    const renderVersion = (this._renderVersion || 0) + 1;
+    this._renderVersion = renderVersion;
     const container = this.containerEl.children[1];
     container.empty();
     container.addClass('eks-view');
     try {
-      await this.renderContent(container);
+      await this.renderContent(container, renderVersion);
     } catch (error) {
+      if (renderVersion !== this._renderVersion) return;
       console.error('工程知识切片界面渲染失败', error);
       container.createEl('h2', { text: '工程知识切片' });
       container.createDiv({ cls: 'eks-empty', text: `界面渲染失败：${error.message}` });
@@ -2523,7 +2568,7 @@ class SlicerDashboardView extends ItemView {
 
   // v1.1.8: 轻量级进度更新，1 秒一次心跳用，不重建整个 dashboard DOM
   refreshProgress(task) {
-    if (!task || !task.progress) return;
+    if (!task || !task.progress || !shouldAcceptIncrementalProgress(task, this.plugin._terminalTaskIds)) return;
     const root = this.containerEl;
     // 更新进度条
     const bar = root.querySelector('.eks-overall-progress');
@@ -2550,12 +2595,16 @@ class SlicerDashboardView extends ItemView {
     }
   }
 
-  async renderContent(container) {
+  async renderContent(container, renderVersion) {
     const tasks = await this.plugin.loadTasks();
+    if (renderVersion !== this._renderVersion) return;
     const counts = statusCounts(tasks);
+    const reviewCount = pendingReviewCount(tasks);
+    if (!this._hasRendered && reviewCount > 0) this.activeSection = 'review';
+    this._hasRendered = true;
     const activeTask = tasks.find((task) => PROCESSING_STATUSES.has(task.status));
     const state = activeTask ? 'running'
-      : counts.needsReview ? 'review'
+      : reviewCount ? 'review'
         : counts.failed ? 'error'
           : counts.pending ? 'ready'
             : counts.written ? 'success' : 'empty';
@@ -2571,7 +2620,7 @@ class SlicerDashboardView extends ItemView {
     const taskProgress = pipelineProgress(activeTask, activeProgress);
     const overallPercent = activeTask && position.total > 0
       ? Math.min(99.9, ((position.ordinal - 1) + taskProgress.completedWork / 100) / position.total * 100)
-      : (tasks.length && tasks.every((task) => ['written', 'needs_review', 'skipped', 'unsupported', 'cancelled'].includes(task.status)) ? 100 : 0);
+      : completionUiSnapshot(tasks).overallPercent;
     status.createDiv({ cls: 'eks-queue-position', text: activeTask ? position.label : (overallPercent === 100 ? '处理队列 已完成' : '处理队列 空闲') });
     status.createDiv({
       cls: 'eks-progress-text',
@@ -2605,14 +2654,14 @@ class SlicerDashboardView extends ItemView {
 
     const summary = container.createDiv('eks-summary-line');
     summary.createSpan({ text: `待处理队列 ${counts.pending}` });
-    summary.createSpan({ text: `待审核 ${counts.needsReview}` });
+    summary.createSpan({ text: `待审核 ${reviewCount}` });
     summary.createSpan({ text: `失败 ${counts.failed}` });
     summary.createSpan({ text: `已入库 ${counts.written}` });
 
     const tabs = container.createDiv({ cls: 'eks-tabs', attr: { role: 'tablist', 'aria-label': '工作区' } });
     const sections = [
       ['tasks', `任务 ${tasks.length}`],
-      ['review', `审核 ${counts.needsReview}`],
+      ['review', `审核 ${reviewCount}`],
       ['errors', `错误 ${counts.failed}`]
     ];
     for (const [id, label] of sections) {
@@ -2629,7 +2678,7 @@ class SlicerDashboardView extends ItemView {
       attr: { id: `eks-panel-${this.activeSection}`, role: 'tabpanel', 'aria-labelledby': `eks-tab-${this.activeSection}`, tabindex: '0' }
     });
     if (this.activeSection === 'tasks') this.renderTaskExplorer(panel, tasks);
-    if (this.activeSection === 'review') await this.renderReview(panel, tasks);
+    if (this.activeSection === 'review') await this.renderReview(panel, tasks, renderVersion);
     if (this.activeSection === 'errors') this.renderErrorCenter(panel, tasks);
 
     const context = container.createEl('details', { cls: 'eks-context' });
@@ -2898,7 +2947,7 @@ class SlicerDashboardView extends ItemView {
     button(actions, '继续自动处理', () => this.plugin.autoProcessQueue(true));
   }
 
-  async renderReview(parent, tasks) {
+  async renderReview(parent, tasks, renderVersion = this._renderVersion) {
     // v2.9.0: 会话级「处理失败」区块——失败记录重启后由 sessionStartupCleanup
     //   自动清除，所以这里只会展示本次会话内的失败，满足"关机即删、重开不显示"。
     const failedTasks = tasks.filter((task) => task.status === 'failed');
@@ -2932,6 +2981,7 @@ class SlicerDashboardView extends ItemView {
     }
     for (const task of reviewTasks) {
       const artifact = await this.plugin.loadArtifact(task, 'review');
+      if (renderVersion !== this._renderVersion) return;
       if (!artifact) continue;
       for (const group of groupReviewItems(artifact.items)) {
         const block = parent.createDiv('eks-review-group');
@@ -8953,6 +9003,53 @@ function queuePosition(task, tasks = []) {
 }
 
 module.exports = { explainIssue, pipelineProgress, queuePosition };
+
+},
+/**
+ * @module src/core/completion-ui
+ * Pure rules for authoritative completion rendering and stale progress rejection.
+ */
+"src/core/completion-ui.js": function(require, module, exports) {
+const PROCESSING = new Set(['parsing', 'classifying', 'summarizing', 'atomizing', 'validating', 'writing']);
+const TERMINAL = new Set(['written', 'needs_review', 'skipped', 'unsupported', 'cancelled']);
+
+function pendingReviewCount(tasks) {
+  return (tasks || []).reduce((sum, task) => {
+    if (task.status !== 'needs_review') return sum;
+    return sum + (Array.isArray(task.review_atom_ids) ? task.review_atom_ids.length : 0);
+  }, 0);
+}
+
+function shouldAcceptIncrementalProgress(task, terminalTaskIds) {
+  return !!task && PROCESSING.has(task.status) && !(terminalTaskIds && terminalTaskIds.has(task.task_id));
+}
+
+function completionUiSnapshot(tasks, completedTaskId) {
+  const rows = Array.isArray(tasks) ? tasks : [];
+  const completed = rows.find((task) => task.task_id === completedTaskId);
+  const active = rows.find((task) => PROCESSING.has(task.status));
+  const runId = completed?.queue_run_id || active?.queue_run_id || '';
+  const cohort = runId ? rows.filter((task) => task.queue_run_id === runId) : rows;
+  const total = Number(completed?.queue_total || active?.queue_total)
+    || Math.max(0, ...cohort.map((task) => Number(task.queue_total) || 0))
+    || cohort.length;
+  const finished = cohort.filter((task) => TERMINAL.has(task.status)).length;
+  const activeProgress = active && Number(active.progress?.completedWork || 0);
+  const overallPercent = total > 0
+    ? Math.min(active ? 99.9 : 100, ((finished + (activeProgress || 0) / 100) / total) * 100)
+    : 0;
+  return {
+    taskCount: rows.length,
+    queuedCount: rows.filter((task) => task.status === 'queued').length,
+    activeCount: rows.filter((task) => PROCESSING.has(task.status)).length,
+    activeTask: active || null,
+    reviewCount: pendingReviewCount(rows),
+    runId,
+    overallPercent
+  };
+}
+
+module.exports = { completionUiSnapshot, pendingReviewCount, shouldAcceptIncrementalProgress };
 
 },
 /**

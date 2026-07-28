@@ -35,7 +35,7 @@ assert.deepStrictEqual(
 assert(selection.eligibleIds.every((id) => !['A39', 'A40'].includes(id)));
 assert.strictEqual(review.isApprovalEligible(items[38]), false);
 
-const renderContent = source.slice(source.indexOf('async renderContent(container)'), source.indexOf('async renderContentLegacy(container)'));
+const renderContent = source.slice(source.indexOf('async renderContent(container,'), source.indexOf('async renderContentLegacy(container)'));
 assert.strictEqual((renderContent.match(/createEl\('progress'/g) || []).length, 1);
 assert(source.includes("text: '技术详情'") && source.includes('JSON.stringify({'));
 assert(source.includes('pageSize = 20') && source.includes("role: 'listitem'"));

@@ -12,7 +12,8 @@ function fingerprint(atom) {
 const ai = {
   classifyDocument: async () => { throw new Error('classification provider must not be called'); },
   summarizeDocument: async () => { throw new Error('summary provider must not be called'); },
-  atomizeSummary: async () => { throw new Error('atomization provider must not be called'); }
+  atomizeSummary: async () => { throw new Error('atomization provider must not be called'); },
+  validateAtomizationResult: (value) => ({ value, errors: [] })
 };
 const workflow = loadBundleModule('src/core/workflow.js', {
   'src/core/ai-pipeline.js': ai,

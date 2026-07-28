@@ -317,6 +317,7 @@ class RateLimiter {
     this.queueTimeoutMs = queueTimeoutMs;
     this.timestamps = []; // 滑动窗口内最近 N 次请求的 timestamp
     this.failures = 0;
+    this.lastFailureAt = 0;
     this.waiters = []; // FIFO 等待队列，每项是 { resolve, startedAt }
   }
 
@@ -405,14 +406,19 @@ class RateLimiter {
   // 记录一次失败；后续 acquire 会自动指数退避
   recordFailure() {
     this.failures += 1;
+    this.lastFailureAt = Date.now();
   }
   recordSuccess() {
     this.failures = 0;
+    this.lastFailureAt = 0;
   }
   backoffMs() {
     if (this.failures === 0) return 0;
     // 1, 2, 4, 8 ... 指数退避到 backoffMaxMs
-    return Math.min(this.backoffMaxMs, this.intervalMs * Math.pow(2, Math.min(this.failures - 1, 10)));
+    const duration = Math.min(this.backoffMaxMs, this.intervalMs * Math.pow(2, Math.min(this.failures - 1, 10)));
+    const remaining = Math.max(0, duration - Math.max(0, Date.now() - this.lastFailureAt));
+    if (!remaining) this.recordSuccess();
+    return remaining;
   }
 
   async run(fn, options = {}) {
@@ -420,7 +426,7 @@ class RateLimiter {
     if (signal?.aborted) throw abortError();
     const backoff = this.backoffMs();
     if (backoff > 0) {
-      try { diag('ratelimit.backoff', { failures: this.failures, backoffMs: backoff }); } catch (_) {}
+      try { diag('ratelimit.backoff', { failures: this.failures, backoffMs: backoff, outboundRequest: true }); } catch (_) {}
       await sleepWithSignal(backoff, signal);
     }
     await this.acquire(signal);
@@ -429,7 +435,9 @@ class RateLimiter {
       this.recordSuccess();
       return result;
     } catch (e) {
-      this.recordFailure();
+      if (e?.name !== 'AbortError' && e?.code !== 'TASK_CANCELLED' && options.countFailure !== false) {
+        this.recordFailure();
+      }
       throw e;
     } finally {
       this.release();
@@ -7787,15 +7795,25 @@ async function atomizeSummary(options) {
   const results = new Array(batches.length);
   let completedBatches = 0;
   let nextBatchIndex = 0;
-  let terminalError = null;
-  const batchController = typeof AbortController === 'function' ? new AbortController() : null;
+  const batchFailures = [];
   const concurrency = Math.max(1, Math.min(3, Number(options.atomizationConcurrency) || 2));
   async function processBatch(index) {
-    if (terminalError || batchController?.signal.aborted) return;
+    if (options.signal?.aborted) throw abortError();
     const batchPointIds = batches[index];
     const stableBatchId = stableAtomBatchId(batchPointIds, index);
     const descriptor = { index, pointIds: batchPointIds, stableBatchId };
-    const cached = typeof options.loadAtomBatch === 'function' ? await options.loadAtomBatch(descriptor) : null;
+    let cached = null;
+    if (typeof options.loadAtomBatch === 'function') {
+      try {
+        cached = await options.loadAtomBatch(descriptor);
+      } catch (error) {
+        const checkpointError = new Error(`无法读取已保存的原子批次 ${index + 1}/${batches.length}：${String(error?.message || error)}`);
+        checkpointError.code = 'ATOMIZATION_CHECKPOINT_READ_FAILED';
+        checkpointError.stage = 'atomization';
+        checkpointError.retryable = true;
+        throw checkpointError;
+      }
+    }
     if (cached) {
       const normalized = normalizeAtomBatch(cached, options.summary, batchPointIds);
       const errors = [
@@ -7829,53 +7847,94 @@ async function atomizeSummary(options) {
       batchTotal: batches.length,
       message: `正在处理第 ${index + 1} 批；已验证 ${completedBatches}/${batches.length} 批`
     });
-    try {
-      const batchResult = await atomizeSummaryBatch(
-        Object.assign({}, options, { signal: batchController?.signal || options.signal }),
-        batchSummary, batchPointIds, index + 1, batches.length
-      );
-      if (terminalError || batchController?.signal.aborted) return;
-      if (typeof options.saveAtomBatch === 'function') await options.saveAtomBatch(descriptor, batchResult);
-      results[index] = batchResult;
-      completedBatches += 1;
-      diag('atomization.batch', {
-        batchIndex: index + 1, batchTotal: batches.length, completedBatches,
-        requestedPoints: batchPointIds.length,
-        atoms: Array.isArray(batchResult?.atoms) ? batchResult.atoms.length : 0,
-        stableBatchId
-      });
-      await emitProgress(options.onProgress, {
-        stage: 'atomization', batchIndex: completedBatches, batchTotal: batches.length,
-        batchComplete: true, message: `已验证并保存 ${completedBatches}/${batches.length} 个原子批次`
-      });
-    } catch (error) {
-      if (!terminalError && error?.name !== 'AbortError') {
-        terminalError = error;
-        batchController?.abort();
-        diag('atomization.batch.terminal', {
-          batchIndex: index + 1, batchTotal: batches.length, completedBatches,
-          code: error?.code || '', message: String(error?.message || error)
-        });
+    const batchResult = await atomizeSummaryBatch(
+      options, batchSummary, batchPointIds, index + 1, batches.length
+    );
+    if (options.signal?.aborted) throw abortError();
+    if (typeof options.saveAtomBatch === 'function') {
+      let saveError = null;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          await options.saveAtomBatch(descriptor, batchResult);
+          saveError = null;
+          break;
+        } catch (error) {
+          saveError = error;
+          diag('atomization.batch.checkpointRetry', {
+            batchIndex: index + 1, batchTotal: batches.length, stableBatchId, attempt,
+            message: String(error?.message || error)
+          });
+        }
+      }
+      if (saveError) {
+        const checkpointError = new Error(`无法保存原子批次 ${index + 1}/${batches.length}：${String(saveError?.message || saveError)}`);
+        checkpointError.code = 'ATOMIZATION_CHECKPOINT_WRITE_FAILED';
+        checkpointError.stage = 'atomization';
+        checkpointError.retryable = true;
+        throw checkpointError;
+      }
+    }
+    results[index] = batchResult;
+    completedBatches += 1;
+    diag('atomization.batch', {
+      batchIndex: index + 1, batchTotal: batches.length, completedBatches,
+      requestedPoints: batchPointIds.length,
+      atoms: Array.isArray(batchResult?.atoms) ? batchResult.atoms.length : 0,
+      stableBatchId
+    });
+    await emitProgress(options.onProgress, {
+      stage: 'atomization', batchIndex: completedBatches, batchTotal: batches.length,
+      batchComplete: true, message: `已验证并保存 ${completedBatches}/${batches.length} 个原子批次`
+    });
+  }
+  async function worker() {
+    while (!options.signal?.aborted) {
+      const index = nextBatchIndex++;
+      if (index >= batches.length) return;
+      try {
+        await processBatch(index);
+      } catch (error) {
+        if (error?.name === 'AbortError' || error?.code === 'TASK_CANCELLED') throw error;
+        const failure = {
+          index, batchIndex: index + 1, pointIds: batches[index],
+          stableBatchId: stableAtomBatchId(batches[index], index),
+          code: error?.code || 'ATOMIZATION_BATCH_FAILED',
+          message: String(error?.message || error)
+        };
+        batchFailures.push(failure);
+        diag('atomization.batch.failed', Object.assign({
+          batchTotal: batches.length, completedBatches
+        }, failure));
       }
     }
   }
-  async function worker() {
-    while (!terminalError && !batchController?.signal.aborted) {
-      const index = nextBatchIndex++;
-      if (index >= batches.length) return;
-      await processBatch(index);
-    }
-  }
   await Promise.allSettled(Array.from({ length: Math.min(concurrency, batches.length) }, () => worker()));
-  if (terminalError) throw terminalError;
+  if (options.signal?.aborted) throw abortError();
+  if (batchFailures.length) {
+    batchFailures.sort((left, right) => left.index - right.index);
+    const error = new Error(
+      `知识原子化仅完成 ${completedBatches}/${batches.length} 批；失败批次：`
+      + batchFailures.map((failure) => `${failure.batchIndex}(${failure.pointIds.join('、') || '空批次'})`).join('、')
+    );
+    error.code = 'ATOMIZATION_BATCH_INCOMPLETE';
+    error.stage = 'atomization';
+    error.category = batchFailures.every((failure) => failure.code.startsWith('ATOMIZATION_CHECKPOINT_'))
+      ? 'checkpoint'
+      : 'ai_provider';
+    error.retryable = true;
+    error.details = { completedBatches, batchTotal: batches.length, failedBatches: batchFailures };
+    throw error;
+  }
   const completedResults = results.filter(Boolean);
 
-  if (!completedResults.length) {
-    return applySchemaConstants(options.atomSchema, {
-      atoms: [],
-      coverage: { point_ids: pointIds, complete: completedResults.length === batches.length },
-      schema_version: '1.1'
-    });
+  if (completedResults.length !== batches.length) {
+    const error = new Error(`知识原子化批次覆盖不完整：已验证 ${completedResults.length}/${batches.length} 批`);
+    error.code = 'ATOMIZATION_BATCH_INCOMPLETE';
+    error.stage = 'atomization';
+    error.category = 'checkpoint';
+    error.retryable = true;
+    error.details = { completedBatches: completedResults.length, batchTotal: batches.length };
+    throw error;
   }
   if (completedResults.length === 1 && batches.length === 1) return completedResults[0];
   const mergedAtoms = completedResults.flatMap((result) => result.atoms || []);
@@ -7911,6 +7970,19 @@ function exactAtomAttribution(atoms, pointIds) {
   }
   return [...expected].filter((pointId) => !attributed.has(pointId))
     .map((pointId) => `知识点 ${pointId} 没有有效归属原子或明确的审核安全结果`);
+}
+
+function validateAtomizationResult(value, summary, atomSchema) {
+  const pointIds = (summary?.key_points || []).map((point) => point.point_id);
+  const normalized = normalizeAtomBatch(value, summary || {}, pointIds);
+  return {
+    value: normalized,
+    errors: [
+      ...validateSchema(atomSchema, normalized).errors,
+      ...exactCoverage(normalized?.coverage, 'point_ids', pointIds, '知识点覆盖不完整'),
+      ...exactAtomAttribution(normalized?.atoms, pointIds)
+    ]
+  };
 }
 
 async function atomizeSummaryBatch(options, summary, pointIds, batchIndex, batchTotal) {
@@ -8598,6 +8670,7 @@ module.exports = {
   safeSlice,
   splitByHeadings,
   splitMarkdownSections,
+  validateAtomizationResult,
   summarizeDocument,
   validateChunks
 };
@@ -8933,11 +9006,21 @@ function toAppError(error, context = {}) {
   const message = redactText(error?.message || error || '未知错误');
   const status = Number(error?.status || error?.statusCode || 0);
   const code = String(error?.code || '');
-  const classified = classifyFailure({ status, code, message });
+  const classified = error?.retryable === true
+    ? {
+        code: code || 'RETRYABLE_STAGE_FAILURE',
+        category: error.category || (code.startsWith('ATOMIZATION_CHECKPOINT_') ? 'checkpoint' : 'ai_provider'),
+        retryable: true,
+        severity: 'error',
+        suggestedAction: '直接重试该文件；已验证并保存的批次会复用，只处理失败或缺失批次。'
+      }
+    : classifyFailure({ status, code, message });
   return new AppError(Object.assign({}, context, classified, {
+    stage: error?.stage || context.stage,
     message: userMessage(classified.category),
     technicalMessage: message,
-    stack: error?.stack
+    stack: error?.stack,
+    details: Object.assign({}, context.details || {}, error?.details || {})
   }));
 }
 
@@ -8963,7 +9046,8 @@ function result(code, category, retryable, message, suggestedAction) {
 function userMessage(category) {
   return ({ auth: '外部服务鉴权失败', rate_limit: '外部服务限流', timeout: '处理阶段超时',
     network: '外部服务暂时不可用', json_parse: '服务返回格式无法解析', schema: '模型输出未通过结构校验',
-    file: '找不到源文件', cancelled: '任务已取消' })[category] || '工程知识切片处理失败';
+    file: '找不到源文件', cancelled: '任务已取消', checkpoint: '已保存批次读取或写入失败',
+    ai_provider: '知识原子化批次未完整完成' })[category] || '工程知识切片处理失败';
 }
 
 function redactText(value) {
@@ -9235,7 +9319,7 @@ module.exports = {
  * @exports runKnowledgeWorkflow
  */
 "src/core/workflow.js": function(require, module, exports) {
-const { atomizeSummary, classifyDocument, summarizeDocument } = require("src/core/ai-pipeline.js");
+const { atomizeSummary, classifyDocument, summarizeDocument, validateAtomizationResult } = require("src/core/ai-pipeline.js");
 const { calculateConfidence } = require("src/core/confidence.js");
 const { atomFingerprint } = require("src/core/identity.js");
 const { buildCardRecord } = require("src/core/markdown-renderer.js");
@@ -9280,7 +9364,24 @@ async function runKnowledgeWorkflow(options) {
   });
   await emitArtifact(options.onArtifact, 'summary', summary);
   const linkCandidates = findLinkCandidates({ title: summary.document_title, content: summary }, options.existingCards || [], { limit: 20 });
-  const atomResult = options.atomResult || await atomizeSummary({
+  let atomResult = options.atomResult;
+  if (atomResult) {
+    const cachedAggregate = validateAtomizationResult(atomResult, summary, options.schemas.atoms);
+    if (cachedAggregate.errors.length) {
+      workflowDiag('atomization.aggregate.cacheRejected', {
+        errors: cachedAggregate.errors,
+        expectedPoints: (summary.key_points || []).length
+      });
+      atomResult = null;
+    } else {
+      atomResult = cachedAggregate.value;
+      workflowDiag('atomization.aggregate.cacheHit', {
+        points: (summary.key_points || []).length,
+        atoms: atomResult.atoms.length
+      });
+    }
+  }
+  atomResult = atomResult || await atomizeSummary({
     summary,
     atomPrompt: options.prompts.atoms,
     typeMapping: options.prompts.typeMapping,

@@ -7,6 +7,22 @@ const { loadBundleModule } = require('./load-bundle-module.js');
 const schemaValidator = loadBundleModule('src/core/schema-validator.js');
 const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '组件包/schemas/knowledge-atoms.schema.json'), 'utf8'));
 
+function loadProductionRateLimiter() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const start = source.indexOf('class RateLimiter {');
+  const end = source.indexOf('\nfunction abortError()', start);
+  assert(start >= 0 && end > start, 'production RateLimiter source is discoverable');
+  const diagnostics = [];
+  const factory = new Function('diag', 'sleepWithSignal', 'abortError',
+    `${source.slice(start, end)}\nreturn RateLimiter;`);
+  const RateLimiter = factory(
+    (scope, payload) => diagnostics.push({ scope, payload }),
+    async () => {},
+    () => Object.assign(new Error('cancelled'), { name: 'AbortError', code: 'TASK_CANCELLED' })
+  );
+  return { RateLimiter, diagnostics };
+}
+
 function fixtureSummary(count = 6) {
   return {
     document_title: '生产故障回归',
@@ -26,6 +42,16 @@ function atom(id, pointId) {
 
 function batch(pointIds) {
   return { atoms: pointIds.map((id, index) => atom(`${id}-${index}`, id)), coverage: { point_ids: pointIds, complete: true }, schema_version: '1.1' };
+}
+
+async function rejectsError(promise, pattern) {
+  try {
+    await promise;
+  } catch (error) {
+    assert(pattern.test(String(error?.message || error)), `expected ${pattern}, received ${error?.message || error}`);
+    return error;
+  }
+  assert.fail(`expected rejection matching ${pattern}`);
 }
 
 async function exactSchemaRepair() {
@@ -58,34 +84,123 @@ async function coordinatedSettlement() {
   const { api } = loadAiPipeline({ schemaValidator });
   const summary = fixtureSummary(6);
   const events = [];
-  let active = 0;
-  let lateSuccesses = 0;
-  await assert.rejects(api.atomizeSummary({
+  const saved = new Set();
+  const failure = await rejectsError(api.atomizeSummary({
     summary, atomPrompt: 'atoms', typeMapping: 'map', tagLibrary: 'tags', linkCandidates: [],
     atomSchema: schema, maxPointsPerRequest: 1, atomizationConcurrency: 3, maxRepairAttempts: 0,
     requestJson: (_prompt, context) => new Promise((resolve, reject) => {
-      active += 1;
-      const finish = () => { active -= 1; };
       if (context.pointIds[0] === 'P2') {
         setTimeout(() => {
-          finish();
           const error = new Error('atom[2] schema invalid');
           error.code = 'AI_SCHEMA_OUTPUT_INVALID';
           reject(error);
         }, 5);
         return;
       }
-      const timer = setTimeout(() => { finish(); lateSuccesses += 1; resolve(batch(context.pointIds)); }, 40);
-      context.signal.addEventListener('abort', () => {
-        clearTimeout(timer); finish();
-        const error = new Error('aborted'); error.name = 'AbortError'; reject(error);
-      }, { once: true });
+      setTimeout(() => resolve(batch(context.pointIds)), 10);
     }),
+    saveAtomBatch: ({ pointIds }) => saved.add(pointIds[0]),
     onProgress: (event) => events.push(event)
-  }), /schema invalid/);
-  assert.strictEqual(active, 0, 'all in-flight batch calls settle before terminal rejection');
-  assert.strictEqual(lateSuccesses, 0, 'cancelled siblings cannot emit late successful batch logs');
-  assert(!events.some((event) => event.batchIndex === event.batchTotal), 'failed run never reports complete progress');
+  }), /仅完成 5\/6 批/);
+  assert.strictEqual(failure.code, 'ATOMIZATION_BATCH_INCOMPLETE');
+  assert.strictEqual(failure.retryable, true);
+  assert.deepStrictEqual([...saved].sort(), ['P1', 'P3', 'P4', 'P5', 'P6'],
+    'one rejected request does not poison workers; every other success is durable');
+  assert(!events.some((event) => event.batchComplete && event.batchIndex === event.batchTotal),
+    'failed run never reports complete validated progress');
+}
+
+async function checkpointReadFailureDoesNotKillWorker() {
+  const { api, diagCalls } = loadAiPipeline({ schemaValidator });
+  const summary = fixtureSummary(8);
+  const cached = new Map(Array.from({ length: 8 }, (_, index) => [`P${index + 1}`, batch([`P${index + 1}`])]));
+  const error = await rejectsError(api.atomizeSummary({
+    summary, atomPrompt: 'atoms', typeMapping: 'map', tagLibrary: 'tags', linkCandidates: [],
+    atomSchema: schema, maxPointsPerRequest: 1, atomizationConcurrency: 2, maxRepairAttempts: 0,
+    loadAtomBatch: ({ pointIds }) => {
+      if (pointIds[0] === 'P2') throw new Error('transient vault read failure');
+      return cached.get(pointIds[0]);
+    },
+    requestJson: async () => { throw new Error('cache-backed batches must not call provider'); }
+  }), /仅完成 7\/8 批/);
+  assert.strictEqual(error.details.failedBatches[0].code, 'ATOMIZATION_CHECKPOINT_READ_FAILED');
+  assert.strictEqual(diagCalls.filter((entry) => entry.scope === 'atomization.batch.cacheHit').length, 7,
+    'the surviving worker drains every other cached batch');
+}
+
+async function resumedRunWith104Batches() {
+  const { api } = loadAiPipeline({ schemaValidator });
+  const { RateLimiter, diagnostics } = loadProductionRateLimiter();
+  const limiter = new RateLimiter({ intervalMs: 1000, maxConcurrent: 1, backoffMaxMs: 1000 });
+  limiter.recordFailure(); // Simulate the preceding real provider failure in the production log.
+  const summary = fixtureSummary(312);
+  const checkpoints = new Map();
+  for (let index = 0; index < 104; index += 1) {
+    const pointIds = [`P${index * 3 + 1}`, `P${index * 3 + 2}`, `P${index * 3 + 3}`];
+    if (index !== 26) checkpoints.set(pointIds.join('|'), batch(pointIds));
+  }
+  const providerCalls = [];
+  const result = await api.atomizeSummary({
+    summary, atomPrompt: 'atoms', typeMapping: 'map', tagLibrary: 'tags', linkCandidates: [],
+    atomSchema: schema, maxPointsPerRequest: 3, atomizationConcurrency: 3, maxRepairAttempts: 0,
+    loadAtomBatch: ({ pointIds }) => checkpoints.get(pointIds.join('|')),
+    saveAtomBatch: ({ pointIds }, value) => checkpoints.set(pointIds.join('|'), value),
+    requestJson: (_prompt, context) => limiter.run(async () => {
+      providerCalls.push(context.pointIds.join('|'));
+      return batch(context.pointIds);
+    })
+  });
+  assert.deepStrictEqual(providerCalls, ['P79|P80|P81'], '104-batch resume calls only missing batch 27');
+  assert.strictEqual(diagnostics.filter((entry) => entry.scope === 'ratelimit.backoff').length, 1,
+    '103 cache hits bypass limiter accounting; only the real outbound request consumes prior cooldown');
+  assert.strictEqual(limiter.failures, 0, 'the outbound success clears prior failure state');
+  assert.strictEqual(result.atoms.length, 312);
+  assert.strictEqual(result.coverage.complete, true);
+  assert.strictEqual(checkpoints.size, 104);
+}
+
+async function limiterCancellationAndStaleFailureAccounting() {
+  const { RateLimiter } = loadProductionRateLimiter();
+  const limiter = new RateLimiter({ intervalMs: 100, maxConcurrent: 2, backoffMaxMs: 1000 });
+  const originalNow = Date.now;
+  let now = 10_000;
+  Date.now = () => now;
+  try {
+    limiter.recordFailure();
+    assert.strictEqual(limiter.backoffMs(), 100);
+    now += 101;
+    assert.strictEqual(limiter.backoffMs(), 0, 'expired failure cooldown cannot contaminate later cache-only recovery');
+    const cancelled = Object.assign(new Error('cancelled sibling'), { name: 'AbortError', code: 'TASK_CANCELLED' });
+    await assert.rejects(limiter.run(async () => { throw cancelled; }), /cancelled sibling/);
+    assert.strictEqual(limiter.failures, 0, 'local cancellation is not a provider failure');
+    await assert.rejects(limiter.run(async () => { throw new Error('real outbound failure'); }), /real outbound failure/);
+    assert.strictEqual(limiter.failures, 1, 'real outbound failure is counted');
+  } finally {
+    Date.now = originalNow;
+  }
+}
+
+function retryableDiagnosticsAndAggregateValidation() {
+  const reliability = loadBundleModule('src/core/reliability.js');
+  const error = Object.assign(new Error('知识原子化仅完成 103/104 批'), {
+    code: 'ATOMIZATION_BATCH_INCOMPLETE',
+    stage: 'atomization',
+    category: 'ai_provider',
+    retryable: true,
+    details: { completedBatches: 103, batchTotal: 104, failedBatches: [{ batchIndex: 27, stableBatchId: '27-fixture' }] }
+  });
+  const appError = reliability.toAppError(error, { stage: 'writing' });
+  assert.strictEqual(appError.stage, 'atomization');
+  assert.strictEqual(appError.category, 'ai_provider');
+  assert.strictEqual(appError.retryable, true);
+  assert.strictEqual(appError.code, 'ATOMIZATION_BATCH_INCOMPLETE');
+  assert.strictEqual(appError.details.failedBatches[0].batchIndex, 27);
+
+  const { api } = loadAiPipeline({ schemaValidator });
+  const invalidAggregate = batch(['P1']);
+  invalidAggregate.coverage = { point_ids: ['P1'], complete: false };
+  const validation = api.validateAtomizationResult(invalidAggregate, fixtureSummary(2), schema);
+  assert(validation.errors.length > 0, 'partial aggregate cache is rejected before card generation');
 }
 
 async function checkpointResumeAndAggregationGate() {
@@ -105,7 +220,8 @@ async function checkpointResumeAndAggregationGate() {
       return batch(context.pointIds);
     }
   };
-  await assert.rejects(api.atomizeSummary(options), /terminal P4 failure/);
+  const firstFailure = await rejectsError(api.atomizeSummary(options), /仅完成 3\/4 批/);
+  assert.strictEqual(firstFailure.details.failedBatches[0].message, 'terminal P4 failure');
   assert.strictEqual(checkpoints.size, 3, 'each valid batch is checkpointed before later failure');
   assert.strictEqual(checkpoints.has(undefined), false, 'checkpoint key is deterministic');
   calls = [];
@@ -135,9 +251,13 @@ function uiProductionSemantics() {
 async function main() {
   await exactSchemaRepair();
   await coordinatedSettlement();
+  await checkpointReadFailureDoesNotKillWorker();
+  await resumedRunWith104Batches();
+  await limiterCancellationAndStaleFailureAccounting();
+  retryableDiagnosticsAndAggregateValidation();
   await checkpointResumeAndAggregationGate();
   uiProductionSemantics();
-  console.log('production repair regressions: 23 assertions passed');
+  console.log('production repair regressions: batch settlement, cache recovery, 104-batch resume and aggregation gates passed');
 }
 
 main().catch((error) => {

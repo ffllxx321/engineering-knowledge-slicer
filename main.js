@@ -1451,7 +1451,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         current.written_card_ids.push(card.card_id);
       }
       if (workflow.review.length) {
-        await this.persistArtifact(current, 'review', { version: '1.1', task_id: current.task_id, items: workflow.review });
+        await this.persistArtifact(current, 'review', { version: '1.3', task_id: current.task_id, metrics: workflow.metrics, items: workflow.review });
         current.review_atom_ids = workflow.review.map((item) => item.atom_id);
       }
       if (workflow.accepted.length) await this.rebuildKnowledgeIndexes();
@@ -1495,9 +1495,28 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         provider: 'minimax',
         inputCharacters: parsePackage?.markdown?.length || 0,
         outputCharacters: JSON.stringify(workflow.summary || {}).length,
-        cardsGenerated: workflow.accepted.length,
-        cardsRejected: workflow.review.length
+        cardsGenerated: workflow.metrics?.candidateCards || workflow.accepted.length + workflow.review.length,
+        cardsRejected: workflow.metrics?.hardRejected || 0,
+        candidateCards: workflow.metrics?.candidateCards,
+        autoApproved: workflow.metrics?.autoApproved,
+        reviewPending: workflow.metrics?.reviewPending,
+        cardsMerged: workflow.metrics?.merged
       }));
+      diag('review.routing', {
+        before: { generated: (workflow.metrics?.candidateCards || 0) + (workflow.metrics?.merged || 0) },
+        after: workflow.metrics,
+        reasonHistogram: (workflow.review || []).reduce((histogram, item) => {
+          for (const failure of item.validationReport?.hardGateFailures || ['SOFT_CONFIDENCE']) {
+            const key = String(failure).replace(/[^A-Z0-9_]/gi, '_').slice(0, 64);
+            histogram[key] = (histogram[key] || 0) + 1;
+          }
+          return histogram;
+        }, {}),
+        diagnosis: {
+          slicingOrEvidence: workflow.review.filter((item) => !item.validationReport?.evidenceFound).length,
+          reviewRouting: workflow.review.filter((item) => item.validationReport?.evidenceFound).length
+        }
+      });
       diag('performance.counters', Object.assign({ taskId: current.task_id, runId: current.run_id }, this.operationCounters));
       this.sessionStats.processed += 1;
       this.sessionStats.review += workflow.review.length;
@@ -2205,7 +2224,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         return null;
       }
       diag('artifact.cacheHit', { taskId: task.task_id, stage: name });
-      return parsed.payload;
+      return name === 'review' ? migrateReviewArtifact(parsed.payload) : parsed.payload;
     } catch { return null; }
   }
 
@@ -2536,7 +2555,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     await this.refreshViews();
   }
 
-  async applyReviewSelection(taskId, groupId, atomIds, action) {
+  async applyReviewSelection(taskId, groupId, atomIds, action, reviewerReason = '') {
     const tasks = await this.loadTasks();
     const task = tasks.find((item) => item.task_id === taskId);
     if (!task) throw new Error('未找到审核任务');
@@ -2551,6 +2570,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       return this.regenerateSelectedReview(task, artifact, chosen);
     }
     if (action === 'approve_selected') {
+      if (!String(reviewerReason || '').trim()) throw new Error('人工批准必须填写审核理由');
       const blocked = chosen.filter((item) => !isApprovalEligible(item));
       if (blocked.length) throw new Error(`所选内容中有 ${blocked.length} 项未通过必要检查，不能批准`);
       const folderMap = (await this.loadRuntimeContracts()).folderMap;
@@ -2582,7 +2602,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const handled = new Set(chosen.map((item) => item.atom_id));
       artifact.handled = [...(artifact.handled || []), ...chosen.map((item) => Object.assign({}, item, {
         review_action: action,
-        review_action_at: now
+        review_action_at: now,
+        reviewer_reason: action === 'approve_selected' ? String(reviewerReason).slice(0, 500) : '',
+        original_failed_soft_gates: action === 'approve_selected'
+          ? (item.validationReport?.hardGateFailures || []).filter((failure) =>
+            !(item.validationReport?.nonOverridableFailures || []).includes(failure))
+          : []
       }))];
       artifact.items = artifact.items.filter((item) => !handled.has(item.atom_id));
     }
@@ -3131,18 +3156,32 @@ class ReviewExceptionModal extends Modal {
       block.createDiv({ cls: 'eks-exception-fact', text: `发生了什么：${explanation.happened}` });
       block.createDiv({ cls: 'eks-exception-fact', text: `影响：${explanation.effect}` });
       block.createDiv({ cls: 'eks-exception-action', text: `建议：${explanation.action}` });
-      const summary = String(
-        item.atom?.content?.summary
-        || item.atom?.content?.executive_summary
-        || item.atom?.content?.description
-        || ''
-      ).trim();
-      if (summary) {
-        const preview = summary.length > 240 ? `${summary.slice(0, 240)}…` : summary;
-        block.createDiv({ cls: 'eks-task-meta', text: `摘要：${preview}` });
+      const context = item.review_context || {};
+      const comparison = block.createDiv({ cls: 'eks-evidence-comparison' });
+      const generated = comparison.createDiv({ cls: 'eks-generated-content' });
+      generated.createEl('h4', { text: '生成内容' });
+      generated.createDiv({ text: context.statement || `${item.atom?.title || ''}\n${JSON.stringify(item.atom?.content || {})}` });
+      const source = comparison.createDiv({ cls: 'eks-source-evidence' });
+      source.createEl('h4', { text: '原文依据' });
+      source.createDiv({ text: context.evidence_quote || '未找到可核验的逐字原文' });
+      source.createDiv({ cls: 'eks-task-meta', text: `位置：${context.locator || '未定位'}${context.page ? ` · 第 ${context.page} 页` : ''}${context.block_id ? ` · 块 ${context.block_id}` : ''}` });
+      const gates = block.createDiv({ cls: 'eks-gate-checklist' });
+      gates.createEl('h4', { text: '自动检查' });
+      const gateLabels = { source_evidence: '原文证据', numbers: '数字/单位/日期', schema: '内容结构', route: '安全目录', tags: '标签', duplicate: '非重复内容' };
+      for (const [gate, label] of Object.entries(gateLabels)) {
+        gates.createSpan({ cls: context.gate_checklist?.[gate] ? 'is-pass' : 'is-fail',
+          text: `${context.gate_checklist?.[gate] ? '✓' : '✕'} ${label}` });
+      }
+      const repair = context.automatic_repair || {};
+      block.createDiv({ cls: 'eks-task-meta', text: repair.attempted
+        ? (repair.repaired ? `自动修复：已从原文重新定位证据（${repair.method || '本地匹配'}）` : `自动修复：已尝试本地证据对齐，但${repair.reason === 'ambiguous_alignment' ? '存在多个相近位置，不能安全决定' : '相似度或唯一性不足'}`)
+        : '自动修复：未执行' });
+      if (!isApprovalEligible(item)) {
+        const blocked = (item.validationReport?.nonOverridableFailures || item.validationReport?.hardGateFailures || []).join('、');
+        block.createDiv({ cls: 'eks-approval-blocked', text: `无法批准：仍有不可绕过的必要检查未通过${blocked ? `（${blocked}）` : ''}。请重新生成、拒绝或转交专家。` });
       }
       const technical = block.createEl('details', { cls: 'eks-technical-details' });
-      technical.createEl('summary', { text: '技术详情' });
+      technical.createEl('summary', { text: '开发诊断' });
       technical.createEl('pre', { text: JSON.stringify({
         atom_id: item.atom_id,
         reasons: item.reasons,
@@ -3172,13 +3211,17 @@ class ReviewExceptionModal extends Modal {
         ? `将批准 ${current.selectedEligible} 项，其余 ${current.total - current.selectedEligible} 项继续留待处理。确认继续？`
         : `确认处理所选 ${current.selected} 项？`;
       if (!window.confirm(message)) return;
-      try { await this.handlers.onAction?.([...this.selectedIds], action); this.close(); }
+      const auditReason = action === 'approve_selected'
+        ? String(window.prompt('请填写人工批准理由（将写入审核审计记录）：', '已逐项核对生成内容与原文依据一致') || '').trim()
+        : '';
+      if (action === 'approve_selected' && !auditReason) { new Notice('人工批准必须填写审核理由'); return; }
+      try { await this.handlers.onAction?.([...this.selectedIds], action, auditReason); this.close(); }
       catch (error) { new Notice(`操作失败：${error.message}`); }
     };
-    actions.createEl('button', { text: '批准所选可批准项', cls: 'mod-cta' }).addEventListener('click', () => runAction('approve_selected'));
-    actions.createEl('button', { text: '重新生成所选' }).addEventListener('click', () => runAction('regenerate_selected'));
+    actions.createEl('button', { text: '原文依据正确 → 人工批准', cls: 'mod-cta' }).addEventListener('click', () => runAction('approve_selected'));
+    actions.createEl('button', { text: '重新生成' }).addEventListener('click', () => runAction('regenerate_selected'));
     actions.createEl('button', { text: '拒绝所选' }).addEventListener('click', () => runAction('reject_selected'));
-    actions.createEl('button', { text: '转人工处理' }).addEventListener('click', () => runAction('manual_selected'));
+    actions.createEl('button', { text: '转交专家' }).addEventListener('click', () => runAction('manual_selected'));
     actions.createEl('button', { text: '无法精确重生成？重做整个文件知识原子' }).addEventListener('click', async () => {
       if (!window.confirm('这会重新生成整个文件的知识原子；已有已批准卡片不会重复写入。确认继续？')) return;
       try { await this.handlers.onWholeRegenerate?.(); this.close(); }
@@ -3894,6 +3937,17 @@ class SlicerDashboardView extends ItemView {
         details.createEl('pre', { text: JSON.stringify(artifact.outcome, null, 2) });
         continue;
       }
+      const taskMetrics = artifact.metrics || {
+        candidateCards: artifact.items.length,
+        autoApproved: Number(task.written_card_ids?.length) || 0,
+        reviewPending: artifact.items.length,
+        hardRejected: Number(artifact.rejected?.length) || 0,
+        merged: 0,
+        automaticallyRepaired: artifact.items.filter((item) => item.review_context?.automatic_repair?.repaired).length
+      };
+      const documentSummary = parent.createDiv('eks-review-document-summary');
+      documentSummary.createEl('h4', { text: '文档处理结果' });
+      documentSummary.createDiv({ text: `生成候选 ${taskMetrics.candidateCards} · 自动批准 ${taskMetrics.autoApproved} · 自动修复 ${taskMetrics.automaticallyRepaired || 0} · 自动丢弃噪声/重复 ${(taskMetrics.hardRejected || 0) + (taskMetrics.merged || 0)} · 真正待处理 ${taskMetrics.reviewPending}` });
       for (const group of groupReviewItems(artifact.items)) {
         const block = parent.createDiv('eks-review-group');
         const header = block.createDiv('eks-review-group-header');
@@ -3909,7 +3963,7 @@ class SlicerDashboardView extends ItemView {
         const eligibleCount = group.items.filter(isApprovalEligible).length;
         button(actions, `查看并处理（可批准 ${eligibleCount}）`, () => {
           new ReviewExceptionModal(this.app, group, task.source_path, {
-            onAction: (ids, action) => this.plugin.applyReviewSelection(task.task_id, group.group_id, ids, action),
+            onAction: (ids, action, reason) => this.plugin.applyReviewSelection(task.task_id, group.group_id, ids, action, reason),
             onWholeRegenerate: () => this.plugin.applyReviewGroup(task.task_id, group.group_id, 'regenerate_group')
           }).open();
         });
@@ -4547,12 +4601,42 @@ function normalizeLegacyArtifact(stage, value) {
     return Array.isArray(value.atoms) && value.atoms.every((atom) => atom && typeof (atom.title || atom.Title) === 'string')
       && allowedOnly(['atoms', 'warnings', 'coverage', 'version']) ? value : null;
   }
-  if (name === 'review') return Array.isArray(value.items) && allowedOnly(['version', 'task_id', 'outcome', 'items']) ? value : null;
+  if (name === 'review') return Array.isArray(value.items) && allowedOnly(['version', 'task_id', 'outcome', 'metrics', 'items', 'handled', 'rejected', 'manual_requests', 'regeneration_requests'])
+    ? migrateReviewArtifact(value) : null;
   if (name === 'error') {
     return typeof (value.message || value.code) === 'string'
       && allowedOnly(['stage', 'code', 'message', 'retryable', 'at', 'details']) ? value : null;
   }
   return null;
+}
+
+function migrateReviewArtifact(value) {
+  const artifact = JSON.parse(JSON.stringify(value || {}));
+  artifact.version = '1.3';
+  artifact.items = (artifact.items || []).map((item) => {
+    const atom = item.atom || {};
+    const source = atom.source || {};
+    const report = item.validationReport || item.validation_report || {};
+    const context = item.review_context || {
+      statement: `${atom.title || ''} ${typeof atom.content === 'string' ? atom.content : JSON.stringify(atom.content || {})}`.trim(),
+      evidence_quote: String(source.evidence_quote || item.proposed_card?.evidence_quote || ''),
+      locator: String(source.source_locator || item.proposed_card?.source_locator || ''),
+      page: source.source_page || source.source_provenance?.page || '',
+      block_id: source.source_provenance?.block_id || source.block_id || '',
+      automatic_repair: { attempted: false, reason: 'legacy_artifact' },
+      gate_checklist: {
+        source_evidence: report.evidenceFound !== false,
+        numbers: report.numberConsistency !== false,
+        schema: report.schemaValid !== false,
+        route: report.routeValid !== false,
+        tags: report.tagsValid !== false,
+        duplicate: !(Number(report.duplicateScore) >= 1)
+      },
+      plain_reasons: (item.reasons || []).map(String)
+    };
+    return Object.assign({}, item, { status: item.status || 'pending', review_context: context });
+  });
+  return artifact;
 }
 
 function pathSetting(containerEl, plugin, name, desc, key) {
@@ -9441,7 +9525,7 @@ module.exports = { extractZipEntryEndingWith };
  */
 "src/core/component-loader.js": function(require, module, exports) {
 const ALLOWED_EXTENSIONS = new Set(['.json', '.md']);
-const BUILTIN_SCHEMA_VERSION = '2.17.1';
+const BUILTIN_SCHEMA_VERSION = '2.17.2';
 const BUILTIN_INFRASTRUCTURE_SCHEMAS = Object.freeze({
   'schemas/block-v0.schema.json': Object.freeze({
     version: BUILTIN_SCHEMA_VERSION,
@@ -10020,6 +10104,75 @@ function verifyLocator(parsePackage, quote, locator) {
   return result;
 }
 
+// Local, deterministic and fail-closed repair for normalized/paraphrased quotes.
+// Only source text from the winning eligible block can become the repaired quote.
+function reconcileEvidence(parsePackage, quote, hint = {}) {
+  const exact = resolveEvidence(parsePackage, quote, hint);
+  if (exact.ok) {
+    const markdown = String(parsePackage?.markdown || '');
+    const verbatim = markdown.slice(exact.locator.text_start, exact.locator.text_end) || String(quote || '');
+    const indexedMatches = Object.values(parsePackage?.evidence_index || {}).filter((entry) =>
+      entry.card_eligible !== false && String(entry.raw_text || '').includes(verbatim));
+    if (indexedMatches.length === 1) {
+      const entry = indexedMatches[0];
+      exact.locator = Object.assign({}, exact.locator, {
+        block_id: entry.block_id,
+        precision: 'block-exact',
+        ...(positiveInteger(entry.locator?.page) ? { page: positiveInteger(entry.locator.page) } : {})
+      });
+      exact.label = locatorLabel(exact.locator);
+    }
+    return Object.assign({ method: 'exact', repaired: false, quote: verbatim }, exact);
+  }
+  const query = comparable(quote);
+  if (query.length < 4) return Object.assign({ attempted: true }, exact);
+  const indexed = Object.values(parsePackage?.evidence_index || {});
+  const entries = (indexed.length ? indexed : (parsePackage?.blocks || []).map((block) => ({
+    block_id: block.block_id, locator: block.locator, raw_text: block.raw?.text || block.text,
+    card_eligible: block.card_eligible
+  }))).filter((entry) => entry.card_eligible !== false && String(entry.raw_text || '').trim())
+    .flatMap((entry) => {
+      const rows = String(entry.raw_text).split(/\n/).map((row) => row.trim()).filter(Boolean);
+      return rows.length > 1 ? [entry, ...rows.map((row) => Object.assign({}, entry, { raw_text: row }))] : [entry];
+    });
+  const queryFacts = factSet(query);
+  const ranked = entries.map((entry) => {
+    const candidate = comparable(entry.raw_text);
+    const token = dice(tokenSet(query), tokenSet(candidate));
+    const chars = dice(grams(query), grams(candidate));
+    const numeric = queryFacts.size ? subset(queryFacts, factSet(candidate)) : 1;
+    const structural = hint.block_id && String(hint.block_id) === String(entry.block_id) ? 0.08
+      : (positiveInteger(hint.page) && positiveInteger(entry.locator?.page) === positiveInteger(hint.page) ? 0.04 : 0);
+    return { entry, token, chars, numeric, score: Math.min(1, 0.48 * chars + 0.36 * token + 0.16 * numeric + structural) };
+  }).sort((a, b) => b.score - a.score || String(a.entry.block_id).localeCompare(String(b.entry.block_id)));
+  const winner = ranked[0];
+  const runner = winner && ranked.find((item) => String(item.entry.block_id) !== String(winner.entry.block_id));
+  const margin = winner ? winner.score - (runner?.score || 0) : 0;
+  if (!winner || winner.score < 0.72 || margin < 0.08 || winner.numeric < 1 || (winner.token < 0.45 && winner.chars < 0.58)) {
+    return { ok: false, attempted: true, reason: winner && margin < 0.08 ? 'ambiguous_alignment' : 'alignment_below_threshold',
+      candidate_count: ranked.length, best_score: round3(winner?.score), margin: round3(margin) };
+  }
+  const raw = String(winner.entry.raw_text || '').trim();
+  const excerpts = raw.split(/(?<=[。！？!?；;\n])|\s{2,}/).map((value) => value.trim()).filter(Boolean);
+  const quoteResult = (excerpts.length ? excerpts : [raw]).map((value) => ({
+    value, score: dice(grams(comparable(value)), grams(query))
+  })).sort((a, b) => b.score - a.score || a.value.length - b.value.length)[0];
+  const verbatim = quoteResult?.value?.slice(0, 800) || '';
+  const direct = resolveEvidence(parsePackage, verbatim, { page: winner.entry.locator?.page });
+  if (!verbatim || !direct.ok) return { ok: false, attempted: true, reason: 'alignment_locator_missing' };
+  direct.locator.block_id = winner.entry.block_id || direct.locator.block_id;
+  direct.locator.precision = 'block-exact';
+  return Object.assign({}, direct, { quote: verbatim, repaired: true, attempted: true, method: 'local-alignment',
+    score: round3(winner.score), margin: round3(margin) });
+}
+function comparable(value) { return normalizeText(value).toLowerCase().replace(/[「」『』“”‘’"'`]/g, '').trim(); }
+function tokenSet(value) { return new Set(String(value).match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]|[a-z]+|\d+(?:\.\d+)?(?:%|‰|mm|cm|m2|m²|m3|m³|mpa|kn)?/giu) || []); }
+function grams(value) { const out = new Set(); for (let i = 0; i < value.length - 1; i += 1) out.add(value.slice(i, i + 2)); return out; }
+function factSet(value) { return new Set((String(value).match(/\d+(?:\.\d+)?\s*(?:%|‰|毫米|厘米|米|平方米|立方米|mm|cm|m|m2|m²|m3|m³|MPa|kN|元|年|月|日)?/gi) || []).map((item) => item.replace(/\s+/g, '').toLowerCase())); }
+function dice(a, b) { if (!a.size && !b.size) return 1; let hit = 0; for (const item of a) if (b.has(item)) hit += 1; return 2 * hit / Math.max(1, a.size + b.size); }
+function subset(a, b) { let hit = 0; for (const item of a) if (b.has(item)) hit += 1; return hit / Math.max(1, a.size); }
+function round3(value) { return Number.isFinite(value) ? Math.round(value * 1000) / 1000 : 0; }
+
 function locatorLabel(locator) {
   const parts = [];
   if (locator.page) parts.push(`第 ${locator.page} 页`);
@@ -10067,7 +10220,7 @@ function failed(reason, matches = 0) { return { ok: false, reason, matches }; }
 
 module.exports = {
   hashText, locatorLabel, normalizeLegacyArtifact, normalizeOcrArtifact, normalizeText,
-  resolveEvidence, verifyLocator
+  reconcileEvidence, resolveEvidence, verifyLocator
 };
 
 },
@@ -13213,6 +13366,11 @@ function buildValidationReport(input = {}) {
   if (input.tagsValid === false) failures.push('TAG');
   if (input.sourceLinkValid === false) failures.push('SOURCE_LINK');
   if (input.evidenceFound === false) failures.push('EVIDENCE');
+  if (input.numberConsistency === false) failures.push('NUMERIC_CONFLICT');
+  if (input.dateConsistency === false) failures.push('DATE_CONFLICT');
+  if (input.entityConsistency === false) failures.push('SUBJECT_CONFLICT');
+  if (input.unsafePath === true) failures.push('UNSAFE_PATH');
+  if (input.unsupportedContent === true) failures.push('UNSUPPORTED_CONTENT');
   if (input.duplicateScore >= 1) failures.push('DUPLICATE');
   return {
     schemaValid: input.schemaValid !== false,
@@ -13228,6 +13386,9 @@ function buildValidationReport(input = {}) {
     atomicityScore: number(input.atomicityScore),
     duplicateScore: number(input.duplicateScore),
     hardGateFailures: failures,
+    nonOverridableFailures: failures.filter((failure) =>
+      ['SCHEMA', 'ROUTING', 'SOURCE_LINK', 'EVIDENCE', 'NUMERIC_CONFLICT', 'DATE_CONFLICT',
+        'SUBJECT_CONFLICT', 'UNSAFE_PATH', 'UNSUPPORTED_CONTENT', 'DUPLICATE'].includes(failure)),
     warnings: Array.isArray(input.warnings) ? input.warnings : [],
     confidenceComponents: input.confidenceComponents || {},
     finalDecision: failures.length ? 'review' : (input.finalDecision || 'auto_ingest')
@@ -13248,8 +13409,21 @@ function createStageMetric(input = {}) {
     bytesRead: Number(input.bytesRead) || 0, bytesWritten: Number(input.bytesWritten) || 0,
     cacheHit: input.cacheHit === true, cacheMiss: input.cacheMiss === true,
     cardsGenerated: Number(input.cardsGenerated) || 0, cardsRejected: Number(input.cardsRejected) || 0,
+    candidateCards: Number(input.candidateCards) || 0, autoApproved: Number(input.autoApproved) || 0,
+    reviewPending: Number(input.reviewPending) || 0, cardsMerged: Number(input.cardsMerged) || 0,
     duplicateCardsMerged: Number(input.duplicateCardsMerged) || 0, errorCode: input.errorCode || ''
   });
+}
+
+function reasonHistogram(items) {
+  const out = {};
+  for (const item of items || []) {
+    for (const failure of item.validationReport?.hardGateFailures || ['SOFT_CONFIDENCE']) {
+      const key = String(failure).replace(/[^A-Z0-9_]/gi, '_').slice(0, 64);
+      out[key] = (out[key] || 0) + 1;
+    }
+  }
+  return out;
 }
 
 function number(value) { return Number.isFinite(Number(value)) ? Number(value) : 0; }
@@ -13447,7 +13621,7 @@ const { buildCardRecord } = require("src/core/markdown-renderer.js");
 const { resolveFixedRoute } = require("src/core/routing.js");
 const { findLinkCandidates, validateRelations } = require("src/core/link-service.js");
 const { buildValidationReport } = require("src/core/reliability.js");
-const { verifyLocator } = require("src/core/provenance.js");
+const { verifyLocator, reconcileEvidence } = require("src/core/provenance.js");
 const workflowDiag = (event, details) => {
   try { globalThis.__eksDiag?.diag?.(event, details); } catch (_) {}
 };
@@ -13517,6 +13691,8 @@ async function runKnowledgeWorkflow(options) {
     requestJson: options.requestJson,
     onProgress: options.onProgress
   });
+  const consolidation = consolidateAtoms(atomResult.atoms || []);
+  atomResult = Object.assign({}, atomResult, { atoms: consolidation.atoms, consolidation: consolidation.metrics });
   await emitArtifact(options.onArtifact, 'atoms', atomResult);
 
   const existingFingerprints = new Set([
@@ -13537,7 +13713,21 @@ async function runKnowledgeWorkflow(options) {
     atom.source = Object.assign({}, atom.source || {}, {
       source_link: `[[${options.parsePackage.source_path}]]`
     });
-    if (Object.keys(options.parsePackage?.evidence_index || {}).length) {
+    const alignment = typeof reconcileEvidence === 'function'
+      ? reconcileEvidence(options.parsePackage, atom.source.evidence_quote, atom.source.source_provenance || {})
+      : { ok: false, attempted: false, reason: 'repair_unavailable' };
+    atom.source.evidence_repair = alignment.ok
+      ? { attempted: true, repaired: !!alignment.repaired, method: alignment.method, score: alignment.score, margin: alignment.margin }
+      : { attempted: true, repaired: false, reason: alignment.reason, best_score: alignment.best_score, margin: alignment.margin };
+    if (alignment.ok) {
+      atom.source.evidence_quote = alignment.quote;
+      atom.source.source_provenance = alignment.locator;
+      atom.source.source_locator = alignment.label;
+      atom.source.source_page = alignment.locator.page || '';
+      atom.source.block_id = alignment.locator.block_id || atom.source.block_id;
+      atom.source.locator_precision = alignment.locator.precision;
+      atom.source.provenance_verified = true;
+    } else if (Object.keys(options.parsePackage?.evidence_index || {}).length) {
       const requestedId = String(atom.source?.source_provenance?.block_id || atom.source?.block_id || '');
       const quote = String(atom.source?.evidence_quote || '');
       let entry = requestedId ? options.parsePackage.evidence_index[requestedId] : null;
@@ -13570,14 +13760,17 @@ async function runKnowledgeWorkflow(options) {
       }
     }
     reconcileAtomLinks(atom, linkCandidates);
+    normalizePresentationFields(atom);
     const fingerprint = atomFingerprint(atom);
     const labelsValid = typeof options.validateLabels === 'function' ? options.validateLabels(atom) : true;
     const routeValid = atom.library === classification.library && atom.folder_type === classification.folder_type;
     const duplicate = existingFingerprints.has(fingerprint);
     const evidenceQuote = String(atom.source?.evidence_quote || '');
-    const excludedEvidenceBlock = (options.parsePackage.blocks || []).find((block) =>
-      block?.card_eligible === false && block?.raw?.text && evidenceQuote && String(block.raw.text).includes(evidenceQuote)
-    );
+    const resolvedBlockId = String(atom.source?.source_provenance?.block_id || atom.source?.block_id || '');
+    const excludedEvidenceBlock = resolvedBlockId
+      ? (options.parsePackage.blocks || []).find((block) =>
+        String(block?.block_id || '') === resolvedBlockId && block?.card_eligible === false)
+      : null;
     const unverifiedVisualApproval = options.parsePackage.source_type === 'pdf'
       && /(批准|审批通过|已签署|approved|accepted)/i.test(`${atom.title || ''}\n${atom.content || ''}\n${evidenceQuote}`)
       && (options.parsePackage.pages || []).some((page) => page?.visual?.approval_status === 'unverified');
@@ -13601,8 +13794,9 @@ async function runKnowledgeWorkflow(options) {
       tagsValid: labelsValid,
       sourceLinkValid: !!atom.source?.source_link,
       parentSummaryValid: true,
-      evidenceFound: confidence.components?.evidence > 0,
+      evidenceFound: atom.source?.provenance_verified === true,
       evidenceMatchScore: confidence.components?.evidence || 0,
+      numberConsistency: !confidence.hard_rules.some((reason) => /数字|日期/.test(reason)),
       atomicityScore: confidence.components?.atom_quality || 0,
       duplicateScore: duplicate ? 1 : 0,
       confidenceComponents: confidence.components || {},
@@ -13624,7 +13818,7 @@ async function runKnowledgeWorkflow(options) {
       const reasons = [...confidence.hard_rules, ...(atom.validation_issues || [])];
       if (excludedEvidenceBlock) reasons.push(`来源块不可生成卡片：${excludedEvidenceBlock.exclusion_reason || 'not_card_content'} (${excludedEvidenceBlock.block_id})`);
       if (unverifiedVisualApproval) reasons.push('视觉印章/签名仅记录可见性，未验证审批状态；禁止自动形成批准结论');
-      if (noEligibleSourceBlocks) reasons.push('来源只包含不可生成卡片的营销、退订、跟踪或清单块');
+      if (noEligibleSourceBlocks) reasons.push('整份来源没有可生成卡片的知识内容块');
       if (quantityAnomaly) reasons.push(`短文档数量异常：${pageCount} 页生成 ${(atomResult.atoms || []).length} 张卡片，超过阈值 ${shortDocumentMaxCards}，需整批人工确认`);
       if (!labelsValid && !reasons.some((reason) => /标签/.test(reason))) reasons.push('标签字典校验未通过');
       if (!routeValid && !reasons.some((reason) => /目录/.test(reason))) reasons.push('知识原子目录与文档分类不一致');
@@ -13639,7 +13833,8 @@ async function runKnowledgeWorkflow(options) {
         confidence,
         validationReport,
         atom,
-        proposed_card: card
+        proposed_card: card,
+        review_context: reviewContext(atom, validationReport, reasons)
       });
     }
   }
@@ -13656,6 +13851,9 @@ async function runKnowledgeWorkflow(options) {
     atoms: (atomResult && Array.isArray(atomResult.atoms)) ? atomResult.atoms.length : 0,
     accepted: accepted.length,
     review: review.length,
+    generated: consolidation.metrics.generated,
+    merged: consolidation.metrics.merged,
+    droppedNoKnowledge: consolidation.metrics.dropped_no_knowledge,
     autoApproveThreshold: Number(options.autoApproveConfidenceThreshold),
     truncated: !!(atomResult && atomResult._truncated)
   });
@@ -13667,8 +13865,91 @@ async function runKnowledgeWorkflow(options) {
     atomResult,
     accepted,
     review,
+    metrics: {
+      candidateCards: accepted.length + review.length,
+      autoApproved: accepted.length,
+      reviewPending: review.length,
+      hardRejected: consolidation.metrics.dropped_no_knowledge,
+      merged: consolidation.metrics.merged,
+      automaticallyRepaired: (atomResult.atoms || []).filter((atom) => atom.source?.evidence_repair?.repaired).length
+    },
     truncated: !!(atomResult && atomResult._truncated),
     truncatedCompleted: Array.isArray(atomResult?.coverage?.point_ids) ? atomResult.coverage.point_ids.length : (atomResult?.atoms?.length || 0)
+  };
+}
+
+function normalizePresentationFields(atom) {
+  const repaired = [];
+  for (const key of ['Category', 'TagL1', 'TagL2', 'Info_Type', 'Event_Type', 'Card_Type', 'Map_Index']) {
+    if (typeof atom[key] !== 'string') continue;
+    const normalized = atom[key].normalize('NFKC').replace(/\s+/g, ' ').trim();
+    if (normalized !== atom[key]) { atom[key] = normalized; repaired.push(key); }
+  }
+  if (repaired.length) atom.presentation_repairs = repaired;
+  return atom;
+}
+
+function consolidateAtoms(atoms) {
+  const output = [];
+  let merged = 0;
+  let dropped = 0;
+  for (const original of atoms || []) {
+    const atom = JSON.parse(JSON.stringify(original));
+    const text = atomText(atom);
+    if (text.length < 8 || /^(目录|版权|联系方式|扫码|退订|unsubscribe)$/i.test(text)) { dropped += 1; continue; }
+    const duplicate = output.findIndex((item) => compatible(item, atom, 0.88, false));
+    const adjacent = output.length && compatible(output[output.length - 1], atom, 0.82, true) ? output.length - 1 : -1;
+    const index = duplicate >= 0 ? duplicate : adjacent;
+    if (index < 0) output.push(atom);
+    else { output[index] = mergeAtoms(output[index], atom); merged += 1; }
+  }
+  return { atoms: output, metrics: { generated: (atoms || []).length, merged, dropped_no_knowledge: dropped, output: output.length } };
+}
+function atomText(atom) {
+  const content = typeof atom?.content === 'string' ? atom.content : Object.entries(atom?.content || {})
+    .filter(([key]) => !['point_ids', 'source_point_ids', 'evidence_ids'].includes(key))
+    .map(([, value]) => typeof value === 'string' ? value : JSON.stringify(value)).join(' ');
+  return `${atom?.title || ''} ${content}`.replace(/\s+/g, ' ').trim();
+}
+function atomFacts(atom) { return new Set(atomText(atom).match(/\d+(?:\.\d+)?\s*(?:%|‰|毫米|厘米|米|平方米|mm|cm|m²|MPa|kN|年|月|日)?/g) || []); }
+function atomSubjects(atom) { return new Set(atomText(atom).match(/(?:厨房|卫生间|卧室|客厅|阳台|楼梯|门|窗|扶手|地面|照明|浴室|玄关)/g) || []); }
+function equalSet(a, b) { return a.size === b.size && [...a].every((item) => b.has(item)); }
+function atomSimilarity(a, b) {
+  const aa = new Set(atomText(a).match(/[\u3400-\u9fff]|[\u3040-\u30ff]|[a-z]+|\d+(?:\.\d+)?/gi) || []);
+  const bb = new Set(atomText(b).match(/[\u3400-\u9fff]|[\u3040-\u30ff]|[a-z]+|\d+(?:\.\d+)?/gi) || []);
+  let hit = 0; for (const item of aa) if (bb.has(item)) hit += 1;
+  return 2 * hit / Math.max(1, aa.size + bb.size);
+}
+function compatible(a, b, threshold, adjacentOnly) {
+  if (!equalSet(atomFacts(a), atomFacts(b)) || !equalSet(atomSubjects(a), atomSubjects(b)) || atomSimilarity(a, b) < threshold) return false;
+  const leftLocator = String(a.source?.source_provenance?.block_id || a.source?.source_locator || '');
+  const rightLocator = String(b.source?.source_provenance?.block_id || b.source?.source_locator || '');
+  const sameEvidence = leftLocator && leftLocator === rightLocator;
+  const equivalentQuote = String(a.source?.evidence_quote || '').trim()
+    && String(a.source?.evidence_quote || '').trim() === String(b.source?.evidence_quote || '').trim();
+  if (!sameEvidence && !equivalentQuote) return false;
+  return !adjacentOnly || sameEvidence;
+}
+function mergeAtoms(a, b) {
+  const merged = JSON.parse(JSON.stringify(a));
+  merged.content = Object.assign({}, typeof a.content === 'object' ? a.content : { statement: a.content }, {
+    point_ids: [...new Set([...(a.content?.point_ids || []), ...(b.content?.point_ids || [])])]
+  });
+  merged.merged_atom_ids = [...new Set([...(a.merged_atom_ids || [a.atom_id]), ...(b.merged_atom_ids || [b.atom_id])])];
+  merged.merged_evidence = [...(a.merged_evidence || [a.source]), ...(b.merged_evidence || [b.source])];
+  return merged;
+}
+function reviewContext(atom, report, reasons) {
+  return {
+    statement: atomText(atom), evidence_quote: String(atom.source?.evidence_quote || ''),
+    locator: String(atom.source?.source_locator || ''), page: atom.source?.source_page || atom.source?.source_provenance?.page || '',
+    block_id: atom.source?.source_provenance?.block_id || atom.source?.block_id || '',
+    automatic_repair: atom.source?.evidence_repair || { attempted: false },
+    gate_checklist: { source_evidence: report.evidenceFound, numbers: report.numberConsistency,
+      schema: report.schemaValid, route: report.routeValid, tags: report.tagsValid, duplicate: report.duplicateScore < 1 },
+    plain_reasons: reasons.map((reason) => /定位|证据|逐字/.test(reason) ? '尚未找到唯一、逐字一致的原文依据'
+      : /数字|日期/.test(reason) ? '数字、单位或日期与原文依据不一致'
+        : /可信度/.test(reason) ? '必要检查已通过，但综合可信度未达到自动入库门槛' : String(reason))
   };
 }
 
@@ -13686,7 +13967,7 @@ async function emitArtifact(handler, name, value) {
   if (typeof handler === 'function') await handler(name, value);
 }
 
-module.exports = { runKnowledgeWorkflow };
+module.exports = { runKnowledgeWorkflow, consolidateAtoms, normalizePresentationFields, reviewContext };
 
 },
 /**
@@ -14012,10 +14293,13 @@ function applyBatchAction(items, action, correction = {}) {
 function isApprovalEligible(item) {
   if (!item || !['pending', 'corrected', 'passed', undefined].includes(item.status)) return false;
   if (item.eligible === false || item.ineligible === true) return false;
-  const hardFailures = item.validationReport?.hardGateFailures || item.validation_report?.hardGateFailures || [];
+  const report = item.validationReport || item.validation_report || {};
+  const hardFailures = report.nonOverridableFailures || (report.hardGateFailures || []).filter((failure) =>
+    ['SCHEMA', 'ROUTING', 'SOURCE_LINK', 'EVIDENCE', 'NUMERIC_CONFLICT', 'DATE_CONFLICT',
+      'SUBJECT_CONFLICT', 'UNSAFE_PATH', 'UNSUPPORTED_CONTENT', 'DUPLICATE'].includes(failure));
   if (hardFailures.length) return false;
   const reasons = (item.reasons || []).join('；');
-  return !/schema|结构校验|必填字段|证据.*(?:缺失|找不到)|locator missing|标签字典校验未通过|目录与.*不一致|重复/i.test(reasons);
+  return !/schema|结构校验|必填字段|证据.*(?:缺失|找不到)|逐字证据|locator missing|数字.*不存在|目录与.*不一致|重复/i.test(reasons);
 }
 
 function reviewSelection(items, selectedIds) {

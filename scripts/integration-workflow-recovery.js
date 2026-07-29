@@ -91,10 +91,10 @@ async function main() {
   assert.strictEqual(providerCalls, 0, 'restart with valid checkpoints must not repeat provider calls');
   assert.deepStrictEqual(artifacts, ['classification', 'summary', 'atoms']);
   assert.strictEqual(result.accepted.length, 1, 'first unique card is accepted once');
-  assert.strictEqual(result.review.length, 1, 'second intra-batch copy is detected');
-  assert(result.review[0].validationReport.hardGateFailures.includes('DUPLICATE'));
-  assert.strictEqual(new Set([...result.accepted, ...result.review.map((item) => item.proposed_card)]
-    .map((card) => card.atom_fingerprint)).size, 1);
+  assert.strictEqual(result.review.length, 0, 'exact intra-batch copy is consolidated before review');
+  assert.strictEqual(result.atomResult.consolidation.merged, 1);
+  assert.deepStrictEqual(result.atomResult.atoms[0].merged_atom_ids, ['a1', 'a2']);
+  assert.strictEqual(result.accepted.length, 1);
 
   const mineru = loadBundleModule('src/core/mineru-api.js', {
     'src/core/zip.js': { extractZipEntryEndingWith: () => '' },
@@ -125,8 +125,8 @@ async function main() {
 
   console.log('workflow integration: 8 passed, 0 failed');
   console.log('  ok - valid restart checkpoints make zero expensive provider calls');
-  console.log('  ok - duplicate atoms in one provider response produce one accepted card');
-  console.log('  ok - duplicate copy is routed to review with DUPLICATE hard gate');
+  console.log('  ok - duplicate atoms in one provider response merge into one accepted card');
+  console.log('  ok - merged atom preserves both source atom ids');
   console.log('  ok - artifact stages remain observable on recovery');
   console.log('  ok - stable fingerprint cardinality remains one');
   console.log('  ok - parser polling accepts AbortSignal');

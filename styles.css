@@ -761,3 +761,9 @@
   border-color: var(--text-error) !important;
   box-shadow: 0 0 0 1px var(--text-error);
 }
+.eks-evidence-comparison{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;margin:12px 0}
+.eks-generated-content,.eks-source-evidence{padding:12px;border:1px solid var(--background-modifier-border);border-radius:8px;white-space:pre-wrap}
+.eks-gate-checklist{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}.eks-gate-checklist h4{width:100%;margin:0}
+.eks-gate-checklist span{padding:3px 8px;border-radius:999px;background:var(--background-secondary)}
+.eks-gate-checklist .is-pass{color:var(--text-success)}.eks-gate-checklist .is-fail,.eks-approval-blocked{color:var(--text-error)}
+@media(max-width:700px){.eks-evidence-comparison{grid-template-columns:1fr}}

@@ -1,15 +1,16 @@
 'use strict';
 const assert = require('assert');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { loadBundleModule } = require('./load-bundle-module');
 const sem = loadBundleModule('src/core/semantic-embedding.js', { crypto });
 
 function settings(overrides = {}) {
   return Object.assign({
     semanticConsent: true, semanticEnabled: true, semanticMode: 'shadow',
-    embeddingEndpoint: 'https://fake.invalid/v1/embeddings',
-    embeddingModel: 'Qwen3-Embedding-0.6B', embeddingDimensions: 3,
-    embeddingApiKeyEnv: 'TEST_EMBED_KEY', embeddingTimeoutMs: 30,
+    embeddingProvider: 'aliyun-bailian-qwen37', embeddingProtocol: 'dashscope-native-v1',
+    embeddingApiKey: 'unit-test-secret-never-log', embeddingTimeoutMs: 30,
     embeddingMaxAttempts: 1, embeddingRetryBaseMs: 1, embeddingRateLimitMs: 0,
     embeddingBatchSize: 2, embeddingConcurrency: 2,
     semanticRelatedThreshold: 0.82, semanticDuplicateThreshold: 0.92,
@@ -32,6 +33,81 @@ function fakeProvider(vector = [1, 0, 0]) {
 }
 
 async function main() {
+  const task = loadBundleModule('src/core/task.js', { crypto, path });
+  const migrated = task.migrateSettings({
+    settingsVersion: 28,
+    semanticConsent: true,
+    semanticEnabled: true,
+    embeddingEndpoint: 'https://legacy.invalid/v1/embeddings',
+    embeddingModel: 'legacy-model',
+    embeddingDimensions: 768,
+    embeddingBatchSize: 64,
+    bidIntakePath: 'custom/bid',
+    artifactsPath: 'custom/artifacts'
+  });
+  assert.strictEqual(migrated.settingsVersion, 29);
+  assert.strictEqual(migrated.embeddingProvider, 'aliyun-bailian-qwen37');
+  assert.strictEqual(migrated.embeddingProtocol, 'dashscope-native-v1');
+  assert.strictEqual(migrated.embeddingModel, 'qwen3.7-text-embedding');
+  assert.strictEqual(migrated.embeddingDimensions, 1024);
+  assert.strictEqual(migrated.embeddingBatchSize, 20);
+  assert.strictEqual(migrated.bidIntakePath, 'custom/bid');
+  assert.strictEqual(migrated.artifactsPath, 'custom/artifacts');
+  assert.strictEqual(migrated.semanticConsent, true);
+  assert.strictEqual(migrated.semanticEnabled, true);
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const semanticUi = source.slice(source.indexOf("text: '语义嵌入（可选 · 影子模式）'"), source.indexOf("text: '生产影子评估（本地优先）'"));
+  assert(semanticUi.includes("'阿里云百炼 API Key'"));
+  for (const hidden of ["'embeddingEndpoint'", "'embeddingModel'", "'embeddingApiKeyEnv'", "'embeddingDimensions'"]) assert(!semanticUi.includes(hidden));
+  assert(source.includes("['Engineering knowledge connection probe.']"));
+  assert(!source.includes('provider.embed([privacyReducedPayload'));
+
+  const vectors = (count, dimensions = 1024) => Array.from({ length: count }, (_, index) => ({
+    text_index: count - index - 1,
+    embedding: Array.from({ length: dimensions }, (_x, dimension) => dimension === index ? 1 : 0)
+  }));
+  let captured;
+  const native = new sem.AliyunBailianQwen37EmbeddingProvider({
+    env: {},
+    fetch: async (url, request) => {
+      captured = { url, request };
+      return { ok: true, status: 200, json: async () => ({ output: { embeddings: vectors(2) }, usage: { total_tokens: 7 }, request_id: 'safe-id' }) };
+    }
+  });
+  const nativeResult = await native.embed(['probe-a', 'probe-b'], settings(), undefined, { textType: 'document' });
+  assert.strictEqual(captured.url, sem.ALIYUN_BAILIAN_ENDPOINT);
+  assert.strictEqual(captured.request.headers.authorization, 'Bearer unit-test-secret-never-log');
+  const nativeBody = JSON.parse(captured.request.body);
+  assert.deepStrictEqual(nativeBody, {
+    model: 'qwen3.7-text-embedding',
+    input: { texts: ['probe-a', 'probe-b'] },
+    parameters: { dimension: 1024, output_type: 'dense', text_type: 'document' }
+  });
+  assert.strictEqual(nativeResult[0][1], 1, 'text_index order must be restored');
+  assert.strictEqual(nativeResult.usage.inputTokens, 7);
+  assert(!JSON.stringify(nativeResult).includes('unit-test-secret'));
+  await assert.rejects(() => native.embed(Array(21).fill('x'), settings()), (error) => error.code === 'SEM_BATCH_LIMIT');
+
+  for (const scenario of [
+    { status: 401, code: 'SEM_AUTH' },
+    { status: 429, code: 'SEM_RATE_LIMIT' },
+    { status: 200, json: { output: { embeddings: [] } }, code: 'SEM_COUNT' },
+    { status: 200, json: { output: { embeddings: vectors(1, 3) } }, code: 'SEM_DIMENSION' },
+    { status: 200, json: { output: { embeddings: [{ text_index: 0, embedding: [...Array(1023).fill(0), NaN] }] } }, code: 'SEM_NONFINITE' }
+  ]) {
+    const provider = new sem.AliyunBailianQwen37EmbeddingProvider({
+      fetch: async () => ({
+        ok: scenario.status === 200, status: scenario.status,
+        json: async () => scenario.json || {}
+      })
+    });
+    await assert.rejects(() => provider.embed(['fixed privacy neutral probe'], settings({ embeddingMaxAttempts: 1 })), (error) => error.code === scenario.code);
+  }
+  const timeoutProvider = new sem.AliyunBailianQwen37EmbeddingProvider({
+    fetch: async (_url, request) => new Promise((_resolve, reject) => request.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))))
+  });
+  await assert.rejects(() => timeoutProvider.embed(['fixed privacy neutral probe'], settings({ embeddingTimeoutMs: 1, embeddingMaxAttempts: 1 })), (error) => error.code === 'SEM_TIMEOUT');
+
   const privateCard = card('c1', ' 混凝土  ', '强度 C30', {
     path: '秘密/项目.md', raw_evidence: '原始证据', diagnostics: { token: 'secret' },
     secret: 'sk-never', tags: ['b', 'a']
@@ -81,7 +157,7 @@ async function main() {
   await resumed.run([card('a', '规范', '厚度 10 mm')]);
   assert.strictEqual(provider2.calls, 0, 'cold start must reuse persisted cache');
 
-  const changed = new sem.SemanticPostProcessor({ settings: settings({ embeddingModel: 'other' }), provider: fakeProvider(), readState: store.read, writeState: store.write });
+  const changed = new sem.SemanticPostProcessor({ settings: settings({ embeddingProtocol: 'changed' }), provider: fakeProvider(), readState: store.read, writeState: store.write });
   await changed.load();
   assert.strictEqual(Object.keys(changed.cache.entries).length, 0, 'model change invalidates semantic cache only');
 
@@ -113,9 +189,9 @@ async function main() {
   await pending;
   assert(aborted);
 
-  const migrated = sem.semanticSettingsSnapshot({ semanticEnabled: true, semanticConsent: false, embeddingApiKey: 'secret' });
-  assert.strictEqual(migrated.consent, false);
-  assert(!JSON.stringify(migrated).includes('secret'));
+  const snapshot = sem.semanticSettingsSnapshot({ semanticEnabled: true, semanticConsent: false, embeddingApiKey: 'secret' });
+  assert.strictEqual(snapshot.consent, false);
+  assert(!JSON.stringify(snapshot).includes('secret'));
   assert(!JSON.stringify(sem.redactDiagnostic({ payload: 'private', vector: [1], apiKey: 'secret', code: 'SEM_AUTH' })).includes('secret'));
   console.log('semantic embedding unit/in-memory Vault integration: ok');
 }

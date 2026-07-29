@@ -66,6 +66,8 @@ const {
 } = require("src/core/completion-ui.js");
 const {
   createStageMetric,
+  loadCredentialFile,
+  saveCredentialFile,
   sanitizeForLog,
   sanitizeSettingsForPersistence,
   toAppError
@@ -93,6 +95,7 @@ const {
   resolveRuntimeTimeZone
 } = require("src/core/time-policy.js");
 const {
+  AliyunBailianQwen37EmbeddingProvider,
   SemanticPostProcessor,
   semanticSettingsSnapshot
 } = require("src/core/semantic-embedding.js");
@@ -344,12 +347,12 @@ function loadSecretsFile() {
     const secretsPath = path.join(os.homedir(), '.eks-secrets.json');
     if (fs.existsSync(secretsPath)) {
       const raw = fs.readFileSync(secretsPath, 'utf-8');
-      const parsed = JSON.parse(raw);
+      const parsed = loadCredentialFile(secretsPath, { fs });
       diag('secrets.loaded', {
         path: secretsPath,
         sizeBytes: raw.length,
         keys: Object.keys(parsed || {}).reduce((acc, k) => {
-          acc[k] = parsed[k] ? keyFingerprint(parsed[k]) : '<empty>';
+          acc[k] = k === 'embeddingApiKey' ? '<configured>' : (parsed[k] ? keyFingerprint(parsed[k]) : '<empty>');
           return acc;
         }, {})
       });
@@ -361,6 +364,33 @@ function loadSecretsFile() {
     console.warn('工程知识切片: 密钥文件加载失败', e);
   }
   return {};
+}
+
+function saveSecretsFile(secrets = {}) {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const secretsPath = path.join(os.homedir(), '.eks-secrets.json');
+  const allowed = ['minimaxApiKey', 'pdfMineruApiKey', 'pdfPaddleOcrApiKey', 'embeddingApiKey'];
+  const previous = loadSecretsFile();
+  const output = Object.assign({}, previous);
+  for (const key of allowed) {
+    const value = String(secrets[key] || '').trim();
+    if (value) output[key] = value;
+  }
+  saveCredentialFile(secretsPath, output, { fs, pid: process.pid });
+}
+
+function saveSecretField(key, value) {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const secretsPath = path.join(os.homedir(), '.eks-secrets.json');
+  const output = loadCredentialFile(secretsPath, { fs });
+  const normalized = String(value || '').trim();
+  if (normalized) output[key] = normalized;
+  else delete output[key];
+  saveCredentialFile(secretsPath, output, { fs, pid: process.pid });
 }
 
 // v1.7 (M-01): 重写 RateLimiter。
@@ -540,6 +570,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       if (_secrets.minimaxApiKey) this.settings.minimaxApiKey = _secrets.minimaxApiKey;
       if (_secrets.pdfMineruApiKey) this.settings.pdfMineruApiKey = _secrets.pdfMineruApiKey;
       if (_secrets.pdfPaddleOcrApiKey) this.settings.pdfPaddleOcrApiKey = _secrets.pdfPaddleOcrApiKey;
+      if (_secrets.embeddingApiKey) this.settings.embeddingApiKey = _secrets.embeddingApiKey;
     }
     // v1.1.6: 报告 effective 密钥指纹（绝不是原值），便于诊断"密钥填了但被插件忽略"类问题
     // v1.1.7: 同时初始化 diag.log 文件路径，让没法开 DevTools 的用户也能拿到日志
@@ -733,6 +764,31 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     await this.refreshViews();
   }
 
+  async testSemanticConnection() {
+    if (this.settings.semanticConsent !== true) {
+      new Notice('请先开启“外部嵌入明确同意”；测试会产生一次外部配额/可能计费请求。');
+      return false;
+    }
+    try {
+      const provider = new AliyunBailianQwen37EmbeddingProvider({
+        fetch: typeof fetch === 'function' ? fetch.bind(globalThis) : null,
+        env: typeof process !== 'undefined' ? process.env : {}
+      });
+      const vectors = await provider.embed(['Engineering knowledge connection probe.'], this.settings, undefined, { textType: 'document' });
+      if (vectors.length !== 1 || vectors[0].length !== 1024 || vectors[0].some((value) => !Number.isFinite(value))) {
+        throw Object.assign(new Error('probe validation failed'), { code: 'SEM_DIMENSION' });
+      }
+      await this.recordServiceTest('semantic', { ok: true, status: 200, code: 'OK' });
+      new Notice('阿里云百炼嵌入连接可用（1024 维）。');
+      return true;
+    } catch (error) {
+      const code = String(error?.code || 'SEM_PROVIDER');
+      await this.recordServiceTest('semantic', { ok: false, status: 0, code });
+      new Notice(`阿里云百炼嵌入连接失败：${code}`);
+      return false;
+    }
+  }
+
   async testServiceConnection(service) {
     const config = serviceConnectionConfig(service, this.settings);
     diag('testConnection.start', { service, url: config.url, apiKey: config.apiKey ? keyFingerprint(config.apiKey) : '<empty>' });
@@ -796,6 +852,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async saveSafeSettings() {
+    saveSecretsFile(this.settings);
     await this.saveData(sanitizeSettingsForPersistence(this.settings));
   }
 
@@ -3980,15 +4037,16 @@ class SlicerSettingTab extends PluginSettingTab {
         this.plugin.settings.semanticEnabled = value === true && this.plugin.settings.semanticConsent === true;
         await this.plugin.saveSettings();
       }));
-    textSetting(containerEl, this.plugin, 'OpenAI-compatible embeddings 端点', '必须自行配置；插件没有硬编码端点。', 'embeddingEndpoint', '');
-    textSetting(containerEl, this.plugin, '嵌入模型', '默认 Qwen3-Embedding-0.6B。改变模型会自动启用新的缓存/索引签名。', 'embeddingModel', 'Qwen3-Embedding-0.6B');
-    textSetting(containerEl, this.plugin, 'API Key 环境变量名', '默认 EKS_EMBEDDING_API_KEY。密钥值不会写入 data.json、诊断或向量索引。', 'embeddingApiKeyEnv', 'EKS_EMBEDDING_API_KEY');
-    numberSetting(containerEl, this.plugin, '嵌入维度', '默认 1024；改变维度会使旧语义缓存和索引失效，但不影响解析/OCR/AI checkpoint。', 'embeddingDimensions', 64, 4096);
+    passwordSetting(containerEl, this.plugin, '阿里云百炼 API Key', '标准 Model Studio API Key。保存在本机 ~/.eks-secrets.json（用户权限），不会写入 vault 的 data.json、诊断、报告或语义数据；也可用 EKS_EMBEDDING_API_KEY 环境变量。', 'embeddingApiKey', 'DashScope API Key');
+    new Setting(containerEl)
+      .setName('测试阿里云嵌入连接')
+      .setDesc('仅发送固定的隐私中性探针，不使用用户卡片或文档内容；会产生 1 次外部配额/可能计费请求，且必须先明确同意。')
+      .addButton((control) => control.setButtonText('测试连接').onClick(() => this.plugin.testSemanticConnection()));
     numberSetting(containerEl, this.plugin, '最大候选数', '精确余弦比较的硬上限，索引接口可替换为 ANN。', 'semanticMaxCandidates', 1, 5000);
     numberSetting(containerEl, this.plugin, 'Top K', '每张卡保留的最多审核建议数。', 'semanticTopK', 1, 50);
     new Setting(containerEl)
       .setName('语义影子操作')
-      .setDesc(`状态：${semantic.enabled ? '已启用' : '未启用'}；模型 ${semantic.model}；${semantic.dimensions} 维；相关 ${semantic.relatedThreshold}；重复候选 ${semantic.duplicateThreshold}。建议不会自动写回 Markdown、关系、状态或合并。`)
+      .setDesc(`状态：${semantic.enabled ? '已启用' : '未启用'}；阿里云百炼 ${semantic.model}；${semantic.dimensions} 维；单批最多 20；相关 ${semantic.relatedThreshold}；重复候选 ${semantic.duplicateThreshold}。建议不会自动写回 Markdown、关系、状态或合并。`)
       .addButton((control) => control.setButtonText('立即运行').onClick(() => this.plugin.runSemanticIndex()))
       .addButton((control) => control.setButtonText('重建索引').onClick(async () => {
         if (typeof window !== 'undefined' && !window.confirm('确认重建独立语义向量索引？不会清除解析/OCR/AI 检查点。')) return;
@@ -4535,6 +4593,7 @@ function passwordSetting(containerEl, plugin, name, desc, key, placeholder = '')
         .setValue(plugin.settings[key] || '')
         .onChange(async (value) => {
           plugin.settings[key] = value.trim();
+          saveSecretField(key, plugin.settings[key]);
           await plugin.saveSettings();
         });
     });
@@ -5323,7 +5382,7 @@ const TASK_STATUSES = new Set([
 const PROCESSING_STATUSES = new Set(['extracting', 'parsing', 'slicing', 'classifying', 'summarizing', 'atomizing', 'validating', 'writing']);
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 28,
+  settingsVersion: 29,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -5428,8 +5487,10 @@ const DEFAULT_SETTINGS = {
   semanticConsent: false,
   semanticEnabled: false,
   semanticMode: 'shadow',
-  embeddingEndpoint: '',
-  embeddingModel: 'Qwen3-Embedding-0.6B',
+  embeddingProvider: 'aliyun-bailian-qwen37',
+  embeddingProtocol: 'dashscope-native-v1',
+  embeddingEndpoint: 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding',
+  embeddingModel: 'qwen3.7-text-embedding',
   embeddingApiKey: '',
   embeddingApiKeyEnv: 'EKS_EMBEDDING_API_KEY',
   embeddingDimensions: 1024,
@@ -5437,7 +5498,7 @@ const DEFAULT_SETTINGS = {
   embeddingMaxAttempts: 3,
   embeddingRetryBaseMs: 500,
   embeddingRateLimitMs: 250,
-  embeddingBatchSize: 16,
+  embeddingBatchSize: 20,
   embeddingConcurrency: 2,
   semanticRelatedThreshold: 0.82,
   semanticDuplicateThreshold: 0.92,
@@ -5451,7 +5512,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 28;
+  migrated.settingsVersion = 29;
   // Runtime contract boundary changed in 2.14.1. Parsed artifacts use their own
   // parser fingerprint and remain reusable; only classification and later stages
   // receive the new pipeline fingerprint.
@@ -5545,17 +5606,19 @@ function migrateSettings(stored = {}) {
   migrated.semanticConsent = source.semanticConsent === true;
   migrated.semanticEnabled = source.semanticEnabled === true && migrated.semanticConsent;
   migrated.semanticMode = 'shadow';
-  migrated.embeddingEndpoint = String(migrated.embeddingEndpoint || '').trim();
-  migrated.embeddingModel = String(migrated.embeddingModel || DEFAULT_SETTINGS.embeddingModel).trim().slice(0, 160);
+  migrated.embeddingProvider = DEFAULT_SETTINGS.embeddingProvider;
+  migrated.embeddingProtocol = DEFAULT_SETTINGS.embeddingProtocol;
+  migrated.embeddingEndpoint = DEFAULT_SETTINGS.embeddingEndpoint;
+  migrated.embeddingModel = DEFAULT_SETTINGS.embeddingModel;
   migrated.embeddingApiKey = String(migrated.embeddingApiKey || '').trim();
   migrated.embeddingApiKeyEnv = /^[A-Z_][A-Z0-9_]{0,79}$/.test(String(migrated.embeddingApiKeyEnv || ''))
     ? String(migrated.embeddingApiKeyEnv) : DEFAULT_SETTINGS.embeddingApiKeyEnv;
-  migrated.embeddingDimensions = Math.max(64, Math.min(4096, Math.round(Number(migrated.embeddingDimensions) || DEFAULT_SETTINGS.embeddingDimensions)));
+  migrated.embeddingDimensions = DEFAULT_SETTINGS.embeddingDimensions;
   migrated.embeddingTimeoutMs = Math.max(1000, Math.min(300000, Math.round(Number(migrated.embeddingTimeoutMs) || DEFAULT_SETTINGS.embeddingTimeoutMs)));
   migrated.embeddingMaxAttempts = Math.max(1, Math.min(5, Math.round(Number(migrated.embeddingMaxAttempts) || DEFAULT_SETTINGS.embeddingMaxAttempts)));
   migrated.embeddingRetryBaseMs = Math.max(100, Math.min(10000, Math.round(Number(migrated.embeddingRetryBaseMs) || DEFAULT_SETTINGS.embeddingRetryBaseMs)));
   migrated.embeddingRateLimitMs = Math.max(0, Math.min(60000, Math.round(Number(migrated.embeddingRateLimitMs) || DEFAULT_SETTINGS.embeddingRateLimitMs)));
-  migrated.embeddingBatchSize = Math.max(1, Math.min(64, Math.round(Number(migrated.embeddingBatchSize) || DEFAULT_SETTINGS.embeddingBatchSize)));
+  migrated.embeddingBatchSize = Math.max(1, Math.min(20, Math.round(Number(migrated.embeddingBatchSize) || DEFAULT_SETTINGS.embeddingBatchSize)));
   migrated.embeddingConcurrency = Math.max(1, Math.min(4, Math.round(Number(migrated.embeddingConcurrency) || DEFAULT_SETTINGS.embeddingConcurrency)));
   migrated.semanticRelatedThreshold = Math.max(0.5, Math.min(1, Number(migrated.semanticRelatedThreshold) || DEFAULT_SETTINGS.semanticRelatedThreshold));
   migrated.semanticDuplicateThreshold = Math.max(migrated.semanticRelatedThreshold, Math.min(1, Number(migrated.semanticDuplicateThreshold) || DEFAULT_SETTINGS.semanticDuplicateThreshold));
@@ -12946,7 +13009,7 @@ module.exports = {
 const SECRET_KEYS = /^(authorization|proxy-authorization|api[-_]?key|token|jwt|secret|password|cookie|set-cookie)$/i;
 const CREDENTIAL = /(Bearer\s+)[^\s,;]+|((?:sk|key|paddle|gh[pousxr])[-_])[A-Za-z0-9._-]{12,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/gi;
 const SENSITIVE_QUERY = /([?&](?:api_?key|access_?token|token|jwt|secret|signature)=)[^&#\s]+/gi;
-const SECRET_SETTING_KEYS = new Set(['minimaxApiKey', 'pdfMineruApiKey', 'pdfPaddleOcrApiKey']);
+const SECRET_SETTING_KEYS = new Set(['minimaxApiKey', 'pdfMineruApiKey', 'pdfPaddleOcrApiKey', 'embeddingApiKey']);
 
 class AppError extends Error {
   constructor(input = {}) {
@@ -13065,6 +13128,27 @@ function sanitizeSettingsForPersistence(settings = {}) {
   return output;
 }
 
+function loadCredentialFile(filePath, options = {}) {
+  const fs = options.fs;
+  if (!fs || !fs.existsSync(filePath)) return {};
+  const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+}
+
+function saveCredentialFile(filePath, secrets = {}, options = {}) {
+  const fs = options.fs;
+  if (!fs) throw new Error('credential filesystem unavailable');
+  const allowed = new Set(['minimaxApiKey', 'pdfMineruApiKey', 'pdfPaddleOcrApiKey', 'embeddingApiKey']);
+  const output = {};
+  for (const [key, value] of Object.entries(secrets || {})) {
+    if (allowed.has(key) && String(value || '').trim()) output[key] = String(value).trim();
+  }
+  const tempPath = `${filePath}.tmp-${Number(options.pid || 0)}`;
+  fs.writeFileSync(tempPath, `${JSON.stringify(output, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tempPath, filePath);
+  try { fs.chmodSync(filePath, 0o600); } catch (_) { /* Windows/受限文件系统可能不支持 chmod */ }
+}
+
 function computeBackoffMs(attempt, options = {}) {
   const baseMs = Math.max(1, Number(options.baseMs) || 800);
   const maxMs = Math.max(baseMs, Number(options.maxMs) || 30000);
@@ -13124,7 +13208,7 @@ function number(value) { return Number.isFinite(Number(value)) ? Number(value) :
 
 module.exports = {
   AppError, buildValidationReport, classifyFailure, computeBackoffMs, createStageMetric,
-  redactText, sanitizeForLog, sanitizeSettingsForPersistence, toAppError
+  loadCredentialFile, redactText, saveCredentialFile, sanitizeForLog, sanitizeSettingsForPersistence, toAppError
 };
 
 },
@@ -13930,6 +14014,10 @@ const CACHE_FILE = 'embedding-cache.v1.json';
 const SUGGESTION_FILE = 'semantic-shadow.v1.json';
 const QUEUE_FILE = 'semantic-queue.v1.json';
 const SECRET_KEY = /(api.?key|token|secret|authorization|password|credential)/i;
+const ALIYUN_BAILIAN_ENDPOINT = 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding';
+const ALIYUN_BAILIAN_MODEL = 'qwen3.7-text-embedding';
+const ALIYUN_BAILIAN_DIMENSIONS = 1024;
+const ALIYUN_BAILIAN_BATCH_MAX = 20;
 
 function stableHash(value) {
   return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
@@ -13955,6 +14043,15 @@ function privacyReducedPayload(card) {
 }
 function cacheKey(model, dimensions, payload) {
   return `${normalizeText(model, 160)}:${Number(dimensions)}:${stableHash(payload)}`;
+}
+function embeddingSignature(settings = {}) {
+  return [
+    settings.embeddingProvider || 'aliyun-bailian-qwen37',
+    settings.embeddingProtocol || 'dashscope-native-v1',
+    ALIYUN_BAILIAN_ENDPOINT,
+    ALIYUN_BAILIAN_MODEL,
+    ALIYUN_BAILIAN_DIMENSIONS
+  ].join(':');
 }
 function cosine(a, b) {
   if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length || !a.length) return -1;
@@ -14033,10 +14130,12 @@ function semanticSettingsSnapshot(settings) {
     enabled: settings.semanticEnabled === true,
     consent: settings.semanticConsent === true,
     mode: 'shadow',
-    endpointConfigured: Boolean(String(settings.embeddingEndpoint || '').trim()),
-    keyConfigured: Boolean(String(settings.embeddingApiKey || '').trim() || String(settings.embeddingApiKeyEnv || '').trim()),
-    model: normalizeText(settings.embeddingModel || 'Qwen3-Embedding-0.6B', 160),
-    dimensions: Number(settings.embeddingDimensions || 1024),
+    provider: 'aliyun-bailian-qwen37',
+    endpointConfigured: true,
+    keyConfigured: Boolean(String(settings.embeddingApiKey || '').trim()
+      || (typeof process !== 'undefined' && String(process.env?.EKS_EMBEDDING_API_KEY || '').trim())),
+    model: ALIYUN_BAILIAN_MODEL,
+    dimensions: ALIYUN_BAILIAN_DIMENSIONS,
     relatedThreshold: Number(settings.semanticRelatedThreshold || 0.82),
     duplicateThreshold: Number(settings.semanticDuplicateThreshold || 0.92)
   };
@@ -14052,16 +14151,16 @@ function sleep(ms, signal) {
   });
 }
 
-class OpenAICompatibleEmbeddingProvider {
+class AliyunBailianQwen37EmbeddingProvider {
   constructor(options = {}) {
     this.fetch = options.fetch;
     this.env = options.env || {};
   }
-  async embed(payloads, settings, signal) {
-    const endpoint = String(settings.embeddingEndpoint || '').trim();
-    const envName = String(settings.embeddingApiKeyEnv || 'EKS_EMBEDDING_API_KEY');
-    const key = String(settings.embeddingApiKey || this.env[envName] || '').trim();
-    if (!endpoint) throw Object.assign(new Error('endpoint required'), { code: 'SEM_CONFIG_ENDPOINT' });
+  async embed(payloads, settings, signal, options = {}) {
+    if (!Array.isArray(payloads) || !payloads.length || payloads.length > ALIYUN_BAILIAN_BATCH_MAX) {
+      throw Object.assign(new Error('batch size invalid'), { code: 'SEM_BATCH_LIMIT', retryable: false });
+    }
+    const key = String(settings.embeddingApiKey || this.env.EKS_EMBEDDING_API_KEY || '').trim();
     if (!key) throw Object.assign(new Error('key required'), { code: 'SEM_AUTH_MISSING' });
     if (!this.fetch) throw Object.assign(new Error('fetch unavailable'), { code: 'SEM_FETCH_UNAVAILABLE' });
     const maxAttempts = Number(settings.embeddingMaxAttempts || 3);
@@ -14072,26 +14171,49 @@ class OpenAICompatibleEmbeddingProvider {
       const forward = () => controller.abort();
       signal?.addEventListener('abort', forward, { once: true });
       try {
-        const response = await this.fetch(endpoint, {
+        const response = await this.fetch(ALIYUN_BAILIAN_ENDPOINT, {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
           body: JSON.stringify({
-            model: settings.embeddingModel,
-            input: payloads,
-            dimensions: Number(settings.embeddingDimensions || 1024)
+            model: ALIYUN_BAILIAN_MODEL,
+            input: { texts: payloads },
+            parameters: {
+              dimension: ALIYUN_BAILIAN_DIMENSIONS,
+              output_type: 'dense',
+              text_type: options.textType === 'query' ? 'query' : 'document',
+              ...(options.textType === 'query' && options.instruct ? { instruct: String(options.instruct) } : {})
+            }
           }),
           signal: controller.signal
         });
         if (response.status === 401 || response.status === 403) throw Object.assign(new Error('authentication failed'), { code: 'SEM_AUTH', retryable: false });
         if (!response.ok) throw Object.assign(new Error(`http ${response.status}`), { code: response.status === 429 ? 'SEM_RATE_LIMIT' : 'SEM_HTTP', retryable: response.status === 429 || response.status >= 500 });
-        const json = await response.json();
-        const rows = Array.isArray(json?.data) ? json.data.slice().sort((a, b) => Number(a.index) - Number(b.index)) : [];
-        const vectors = rows.map((row) => row?.embedding);
-        const dimensions = Number(settings.embeddingDimensions || 1024);
-        if (vectors.length !== payloads.length || vectors.some((vector) => !Array.isArray(vector) || vector.length !== dimensions || vector.some((n) => !Number.isFinite(Number(n))))) {
-          throw Object.assign(new Error('invalid embedding schema'), { code: 'SEM_SCHEMA', retryable: false });
+        let json;
+        try { json = await response.json(); } catch (_) {
+          throw Object.assign(new Error('invalid response json'), { code: 'SEM_SCHEMA', retryable: false });
         }
-        return vectors.map((vector) => vector.map(Number));
+        const rows = Array.isArray(json?.output?.embeddings) ? json.output.embeddings : [];
+        if (rows.length !== payloads.length) throw Object.assign(new Error('embedding count mismatch'), { code: 'SEM_COUNT', retryable: false });
+        const ordered = new Array(payloads.length);
+        for (const row of rows) {
+          const index = Number(row?.text_index);
+          if (!Number.isInteger(index) || index < 0 || index >= payloads.length || ordered[index]) {
+            throw Object.assign(new Error('embedding order mismatch'), { code: 'SEM_SCHEMA', retryable: false });
+          }
+          const vector = row?.embedding;
+          if (!Array.isArray(vector)) throw Object.assign(new Error('embedding schema mismatch'), { code: 'SEM_SCHEMA', retryable: false });
+          if (vector.length !== ALIYUN_BAILIAN_DIMENSIONS) throw Object.assign(new Error('embedding dimension mismatch'), { code: 'SEM_DIMENSION', retryable: false });
+          if (vector.some((value) => !Number.isFinite(Number(value)))) throw Object.assign(new Error('embedding nonfinite value'), { code: 'SEM_NONFINITE', retryable: false });
+          ordered[index] = vector.map(Number);
+        }
+        Object.defineProperty(ordered, 'usage', {
+          value: {
+            inputTokens: Number(json?.usage?.total_tokens || json?.usage?.input_tokens || 0),
+            requestId: normalizeText(json?.request_id || '', 120)
+          },
+          enumerable: false
+        });
+        return ordered;
       } catch (error) {
         last = error;
         if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'SEM_ABORTED' });
@@ -14149,14 +14271,14 @@ class SemanticPostProcessor {
     this.readState = options.readState || (async () => null);
     this.writeState = options.writeState || (async () => {});
     this.diagnostics = options.diagnostics || (() => {});
-    this.provider = options.provider || new OpenAICompatibleEmbeddingProvider({ fetch: options.fetch, env: options.env });
+    this.provider = options.provider || new AliyunBailianQwen37EmbeddingProvider({ fetch: options.fetch, env: options.env });
     this.controller = new AbortController();
     this.queue = [];
     this.running = 0;
-    this.metrics = { queued: 0, processed: 0, failed: 0, cacheHits: 0, requests: 0, comparisons: 0, suggestions: 0 };
+    this.metrics = { queued: 0, processed: 0, failed: 0, cacheHits: 0, requests: 0, embeddingInputTokens: 0, comparisons: 0, suggestions: 0 };
   }
   configure(settings) { this.settings = settings || {}; }
-  signature() { return `${this.settings.embeddingModel}:${Number(this.settings.embeddingDimensions || 1024)}`; }
+  signature() { return embeddingSignature(this.settings); }
   emit(stage, event) { this.diagnostics(stage, redactDiagnostic(Object.assign({ stage }, event))); }
   async load() {
     const [cache, index, suggestions, queue] = await Promise.all([
@@ -14203,9 +14325,9 @@ class SemanticPostProcessor {
   }
   async processBatch(cards) {
     if (!this.isAllowed()) return { processed: 0, failed: 0 };
-    const batch = cards.slice(0, Math.max(1, Number(this.settings.embeddingBatchSize || 16)));
+    const batch = cards.slice(0, Math.min(ALIYUN_BAILIAN_BATCH_MAX, Math.max(1, Number(this.settings.embeddingBatchSize || ALIYUN_BAILIAN_BATCH_MAX))));
     const payloads = batch.map(privacyReducedPayload);
-    const keys = payloads.map((payload) => cacheKey(this.settings.embeddingModel, this.settings.embeddingDimensions, payload));
+    const keys = payloads.map((payload) => cacheKey(this.signature(), ALIYUN_BAILIAN_DIMENSIONS, payload));
     const vectors = new Array(batch.length);
     const misses = [];
     keys.forEach((key, index) => {
@@ -14217,8 +14339,9 @@ class SemanticPostProcessor {
     if (misses.length) {
       try {
         if (Number(this.settings.embeddingRateLimitMs || 0)) await sleep(Number(this.settings.embeddingRateLimitMs), this.controller.signal);
-        const embedded = await this.provider.embed(misses.map((index) => payloads[index]), this.settings, this.controller.signal);
+        const embedded = await this.provider.embed(misses.map((index) => payloads[index]), this.settings, this.controller.signal, { textType: 'document' });
         this.metrics.requests += 1;
+        this.metrics.embeddingInputTokens += Math.max(0, Number(embedded.usage?.inputTokens || 0));
         misses.forEach((index, offset) => {
           vectors[index] = embedded[offset];
           this.cache.entries[keys[index]] = { vector: embedded[offset], createdAt: Date.now() };
@@ -14267,8 +14390,9 @@ class SemanticPostProcessor {
   }
   async run(cards) {
     if (!this.isAllowed()) return Object.assign({}, this.metrics, { code: 'SEM_CONSENT_REQUIRED' });
-    for (let i = 0; i < cards.length; i += Math.max(1, Number(this.settings.embeddingBatchSize || 16))) {
-      await this.processBatch(cards.slice(i, i + Number(this.settings.embeddingBatchSize || 16)));
+    const size = Math.min(ALIYUN_BAILIAN_BATCH_MAX, Math.max(1, Number(this.settings.embeddingBatchSize || ALIYUN_BAILIAN_BATCH_MAX)));
+    for (let i = 0; i < cards.length; i += size) {
+      await this.processBatch(cards.slice(i, i + size));
     }
     await this.persist();
     return Object.assign({}, this.metrics);
@@ -14294,9 +14418,10 @@ class SemanticPostProcessor {
 }
 
 module.exports = {
-  CACHE_SCHEMA, ExactCosineIndex, INDEX_SCHEMA, OpenAICompatibleEmbeddingProvider,
+  ALIYUN_BAILIAN_BATCH_MAX, ALIYUN_BAILIAN_DIMENSIONS, ALIYUN_BAILIAN_ENDPOINT, ALIYUN_BAILIAN_MODEL,
+  AliyunBailianQwen37EmbeddingProvider, CACHE_SCHEMA, ExactCosineIndex, INDEX_SCHEMA,
   SemanticPostProcessor, cacheKey, cardId, cosine, deterministicGuard, extractFacts,
-  inferRelation, metadataOf, privacyReducedPayload, redactDiagnostic, semanticSettingsSnapshot,
+  embeddingSignature, inferRelation, metadataOf, privacyReducedPayload, redactDiagnostic, semanticSettingsSnapshot,
   privacyReducedCard, stableHash
 };
 

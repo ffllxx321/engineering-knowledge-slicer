@@ -41,6 +41,6 @@ Failed runs also best-effort persist `diagnostic-report.json` beside the run art
 ````
 # 语义后处理诊断（v2.16）
 
-语义阶段仅发出 `semantic.provider`、`semantic.complete`、`semantic.lifecycle` 等稳定阶段。常见代码包括 `SEM_CONFIG_ENDPOINT`、`SEM_AUTH_MISSING`、`SEM_AUTH`、`SEM_TIMEOUT`、`SEM_RATE_LIMIT`、`SEM_HTTP`、`SEM_SCHEMA`、`SEM_ABORTED`。
+语义阶段仅发出 `semantic.provider`、`semantic.complete`、`semantic.lifecycle` 等稳定阶段。常见代码包括 `SEM_AUTH_MISSING`、`SEM_AUTH`、`SEM_TIMEOUT`、`SEM_RATE_LIMIT`、`SEM_HTTP`、`SEM_SCHEMA`、`SEM_COUNT`、`SEM_DIMENSION`、`SEM_NONFINITE`、`SEM_BATCH_LIMIT`、`SEM_ABORTED`。日志不会记录 API Key、输入、向量、端点参数或原始响应。
 
 事件只包含代码、成功标志和计数等有界字段；载荷、向量、HTTP 原始响应、路径和凭证字段会被删除。语义失败计入控制台“非阻塞失败”，不会改变卡片或摄取任务状态。

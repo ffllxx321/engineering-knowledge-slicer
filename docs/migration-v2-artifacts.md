@@ -22,4 +22,6 @@
 - 新数据位于受管 artifacts 目录下的 `semantic/`，使用独立 schema 和 `模型:维度` 签名。签名变化会忽略旧语义缓存/索引。
 - 解析包、OCR、Office 提取、分类、总结、知识原子和审核 artifacts 的路径、版本、哈希与复用规则不变。
 - 清空/重建语义数据只处理 `semantic/` 下的缓存、索引、队列和建议，不删除卡片，也不触碰摄取 checkpoints。
+- v2.17 将 v2.16 的可配置 OpenAI-compatible 语义参数迁移到固定 `aliyun-bailian-qwen37:dashscope-native-v1` 签名。提供商、协议、端点、模型或维度签名变化时只忽略旧语义缓存、索引与建议；队列、卡片、受管路径和昂贵的解析/OCR/AI checkpoints 保留。
+- v2.17 将 `settingsVersion` 升至 29；已明确同意/启用的 v2.16 布尔状态保留，其他值不会被宽松转换为启用。
 - 路径继续通过 vault 规范化和 adapter API 访问，兼容 `/` 分隔的 Windows vault 相对路径。

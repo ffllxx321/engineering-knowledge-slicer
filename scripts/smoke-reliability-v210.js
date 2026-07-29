@@ -1,6 +1,7 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { loadBundleModule } = require('./load-bundle-module.js');
 
 const api = loadBundleModule('src/core/reliability.js');
@@ -19,9 +20,29 @@ test('设置持久化不包含任何运行时密钥', () => {
     minimaxApiKey: 'secret-value',
     pdfMineruApiKey: 'secret-value',
     pdfPaddleOcrApiKey: 'secret-value',
+    embeddingApiKey: 'secret-value',
     token: 'secret-value'
   });
   assert.deepStrictEqual(value, { theme: 'native' });
+});
+
+test('本地凭据原子持久化并可在重启式重新读取后恢复', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eks-credential-test-'));
+  const target = path.join(directory, '.eks-secrets.json');
+  try {
+    api.saveCredentialFile(target, {
+      embeddingApiKey: 'restart-secret',
+      minimaxApiKey: 'minimax-secret',
+      ignored: 'must-not-persist'
+    }, { fs, pid: 123 });
+    const restarted = api.loadCredentialFile(target, { fs });
+    assert.strictEqual(restarted.embeddingApiKey, 'restart-secret');
+    assert.strictEqual(restarted.minimaxApiKey, 'minimax-secret');
+    assert(!Object.hasOwn(restarted, 'ignored'));
+    if (process.platform !== 'win32') assert.strictEqual(fs.statSync(target).mode & 0o777, 0o600);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('Header、JWT、Bearer 与 URL query 深度脱敏', () => {

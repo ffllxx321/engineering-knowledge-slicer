@@ -1,6 +1,6 @@
 # 工程知识切片（Engineering Knowledge Slicer）
 
-> 当前版本 **v2.15.0**（settingsVersion 27）· Obsidian Desktop 1.5.0+ · MIT
+> 当前版本 **v2.17.0**（settingsVersion 29）· Obsidian Desktop 1.5.0+ · MIT
 
 通过 **MinerU / PaddleOCR + MiniMax M3**，把工程资料（PDF、Word、PPT、图片、邮件等）批量转化为**中文、可追溯、固定目录归档**的 Obsidian 知识卡片。
 
@@ -82,7 +82,7 @@
 }
 ```
 
-`useEnvKeys` 开关默认开启，插件启动时自动注入。也可以在 UI 设置面板直接输入（会落到 `data.json`，请勿放入同步目录）。
+`useEnvKeys` 开关默认开启，插件启动时自动注入。也可以在 UI 设置面板直接输入；输入值会原子写入同一份 `~/.eks-secrets.json`，不会写入 vault 的 `data.json`。该文件是本地普通凭据文件，不是操作系统安全密钥库。
 
 ## v2.7 切片引擎（借鉴 Tencent/WeKnora）
 
@@ -193,7 +193,9 @@ node scripts/smoke-v292.js           # 诊断日志故障回归（v2.9.2，22 �
 依次运行 `npm ci`、`npm run lint`、`npm run typecheck`、`npm test`、`npm run build`、`npm run benchmark`。
 # 可选语义嵌入（v2.16）
 
-插件可在最终卡片成功持久化后，异步调用用户自行配置的 OpenAI-compatible embeddings 服务。默认模型为 `Qwen3-Embedding-0.6B`、默认 1024 维、默认 Shadow 模式且关闭。必须在设置中明确同意并启用；端点没有默认值，密钥建议通过 `EKS_EMBEDDING_API_KEY`（环境变量名可配置）提供，密钥值不会写入插件设置或诊断。
+插件可在最终卡片成功持久化后，异步调用阿里云百炼 Model Studio 的原生 DashScope 文本嵌入接口。内置提供商 `aliyun-bailian-qwen37` 固定使用北京公共同步端点 `https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding`、模型 `qwen3.7-text-embedding`、1024 维 dense 输出、`document` 文本类型，单请求最多 20 条。默认 Shadow 模式且关闭，必须在设置中明确同意并启用。
+
+正常设置只需填写标准 Model Studio API Key。密钥不会写入 vault 内的 `data.json`、诊断、报告、向量或队列，但会以与 MiniMax/MinerU 相同的最低风险方式持久化到本机用户目录 `~/.eks-secrets.json`，并尽力设置为仅当前用户可读写；这不是操作系统安全密钥库，也不是“不落盘”。内部仍支持 `EKS_EMBEDDING_API_KEY` 环境变量回退。设置页“测试连接”只发送固定隐私中性探针，不使用卡片/文档内容；测试要求先同意，并会产生一次外部配额或可能计费请求。
 
 发送文本固定为标题、分类、标签和规范化主张摘要。源文件/卡片路径、原始证据、秘密、诊断、完整 Markdown 和易变运行数据不会发送。向量只保存在独立版本化 JSON 索引，不写入 Markdown。Shadow 结果仅提供脱敏指标和审核建议，不会自动删除、合并、改状态或写关系。提供“立即运行 / 重建索引 / 清空语义数据”显式控制。
 

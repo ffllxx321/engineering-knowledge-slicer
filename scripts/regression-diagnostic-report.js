@@ -40,8 +40,8 @@ function fixture(overrides = {}) {
 }
 
 const report = fixture();
-assert.strictEqual(report.reportVersion, '1.0');
-assert.strictEqual(report.schemaVersion, 'eks-diagnostic-report/1.0');
+assert.strictEqual(report.reportVersion, '1.1');
+assert.strictEqual(report.schemaVersion, 'eks-diagnostic-report/1.1');
 assert.strictEqual(report.identity.sourceHash, 'abcdef0123456789abcdef01');
 assert.strictEqual(report.work.atomBatches.expected, 104);
 assert.strictEqual(report.work.atomBatches.completed, 27);

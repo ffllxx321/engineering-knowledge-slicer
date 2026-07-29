@@ -32,6 +32,13 @@ const { probeLocalOcr } = require("src/core/local-ocr.js");
 const { createFolderIndexMarkdown, folderIndexPath } = require("src/core/moc.js");
 const { parseTagLibrary, suggestMapIndex, validateCard } = require("src/core/tags.js");
 const { detectEcosystemPlugins } = require("src/core/ecosystem.js");
+const {
+  ComponentError,
+  normalizeComponentRelativePath,
+  normalizeFolderMapConfig,
+  resolveComponentFilePath,
+  validateRuntimeContracts
+} = require("src/core/component-loader.js");
 const { cardOutputPath, resolveFixedRoute } = require("src/core/routing.js");
 const { migrateTaskLedgerV3 } = require("src/core/migration.js");
 const { createTaskRecord } = require("src/core/pipeline.js");
@@ -1146,6 +1153,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
       this.assertTaskCanContinue(current);
 
+      current.status = 'slicing';
+      await this.setTaskProgress(current, '正在加载运行时组件与路由配置', {
+        stage: 'component-contracts', elapsedMs: Date.now() - startedAt
+      });
       const contracts = await this.loadRuntimeContracts();
       const tagLibraryText = await this.loadTagLibraryText();
       const tagLibrary = parseTagLibrary(tagLibraryText);
@@ -1346,12 +1357,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         sourcePath: current.source_path,
         version: runtimeVersions(this.settings),
         details: {
-          requestCount: this.operationCounters.apiRequests,
-          retryCount: this.operationCounters.aiRetries,
-          inputCharacters: this.operationCounters.promptCharacters,
-          estimatedInputTokens: Math.ceil(this.operationCounters.promptCharacters / 3),
-          outputCharacters: this.operationCounters.outputCharacters,
-          estimatedOutputTokens: Math.ceil(this.operationCounters.outputCharacters / 3),
+          requestCount: Math.max(0, this.operationCounters.apiRequests - Number(counterBaseline.apiRequests || 0)),
+          retryCount: Math.max(0, this.operationCounters.aiRetries - Number(counterBaseline.aiRetries || 0)),
+          inputCharacters: Math.max(0, this.operationCounters.promptCharacters - Number(counterBaseline.promptCharacters || 0)),
+          estimatedInputTokens: Math.ceil(Math.max(0, this.operationCounters.promptCharacters - Number(counterBaseline.promptCharacters || 0)) / 3),
+          outputCharacters: Math.max(0, this.operationCounters.outputCharacters - Number(counterBaseline.outputCharacters || 0)),
+          estimatedOutputTokens: Math.ceil(Math.max(0, this.operationCounters.outputCharacters - Number(counterBaseline.outputCharacters || 0)) / 3),
           causalChain: errorCausalChain(error),
           progress: current.progress ? {
             stage: current.progress.stage,
@@ -1919,29 +1930,53 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async loadComponentText(relativePath) {
-    const path = normalizeVaultPath(`${this.settings.componentPackPath}/${relativePath}`);
+    let normalizedRelative;
+    try {
+      normalizedRelative = normalizeComponentRelativePath(relativePath);
+    } catch (error) {
+      diag('component.pathInvalid', {
+        code: error.code || 'COMPONENT_PATH_INVALID',
+        reason: error.details?.reason || 'invalid_relative_path',
+        extension: error.details?.extension || ''
+      });
+      throw error;
+    }
+    const path = resolveComponentFilePath(this.settings.componentPackPath, normalizedRelative);
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) throw new Error(`组件包文件不存在：${path}`);
+    if (!(file instanceof TFile)) {
+      diag('component.cacheMiss', {
+        relativePath: normalizedRelative, reason: file instanceof TFolder ? 'directory' : 'not_found'
+      });
+      throw new ComponentError('COMPONENT_NOT_FOUND', `组件文件不存在：${normalizedRelative}`, {
+        reason: file instanceof TFolder ? 'path_is_directory' : 'not_found',
+        relativePath: normalizedRelative
+      });
+    }
     const fingerprint = `${file.stat?.mtime || 0}:${file.stat?.size || 0}`;
     const cached = this.componentCache.get(path);
     if (cached?.fingerprint === fingerprint) {
-      diag('component.cacheHit', { path });
+      diag('component.cacheHit', { relativePath: normalizedRelative });
       return cached.text;
     }
     const text = await this.app.vault.read(file);
     this.componentCache.set(path, { fingerprint, text });
-    diag('component.cacheMiss', { path });
+    diag('component.cacheMiss', { relativePath: normalizedRelative, reason: 'read' });
     return text;
   }
 
   async loadComponentJson(relativePath) {
     const text = await this.loadComponentText(relativePath);
-    try { return JSON.parse(text); } catch (error) { throw new Error(`${relativePath} 不是有效 JSON：${error.message}`); }
+    try { return JSON.parse(text); } catch (error) {
+      throw new ComponentError('COMPONENT_CONFIG_INVALID', `组件 JSON 配置无效：${relativePath}`, {
+        reason: 'invalid_json', relativePath: String(relativePath || ''), parseError: String(error.message || '').slice(0, 160)
+      });
+    }
   }
 
   async loadRuntimeContracts() {
-    return {
-      folderMap: await this.loadComponentJson('folder-map.json'),
+    const folderMap = normalizeFolderMapConfig(await this.loadComponentJson('folder-map.json'));
+    const contracts = {
+      folderMap,
       schemas: {
         classification: await this.loadComponentJson('schemas/classification.schema.json'),
         summary: await this.loadComponentJson('schemas/structured-summary.schema.json'),
@@ -1956,6 +1991,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         tagLibrary: await this.loadComponentText('Tag_Library.md')
       }
     };
+    validateRuntimeContracts(contracts);
+    return contracts;
   }
 
   async loadArtifact(task, name) {
@@ -5001,7 +5038,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 25,
+  settingsVersion: 26,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -5077,7 +5114,7 @@ const DEFAULT_SETTINGS = {
   // 空值表示跟随 Obsidian / 操作系统运行时本地时区；可配置 IANA 时区以稳定跨设备日期语义。
   businessTimeZone: '',
   maxExcerptLength: 500,
-  pipelineVersion: '1.2.0',
+  pipelineVersion: '1.2.1',
   promptBundleVersion: '1.1',
   schemaVersion: '1.1',
   // v1.3: 诊断日志默认写到 vault 之外（~/.eks/logs/diag.log），
@@ -5111,7 +5148,11 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 25;
+  migrated.settingsVersion = 26;
+  // Runtime contract boundary changed in 2.14.1. Parsed artifacts use their own
+  // parser fingerprint and remain reusable; only classification and later stages
+  // receive the new pipeline fingerprint.
+  migrated.pipelineVersion = DEFAULT_SETTINGS.pipelineVersion;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -8931,6 +8972,181 @@ module.exports = { extractZipEntryEndingWith };
 
 },
 /**
+ * @module src/core/component-loader
+ * Component path and legacy folder-map contract boundary.
+ */
+"src/core/component-loader.js": function(require, module, exports) {
+const ALLOWED_EXTENSIONS = new Set(['.json', '.md']);
+const LEGACY_PROMPTS = Object.freeze({
+  'bid:00-项目总览': '提示词/招投标/00-项目总览.md',
+  'bid:01-营业与客户信息': '提示词/招投标/01-营业与客户信息.md',
+  'bid:02-招标文件解读': '提示词/招投标/02-招标文件解读.md',
+  'bid:03-投标决策与立项': '提示词/招投标/03-投标决策与立项.md',
+  'bid:04-设计优化方案': '提示词/招投标/04-设计优化方案.md',
+  'bid:04-设计优化方案及设计方案(EPC工程)': '提示词/招投标/04-EPC设计方案.md',
+  'bid:05-报批报建（当地政策）': '提示词/招投标/05-报批报建.md',
+  'bid:06-技术标': '提示词/招投标/06-技术标.md',
+  'bid:07-商务报价': '提示词/招投标/07-商务报价.md',
+  'bid:08-采购与分包': '提示词/招投标/08-采购与分包.md',
+  'bid:09-风险评估与合规': '提示词/招投标/09-风险评估与合规.md',
+  'bid:10-内部会议与评审': '提示词/招投标/10-内部会议与评审.md',
+  'bid:11-答疑澄清与投标过程': '提示词/招投标/11-答疑澄清与投标过程.md',
+  'bid:12-开标评标与中标跟踪': '提示词/招投标/12-开标评标与中标跟踪.md',
+  'bid:13-合同谈判与签约': '提示词/招投标/13-合同谈判与签约.md',
+  'bid:14-发表资料与对外汇报': '提示词/招投标/14-发表资料与对外汇报.md',
+  'bid:15-复盘与知识沉淀': '提示词/招投标/15-复盘与知识沉淀.md',
+  'bid:90-通用知识库': '提示词/招投标/90-通用知识库.md',
+  'bid:91-模板库': '提示词/招投标/91-模板库.md',
+  'business:01-客户库': '提示词/业务库/01-客户库.md',
+  'business:02-案例库': '提示词/业务库/02-案例库.md',
+  'business:03-提案库': '提示词/业务库/03-提案库.md',
+  'business:04-报价库': '提示词/业务库/04-报价库.md',
+  'business:05-施工计划库': '提示词/业务库/05-施工计划库.md',
+  'business:06-风险库': '提示词/业务库/06-风险库.md',
+  'business:07-失败中成长': '提示词/业务库/07-失败中成长.md',
+  'business:08-人才能力库': '提示词/业务库/08-人才能力库.md',
+  'business:09-政府申请（报批报建）': '提示词/业务库/09-政府申请.md'
+});
+
+class ComponentError extends Error {
+  constructor(code, message, details = {}) {
+    super(String(message || '组件配置错误'));
+    this.name = 'ComponentError';
+    this.code = code;
+    this.category = 'component_config';
+    this.retryable = false;
+    this.stage = 'component-contracts';
+    this.details = details;
+  }
+}
+
+function fail(reason, value = '') {
+  const extension = String(value || '').match(/(\.[^./\\]+)$/)?.[1]?.toLowerCase() || '';
+  throw new ComponentError('COMPONENT_PATH_INVALID', '组件相对路径无效。', {
+    reason, extension
+  });
+}
+
+function normalizeComponentRelativePath(value, options = {}) {
+  if (typeof value !== 'string') fail('not_a_string', value);
+  const original = value;
+  const replaced = original.trim().replace(/\\/g, '/');
+  if (!replaced) fail('empty', original);
+  if (replaced.endsWith('/')) fail('trailing_slash', original);
+  if (replaced.startsWith('/') || /^[A-Za-z]:\//.test(replaced) || replaced.startsWith('//')) fail('absolute_path', original);
+  if (/[\0-\x1f\x7f]/.test(replaced)) fail('control_character', original);
+  const segments = replaced.split('/');
+  if (segments.some((segment) => !segment || segment === '.' || segment === '..')) fail('unsafe_segment', original);
+  const normalized = segments.join('/');
+  const dot = normalized.lastIndexOf('.');
+  const extension = dot >= 0 ? normalized.slice(dot).toLowerCase() : '';
+  const allowed = new Set(options.allowedExtensions || ALLOWED_EXTENSIONS);
+  if (!allowed.has(extension)) fail(extension ? 'unsupported_extension' : 'missing_extension', original);
+  return normalized;
+}
+
+function resolveComponentFilePath(rootValue, relativeValue) {
+  const root = String(rootValue || '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (!root || root === '.' || root.startsWith('/') || /^[A-Za-z]:\//.test(root)
+    || /(^|\/)\.\.(?:\/|$)/.test(root)) {
+    throw new ComponentError('COMPONENT_CONFIG_INVALID', '组件包根路径无效。', {
+      reason: !root ? 'empty_component_root' : 'unsafe_component_root'
+    });
+  }
+  const relativePath = normalizeComponentRelativePath(relativeValue);
+  const path = `${root}/${relativePath}`.replace(/\/+/g, '/');
+  if (path === root || !path.startsWith(`${root}/`)) {
+    throw new ComponentError('COMPONENT_PATH_INVALID', '组件相对路径不能指向组件包根目录。', {
+      reason: 'resolved_to_component_root'
+    });
+  }
+  return path;
+}
+
+function normalizeFolderMapConfig(folderMap) {
+  if (!folderMap || typeof folderMap !== 'object' || Array.isArray(folderMap) || !Array.isArray(folderMap.routes)) {
+    throw new ComponentError('COMPONENT_CONFIG_INVALID', 'folder-map.json 缺少 routes 数组。', {
+      reason: 'routes_missing'
+    });
+  }
+  const seen = new Set();
+  const routes = folderMap.routes.map((route, index) => {
+    if (!route || typeof route !== 'object' || Array.isArray(route)) {
+      throw new ComponentError('COMPONENT_CONFIG_INVALID', `folder-map route ${index + 1} 无效。`, {
+        reason: 'route_not_object', routeIndex: index
+      });
+    }
+    const next = Object.assign({}, route);
+    const library = String(next.library || '').trim();
+    const folderType = String(next.folder_type || '').trim();
+    const outputFolder = String(next.output_folder || '').trim();
+    if (!library || !folderType || !outputFolder) {
+      throw new ComponentError('COMPONENT_CONFIG_INVALID', `folder-map route ${index + 1} 缺少必填字段。`, {
+        reason: 'route_fields_missing', routeIndex: index
+      });
+    }
+    const routeKey = `${library}:${folderType}`;
+    if (seen.has(routeKey)) {
+      throw new ComponentError('COMPONENT_CONFIG_INVALID', `folder-map route ${index + 1} 重复。`, {
+        reason: 'duplicate_route', routeIndex: index
+      });
+    }
+    seen.add(routeKey);
+    const candidates = [next.prompt, next.prompt_path, next.promptPath, next.template]
+      .filter((candidate) => typeof candidate === 'string' && candidate.trim());
+    if (candidates.length > 1 && new Set(candidates.map((item) => item.trim().replace(/\\/g, '/'))).size > 1) {
+      throw new ComponentError('COMPONENT_CONFIG_INVALID', `folder-map route ${index + 1} 含冲突 prompt 字段。`, {
+        reason: 'ambiguous_prompt_fields', routeIndex: index
+      });
+    }
+    let prompt = candidates[0];
+    if (!prompt) prompt = LEGACY_PROMPTS[`${String(next.library || '').trim()}:${String(next.folder_type || '').trim()}`];
+    if (!prompt) {
+      throw new ComponentError('COMPONENT_CONFIG_INVALID', `folder-map route ${index + 1} 缺少可确定的 prompt。`, {
+        reason: 'prompt_missing', routeIndex: index,
+        library: String(next.library || '').slice(0, 24),
+        folderTypeHashRequired: Boolean(next.folder_type)
+      });
+    }
+    next.prompt = normalizeComponentRelativePath(prompt, { allowedExtensions: ['.md'] });
+    delete next.prompt_path;
+    delete next.promptPath;
+    delete next.template;
+    return next;
+  });
+  return Object.assign({}, folderMap, { routes });
+}
+
+function validateRuntimeContracts(contracts) {
+  for (const [name, schema] of Object.entries(contracts?.schemas || {})) {
+    if (!schema || typeof schema !== 'object' || Array.isArray(schema)
+      || schema.type !== 'object' || !schema.properties || !Array.isArray(schema.required)) {
+      throw new ComponentError('COMPONENT_CONFIG_INVALID', `Schema 配置无效：${name}`, {
+        reason: 'schema_contract_invalid', component: name
+      });
+    }
+  }
+  for (const [name, prompt] of Object.entries(contracts?.prompts || {})) {
+    if (typeof prompt !== 'string' || !prompt.trim()) {
+      throw new ComponentError('COMPONENT_CONFIG_INVALID', `Prompt/模板内容为空：${name}`, {
+        reason: 'prompt_content_empty', component: name
+      });
+    }
+  }
+  return contracts;
+}
+
+module.exports = {
+  ComponentError,
+  LEGACY_PROMPTS,
+  normalizeComponentRelativePath,
+  normalizeFolderMapConfig,
+  resolveComponentFilePath,
+  validateRuntimeContracts
+};
+
+},
+/**
  * @module src/core/component-contracts
  * 跨模块共享的契约 / 类型守卫 / 卡片字段约束
  */
@@ -12017,8 +12233,8 @@ module.exports = { buildCardRecord, cardFileName, renderKnowledgeCard, renderStr
 "src/core/diagnostic-report.js": function(require, module, exports) {
 const crypto = require("crypto");
 
-const REPORT_VERSION = '1.0';
-const SCHEMA_VERSION = 'eks-diagnostic-report/1.0';
+const REPORT_VERSION = '1.1';
+const SCHEMA_VERSION = 'eks-diagnostic-report/1.1';
 const MAX_JSON_BYTES = 64 * 1024;
 const MAX_MARKDOWN_BYTES = 72 * 1024;
 const SECRET_KEY = /^(?:sourcePath|artifactPath)$|(?:authorization|api[-_]?key|token|jwt|secret|password|cookie|prompt|source[_-]?(?:text|content|markdown)|body|response)/i;
@@ -12188,8 +12404,11 @@ function workDiagnosis(events, artifacts, error) {
 
 function counterSummary(events, counters = {}) {
   const count = (pattern) => events.reduce((sum, event) => sum + (pattern.test(event.code) ? Number(event.count) || 1 : 0), 0);
+  const hasRequestCounter = Object.hasOwn(counters || {}, 'apiRequests');
   return {
-    outboundRequests: count(/^outbound\.request$/) || Number(counters.apiRequests) || count(/minimax\.(?:http|transport|timeout)/),
+    outboundRequests: hasRequestCounter
+      ? Math.max(0, Number(counters.apiRequests) || 0)
+      : count(/^outbound\.request$/) || count(/minimax\.(?:http|transport|timeout)/),
     retries: count(/^outbound\.retry$/) || Number(counters.aiRetries) || count(/retry|checkpointRetry/i),
     rateLimits: events.reduce((sum, event) => sum + (event.code === 'outbound.retry' && event.data?.rateLimited ? 1 : 0), 0),
     backoffs: count(/backoff/i),
@@ -12397,6 +12616,9 @@ function classifyFailure(input = {}) {
   const status = Number(input.status || 0);
   const code = String(input.code || '').toUpperCase();
   const message = String(input.message || '');
+  if (code === 'COMPONENT_PATH_INVALID') return result(code, 'component_config', false, '组件路径配置无效', '修正组件相对路径后重试；路径必须是组件包内的 .md 或 .json 文件，不能是目录。');
+  if (code === 'COMPONENT_NOT_FOUND') return result(code, 'component_config', false, '找不到组件文件', '恢复或修正缺失的组件文件后重试；已有解析产物会复用，无需重新上传。');
+  if (code === 'COMPONENT_CONFIG_INVALID') return result(code, 'component_config', false, '组件配置无效', '修正 folder-map、Schema 或 Prompt 配置后重试；不会重新上传已解析文件。');
   if (code === 'OCR_CANCELLED') return result(code, 'cancelled', false, '本地 OCR 已取消', '如需继续，请重新将文件加入队列；有效页级检查点会复用。');
   if (code === 'OCR_UNAVAILABLE') return result(code, 'local_ocr', true, '本地 OCR 不可用', '在设置中启用并检测本地 OCR，或配置绝对可执行文件路径。');
   if (code === 'OCR_RENDER_FAILURE') return result(code, 'local_ocr', true, 'PDF 页面渲染失败', '确认 pdftoppm 可用后重试；已完成页面会复用。');
@@ -12421,7 +12643,7 @@ function result(code, category, retryable, message, suggestedAction) {
 function userMessage(category) {
   return ({ auth: '外部服务鉴权失败', rate_limit: '外部服务限流', timeout: '处理阶段超时',
     network: '外部服务暂时不可用', json_parse: '服务返回格式无法解析', schema: '模型输出未通过结构校验',
-    file: '找不到源文件', cancelled: '任务已取消', checkpoint: '已保存批次读取或写入失败',
+    file: '找不到源文件', component_config: '组件配置加载失败', cancelled: '任务已取消', checkpoint: '已保存批次读取或写入失败',
     ai_provider: '知识原子化批次未完整完成', local_ocr: '本地 OCR 处理失败' })[category] || '工程知识切片处理失败';
 }
 

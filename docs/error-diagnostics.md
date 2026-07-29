@@ -2,9 +2,9 @@
 
 When a task fails, open **Dashboard → Errors**, expand the failure, and select **Copy redacted diagnostic report**. Send the complete copied report to support. Do not send the source document, API keys, prompts, raw model responses, or the unbounded `diag.log`.
 
-The copied Markdown starts with a short human-readable summary and contains one bounded JSON object under `## Machine-readable report`. The current identifiers are `reportVersion: "1.0"` and `schemaVersion: "eks-diagnostic-report/1.0"`.
+The copied Markdown starts with a short human-readable summary and contains one bounded JSON object under `## Machine-readable report`. The current identifiers are `reportVersion: "1.1"` and `schemaVersion: "eks-diagnostic-report/1.1"`.
 
-The report includes plugin/runtime/platform versions, a non-secret settings allowlist, task/run IDs, source hashes and type, stage/status/timing, the stable final error and causal summary, last valid checkpoint, summary chunk and atom batch coverage, cache/request/retry/rate-limit/backoff counts, a compact failure timeline, terminal persistence/UI state, validated artifact inventory, and concrete next actions.
+The report includes plugin/runtime/platform versions, a non-secret settings allowlist, task/run IDs, source hashes and type, stage/status/timing, the stable final error and causal summary, last valid checkpoint, summary chunk and atom batch coverage, task-local cache/request/retry/rate-limit/backoff counts, a compact failure timeline, terminal persistence/UI state, validated artifact inventory, and concrete next actions. Component loading failures use the `component-contracts` stage and one of the three `COMPONENT_*` codes.
 
 Privacy and bounds:
 
@@ -36,6 +36,6 @@ Failed runs also best-effort persist `diagnostic-report.json` beside the run art
 ## Machine-readable report
 
 ```json
-{ "...": "complete bounded eks-diagnostic-report/1.0 object" }
+{ "...": "complete bounded eks-diagnostic-report/1.1 object" }
 ```
 ````

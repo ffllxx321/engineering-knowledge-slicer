@@ -7,6 +7,9 @@
 | `CONFIG_*` | config | 否 | 修正设置 |
 | `SECRET_*` | secret | 否 | 配置密钥，禁止写日志 |
 | `FILE_NOT_FOUND` / `FILE_*` | file | 否 | 检查文件与路径 |
+| `COMPONENT_PATH_INVALID` | component_config | 否 | 相对路径必须指向组件包内 `.md`/`.json` 文件，不能为空、目录、根路径或穿越路径 |
+| `COMPONENT_NOT_FOUND` | component_config | 否 | 恢复或修正缺失组件文件；重试复用 parsed artifact |
+| `COMPONENT_CONFIG_INVALID` | component_config | 否 | 修正 folder-map、Schema 或 Prompt 配置 |
 | `UNSUPPORTED_*` | unsupported | 否 | 转为支持格式 |
 | `SIZE_LIMIT_*` | size_limit | 否 | 拆分文件或调整明确上限 |
 | `PARSER_*` / `OCR_*` | parser/ocr | 视状态 | 检查服务与解析质量 |
@@ -37,3 +40,7 @@
 `SCHEMA_OUTPUT_INVALID`。字段缺失/额外字段、精确 coverage 失败和最终契约校验失败均走该分类，
 不会再落入 `INTERNAL_UNEXPECTED`。性能 counters 中的 `summaryReduceRequests` 统计首次 reduce、
 JSON repair retry，以及 SSE 失败后的非流式降级调用。
+
+组件错误在 JSON/schema 关键词分类之前处理，因此组件配置中的 JSON 或 validation 文本不会
+污染模型输出错误统计。组件诊断阶段固定为 `component-contracts`，技术详情只包含相对路径、
+失败原因、扩展名和路由序号等安全元数据，不包含源文档内容。

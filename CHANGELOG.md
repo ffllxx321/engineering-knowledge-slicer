@@ -1,5 +1,14 @@
 # 工程知识切片 变更记录
 
+## v2.14.1 — 2026-07-29 组件路径与解析续传生产修复
+
+- 修复旧版/缺字段 `folder-map.json` 在加载类型 Prompt 时把空相对路径归一化为组件根目录（如 `06-知识库`）并反复按文件读取的问题。组件加载现在先拒绝空值、根目录、尾随斜杠、绝对路径、穿越段和非 `.md`/`.json` 扩展名，Windows 分隔符与合法自定义组件根保持兼容。
+- 仅对内置 28 条固定路由或无歧义旧字段确定性补齐 Prompt；未知路由缺 Prompt、冲突字段和无效 JSON 均 fail closed，不依据文档内容发明路由。
+- 新增 `COMPONENT_PATH_INVALID`、`COMPONENT_NOT_FOUND`、`COMPONENT_CONFIG_INVALID`，统一归为 `component_config`，不再被 JSON/validation 关键词误报为模型 `SCHEMA_OUTPUT_INVALID`。诊断只记录相对组件路径、原因和扩展名。
+- 解析完成后显式进入 `component-contracts` 阶段，组件失败不再沿用 `mineru-api-download`。任务级请求计数以本次运行基线为准，显式零值不会被全局时间线的旧请求覆盖。
+- pipeline 指纹升级到 1.2.1：重试保留 `parsed` artifact，仅使 classification 及其下游按需失效；不会再次上传、下载或调用 PDF parser。新增生产序列、Windows/空值/根路径、错误分类、零调用续传、自定义根和计数回归。
+- 诊断报告升级为 `eks-diagnostic-report/1.1`；三文件发布合同、上传授权门、正常请求量、影子只读行为和用户数据保持不变。
+
 ## v2.14.0 — 2026-07-29 本地文本/邮件 block_v0 归一化
 
 - 基于 v2.13 影子评估审计保持质量阈值与 prompt 调优 gated：现有本地真实样本不是足够、可归因的独立 cohort，不据此制造提升结论。

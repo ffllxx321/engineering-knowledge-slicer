@@ -8,6 +8,12 @@
 - packing 先合并短原子块，只有单块超过硬 token 预算时才拆分；拆片继承完整 provenance locator。诊断指标包括输入块、拆分块、输出包、最大 token 和 locator 覆盖率。
 - marketing、unsubscribe、tracking 与 remote asset 保留在 provenance，但 `card_eligible=false`。PDF 中印章/签名的“可见性”与“审批状态”分离，未验证视觉信息不能自动形成批准结论。
 
+## 本地文本与邮件（MD / TXT / EML）
+
+`localTextBlockAdapterEnabled=true` 默认开启。MD/TXT 按稳定行范围输出标题、段落、列表、表格与 fenced code 块；EML 在相同正文块之外保留主题、信封字段和附件清单。信封字段除主题外不可直接制卡，附件 inventory 不包含附件正文，附件二进制仍只通过原有保存与独立入队路径处理。
+
+这些格式与 OOXML/MSG/PDF 共用 `block_packs`、`evidence_index` 和结构优先分类抽样。文本 pack 的 hard/soft 上限换算为旧 `aiChunkSize` 字符预算的保守等价值，避免 soft packing 使正常模式 summary map 请求数高于旧文本切分。关闭适配器时回退到既有 `text-normalizer` / `eml-parser`，旧 parsed artifact 通过输入指纹安全失效，不迁移或重写用户卡片。归一化不调用 provider，也不改变上传授权。
+
 默认值：`localMsgAdapterEnabled=true`、`localPdfInventoryEnabled=true`、`blockV0PackingEnabled=true`、`localOcrEnabled=false`、`localOcrProvider=auto`、`localOcrLanguages=chi_sim+eng`、`localOcrConcurrency=2`、`localOcrTimeoutMs=120000`、`localOcrQualityThreshold=0.72`、`pdfAllowExternalUpload=false`。升级时本地 OCR 明确迁移为关闭，不会因机器上恰好存在引擎而开始处理或外传。
 
 ## 本地 OOXML（DOCX / XLSX / PPTX）

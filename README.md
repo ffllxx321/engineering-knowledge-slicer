@@ -1,6 +1,6 @@
 # 工程知识切片（Engineering Knowledge Slicer）
 
-> 当前版本 **v2.13.0**（settingsVersion 24）· Obsidian Desktop 1.5.0+ · MIT
+> 当前版本 **v2.14.0**（settingsVersion 25）· Obsidian Desktop 1.5.0+ · MIT
 
 通过 **MinerU / PaddleOCR + MiniMax M3**，把工程资料（PDF、Word、PPT、图片、邮件等）批量转化为**中文、可追溯、固定目录归档**的 Obsidian 知识卡片。
 
@@ -9,6 +9,7 @@
 - **端到端流水线**：源文件 → 云端文档解析（MinerU 主 / PaddleOCR 补盲）→ 类型判定 → 结构化总结 → 知识原子化 → 自动入库 / 审核台
 - **低成本本地摄取**：DOCX / XLSX / PPTX 默认使用零运行时依赖的本地 OOXML 结构解析；失败或关闭时只有显式外传授权成立才会上传。PDF 可选本地页清单与 OCR，MSG 默认本地只读解析
 - **邮件附件闭环（v2.9）**：.eml 的附件保存到 `_attachments/` 并自动入队切片；邮件卡与附件卡互相「[[…]]」双向链接，附件文件→卡片方向由 Obsidian 反向链接面板提供
+- **本地文本证据块（v2.14）**：MD / TXT / EML 默认归一化为稳定行定位的 `block_v0`，与 Office、MSG、PDF/OCR 共用 evidence index、结构 packing 和分类抽样；不增加 AI 请求，EML 附件保存与入队语义保持不变
 - **固定目录归档**：业务库 / 招投标两条线，由 `组件包/folder-map.json` 唯一路由到 28 个固定目录
 - **v2.7 切片引擎**：借鉴 Tencent/WeKnora 的知识点切片思路——文档画像驱动策略选择、标题层级面包屑、受保护区域（表格/代码块/公式）永不切断、小节合并、切片重叠、覆盖校验
 - **可信度门槛**：五维加权（解析/类型/证据/结构/原子质量）+ 硬性门槛，低于 `autoApproveConfidenceThreshold`（默认 0.9）的卡片进入审核台

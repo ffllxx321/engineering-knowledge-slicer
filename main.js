@@ -1040,6 +1040,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         if (!(file instanceof TFile)) throw new Error(`未找到源文件：${current.source_path}`);
         const buffer = Buffer.from(await this.app.vault.readBinary(file));
         const extracted = await extractTextFromBuffer(current.source_path, buffer, {
+          localTextBlockAdapter: this.settings.localTextBlockAdapterEnabled !== false,
           pdfExtractor: await this.getPdfExtractorConfig(current),
           localMsgAdapter: this.settings.localMsgAdapterEnabled !== false,
           localOoxml: {
@@ -1529,6 +1530,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           const buffer = Buffer.from(await this.app.vault.readBinary(file));
           sizeBytes = buffer.length;
           const extracted = await extractTextFromBuffer(task.source_path, buffer, {
+            localTextBlockAdapter: this.settings.localTextBlockAdapterEnabled !== false,
             pdfExtractor: { enabled: false, allowExternalUpload: false, confirmUploads: true },
             localMsgAdapter: this.settings.localMsgAdapterEnabled !== false,
             localOoxml: {
@@ -1808,7 +1810,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       if (!(file instanceof TFile)) throw new Error(`Source file not found: ${current.sourcePath}`);
       const buffer = Buffer.from(await this.app.vault.readBinary(file));
       const extracted = await extractTextFromBuffer(current.sourcePath, buffer, {
-        pdfExtractor: await this.getPdfExtractorConfig(current)
+        pdfExtractor: await this.getPdfExtractorConfig(current),
+        localTextBlockAdapter: this.settings.localTextBlockAdapterEnabled !== false,
+        blockPacking: this.settings.blockV0PackingEnabled === false ? false : {
+          hardBudget: Math.max(128, Math.floor(Number(this.settings.aiChunkSize || 8000) / 4))
+        }
       });
       if (extracted.status !== 'ok') {
         current.status = extracted.status;
@@ -2004,6 +2010,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       blockContractVersion: 'block_v0',
       parserContractVersion: 'document-parser-v2',
       localMsgAdapterEnabled: this.settings.localMsgAdapterEnabled !== false,
+      localTextBlockAdapterEnabled: this.settings.localTextBlockAdapterEnabled !== false,
       localDocxAdapterEnabled: this.settings.localDocxAdapterEnabled !== false,
       localXlsxAdapterEnabled: this.settings.localXlsxAdapterEnabled !== false,
       localPptxAdapterEnabled: this.settings.localPptxAdapterEnabled !== false,
@@ -3823,6 +3830,14 @@ class SlicerSettingTab extends PluginSettingTab {
     containerEl.createEl('h3', { text: '本地 Office 解析（DOCX / XLSX / PPTX）' });
 
     new Setting(containerEl)
+      .setName('启用本地文本证据块')
+      .setDesc('默认开启。为 MD、TXT、EML 生成稳定行定位、证据索引和统一分包；全程本地且不增加 AI 请求。')
+      .addToggle((toggle) => toggle.setValue(this.plugin.settings.localTextBlockAdapterEnabled !== false).onChange(async (value) => {
+        this.plugin.settings.localTextBlockAdapterEnabled = value === true;
+        await this.plugin.saveSafeSettings();
+      }));
+
+    new Setting(containerEl)
       .setName('启用本地 DOCX 适配器')
       .setDesc('默认开启。优先在本机解析 OOXML；失败时仍需现有外传授权才会使用云端解析。')
       .addToggle((toggle) => toggle.setValue(this.plugin.settings.localDocxAdapterEnabled !== false).onChange(async (value) => {
@@ -4986,7 +5001,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 24,
+  settingsVersion: 25,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -5010,6 +5025,7 @@ const DEFAULT_SETTINGS = {
   localDocxAdapterEnabled: true,
   localXlsxAdapterEnabled: true,
   localPptxAdapterEnabled: true,
+  localTextBlockAdapterEnabled: true,
   ooxmlMaxEntries: 4096,
   ooxmlMaxUncompressedBytes: 805306368,
   ooxmlMaxXmlBytes: 67108864,
@@ -5095,7 +5111,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 24;
+  migrated.settingsVersion = 25;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -5149,6 +5165,7 @@ function migrateSettings(stored = {}) {
   if (migrated.localDocxAdapterEnabled === undefined) migrated.localDocxAdapterEnabled = true;
   if (migrated.localXlsxAdapterEnabled === undefined) migrated.localXlsxAdapterEnabled = true;
   if (migrated.localPptxAdapterEnabled === undefined) migrated.localPptxAdapterEnabled = true;
+  if (migrated.localTextBlockAdapterEnabled === undefined) migrated.localTextBlockAdapterEnabled = true;
   migrated.ooxmlMaxEntries = Math.max(64, Math.min(16384, Math.round(Number(migrated.ooxmlMaxEntries) || DEFAULT_SETTINGS.ooxmlMaxEntries)));
   migrated.ooxmlMaxUncompressedBytes = Math.max(16 * 1024 * 1024, Math.min(2 * 1024 * 1024 * 1024, Math.round(Number(migrated.ooxmlMaxUncompressedBytes) || DEFAULT_SETTINGS.ooxmlMaxUncompressedBytes)));
   migrated.ooxmlMaxXmlBytes = Math.max(1024 * 1024, Math.min(256 * 1024 * 1024, Math.round(Number(migrated.ooxmlMaxXmlBytes) || DEFAULT_SETTINGS.ooxmlMaxXmlBytes)));
@@ -7034,9 +7051,103 @@ function inspectPdf(buffer, options = {}) {
 function blocksToMarkdown(blocks) {
   return (blocks || []).filter((b) => b.parse.status === 'present' && b.raw.text).map((b) => b.raw.text).join('\n\n').trim();
 }
+function normalizeLocalTextBlocks(text, options = {}) {
+  const sourceHash = String(options.sourceHash || hash(options.buffer || ''));
+  const sourceType = String(options.sourceType || 'txt');
+  const scheme = sourceType === 'md' ? 'markdown-line' : sourceType === 'email' ? 'email-body-line' : 'text-line';
+  const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
+  const blocks = [];
+  let order = Math.max(0, Number(options.orderStart) || 0);
+  const add = (kind, value, start, end, extra = {}) => {
+    const raw = String(value || '').trim();
+    if (!raw) return;
+    const classification = classifyContent(raw);
+    blocks.push(createBlock({
+      source_hash: sourceHash, order: order++, kind, raw_text: raw,
+      locator: { scheme, value: `L${start + 1}-L${end + 1}` },
+      parse_method: `${sourceType}-block-v0`, status: 'present',
+      card_eligible: extra.card_eligible === false ? false : classification.eligible,
+      exclusion_reason: extra.exclusion_reason || classification.kind || '',
+      metadata: Object.assign({ line_start: start + 1, line_end: end + 1 }, extra.metadata || {})
+    }));
+  };
+  let paragraph = []; let paragraphStart = 0; let fenced = false; let fenceStart = 0; let fence = [];
+  const flushParagraph = (end) => {
+    if (paragraph.length) add('paragraph', paragraph.join('\n'), paragraphStart, end);
+    paragraph = [];
+  };
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^\s*```/.test(line)) {
+      flushParagraph(index - 1);
+      if (!fenced) { fenced = true; fenceStart = index; fence = [line]; }
+      else { fence.push(line); add('code_block', fence.join('\n'), fenceStart, index); fenced = false; fence = []; }
+      continue;
+    }
+    if (fenced) { fence.push(line); continue; }
+    if (!line.trim()) { flushParagraph(index - 1); continue; }
+    const heading = /^(#{1,6})\s+(.+)$/.exec(line);
+    if (heading) {
+      flushParagraph(index - 1);
+      add('heading', line, index, index, { metadata: { level: heading[1].length } });
+      continue;
+    }
+    if (/^\s*(?:[-*+]|\d+[.)])\s+/.test(line)) {
+      flushParagraph(index - 1); add('list_item', line, index, index); continue;
+    }
+    if (/^\s*\|.*\|\s*$/.test(line)) {
+      flushParagraph(index - 1);
+      const start = index; const table = [line];
+      while (index + 1 < lines.length && /^\s*\|.*\|\s*$/.test(lines[index + 1])) table.push(lines[++index]);
+      add('table', table.join('\n'), start, index); continue;
+    }
+    if (!paragraph.length) paragraphStart = index;
+    paragraph.push(line);
+  }
+  if (fenced) add('code_block', fence.join('\n'), fenceStart, lines.length - 1, { metadata: { unterminated: true } });
+  flushParagraph(lines.length - 1);
+  return blocks;
+}
+function createEmailBlocks(email, bodyText, buffer) {
+  const sourceHash = hash(buffer || '');
+  const blocks = []; let order = 0;
+  for (const [field, value] of [['subject', email.subject], ['from', email.from], ['to', email.to], ['cc', email.cc], ['date', email.date], ['message_id', email.messageId]]) {
+    if (!String(value || '').trim()) continue;
+    blocks.push(createBlock({
+      source_hash: sourceHash, order: order++, kind: `email_${field}`, raw_text: String(value),
+      locator: { scheme: 'mime-header', value: field }, parse_method: 'eml-mime',
+      status: 'present', card_eligible: field === 'subject', exclusion_reason: field === 'subject' ? '' : 'envelope_metadata'
+    }));
+  }
+  const body = normalizeLocalTextBlocks(bodyText, { sourceHash, sourceType: 'email', orderStart: order });
+  blocks.push(...body);
+  order += body.length;
+  for (let index = 0; index < (email.attachments || []).length; index += 1) {
+    const attachment = email.attachments[index];
+    blocks.push(createBlock({
+      source_hash: sourceHash, order: order++, kind: 'attachment', raw_text: '',
+      locator: { scheme: 'mime-attachment', value: `part:${index + 1}` }, parse_method: 'eml-mime',
+      status: 'present', card_eligible: false, exclusion_reason: 'attachment_inventory',
+      metadata: {
+        filename: String(attachment.filename || ''), content_type: String(attachment.contentType || ''),
+        size_bytes: Buffer.isBuffer(attachment.data) ? attachment.data.length : 0
+      }
+    }));
+  }
+  return blocks;
+}
+function localTextPackingOptions(options) {
+  const input = options && typeof options === 'object' ? options : {};
+  const legacyTokenBudget = Math.max(16, Number(input.hardBudget) || 2000);
+  const characterEquivalentBudget = legacyTokenBudget * 4;
+  return Object.assign({}, input, {
+    hardBudget: characterEquivalentBudget,
+    softBudget: characterEquivalentBudget
+  });
+}
 module.exports = {
   BLOCK_SCHEMA_VERSION, DEFAULT_LIMITS, blocksToMarkdown, classifyContent, createBlock, estimateTokens,
-  inspectPdf, packBlocks, parseMsg, redactQueryTokens, stableId, validateBlock
+  createEmailBlocks, inspectPdf, localTextPackingOptions, normalizeLocalTextBlocks, packBlocks, parseMsg, redactQueryTokens, stableId, validateBlock
 };
 
 },
@@ -7048,7 +7159,7 @@ module.exports = {
 "src/core/extractors.js": function(require, module, exports) {
 const { createParsePackage, documentPlan } = require("src/core/document-parser.js");
 const { extractDocumentWithApis } = require("src/core/external-pdf.js");
-const { blocksToMarkdown, createBlock, inspectPdf, packBlocks, parseMsg } = require("src/core/block-v0.js");
+const { blocksToMarkdown, createBlock, createEmailBlocks, inspectPdf, localTextPackingOptions, normalizeLocalTextBlocks, packBlocks, parseMsg } = require("src/core/block-v0.js");
 const { probeLocalOcr, runLocalPdfOcr } = require("src/core/local-ocr.js");
 const { parseOoxml } = require("src/core/ooxml.js");
 
@@ -7063,11 +7174,20 @@ async function extractTextFromBuffer(filePath, buffer, options = {}) {
     };
   }
   if (plan.mode === 'text') {
-    return withParsePackage(textResult(buffer, plan.sourceType), {
+    const result = textResult(buffer, plan.sourceType);
+    if (result.status !== 'ok' || options.localTextBlockAdapter === false) return withParsePackage(result, {
       sourcePath: filePath,
       buffer,
       sourceType: plan.sourceType,
       parser: 'text-normalizer'
+    });
+    const blocks = normalizeLocalTextBlocks(result.text, { buffer, sourceType: plan.sourceType });
+    const packed = options.blockPacking === false ? { packs: [], metrics: { disabled: true } } : packBlocks(blocks, localTextPackingOptions(options.blockPacking));
+    result.blocks = blocks;
+    result.metadata = { block_metrics: packed.metrics, block_normalizer: 'local-text-v0' };
+    return withParsePackage(result, {
+      sourcePath: filePath, buffer, sourceType: plan.sourceType, parser: 'text-block-v0',
+      metadata: result.metadata, blocks, blockPacks: packed.packs
     });
   }
   if (plan.mode === 'email') {
@@ -7099,6 +7219,16 @@ async function extractTextFromBuffer(filePath, buffer, options = {}) {
     // 附件二进制挂在 result 上（不进 parsePackage 的 JSON 序列化），
     // 由 processTask 落盘到 _attachments 并入队切片。
     result.attachments = email.attachments || [];
+    if (options.localTextBlockAdapter !== false && result.status === 'ok') {
+      const blocks = createEmailBlocks(email, bodyText, buffer);
+      const packed = options.blockPacking === false ? { packs: [], metrics: { disabled: true } } : packBlocks(blocks, localTextPackingOptions(options.blockPacking));
+      result.blocks = blocks;
+      result.metadata = Object.assign({}, metadata, { block_metrics: packed.metrics, block_normalizer: 'eml-block-v0' });
+      return withParsePackage(result, {
+        sourcePath: filePath, buffer, sourceType: 'email', parser: 'eml-block-v0',
+        metadata: result.metadata, blocks, blockPacks: packed.packs
+      });
+    }
     return withParsePackage(result, {
       sourcePath: filePath,
       buffer,
@@ -9307,6 +9437,7 @@ function normalizeParser(parser) {
   if (value.startsWith('mineru-api')) return 'mineru-api';
   if (value.startsWith('paddleocr-api')) return 'paddleocr-api';
   if (value === 'eml-parser') return value;
+  if (value === 'eml-block-v0' || value === 'text-block-v0') return value;
   if (value === 'msg-cfb-mapi') return value;
   if (value === 'pdf-local-inventory') return value;
   if (value === 'docx-ooxml-local' || value === 'xlsx-ooxml-local' || value === 'pptx-ooxml-local') return value;
@@ -10249,12 +10380,15 @@ async function summarizeDocument(options) {
       tokenEstimate: pack.token_count
     }))
     : [];
-  const chunks = packedChunks.length ? packedChunks : splitMarkdownSections(options.parsePackage.markdown, {
+  const legacyChunks = splitMarkdownSections(options.parsePackage.markdown, {
     maxChars: options.maxChunkChars,
     overlapRatio: options.chunkOverlapRatio,
     coalesceTiny: options.coalesceTinyChunks,
     provenance: options.parsePackage.provenance
   });
+  // block-native 输入不得仅因结构 packing 增加正常模式 provider 请求。
+  // 若 pack 数高于既有 splitter，则保留旧切分；证据仍在 parsePackage.evidence_index 中做逐字回查。
+  const chunks = packedChunks.length && packedChunks.length <= legacyChunks.length ? packedChunks : legacyChunks;
   const partials = new Array(chunks.length);
   diag('summary.map.plan', {
     chunkTotal: chunks.length,

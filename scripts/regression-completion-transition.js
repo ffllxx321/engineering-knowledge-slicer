@@ -7,7 +7,9 @@ const {
   completionUiSnapshot,
   pendingReviewCount,
   shouldAcceptIncrementalProgress
-} = loadBundleModule('src/core/completion-ui.js');
+} = loadBundleModule('src/core/completion-ui.js', {
+  'src/core/task.js': loadBundleModule('src/core/task.js', { crypto: require('crypto'), path })
+});
 
 function task(overrides = {}) {
   return Object.assign({

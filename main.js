@@ -21,11 +21,15 @@ const {
   detectSourceType,
   isProcessableSource,
   migrateSettings,
+  normalizeConfiguredPath,
   normalizeVaultPath,
   rollbackPath,
   sourceHash,
   statusCounts,
-  tasksPath
+  TASK_STATUSES,
+  PROCESSING_STATUSES,
+  tasksPath,
+  validateConfiguredPathSet
 } = require("src/core/task.js");
 const { extractTextFromBuffer, sanitizeAttachmentFileName } = require("src/core/extractors.js");
 const { probeLocalOcr } = require("src/core/local-ocr.js");
@@ -39,7 +43,7 @@ const {
   resolveComponentFilePath,
   validateRuntimeContracts
 } = require("src/core/component-loader.js");
-const { cardOutputPath, resolveFixedRoute } = require("src/core/routing.js");
+const { cardOutputPath, resolveFixedRoute, resolveOutputRoute } = require("src/core/routing.js");
 const { migrateTaskLedgerV3 } = require("src/core/migration.js");
 const { createTaskRecord } = require("src/core/pipeline.js");
 // v2.9.2: requestMiniMaxStream 之前漏了导入，SSE 开启时 line ~906 引用直接抛 ReferenceError
@@ -117,6 +121,13 @@ globalThis.__eksDiag.forceFlushDiag = globalThis.__eksDiag.forceFlushDiag || fun
 //       顺序固定为 normalizeVaultPath → normalizeUnicodeForm，调用方不再各自拼。
 function normalizePathForCompare(value) {
   return normalizeUnicodeForm(normalizeVaultPath(value));
+}
+
+function isSafeCardOutputPath(settings, value) {
+  const candidate = normalizePathForCompare(value);
+  return [settings.bidOutputPath, settings.businessOutputPath]
+    .map(normalizePathForCompare)
+    .some((root) => root && candidate !== root && candidate.startsWith(`${root}/`));
 }
 function normalizeUnicodeForm(value) {
   let str = String(value || '');
@@ -517,8 +528,6 @@ function sleepWithSignal(ms, signal) {
 }
 
 const VIEW_TYPE_SLICER = 'engineering-knowledge-slicer-dashboard';
-const PROCESSING_STATUSES = new Set(['parsing', 'classifying', 'summarizing', 'atomizing', 'validating', 'writing']);
-
 module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, migrateSettings(await this.loadData()));
@@ -769,6 +778,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async ensureFolders() {
+    const pathErrors = validateConfiguredPathSet(this.settings);
+    if (pathErrors.length) {
+      const error = new Error(`受管目录设置无效（${pathErrors.map((item) => item.key).join('、')}），请在插件设置中修正空路径、根目录或重叠目录。`);
+      error.code = 'SETTINGS_PATH_INVALID';
+      throw error;
+    }
     for (const path of [
       this.settings.bidIntakePath,
       this.settings.businessIntakePath,
@@ -975,25 +990,52 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
   async rollbackLastBatch() {
     const tasks = await this.loadTasks();
-    const written = tasks.filter((t) => t.status === 'written' && t.writtenFiles && t.writtenFiles.length);
-    if (!written.length) {
+    const candidates = tasks.filter((t) => ['written', 'archived', 'rolled_back'].includes(t.status)
+      && ((t.writtenFiles && t.writtenFiles.length) || (t.written_card_ids && t.written_card_ids.length)));
+    if (!candidates.length) {
       new Notice('没有可回滚的已入库卡片批次。');
       return;
     }
-    const lastBatch = written[written.length - 1];
+    const lastBatch = candidates[candidates.length - 1];
+    if (lastBatch.status === 'rolled_back') {
+      new Notice('最近批次已经回滚；未改动任何文件。');
+      return;
+    }
+    const journal = await this.loadRollbackJournal();
+    let entries = journal.filter((row) => row && row.task_id === lastBatch.task_id && row.written_path);
+    if (!entries.length) {
+      const legacyPaths = new Set((lastBatch.writtenFiles || []).map(normalizeVaultPath).filter(Boolean));
+      if (legacyPaths.size) entries = [...legacyPaths].map((written_path) => ({ written_path, previous_content: null, legacy: true }));
+      else if ((lastBatch.written_card_ids || []).length) {
+        const legacyIds = new Set(lastBatch.written_card_ids);
+        entries = (await this.loadExistingCards(''))
+          .filter((card) => legacyIds.has(card.card_id))
+          .filter((card) => !lastBatch.source_hash || readFrontmatterValue(card.text, 'source_hash') === lastBatch.source_hash)
+          .map((card) => ({ written_path: card.path, previous_content: null, legacy_card_id: card.card_id }));
+      }
+    }
+    let restored = 0;
     let deleted = 0;
-    for (const filePath of lastBatch.writtenFiles) {
+    for (const entry of entries.slice().reverse()) {
+      const filePath = normalizeVaultPath(entry.written_path);
+      if (!isSafeCardOutputPath(this.settings, filePath)) continue;
       const file = this.app.vault.getAbstractFileByPath(filePath);
-      if (file instanceof TFile) {
+      if (entry.previous_content !== null && entry.previous_content !== undefined) {
+        if (file instanceof TFile && await this.app.vault.read(file) === entry.previous_content) continue;
+        await writeFile(this.app, filePath, String(entry.previous_content));
+        restored += 1;
+      } else if (file instanceof TFile) {
         await this.app.vault.trash(file);
-        deleted++;
+        deleted += 1;
       }
     }
     lastBatch.status = 'rolled_back';
     lastBatch.updated_at = new Date().toISOString();
     await this.saveTasks(upsertTask(tasks, lastBatch));
-    this.sessionStats.lastMessage = `已回滚 ${deleted} 张卡片`;
-    new Notice(`已回滚最近一批 ${deleted} 张知识卡片。`);
+    await this.flushSaveTasksImmediate();
+    await this.rebuildKnowledgeIndexes();
+    this.sessionStats.lastMessage = `已回滚：恢复 ${restored}，删除新建 ${deleted}`;
+    new Notice(`已回滚最近批次：恢复 ${restored} 个覆盖文件，删除 ${deleted} 个新建文件。`);
     await this.refreshViews();
   }
 
@@ -1158,6 +1200,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         stage: 'component-contracts', elapsedMs: Date.now() - startedAt
       });
       const contracts = await this.loadRuntimeContracts();
+      current.component_contract_hash = contracts.contractHash;
       const tagLibraryText = await this.loadTagLibraryText();
       const tagLibrary = parseTagLibrary(tagLibraryText);
       // Atom regeneration must see cards already written for this source. Otherwise a
@@ -1528,7 +1571,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       if (shadow) cache.checkpointHits = (cache.checkpointHits || 0) + 1;
       return shadow;
     };
-    const saveCheckpoint = (name, value) => this.persistArtifact(shadowTask, `shadow-${name}`, value);
+    const saveCheckpoint = (name, value) => this.persistShadowArtifact(shadowTask, `shadow-${name}`, value);
     const counterBaseline = Object.assign({}, this.operationCounters);
     try {
       parsePackage = await this.loadArtifact(task, 'parsed');
@@ -1897,7 +1940,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           draftFiles.push(draftPath);
         } else {
           const approved = approveMarkdownStatus(markdown, approvedStatus(library));
-          const outputPath = await writeUnique(this.app, cardOutputPath(this.settings, card, safeCardFileName(card.Title, current.sourceHash)), approved);
+          const folderMap = normalizeFolderMapConfig(await this.loadComponentJson('folder-map.json'));
+          const outputPath = await writeUnique(this.app, cardOutputPath(this.settings, folderMap, card, safeCardFileName(card.Title, current.sourceHash)), approved);
+          await this.appendRollback({
+            task_id: current.task_id, card_id: String(card.card_id || ''),
+            written_path: outputPath, previous_content: null, written_at: new Date().toISOString()
+          });
           writtenFiles.push(outputPath);
           await this.ensureMocForDraft(approved);
         }
@@ -1992,6 +2040,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
     };
     validateRuntimeContracts(contracts);
+    contracts.contractHash = require('crypto').createHash('sha256').update(JSON.stringify({
+      folderMap: contracts.folderMap, schemas: contracts.schemas, prompts: contracts.prompts
+    })).digest('hex');
     return contracts;
   }
 
@@ -2004,7 +2055,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const parsed = JSON.parse(await this.app.vault.read(file));
       // v2.10: 旧产物仍按原格式读取；新产物带输入指纹，只有来源与运行时契约
       // 完全一致才复用，避免 prompt/schema/pipeline 升级后误用旧 AI 结果。
-      if (!parsed || ![2, 3].includes(parsed.artifactVersion) || !Object.hasOwn(parsed, 'payload')) return parsed;
+      if (!parsed || ![2, 3].includes(parsed.artifactVersion) || !Object.hasOwn(parsed, 'payload')) {
+        const legacy = normalizeLegacyArtifact(name, parsed);
+        if (!legacy) diag('artifact.cacheMiss', { taskId: task.task_id, stage: name, reason: 'legacy_unverifiable' });
+        return legacy;
+      }
+      if ((parsed.stage && parsed.stage !== name) || (parsed.validationState && parsed.validationState !== 'valid')) return null;
       if (parsed.inputFingerprint !== this.artifactInputFingerprint(task, name)) {
         diag('artifact.cacheMiss', { taskId: task.task_id, stage: name, reason: 'fingerprint_changed' });
         return null;
@@ -2039,8 +2095,22 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     return path;
   }
 
+  async persistShadowArtifact(task, name, value) {
+    const stableRun = `shadow-${String(task.source_hash || task.task_id || 'unknown').slice(0, 24)}`;
+    const path = normalizeVaultPath(`${this.settings.artifactsPath}/_shadow/${stableRun}/${name}.json`);
+    const envelope = {
+      artifactVersion: 3, stage: name,
+      inputFingerprint: this.artifactInputFingerprint(task, name.replace(/^shadow-/, '')),
+      completedAt: new Date().toISOString(), validationState: 'valid', payload: value
+    };
+    await writeFile(this.app, path, JSON.stringify(envelope, null, 2));
+    task.artifacts = Object.assign({}, task.artifacts || {}, { [name]: path });
+    return path;
+  }
+
   artifactInputFingerprint(task, name) {
     const crypto = require('crypto');
+    const fingerprintName = String(name || '').replace(/^shadow-/, '');
     const versions = runtimeVersions(this.settings);
     const parsedScope = {
       fingerprintVersion: 'parsed-input-v1',
@@ -2066,13 +2136,26 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         qualityThreshold: this.settings.localOcrQualityThreshold
       }
     };
-    const isPageOcrCheckpoint = String(name).startsWith('ocr-page-');
-    const versionScope = name === 'parsed' ? parsedScope : isPageOcrCheckpoint ? { checkpointContract: 'local-ocr-v1' } : versions;
+    const isPageOcrCheckpoint = fingerprintName.startsWith('ocr-page-');
+    const workflowSettings = {
+      minimaxModel: this.settings.minimaxModel,
+      targetLanguage: this.settings.targetLanguage,
+      aiChunkSize: this.settings.aiChunkSize,
+      aiMaxChunks: this.settings.aiMaxChunks,
+      maxPointsPerRequest: this.settings.maxPointsPerRequest,
+      shortDocumentMaxCards: this.settings.shortDocumentMaxCards,
+      chunkOverlapRatio: this.settings.chunkOverlapRatio,
+      coalesceTinyChunks: this.settings.coalesceTinyChunks,
+      maxExcerptLength: this.settings.maxExcerptLength
+    };
+    const versionScope = fingerprintName === 'parsed' ? parsedScope : isPageOcrCheckpoint
+      ? { checkpointContract: 'local-ocr-v1' }
+      : Object.assign({}, versions, workflowSettings, { componentContractHash: task.component_contract_hash || '' });
     return crypto.createHash('sha256').update(JSON.stringify({
       sourceHash: task.source_hash || '',
-      stage: name,
+      stage: fingerprintName,
       versions: versionScope,
-      parsedInputFingerprint: name === 'parsed' || isPageOcrCheckpoint ? '' :
+      parsedInputFingerprint: fingerprintName === 'parsed' || isPageOcrCheckpoint ? '' :
         crypto.createHash('sha256').update(JSON.stringify({ sourceHash: task.source_hash || '', parsedScope })).digest('hex')
     })).digest('hex');
   }
@@ -2288,7 +2371,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         unresolved.push(item);
         continue;
       }
-      const route = resolveFixedRoute(folderMap, item.atom);
+      const route = resolveOutputRoute(this.settings, folderMap, item.atom);
       const card = Object.assign({}, item.proposed_card, {
         Category: item.atom.Category,
         TagL1: item.atom.TagL1,
@@ -2333,7 +2416,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const folderMap = (await this.loadRuntimeContracts()).folderMap;
       const existingIds = new Set((await this.loadExistingCards('')).map((card) => card.card_id));
       for (const item of chosen) {
-        const route = resolveFixedRoute(folderMap, item.atom);
+        const route = resolveOutputRoute(this.settings, folderMap, item.atom);
         const card = Object.assign({}, item.proposed_card, {
           Category: item.atom?.Category,
           TagL1: item.atom?.TagL1,
@@ -2500,7 +2583,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       TagL1: readFrontmatterValue(approved, 'TagL1'),
       TagL2: readFrontmatterValue(approved, 'TagL2')
     };
-    const outputPath = await writeUnique(this.app, cardOutputPath(this.settings, routeCard, safeCardFileName(title, Date.now().toString(16))), approved);
+    const folderMap = normalizeFolderMapConfig(await this.loadComponentJson('folder-map.json'));
+    const outputPath = await writeUnique(this.app, cardOutputPath(this.settings, folderMap, routeCard, safeCardFileName(title, Date.now().toString(16))), approved);
+    await this.appendRollback({
+      task_id: taskId, card_id: String(routeCard.card_id || ''),
+      written_path: outputPath, previous_content: null, written_at: new Date().toISOString()
+    });
 
     const tasks = await this.loadTasks();
     const task = tasks.find((item) => item.task_id === taskId);
@@ -2817,6 +2905,18 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     }
     rows.push(entry);
     await writeFile(this.app, path, JSON.stringify(rows, null, 2));
+  }
+
+  async loadRollbackJournal() {
+    const path = rollbackPath(this.settings);
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return [];
+    try {
+      const rows = JSON.parse(await this.app.vault.read(file));
+      return Array.isArray(rows) ? rows : [];
+    } catch {
+      return [];
+    }
   }
 
   async showHistoryForFile(file) {
@@ -3297,7 +3397,11 @@ class SlicerDashboardView extends ItemView {
       this.taskSearchTimer = setTimeout(() => this.render(), 150);
     });
     const filter = controls.createEl('select', { attr: { 'aria-label': '按状态筛选任务' } });
-    for (const [value, label] of [['all', '全部状态'], ['queued', '待处理队列'], ['processing', '处理中'], ['needs_review', '待审核'], ['failed', '失败'], ['written', '已完成']]) {
+    for (const [value, label] of [
+      ['all', '全部状态'], ['queued', '待处理队列'], ['processing', '处理中'],
+      ['needs_review', '待审核'], ['needs_ocr', '需要 OCR'], ['unsupported_media', '暂不支持媒体'],
+      ['failed', '失败'], ['written', '已完成'], ['rolled_back', '已回滚']
+    ]) {
       const option = filter.createEl('option', { text: label, attr: { value } });
       option.selected = this.taskFilter === value;
     }
@@ -3349,7 +3453,7 @@ class SlicerDashboardView extends ItemView {
         });
       });
       const actions = details.createDiv('eks-row-actions');
-      if (task.status === 'failed') button(actions, '重试', () => this.plugin.retryTask(task.task_id));
+      if (['failed', 'needs_ocr'].includes(task.status)) button(actions, '重试', () => this.plugin.retryTask(task.task_id));
       if (PROCESSING_STATUSES.has(task.status)) button(actions, '取消', () => this.plugin.cancelCurrentTask(task.task_id));
       button(actions, '打开源文件', () => this.plugin.app.workspace.openLinkText(task.source_path, '', false));
     }
@@ -4213,14 +4317,55 @@ class SlicerSettingTab extends PluginSettingTab {
   }
 }
 
+function normalizeLegacyArtifact(stage, value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const name = String(stage || '').replace(/^shadow-/, '');
+  const keys = Object.keys(value);
+  const allowedOnly = (allowed) => keys.every((key) => allowed.includes(key));
+  if (name === 'parsed') {
+    return typeof value.markdown === 'string' && typeof value.parser === 'string'
+      && Array.isArray(value.blocks)
+      && value.blocks.every((block) => block && typeof block.text === 'string'
+        && typeof block.block_id === 'string' && typeof block.block_type === 'string') ? value : null;
+  }
+  if (name === 'classification') {
+    return ['bid', 'business'].includes(value.library) && typeof value.folder_type === 'string'
+      && value.folder_type.trim() && allowedOnly(['library', 'folder_type', 'confidence', 'reasoning', 'document_type']) ? value : null;
+  }
+  if (name === 'summary') {
+    return typeof value.title === 'string' && Array.isArray(value.sections)
+      && allowedOnly(['title', 'executive_summary', 'sections', 'key_points', 'entities', 'relations', 'source_outline']) ? value : null;
+  }
+  if (name === 'atoms') {
+    return Array.isArray(value.atoms) && value.atoms.every((atom) => atom && typeof (atom.title || atom.Title) === 'string')
+      && allowedOnly(['atoms', 'warnings', 'coverage', 'version']) ? value : null;
+  }
+  if (name === 'review') return Array.isArray(value.items) && allowedOnly(['version', 'task_id', 'outcome', 'items']) ? value : null;
+  if (name === 'error') {
+    return typeof (value.message || value.code) === 'string'
+      && allowedOnly(['stage', 'code', 'message', 'retryable', 'at', 'details']) ? value : null;
+  }
+  return null;
+}
+
 function pathSetting(containerEl, plugin, name, desc, key) {
-  new Setting(containerEl)
+  const setting = new Setting(containerEl)
     .setName(name)
-    .setDesc(desc)
+    .setDesc(`${desc} 必须是 vault 内非空目录；不允许根目录、.. 或危险重叠。`)
     .addText((text) => text
       .setValue(plugin.settings[key])
       .onChange(async (value) => {
-        plugin.settings[key] = normalizeVaultPath(value);
+        const candidate = Object.assign({}, plugin.settings, { [key]: String(value || '').trim().replace(/\\/g, '/') });
+        const error = validateConfiguredPathSet(candidate).find((item) => item.key === key);
+        if (error) {
+          text.inputEl?.classList?.add('eks-input-invalid');
+          text.inputEl?.setAttribute?.('aria-invalid', 'true');
+          setting.setDesc(`${desc} 当前值无效：${error.reason === 'overlap' ? '与另一受管目录重叠' : '路径为空、为根目录或含穿越段'}；未保存。`);
+          return;
+        }
+        text.inputEl?.classList?.remove('eks-input-invalid');
+        text.inputEl?.removeAttribute?.('aria-invalid');
+        plugin.settings[key] = normalizeConfiguredPath(candidate[key], plugin.settings[key]);
         await plugin.saveSettings();
       }));
 }
@@ -4449,10 +4594,11 @@ function formatDuration(milliseconds) {
 
 function stageLabel(stage) {
   const labels = {
-    start: '准备', queued: '排队', parsing: '文档解析', parsed: '解析完成', classifying: '类型判定', classification: '类型判定',
+    start: '准备', discovered: '已发现', queued: '排队', parsing: '文档解析', parsed: '解析完成', classifying: '类型判定', classified: '类型判定完成', classification: '类型判定',
     summarizing: '结构化总结', 'summary-map': '逐段总结', 'summary-reduce': '合并总结', atomizing: '知识原子化', atomization: '知识原子化',
-    validating: '可信度与契约校验', writing: '写入知识库', complete: '完成', failed: '失败', paused: '已暂停', cancelled: '已取消',
-    skipped: '已跳过', unsupported: '不支持'
+    summarized: '总结完成', validating: '可信度与契约校验', writing: '写入知识库', written: '已完成', archived: '已归档', complete: '完成', failed: '失败', paused: '已暂停', cancelled: '已取消',
+    extracting: '提取内容', slicing: '内容切片', skipped: '已跳过', unsupported: '不支持',
+    unsupported_media: '暂不支持的媒体', needs_ocr: '需要 OCR', rolled_back: '已回滚'
   };
   return labels[stage] || String(stage || '等待');
 }
@@ -5036,9 +5182,17 @@ module.exports = {
 "src/core/task.js": function(require, module, exports) {
 const crypto = require("crypto");
 const path = require("path");
+const TASK_STATUSES = new Set([
+  'discovered', 'queued', 'extracting', 'parsing', 'parsed', 'slicing',
+  'classifying', 'classified', 'summarizing', 'summarized', 'atomizing',
+  'validating', 'writing', 'written', 'paused', 'cancelled', 'failed',
+  'needs_review', 'needs_ocr', 'skipped', 'unsupported', 'unsupported_media',
+  'archived', 'rolled_back'
+]);
+const PROCESSING_STATUSES = new Set(['extracting', 'parsing', 'slicing', 'classifying', 'summarizing', 'atomizing', 'validating', 'writing']);
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 26,
+  settingsVersion: 27,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -5114,7 +5268,7 @@ const DEFAULT_SETTINGS = {
   // 空值表示跟随 Obsidian / 操作系统运行时本地时区；可配置 IANA 时区以稳定跨设备日期语义。
   businessTimeZone: '',
   maxExcerptLength: 500,
-  pipelineVersion: '1.2.1',
+  pipelineVersion: '1.3.0',
   promptBundleVersion: '1.1',
   schemaVersion: '1.1',
   // v1.3: 诊断日志默认写到 vault 之外（~/.eks/logs/diag.log），
@@ -5148,21 +5302,24 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 26;
+  migrated.settingsVersion = 27;
   // Runtime contract boundary changed in 2.14.1. Parsed artifacts use their own
   // parser fingerprint and remain reusable; only classification and later stages
   // receive the new pipeline fingerprint.
   migrated.pipelineVersion = DEFAULT_SETTINGS.pipelineVersion;
   migrated.aiProvider = 'minimax';
-  migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
-  migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
-  migrated.bidOutputPath = DEFAULT_SETTINGS.bidOutputPath;
-  migrated.businessOutputPath = DEFAULT_SETTINGS.businessOutputPath;
-  migrated.intakePath = DEFAULT_SETTINGS.intakePath;
-  migrated.outputPath = DEFAULT_SETTINGS.outputPath;
-  migrated.artifactsPath = DEFAULT_SETTINGS.artifactsPath;
-  migrated.draftPath = DEFAULT_SETTINGS.draftPath;
-  migrated.logPath = DEFAULT_SETTINGS.logPath;
+  const pathKeys = [
+    'bidIntakePath', 'businessIntakePath', 'bidOutputPath', 'businessOutputPath',
+    'intakePath', 'outputPath', 'artifactsPath', 'draftPath', 'logPath', 'componentPackPath'
+  ];
+  for (const key of pathKeys) {
+    migrated[key] = normalizeConfiguredPath(source[key], DEFAULT_SETTINGS[key]);
+  }
+  const pathErrors = validateConfiguredPathSet(migrated);
+  for (const error of pathErrors) {
+    if (error.reason === 'overlap') continue;
+    migrated[error.key] = DEFAULT_SETTINGS[error.key];
+  }
   migrated.pdfExtractionOrder = DEFAULT_SETTINGS.pdfExtractionOrder;
   // v2.12：保留所有合法旧偏好；只迁移非法/缺失值，并与运行时评分使用同一安全范围。
   const storedThreshold = Number(source.autoApproveConfidenceThreshold);
@@ -5272,7 +5429,39 @@ const SOURCE_TYPE_BY_EXT = {
 const PROCESSABLE_TYPES = new Set(['md', 'txt', 'pdf', 'docx', 'pptx', 'xlsx', 'email', 'outlook-msg', 'html', 'image']);
 
 function normalizeVaultPath(filePath) {
-  return String(filePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  return String(filePath || '').replace(/\\/g, '/').replace(/^[A-Za-z]:\/+/, '').replace(/^\/+/, '').replace(/\/+/g, '/').replace(/\/+$/, '');
+}
+
+function normalizeConfiguredPath(value, fallback = '') {
+  const raw = String(value == null ? '' : value).trim().replace(/\\/g, '/');
+  if (!raw || raw === '/' || /^[A-Za-z]:\//.test(raw)) return normalizeVaultPath(fallback);
+  const normalized = normalizeVaultPath(raw);
+  const parts = normalized.split('/');
+  if (!normalized || parts.some((part) => part === '..' || part === '.')) return normalizeVaultPath(fallback);
+  return normalized;
+}
+
+function validateConfiguredPathSet(settings) {
+  const keys = ['bidIntakePath', 'businessIntakePath', 'bidOutputPath', 'businessOutputPath', 'artifactsPath', 'draftPath', 'logPath', 'componentPackPath'];
+  const errors = [];
+  for (const key of keys) {
+    const raw = String(settings[key] == null ? '' : settings[key]).trim();
+    const normalized = normalizeVaultPath(raw);
+    if (!raw || !normalized || raw === '/' || /^[A-Za-z]:[\\/]/.test(raw) || normalized.split('/').some((p) => p === '..' || p === '.')) {
+      errors.push({ key, reason: 'invalid' });
+    }
+  }
+  for (let i = 0; i < keys.length; i += 1) {
+    for (let j = i + 1; j < keys.length; j += 1) {
+      const a = normalizeVaultPath(settings[keys[i]]);
+      const b = normalizeVaultPath(settings[keys[j]]);
+      if (a && b && (a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`))) {
+        const allowed = new Set(['artifactsPath:draftPath', 'artifactsPath:logPath']);
+        if (!allowed.has(`${keys[i]}:${keys[j]}`)) errors.push({ key: keys[j], otherKey: keys[i], reason: 'overlap' });
+      }
+    }
+  }
+  return errors;
 }
 
 // v1.1.2: 把 Buffer.from 的副作用收拢到一处。
@@ -5334,15 +5523,16 @@ function statusCounts(tasks) {
     needsReview: 0,
     failed: 0,
     written: 0,
-    skipped: 0
+    skipped: 0,
+    rolledBack: 0
   };
-  const processing = new Set(['parsing', 'classifying', 'summarizing', 'atomizing', 'validating', 'writing']);
   for (const task of tasks) {
     if (task.status === 'queued' || task.status === 'discovered') counts.pending += 1;
-    if (processing.has(task.status)) counts.processing += 1;
+    if (PROCESSING_STATUSES.has(task.status)) counts.processing += 1;
     if (task.status === 'needs_review') counts.needsReview += 1;
     if (task.status === 'failed') counts.failed += 1;
-    if (Array.isArray(task.written_card_ids) && task.written_card_ids.length) counts.written += task.written_card_ids.length;
+    if (task.status === 'rolled_back') counts.rolledBack += 1;
+    else if (Array.isArray(task.written_card_ids) && task.written_card_ids.length) counts.written += task.written_card_ids.length;
     else if (Array.isArray(task.writtenFiles) && task.writtenFiles.length) counts.written += task.writtenFiles.length;
     else if (task.status === 'written' || task.status === 'archived') counts.written += 1;
     if (task.status === 'skipped' || task.status === 'unsupported' || task.status === 'unsupported_media' || task.status === 'needs_ocr') counts.skipped += 1;
@@ -5365,10 +5555,14 @@ module.exports = {
   futureMediaStatus,
   isProcessableSource,
   migrateSettings,
+  normalizeConfiguredPath,
   normalizeVaultPath,
   rollbackPath,
   sourceHash,
   statusCounts,
+  TASK_STATUSES,
+  PROCESSING_STATUSES,
+  validateConfiguredPathSet,
   tasksPath
 };
 
@@ -8357,9 +8551,30 @@ function resolveFixedRoute(folderMap, value) {
 
 // v1.5 (M-02 + m-03): cardOutputFolder 折入 cardOutputPath 内部，避免外部多跳一层。
 //                     sanitizeFileName 同步处理 '..' 路径穿越（m-03）。
-function cardOutputPath(folderMap, card, fileName) {
-  const outputFolder = resolveFixedRoute(folderMap, card).output_folder.replace(/\/$/, '');
+function resolveOutputRoute(settings, folderMap, value) {
+  const route = resolveFixedRoute(folderMap, value);
+  const library = value.library || route.library;
+  const root = normalizeRoutePath(library === 'business' ? settings.businessOutputPath : settings.bidOutputPath);
+  const legacyRoot = library === 'business' ? '06-知识库/wiki/业务库' : '06-知识库/wiki/招投标';
+  let configured = normalizeRoutePath(route.output_folder);
+  if (!root || !configured) throw new Error('输出路径不能为空或指向 vault 根目录');
+  if (configured === legacyRoot) throw new Error('输出路由不能直接指向知识库根目录');
+  if (configured.startsWith(`${legacyRoot}/`)) configured = configured.slice(legacyRoot.length + 1);
+  else if (configured.startsWith(`${root}/`)) configured = configured.slice(root.length + 1);
+  const resolved = normalizeRoutePath(`${root}/${configured}`);
+  if (!resolved.startsWith(`${root}/`) || resolved === root || resolved.split('/').some((part) => part === '..' || part === '.')) {
+    throw new Error('输出路由越界或指向目录根');
+  }
+  return Object.assign({}, route, { output_folder: resolved });
+}
+
+function cardOutputPath(settings, folderMap, card, fileName) {
+  const outputFolder = resolveOutputRoute(settings, folderMap, card).output_folder;
   return `${outputFolder}/${sanitizeFileName(fileName)}`;
+}
+
+function normalizeRoutePath(value) {
+  return String(value || '').trim().replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/').replace(/\/+$/, '');
 }
 
 function sanitizeFileName(value) {
@@ -8369,7 +8584,7 @@ function sanitizeFileName(value) {
   return fileName.toLowerCase().endsWith('.md') ? fileName : `${fileName}.md`;
 }
 
-module.exports = { cardOutputPath, resolveFixedRoute, sanitizeFileName };
+module.exports = { cardOutputPath, resolveFixedRoute, resolveOutputRoute, sanitizeFileName };
 
 
 },
@@ -9092,6 +9307,13 @@ function normalizeFolderMapConfig(folderMap) {
       });
     }
     seen.add(routeKey);
+    const normalizedOutput = outputFolder.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/').replace(/\/+$/, '');
+    if (!normalizedOutput || normalizedOutput.split('/').some((part) => part === '.' || part === '..')) {
+      throw new ComponentError('COMPONENT_CONFIG_INVALID', `folder-map route ${index + 1} 输出路径无效。`, {
+        reason: 'unsafe_output_folder', routeIndex: index
+      });
+    }
+    next.output_folder = normalizedOutput;
     const candidates = [next.prompt, next.prompt_path, next.promptPath, next.template]
       .filter((candidate) => typeof candidate === 'string' && candidate.trim());
     if (candidates.length > 1 && new Set(candidates.map((item) => item.trim().replace(/\\/g, '/'))).size > 1) {
@@ -9232,7 +9454,7 @@ module.exports = {
 const crypto = require("crypto");
 
 const LEGACY_ACTIVE = new Set(['extracting', 'parsing', 'classifying', 'summarizing', 'slicing', 'atomizing', 'validating', 'writing']);
-const VALID_TERMINAL = new Set(['queued', 'written', 'needs_review', 'failed', 'skipped', 'cancelled', 'unsupported', 'paused']);
+const VALID_TERMINAL = new Set(['queued', 'written', 'needs_review', 'needs_ocr', 'failed', 'skipped', 'cancelled', 'unsupported', 'unsupported_media', 'paused', 'rolled_back']);
 
 // v1.1.3: bundle 内每个模块都是独立作用域，main.js 顶层定义进不来。
 // 这里保留一份与主定义完全一致的局部副本，专门给 migrateTaskLedgerV3 用。
@@ -9251,7 +9473,7 @@ function migrateTaskLedgerV3(tasks, versions = {}) {
   const pipelineVersion = versions.pipelineVersion || '1.1.1';
   const promptBundleVersion = versions.promptBundleVersion || '1.1';
   return (Array.isArray(tasks) ? tasks : []).map((task) => {
-    const canonical = task.schema_version === '1.1' && Boolean(task.task_id) && Boolean(task.run_id);
+    const canonical = ['1.1', '1.2'].includes(task.schema_version) && Boolean(task.task_id) && Boolean(task.run_id);
     // v1.1.2: 旧任务 source_path 可能在 macOS 上是 NFD 编码、Windows 上是 GBK，统一规范成 NFC，
     // 避免按路径查文件时因编码不一致出现"找不到源文件"。
     const sourcePath = normalizeUnicodeForm(String(task.source_path || task.sourcePath || '').replace(/\\/g, '/'));
@@ -9287,12 +9509,14 @@ function migrateTaskLedgerV3(tasks, versions = {}) {
       library,
       pipeline_version: pipelineVersion,
       prompt_bundle_version: promptBundleVersion,
-      schema_version: '1.1',
+      schema_version: versions.schemaVersion || '1.1',
       status,
       remote_jobs: Array.isArray(task.remote_jobs) ? task.remote_jobs : [],
       retry_counts: task.retry_counts || {},
       artifacts: task.artifacts || {},
-      written_card_ids: task.written_card_ids || task.writtenFiles || [],
+      written_card_ids: Array.isArray(task.written_card_ids) ? task.written_card_ids : [],
+      writtenFiles: Array.isArray(task.writtenFiles) ? task.writtenFiles.map((value) => String(value).replace(/\\/g, '/')) : [],
+      component_contract_hash: String(task.component_contract_hash || ''),
       review_atom_ids: task.review_atom_ids || task.draftFiles || [],
       errors,
       progress: task.progress || {},
@@ -12233,8 +12457,8 @@ module.exports = { buildCardRecord, cardFileName, renderKnowledgeCard, renderStr
 "src/core/diagnostic-report.js": function(require, module, exports) {
 const crypto = require("crypto");
 
-const REPORT_VERSION = '1.1';
-const SCHEMA_VERSION = 'eks-diagnostic-report/1.1';
+const REPORT_VERSION = '1.2';
+const SCHEMA_VERSION = 'eks-diagnostic-report/1.2';
 const MAX_JSON_BYTES = 64 * 1024;
 const MAX_MARKDOWN_BYTES = 72 * 1024;
 const SECRET_KEY = /^(?:sourcePath|artifactPath)$|(?:authorization|api[-_]?key|token|jwt|secret|password|cookie|prompt|source[_-]?(?:text|content|markdown)|body|response)/i;
@@ -13231,8 +13455,8 @@ module.exports = { explainIssue, pipelineProgress, queuePosition };
  * Pure rules for authoritative completion rendering and stale progress rejection.
  */
 "src/core/completion-ui.js": function(require, module, exports) {
-const PROCESSING = new Set(['parsing', 'classifying', 'summarizing', 'atomizing', 'validating', 'writing']);
-const TERMINAL = new Set(['written', 'needs_review', 'skipped', 'unsupported', 'cancelled']);
+const { PROCESSING_STATUSES: PROCESSING } = require("src/core/task.js");
+const TERMINAL = new Set(['written', 'needs_review', 'needs_ocr', 'skipped', 'unsupported', 'unsupported_media', 'cancelled', 'rolled_back']);
 
 function pendingReviewCount(tasks) {
   return (tasks || []).reduce((sum, task) => {

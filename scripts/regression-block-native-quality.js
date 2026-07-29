@@ -55,6 +55,6 @@ const main = require('fs').readFileSync(require('path').join(__dirname, '..', 'm
 assert(main.includes("extracted.status === 'review_required' && extracted.parsePackage"));
 assert(main.includes("kind: 'review_required'"));
 assert(main.includes("fingerprintVersion: 'parsed-input-v1'"));
-assert(main.includes("isPageOcrCheckpoint ? { checkpointContract: 'local-ocr-v1' }"));
-assert(main.includes("parsedInputFingerprint: name === 'parsed' || isPageOcrCheckpoint ? ''"));
+assert(main.includes("? { checkpointContract: 'local-ocr-v1' }"));
+assert(main.includes("parsedInputFingerprint: fingerprintName === 'parsed' || isPageOcrCheckpoint ? ''"));
 console.log('block-native quality closure regression passed');

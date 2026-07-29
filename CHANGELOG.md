@@ -1,5 +1,15 @@
 # 工程知识切片 变更记录
 
+## v2.15.0 — 2026-07-29 可靠性一致性修复
+
+- settingsVersion 27 保留全部合法自定义输入、输出、产物、审核、日志与组件路径；统一 Windows 分隔符，仅对缺失、空、根、盘符绝对和穿越路径补默认值。危险重叠不静默改址，处理前返回隐私安全的可操作错误。
+- folder-map 统一按配置的招投标/业务输出根解析；内置旧绝对默认路由自动去旧根后重挂，自定义相对路由兼容。正常写入、审核批准/重生成、MOC、索引和回滚共用边界，拒绝双前缀、根目标与逃逸。
+- rollback journal 成为回滚权威：恢复覆盖文件，只删除新建文件，重复执行为空操作，完成后重建索引；旧 `writtenFiles` 仅限配置输出根内安全解析，绝不广删。
+- 状态契约补齐 `extracting`、`slicing`、`needs_ocr`、`unsupported_media`、`archived`、`rolled_back`，同步 schema、迁移、计数、处理态与 UI；task schema 标识更新到 1.2。
+- 裸 JSON artifact 改为 parsed/classification/summary/atoms/review/error 分阶段白名单；不可验证数据按 cache miss 处理。v2/v3 envelope 继续选择性复用，避免重复昂贵 PDF/OCR checkpoint。
+- shadow checkpoint 独立写入 `_shadow`，不再调用正常任务账本持久化或改变终态。下游指纹加入组件内容 hash，组件变化不使 parsed 失效，输出根变化只影响写入路由。
+- 诊断报告更新到 1.2；版本更新为 2.15.0，pipeline 1.3.0。模型 Prompt、质量门槛、路由分类与格式集合不变。
+
 ## v2.14.1 — 2026-07-29 组件路径与解析续传生产修复
 
 - 修复旧版/缺字段 `folder-map.json` 在加载类型 Prompt 时把空相对路径归一化为组件根目录（如 `06-知识库`）并反复按文件读取的问题。组件加载现在先拒绝空值、根目录、尾随斜杠、绝对路径、穿越段和非 `.md`/`.json` 扩展名，Windows 分隔符与合法自定义组件根保持兼容。

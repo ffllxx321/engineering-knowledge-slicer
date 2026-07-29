@@ -2,6 +2,13 @@
 
 ## Unreleased — 系统可靠性、检查点与可观测性优化
 
+- 新增宽松、版本化 `block_v0` 合同与结构优先 token packing，保留稳定 locator/provenance 并暴露覆盖率和预算指标。
+- `.msg` 从 unsupported 改为本地 CFB/MAPI 解析；查询 token 脱敏，tracking/marketing/unsubscribe 保留溯源但禁止生成卡片。
+- PDF 增加本地 native/scanned/mixed/blank 页清单与 typed OCR gate；不改变 `pdfAllowExternalUpload`，扫描件无 OCR provider 时进入可操作审核状态。
+- 新增生产安全的 `local_ocr_v1` provider：自动优先探测 Tesseract，支持无 shell 插值的自定义绝对可执行文件，页级超时/取消/资源限制/有界并发/临时目录清理，以及按来源、provider 版本和设置指纹持久化的页级 checkpoint。
+- 修复三文件发布包中的本地 OCR 运行时依赖：`src/local-ocr.js` 仅作为构建源并确定性嵌入 `main.js` 内部模块；构建会拒绝相对运行时依赖，并在仅含 `main.js`、`manifest.json`、`styles.css` 的洁净目录验证插件入口可加载。
+- 扫描与混合页的本地 OCR 结果确定性合并到 `block_v0`/`parsePackage`；保留旋转、bbox、图像与 quote locator、置信度和语言。低置信或未验证印章、签名、视觉审批材料禁止自动制卡，印章图像不会推断为已批准。
+- 将视觉印章/签名可见性与审批结论分离，并为新适配器、限制和 packing 增加确定性合成回归。
 - 新增 `eks-diagnostic-report/1.0`：失败任务最佳努力持久化、Dashboard 一键复制的结构化 Markdown + JSON 诊断报告。报告覆盖运行时/安全设置、稳定任务与来源哈希、阶段与耗时、错误分类/可重试性、最后有效检查点、summary chunk/atom batch 缺口（含 27/104 等场景）、缓存与出站重试计数、紧邻故障的压缩时间线、终态持久化/UI 转场和 artifact 校验。
 - 报告深度脱敏并排除源正文、prompt、模型响应、密钥及完整路径；JSON/Markdown 分别具有 64/72 KiB 硬上限。重复 cache hit 合并为稳定 ID 范围/计数。报告生成、持久化和剪贴板失败均不影响任务状态。
 - 新增确定性 `regression-diagnostic-report`，覆盖结构版本、脱敏、硬大小边界、27/104 缺批诊断、事件压缩以及源路径/API Key 不泄漏。

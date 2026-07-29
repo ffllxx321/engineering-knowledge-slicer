@@ -28,6 +28,7 @@ const {
   tasksPath
 } = require("src/core/task.js");
 const { extractTextFromBuffer, sanitizeAttachmentFileName } = require("src/core/extractors.js");
+const { probeLocalOcr } = require("src/core/local-ocr.js");
 const { createFolderIndexMarkdown, folderIndexPath } = require("src/core/moc.js");
 const { parseTagLibrary, suggestMapIndex, validateCard } = require("src/core/tags.js");
 const { detectEcosystemPlugins } = require("src/core/ecosystem.js");
@@ -564,7 +565,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.taskControllers = new Map();
     this._terminalTaskIds = new Set();
     this.componentCache = new Map();
-    this.operationCounters = { apiRequests: 0, aiRetries: 0, summaryReduceRequests: 0, promptCharacters: 0, outputCharacters: 0, bytesRead: 0, bytesWritten: 0, ledgerWrites: 0, artifactWrites: 0, uiFullRenders: 0, uiIncrementalRefreshes: 0 };
+    this.operationCounters = { apiRequests: 0, aiRetries: 0, summaryReduceRequests: 0, promptCharacters: 0, outputCharacters: 0, bytesRead: 0, bytesWritten: 0, ledgerWrites: 0, artifactWrites: 0, uiFullRenders: 0, uiIncrementalRefreshes: 0, ocrPages: 0, ocrCacheHits: 0, ocrCacheMisses: 0, ocrLowConfidenceBlocks: 0 };
     this.sessionStats = { scanned: 0, processed: 0, written: 0, review: 0, failed: 0, skipped: 0, current: '', lastMessage: '等待开始处理' };
     this.registerView(VIEW_TYPE_SLICER, (leaf) => new SlicerDashboardView(leaf, this));
 
@@ -1026,11 +1027,59 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         if (!(file instanceof TFile)) throw new Error(`未找到源文件：${current.source_path}`);
         const buffer = Buffer.from(await this.app.vault.readBinary(file));
         const extracted = await extractTextFromBuffer(current.source_path, buffer, {
-          pdfExtractor: await this.getPdfExtractorConfig(current)
+          pdfExtractor: await this.getPdfExtractorConfig(current),
+          localMsgAdapter: this.settings.localMsgAdapterEnabled !== false,
+          localPdfInventory: this.settings.localPdfInventoryEnabled !== false,
+          blockPacking: this.settings.blockV0PackingEnabled === false ? false : { hardBudget: Math.max(128, Math.floor(Number(this.settings.aiChunkSize || 8000) / 4)) },
+          localOcr: {
+            enabled: this.settings.localOcrEnabled === true,
+            provider: this.settings.localOcrProvider,
+            executable: this.settings.localOcrExecutable,
+            languages: this.settings.localOcrLanguages,
+            concurrency: this.settings.localOcrConcurrency,
+            timeoutMs: this.settings.localOcrTimeoutMs,
+            qualityThreshold: this.settings.localOcrQualityThreshold
+          },
+          signal: taskController.signal,
+          loadOcrCheckpoint: (key) => this.loadArtifact(current, key),
+          saveOcrCheckpoint: (key, value) => this.persistArtifact(current, key, value)
         });
         if (taskController.signal.aborted) throw abortError();
+        if (extracted.status === 'ocr_required') {
+          current.status = 'needs_review';
+          current.errors = [...(current.errors || []), {
+            stage: 'parsing', code: extracted.actionable?.code || 'PDF_OCR_PROVIDER_REQUIRED',
+            message: extracted.message, retryable: true,
+            suggestedAction: '配置本地 OCR provider，或在确认文件合规后明确允许现有远程 PDF 解析。',
+            at: new Date().toISOString()
+          }];
+          await this.persistArtifact(current, 'pdf-inventory', {
+            status: 'ocr_required', blocks: extracted.blocks || [], pages: extracted.pageInventory || [],
+            actionable: extracted.actionable || {}
+          });
+          await this.saveTasks(upsertTask(await this.loadTasks(), current));
+          this.sessionStats.review += 1;
+          this.sessionStats.lastMessage = `扫描件需要 OCR：${current.source_path}`;
+          return;
+        }
         if (extracted.status !== 'ok' || !extracted.parsePackage) throw new Error(extracted.message || '文档解析 API 未返回可用 Markdown');
         parsePackage = extracted.parsePackage;
+        const localOcrMetrics = parsePackage.metadata?.local_ocr?.metrics;
+        if (localOcrMetrics) {
+          this.operationCounters.ocrPages += Number(localOcrMetrics.pages_completed) || 0;
+          this.operationCounters.ocrCacheHits += Number(localOcrMetrics.cache_hits) || 0;
+          this.operationCounters.ocrCacheMisses += Number(localOcrMetrics.cache_misses) || 0;
+          this.operationCounters.ocrLowConfidenceBlocks += Number(localOcrMetrics.low_confidence_blocks) || 0;
+          diag('localOcr.completed', {
+            taskId: current.task_id, provider: parsePackage.metadata.local_ocr.provider,
+            pages: Number(localOcrMetrics.pages_completed) || 0,
+            skippedNative: Number(localOcrMetrics.pages_skipped_native) || 0,
+            skippedBlank: Number(localOcrMetrics.pages_skipped_blank) || 0,
+            cacheHits: Number(localOcrMetrics.cache_hits) || 0,
+            cacheMisses: Number(localOcrMetrics.cache_misses) || 0,
+            lowConfidenceBlocks: Number(localOcrMetrics.low_confidence_blocks) || 0
+          });
+        }
         // v2.9.0: 邮件附件落盘 + 入队切片。只在首次解析执行；
         //   续传时 parsed artifact 已含 emailAttachments（保存路径），跳过本块。
         if (Array.isArray(extracted.attachments) && extracted.attachments.length) {
@@ -1597,7 +1646,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       schemas: {
         classification: await this.loadComponentJson('schemas/classification.schema.json'),
         summary: await this.loadComponentJson('schemas/structured-summary.schema.json'),
-        atoms: await this.loadComponentJson('schemas/knowledge-atoms.schema.json')
+        atoms: await this.loadComponentJson('schemas/knowledge-atoms.schema.json'),
+        blockV0: await this.loadComponentJson('schemas/block-v0.schema.json')
       },
       prompts: {
         classifier: await this.loadComponentText('提示词/00-类型判定.md'),
@@ -3387,6 +3437,84 @@ class SlicerSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
+    containerEl.createEl('h3', { text: '本地 OCR（扫描 PDF）' });
+
+    new Setting(containerEl)
+      .setName('启用本地 OCR')
+      .setDesc('默认关闭。开启后仅处理 PDF 中扫描或混合页；原生文本页和空白页会跳过，源文件不会上传。')
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.localOcrEnabled === true)
+        .onChange(async (value) => {
+          this.plugin.settings.localOcrEnabled = value === true;
+          await this.plugin.saveSafeSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('本地 OCR provider')
+      .setDesc('auto 优先使用已安装的 Tesseract；也可指定实现 JSON 合同的本地可执行程序。')
+      .addDropdown((dropdown) => dropdown
+        .addOption('auto', '自动探测')
+        .addOption('tesseract', 'Tesseract')
+        .addOption('executable', '自定义可执行程序')
+        .setValue(this.plugin.settings.localOcrProvider || 'auto')
+        .onChange(async (value) => {
+          this.plugin.settings.localOcrProvider = value;
+          await this.plugin.saveSafeSettings();
+        }));
+
+    textSetting(containerEl, this.plugin, '本地 OCR 可执行文件', '自定义 provider 的绝对可执行文件路径；不会通过 shell 执行，也不会写入诊断报告。', 'localOcrExecutable', '');
+    textSetting(containerEl, this.plugin, 'OCR 语言', 'Tesseract 语言组合，例如 chi_sim+eng。仅允许字母、数字、_、+、.、-。', 'localOcrLanguages', 'chi_sim+eng');
+
+    new Setting(containerEl)
+      .setName('OCR 并发页数')
+      .setDesc('同时渲染和识别的页数，范围 1–4，默认 2。')
+      .addDropdown((dropdown) => dropdown
+        .addOption('1', '1').addOption('2', '2（默认）').addOption('3', '3').addOption('4', '4')
+        .setValue(String(this.plugin.settings.localOcrConcurrency || 2))
+        .onChange(async (value) => {
+          this.plugin.settings.localOcrConcurrency = Number(value);
+          await this.plugin.saveSafeSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('单页 OCR 超时（秒）')
+      .setDesc('渲染或识别超过此时间会终止子进程，范围 1–600 秒。')
+      .addText((text) => text.setValue(String(Math.round((this.plugin.settings.localOcrTimeoutMs || 120000) / 1000)))
+        .onChange(async (value) => {
+          const seconds = Number(value);
+          if (Number.isFinite(seconds) && seconds >= 1 && seconds <= 600) {
+            this.plugin.settings.localOcrTimeoutMs = Math.round(seconds * 1000);
+            await this.plugin.saveSafeSettings();
+          }
+        }));
+
+    new Setting(containerEl)
+      .setName('OCR 质量门槛')
+      .setDesc('低于门槛的 OCR block 保留溯源但 card_eligible=false，范围 0–1。')
+      .addText((text) => text.setValue(String(this.plugin.settings.localOcrQualityThreshold ?? 0.72))
+        .onChange(async (value) => {
+          const threshold = Number(value);
+          if (Number.isFinite(threshold) && threshold >= 0 && threshold <= 1) {
+            this.plugin.settings.localOcrQualityThreshold = threshold;
+            await this.plugin.saveSafeSettings();
+          }
+        }))
+      .addButton((button) => button.setButtonText('检测本地 OCR').onClick(async () => {
+        const result = await probeLocalOcr({
+          enabled: this.plugin.settings.localOcrEnabled === true,
+          provider: this.plugin.settings.localOcrProvider,
+          executable: this.plugin.settings.localOcrExecutable,
+          languages: this.plugin.settings.localOcrLanguages,
+          timeoutMs: this.plugin.settings.localOcrTimeoutMs,
+          qualityThreshold: this.plugin.settings.localOcrQualityThreshold
+        });
+        diag('localOcr.probe', {
+          available: result.available, provider: result.provider,
+          version: result.available ? result.version : '', reason: result.reason || ''
+        });
+        new Notice(result.available ? `本地 OCR 可用：${result.provider} ${result.version}` : `本地 OCR 不可用：${result.reason || '未找到可执行程序'}`);
+      }));
+
     containerEl.createEl('h3', { text: '云端文档解析' });
 
     new Setting(containerEl)
@@ -4089,7 +4217,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 18,
+  settingsVersion: 20,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -4109,6 +4237,16 @@ const DEFAULT_SETTINGS = {
   minimaxEndpoint: 'https://api.minimaxi.com/anthropic/v1/messages',
   pdfExtractionOrder: 'mineru-api,paddleocr-api',
   pdfAllowExternalUpload: false,
+  localMsgAdapterEnabled: true,
+  localPdfInventoryEnabled: true,
+  blockV0PackingEnabled: true,
+  localOcrEnabled: false,
+  localOcrProvider: 'auto',
+  localOcrExecutable: '',
+  localOcrLanguages: 'chi_sim+eng',
+  localOcrConcurrency: 2,
+  localOcrTimeoutMs: 120000,
+  localOcrQualityThreshold: 0.72,
   pdfMineruApiKey: '',
   pdfMineruApiEndpoint: 'https://mineru.net/api/v4',
   pdfMineruApiModel: 'vlm',
@@ -4173,7 +4311,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 18;
+  migrated.settingsVersion = 20;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -4229,6 +4367,16 @@ function migrateSettings(stored = {}) {
     migrated.maxConcurrentDocuments = DEFAULT_SETTINGS.maxConcurrentDocuments;
   }
   if (migrated.pdfAllowExternalUpload === undefined) migrated.pdfAllowExternalUpload = false;
+  if (migrated.localMsgAdapterEnabled === undefined) migrated.localMsgAdapterEnabled = true;
+  if (migrated.localPdfInventoryEnabled === undefined) migrated.localPdfInventoryEnabled = true;
+  if (migrated.blockV0PackingEnabled === undefined) migrated.blockV0PackingEnabled = true;
+  migrated.localOcrEnabled = source.localOcrEnabled === true;
+  if (!['auto', 'tesseract', 'executable'].includes(migrated.localOcrProvider)) migrated.localOcrProvider = DEFAULT_SETTINGS.localOcrProvider;
+  migrated.localOcrExecutable = String(migrated.localOcrExecutable || '').trim();
+  migrated.localOcrLanguages = String(migrated.localOcrLanguages || DEFAULT_SETTINGS.localOcrLanguages).replace(/[^A-Za-z0-9_+.-]/g, '') || DEFAULT_SETTINGS.localOcrLanguages;
+  migrated.localOcrConcurrency = Math.max(1, Math.min(4, Math.round(Number(migrated.localOcrConcurrency) || DEFAULT_SETTINGS.localOcrConcurrency)));
+  migrated.localOcrTimeoutMs = Math.max(1000, Math.min(600000, Math.round(Number(migrated.localOcrTimeoutMs) || DEFAULT_SETTINGS.localOcrTimeoutMs)));
+  migrated.localOcrQualityThreshold = Math.max(0, Math.min(1, Number.isFinite(Number(migrated.localOcrQualityThreshold)) ? Number(migrated.localOcrQualityThreshold) : DEFAULT_SETTINGS.localOcrQualityThreshold));
   if (!Number(migrated.rateLimitMs)) migrated.rateLimitMs = DEFAULT_SETTINGS.rateLimitMs;
   if (!Number(migrated.rateLimitMaxConcurrent)) migrated.rateLimitMaxConcurrent = DEFAULT_SETTINGS.rateLimitMaxConcurrent;
   if (migrated.useEnvKeys === undefined) migrated.useEnvKeys = DEFAULT_SETTINGS.useEnvKeys;
@@ -4271,7 +4419,7 @@ const SOURCE_TYPE_BY_EXT = {
   '.m4a': 'audio'
 };
 
-const PROCESSABLE_TYPES = new Set(['md', 'txt', 'pdf', 'docx', 'pptx', 'xlsx', 'email', 'html', 'image']);
+const PROCESSABLE_TYPES = new Set(['md', 'txt', 'pdf', 'docx', 'pptx', 'xlsx', 'email', 'outlook-msg', 'html', 'image']);
 
 function normalizeVaultPath(filePath) {
   return String(filePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
@@ -4324,7 +4472,7 @@ function buildTaskFromFile(sourcePath, buffer, now = new Date()) {
 function futureMediaStatus(filePath) {
   const sourceType = detectSourceType(filePath);
   if (sourceType === 'video' || sourceType === 'audio') return 'unsupported_media';
-  if (sourceType === 'outlook-msg') return 'unsupported_media';
+  if (sourceType === 'outlook-msg') return 'queued';
   return 'skipped';
 }
 
@@ -4513,6 +4661,802 @@ module.exports = {
 
 },
 /**
+ * @module src/core/local-ocr.js
+ */
+"src/core/local-ocr.js": function(require, module, exports) {
+'use strict';
+
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const CONTRACT_VERSION = 'local_ocr_v1';
+const DEFAULT_LIMITS = Object.freeze({
+  maxPages: 500,
+  maxPageBytes: 24 * 1024 * 1024,
+  maxAggregateBytes: 256 * 1024 * 1024,
+  maxPixelsPerPage: 40 * 1000 * 1000,
+  maxAggregatePixels: 400 * 1000 * 1000,
+  maxTextCharsPerPage: 250000,
+  maxAggregateTextChars: 2 * 1000 * 1000
+});
+
+class LocalOcrError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'LocalOcrError';
+    this.code = code;
+    this.category = 'local_ocr';
+    this.retryable = ['OCR_UNAVAILABLE', 'OCR_RENDER_FAILURE', 'OCR_TIMEOUT'].includes(code);
+    this.page = Number(details.page) || undefined;
+    this.metrics = details.metrics || undefined;
+    if (details.cause) this.cause = details.cause;
+  }
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function normalizeSettings(input = {}) {
+  const limits = Object.assign({}, DEFAULT_LIMITS, input.limits || {});
+  return {
+    enabled: input.enabled === true,
+    provider: ['auto', 'tesseract', 'executable'].includes(input.provider) ? input.provider : 'auto',
+    executable: String(input.executable || '').trim(),
+    languages: String(input.languages || 'chi_sim+eng').trim().replace(/[^A-Za-z0-9_+.-]/g, ''),
+    concurrency: clampInt(input.concurrency, 1, 4, 2),
+    timeoutMs: clampInt(input.timeoutMs, 1000, 600000, 120000),
+    qualityThreshold: clampNumber(input.qualityThreshold, 0, 1, 0.72),
+    dpi: clampInt(input.dpi, 72, 400, 200),
+    limits: {
+      maxPages: clampInt(limits.maxPages, 1, 5000, DEFAULT_LIMITS.maxPages),
+      maxPageBytes: clampInt(limits.maxPageBytes, 1024, 256 * 1024 * 1024, DEFAULT_LIMITS.maxPageBytes),
+      maxAggregateBytes: clampInt(limits.maxAggregateBytes, 1024, 1024 * 1024 * 1024, DEFAULT_LIMITS.maxAggregateBytes),
+      maxPixelsPerPage: clampInt(limits.maxPixelsPerPage, 10000, 200 * 1000 * 1000, DEFAULT_LIMITS.maxPixelsPerPage),
+      maxAggregatePixels: clampInt(limits.maxAggregatePixels, 10000, 1000 * 1000 * 1000, DEFAULT_LIMITS.maxAggregatePixels),
+      maxTextCharsPerPage: clampInt(limits.maxTextCharsPerPage, 1, 2 * 1000 * 1000, DEFAULT_LIMITS.maxTextCharsPerPage),
+      maxAggregateTextChars: clampInt(limits.maxAggregateTextChars, 1, 10 * 1000 * 1000, DEFAULT_LIMITS.maxAggregateTextChars)
+    }
+  };
+}
+
+function settingsFingerprint(settings) {
+  const safe = normalizeSettings(settings);
+  return sha256(stableJson({
+    contract: CONTRACT_VERSION,
+    provider: safe.provider,
+    executable: safe.executable ? path.basename(safe.executable) : '',
+    languages: safe.languages,
+    qualityThreshold: safe.qualityThreshold,
+    dpi: safe.dpi,
+    limits: safe.limits
+  }));
+}
+
+async function probeLocalOcr(settings = {}, dependencies = {}) {
+  const config = normalizeSettings(settings);
+  if (!config.enabled) return unavailable('disabled', config);
+  const candidates = config.provider === 'auto' ? ['tesseract', 'executable'] : [config.provider];
+  for (const provider of candidates) {
+    if (provider === 'tesseract') {
+      const executable = await resolveExecutable(dependencies.tesseractExecutable || 'tesseract', dependencies);
+      if (executable) {
+        const version = await probeVersion(executable, ['--version'], config.timeoutMs, dependencies);
+        if (version.available) return available('tesseract', executable, version.version, config);
+      }
+    }
+    if (provider === 'executable' && config.executable) {
+      if (!path.isAbsolute(config.executable)) continue;
+      const executable = await resolveExecutable(config.executable, dependencies);
+      if (executable) {
+        const version = await probeVersion(executable, ['--version'], config.timeoutMs, dependencies);
+        if (version.available) return available('executable', executable, version.version, config);
+      }
+    }
+  }
+  return unavailable(config.executable ? 'probe_failed' : 'not_configured', config);
+}
+
+async function runLocalPdfOcr(input = {}, dependencies = {}) {
+  const config = normalizeSettings(input.settings);
+  const metrics = {
+    pages_total: 0, pages_requested: 0, pages_completed: 0, pages_skipped_native: 0,
+    pages_skipped_blank: 0, cache_hits: 0, cache_misses: 0, bytes_rendered: 0,
+    pixels_rendered: 0, text_characters: 0, low_confidence_pages: 0, low_confidence_blocks: 0
+  };
+  checkAbort(input.signal, metrics);
+  const probe = input.probe || await probeLocalOcr(config, dependencies);
+  if (!probe.available) throw new LocalOcrError('OCR_UNAVAILABLE', '本地 OCR 未启用、未配置或不可用。', { metrics });
+  const pages = [...(input.pages || [])].sort((a, b) => Number(a.page) - Number(b.page));
+  metrics.pages_total = pages.length;
+  if (pages.length > config.limits.maxPages) throw limitError('PDF 页数超过本地 OCR 限制。', metrics);
+  const targets = [];
+  for (const page of pages) {
+    if (page.classification === 'native') metrics.pages_skipped_native += 1;
+    else if (page.classification === 'blank') metrics.pages_skipped_blank += 1;
+    else if (page.classification === 'scanned' || page.classification === 'mixed') targets.push(page);
+  }
+  metrics.pages_requested = targets.length;
+  const providerVersion = String(probe.version || 'unknown').slice(0, 200);
+  const fingerprint = settingsFingerprint(config);
+  const sourceHash = String(input.sourceHash || '');
+  const results = new Array(targets.length);
+  let next = 0;
+  let stopped = false;
+  const tempRoot = await fs.promises.mkdtemp(path.join(dependencies.tempRoot || os.tmpdir(), 'eks-local-ocr-'));
+  try {
+    async function worker() {
+      while (!stopped) {
+        checkAbort(input.signal, metrics);
+        const index = next++;
+        if (index >= targets.length) return;
+        const page = targets[index];
+        const cacheKey = checkpointKey(sourceHash, page.page, probe.provider, providerVersion, fingerprint);
+        let cached = null;
+        if (typeof input.loadCheckpoint === 'function') {
+          try { cached = await input.loadCheckpoint(cacheKey, page.page); } catch (_) { cached = null; }
+        }
+        if (validCheckpoint(cached, { cacheKey, sourceHash, page: page.page, providerVersion, fingerprint, limits: config.limits })) {
+          metrics.cache_hits += 1;
+          results[index] = cached.result;
+          addResultMetrics(metrics, cached.result);
+          continue;
+        }
+        metrics.cache_misses += 1;
+        const pageResult = await processPage({
+          pdfBuffer: input.pdfBuffer, page, probe, config, tempRoot, signal: input.signal, metrics
+        }, dependencies);
+        results[index] = pageResult;
+        addResultMetrics(metrics, pageResult);
+        if (typeof input.saveCheckpoint === 'function') {
+          await input.saveCheckpoint(cacheKey, {
+            contract: CONTRACT_VERSION, cacheKey, sourceHash, page: page.page,
+            provider: probe.provider, providerVersion, settingsFingerprint: fingerprint,
+            result: pageResult
+          }, page.page);
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(config.concurrency, Math.max(1, targets.length)) }, worker));
+  } catch (error) {
+    stopped = true;
+    if (error instanceof LocalOcrError) throw error;
+    throw new LocalOcrError('OCR_MALFORMED_OUTPUT', '本地 OCR 返回无法处理的结果。', { cause: error, metrics });
+  } finally {
+    await fs.promises.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+  }
+  checkAbort(input.signal, metrics);
+  return {
+    status: 'ok', contract: CONTRACT_VERSION, provider: probe.provider,
+    providerVersion, settingsFingerprint: fingerprint, pages: results, metrics
+  };
+}
+
+async function processPage(context, dependencies) {
+  const { page, config, tempRoot, signal, metrics } = context;
+  checkAbort(signal, metrics);
+  const rendered = typeof dependencies.renderPage === 'function'
+    ? await dependencies.renderPage(context)
+    : await renderPdfPage(context, dependencies);
+  checkAbort(signal, metrics);
+  validateRendered(rendered, config.limits, metrics, page.page);
+  metrics.bytes_rendered += rendered.bytes;
+  metrics.pixels_rendered += rendered.width * rendered.height;
+  if (metrics.bytes_rendered > config.limits.maxAggregateBytes || metrics.pixels_rendered > config.limits.maxAggregatePixels) {
+    throw limitError('本地 OCR 累计渲染限制已超出。', metrics, page.page);
+  }
+  let raw;
+  if (typeof dependencies.recognizePage === 'function') raw = await dependencies.recognizePage(Object.assign({}, context, { rendered }));
+  else raw = await recognizePage(Object.assign({}, context, { rendered }), dependencies);
+  checkAbort(signal, metrics);
+  const normalized = normalizeOcrResult(raw, page, config);
+  if (normalized.text.length > config.limits.maxTextCharsPerPage) throw limitError('单页 OCR 文本超过限制。', metrics, page.page);
+  if (metrics.text_characters + normalized.text.length > config.limits.maxAggregateTextChars) throw limitError('OCR 累计文本超过限制。', metrics, page.page);
+  return normalized;
+}
+
+async function renderPdfPage(context, dependencies) {
+  const { pdfBuffer, page, config, tempRoot, signal, metrics } = context;
+  if (!Buffer.isBuffer(pdfBuffer)) throw new LocalOcrError('OCR_RENDER_FAILURE', '缺少 PDF 二进制输入。', { page: page.page, metrics });
+  const pdfPath = path.join(tempRoot, 'source.pdf');
+  try { await fs.promises.access(pdfPath); } catch { await fs.promises.writeFile(pdfPath, pdfBuffer, { mode: 0o600 }); }
+  const renderer = await resolveExecutable(dependencies.rendererExecutable || 'pdftoppm', dependencies);
+  if (!renderer) throw new LocalOcrError('OCR_RENDER_FAILURE', '未找到本地 PDF 渲染器 pdftoppm。', { page: page.page, metrics });
+  const prefix = path.join(tempRoot, `page-${page.page}`);
+  await spawnCaptured(renderer, ['-f', String(page.page), '-l', String(page.page), '-singlefile', '-r', String(config.dpi), '-png', pdfPath, prefix], {
+    signal, timeoutMs: config.timeoutMs, maxOutputBytes: 64 * 1024, dependencies
+  }, 'OCR_RENDER_FAILURE', page.page, metrics);
+  const imagePath = `${prefix}.png`;
+  const stat = await fs.promises.stat(imagePath).catch(() => null);
+  if (!stat || !stat.isFile()) throw new LocalOcrError('OCR_RENDER_FAILURE', 'PDF 渲染器未生成页面图像。', { page: page.page, metrics });
+  const dimensions = readPngDimensions(await fs.promises.readFile(imagePath, { encoding: null, flag: 'r' }));
+  return { path: imagePath, bytes: stat.size, width: dimensions.width, height: dimensions.height };
+}
+
+async function recognizePage(context, dependencies) {
+  const { probe, rendered, page, config, signal, metrics } = context;
+  if (probe.provider === 'tesseract') {
+    const output = await spawnCaptured(probe.executable, [rendered.path, 'stdout', '-l', config.languages, 'tsv'], {
+      signal, timeoutMs: config.timeoutMs, maxOutputBytes: config.limits.maxTextCharsPerPage * 8, dependencies
+    }, 'OCR_TIMEOUT', page.page, metrics);
+    return parseTesseractTsv(output.stdout, config.languages);
+  }
+  const output = await spawnCaptured(probe.executable, [
+    '--input', rendered.path, '--page', String(page.page), '--languages', config.languages, '--format', 'json'
+  ], {
+    signal, timeoutMs: config.timeoutMs, maxOutputBytes: config.limits.maxTextCharsPerPage * 8, dependencies
+  }, 'OCR_TIMEOUT', page.page, metrics);
+  try { return JSON.parse(output.stdout); } catch (cause) {
+    throw new LocalOcrError('OCR_MALFORMED_OUTPUT', '本地 OCR 可执行程序未返回有效 JSON。', { page: page.page, cause, metrics });
+  }
+}
+
+function normalizeOcrResult(raw, page, config) {
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.blocks)) {
+    throw new LocalOcrError('OCR_MALFORMED_OUTPUT', '本地 OCR 结果缺少 blocks 数组。', { page: page.page });
+  }
+  const blocks = raw.blocks.map((block, index) => {
+    const text = String(block.text || '').trim();
+    const confidence = clampNumber(block.confidence, 0, 1, 0);
+    const bbox = validBbox(block.bbox) ? block.bbox.map(Number) : null;
+    const visualType = normalizeVisualType(block.visual_type || block.kind);
+    const eligible = !!text && confidence >= config.qualityThreshold && !visualType;
+    return {
+      text, confidence, bbox, language: String(block.language || raw.language || config.languages || 'unknown').slice(0, 64),
+      locator: {
+        scheme: 'pdf-quote', value: `page:${page.page}:ocr:${index + 1}`,
+        page: Number(page.page), bbox, rotation: normalizeRotation(page.rotation),
+        image_locator: page.image_locators?.[0] || null,
+        quote_hash: sha256(text)
+      },
+      raw_fields: block.raw_fields && typeof block.raw_fields === 'object' ? block.raw_fields : {},
+      inferred: block.inferred && typeof block.inferred === 'object' ? block.inferred : {},
+      visual_type: visualType,
+      card_eligible: eligible,
+      exclusion_reason: visualType ? `unverified_${visualType}` : (!text ? 'empty_ocr' : (confidence < config.qualityThreshold ? 'low_confidence_ocr' : null))
+    };
+  });
+  const text = blocks.filter((block) => block.text).map((block) => block.text).join('\n');
+  const confidence = blocks.length ? blocks.reduce((sum, block) => sum + block.confidence, 0) / blocks.length : 0;
+  return {
+    page: Number(page.page), classification: page.classification, rotation: normalizeRotation(page.rotation),
+    text, confidence: Number(confidence.toFixed(6)), language: String(raw.language || config.languages || 'unknown').slice(0, 64),
+    blocks, image_locators: page.image_locators || [],
+    status: text ? (confidence >= config.qualityThreshold ? 'ok' : 'low_confidence') : 'empty'
+  };
+}
+
+function parseTesseractTsv(tsv, language) {
+  const lines = String(tsv || '').split(/\r?\n/);
+  if (!/^level\tpage_num\tblock_num/.test(lines[0] || '')) throw new LocalOcrError('OCR_MALFORMED_OUTPUT', 'Tesseract TSV 头无效。');
+  const blocks = [];
+  for (const line of lines.slice(1)) {
+    const cols = line.split('\t');
+    if (cols.length < 12 || cols[0] !== '5') continue;
+    const text = cols.slice(11).join('\t').trim();
+    if (!text) continue;
+    const left = Number(cols[6]); const top = Number(cols[7]); const width = Number(cols[8]); const height = Number(cols[9]);
+    const rawConfidence = Number(cols[10]);
+    blocks.push({ text, confidence: rawConfidence < 0 ? 0 : rawConfidence / 100, bbox: [left, top, left + width, top + height], language });
+  }
+  return { language, blocks };
+}
+
+function validCheckpoint(value, expected) {
+  if (!value || value.contract !== CONTRACT_VERSION || value.cacheKey !== expected.cacheKey ||
+      value.sourceHash !== expected.sourceHash || Number(value.page) !== Number(expected.page) ||
+      value.providerVersion !== expected.providerVersion || value.settingsFingerprint !== expected.fingerprint) return false;
+  try {
+    const result = value.result;
+    if (!result || Number(result.page) !== Number(expected.page) || !Array.isArray(result.blocks) || typeof result.text !== 'string') return false;
+    if (result.text.length > expected.limits.maxTextCharsPerPage) return false;
+    return result.blocks.every((block) => typeof block.text === 'string' && Number.isFinite(block.confidence) && block.confidence >= 0 && block.confidence <= 1);
+  } catch { return false; }
+}
+
+function checkpointKey(sourceHash, page, provider, providerVersion, fingerprint) {
+  return `ocr-page-${sha256(`${sourceHash}\0${page}\0${provider}\0${providerVersion}\0${fingerprint}`).slice(0, 32)}`;
+}
+
+async function spawnCaptured(executable, args, options, failureCode, page, metrics) {
+  if (!path.isAbsolute(executable)) throw new LocalOcrError('OCR_UNAVAILABLE', 'OCR 可执行文件必须解析为绝对路径。', { page, metrics });
+  const spawnImpl = options.dependencies.spawn || spawn;
+  return new Promise((resolve, reject) => {
+    let settled = false; let stdout = ''; let stderr = ''; let outputBytes = 0; let timedOut = false;
+    const child = spawnImpl(executable, args, { shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      options.signal?.removeEventListener('abort', onAbort);
+      if (error) reject(error); else resolve(result);
+    };
+    const stop = () => { try { child.kill('SIGKILL'); } catch (_) {} };
+    const onAbort = () => {
+      stop();
+      finish(new LocalOcrError('OCR_CANCELLED', '本地 OCR 已取消。', { page, metrics }));
+    };
+    const timer = setTimeout(() => {
+      timedOut = true; stop();
+      finish(new LocalOcrError('OCR_TIMEOUT', '本地 OCR 执行超时。', { page, metrics }));
+    }, options.timeoutMs);
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    for (const [stream, append] of [[child.stdout, (s) => { stdout += s; }], [child.stderr, (s) => { stderr += s; }]]) {
+      stream?.on('data', (chunk) => {
+        outputBytes += chunk.length;
+        if (outputBytes > options.maxOutputBytes) {
+          stop();
+          finish(limitError('OCR 子进程输出超过限制。', metrics, page));
+        } else append(chunk.toString('utf8'));
+      });
+    }
+    child.on('error', (cause) => finish(new LocalOcrError(failureCode, '本地 OCR 子进程启动失败。', { page, cause, metrics })));
+    child.on('close', (code) => {
+      if (timedOut || settled) return;
+      if (code !== 0) finish(new LocalOcrError(failureCode, `本地 OCR 子进程失败（退出码 ${Number(code)}）。`, { page, metrics }));
+      else finish(null, { stdout, stderr: stderr.slice(0, 1024), code });
+    });
+  });
+}
+
+async function resolveExecutable(command, dependencies = {}) {
+  if (typeof dependencies.resolveExecutable === 'function') return dependencies.resolveExecutable(command);
+  const value = String(command || '');
+  if (!value || /[\0\r\n]/.test(value)) return null;
+  if (path.isAbsolute(value)) return validateExecutable(value);
+  if (value.includes('/') || value.includes('\\')) return null;
+  for (const directory of String(process.env.PATH || '').split(path.delimiter)) {
+    if (!directory) continue;
+    const candidate = path.resolve(directory, value);
+    if (await validateExecutable(candidate)) return candidate;
+  }
+  return null;
+}
+
+async function validateExecutable(candidate) {
+  try {
+    const stat = await fs.promises.stat(candidate);
+    if (!stat.isFile()) return null;
+    await fs.promises.access(candidate, fs.constants.X_OK);
+    return await fs.promises.realpath(candidate);
+  } catch { return null; }
+}
+
+async function probeVersion(executable, args, timeoutMs, dependencies) {
+  try {
+    const result = await spawnCaptured(executable, args, {
+      timeoutMs: Math.min(timeoutMs, 10000), maxOutputBytes: 64 * 1024, dependencies
+    }, 'OCR_UNAVAILABLE');
+    const version = `${result.stdout}\n${result.stderr}`.trim().split(/\r?\n/)[0] || path.basename(executable);
+    return { available: true, version: version.slice(0, 200) };
+  } catch { return { available: false, version: '' }; }
+}
+
+function readPngDimensions(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 24 || buffer.subarray(1, 4).toString() !== 'PNG') {
+    throw new LocalOcrError('OCR_RENDER_FAILURE', '渲染图像不是有效 PNG。');
+  }
+  return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+}
+
+function validateRendered(rendered, limits, metrics, page) {
+  if (!rendered || !rendered.path || !Number.isFinite(rendered.bytes) || !Number.isFinite(rendered.width) || !Number.isFinite(rendered.height)) {
+    throw new LocalOcrError('OCR_RENDER_FAILURE', '渲染结果字段不完整。', { page, metrics });
+  }
+  const pixels = rendered.width * rendered.height;
+  if (rendered.bytes > limits.maxPageBytes || pixels > limits.maxPixelsPerPage) throw limitError('单页 OCR 渲染限制已超出。', metrics, page);
+}
+
+function addResultMetrics(metrics, result) {
+  metrics.pages_completed += 1;
+  metrics.text_characters += result.text.length;
+  if (result.status === 'low_confidence') metrics.low_confidence_pages += 1;
+  metrics.low_confidence_blocks += result.blocks.filter((block) => block.exclusion_reason === 'low_confidence_ocr').length;
+}
+
+function checkAbort(signal, metrics) {
+  if (signal?.aborted) throw new LocalOcrError('OCR_CANCELLED', '本地 OCR 已取消。', { metrics });
+}
+
+function limitError(message, metrics, page) {
+  return new LocalOcrError('OCR_LIMITS_EXCEEDED', message, { metrics, page });
+}
+
+function available(provider, executable, version, settings) {
+  return { available: true, contract: CONTRACT_VERSION, provider, executable, version, settingsFingerprint: settingsFingerprint(settings) };
+}
+
+function unavailable(reason, settings) {
+  return { available: false, contract: CONTRACT_VERSION, provider: settings.provider, reason, settingsFingerprint: settingsFingerprint(settings) };
+}
+
+function normalizeVisualType(value) {
+  const text = String(value || '').toLowerCase();
+  if (/stamp|seal|印章|盖章/.test(text)) return 'stamp';
+  if (/signature|签名|签字/.test(text)) return 'signature';
+  if (/approval|批准|审批/.test(text)) return 'approval_visual';
+  return '';
+}
+
+function normalizeRotation(value) {
+  const rotation = Number(value) || 0;
+  return ((rotation % 360) + 360) % 360;
+}
+
+function validBbox(value) {
+  return Array.isArray(value) && value.length === 4 && value.every((item) => Number.isFinite(Number(item)));
+}
+
+function clampInt(value, min, max, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.round(n))) : fallback;
+}
+
+function clampNumber(value, min, max, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+}
+
+module.exports = {
+  CONTRACT_VERSION, DEFAULT_LIMITS, LocalOcrError, checkpointKey, normalizeOcrResult,
+  normalizeSettings, parseTesseractTsv, probeLocalOcr, runLocalPdfOcr,
+  settingsFingerprint, validCheckpoint
+};
+
+},
+/**
+ * @module src/core/block-v0
+ * Local, deterministic ingestion contract and structure-first packing.
+ */
+"src/core/block-v0.js": function(require, module, exports) {
+const crypto = require("crypto");
+const BLOCK_SCHEMA_VERSION = 'block_v0';
+const DEFAULT_LIMITS = Object.freeze({
+  maxFileBytes: 64 * 1024 * 1024, maxStreams: 4096, maxStreamBytes: 16 * 1024 * 1024,
+  maxTextChars: 2 * 1024 * 1024, maxAttachments: 256, maxPdfPages: 5000
+});
+
+function hash(value) {
+  return crypto.createHash('sha256').update(value || '').digest('hex');
+}
+function stableId(sourceHash, order, locator, rawText) {
+  return `block-${hash(`${sourceHash}\0${order}\0${locator?.scheme || ''}\0${locator?.value || ''}\0${rawText || ''}`).slice(0, 24)}`;
+}
+function createBlock(input) {
+  const raw = String(input.raw_text ?? input.text ?? '');
+  const inferred = input.inferred && typeof input.inferred === 'object' ? input.inferred : {};
+  const status = ['present', 'missing', 'unsupported', 'extraction_failed'].includes(input.status) ? input.status : (raw ? 'present' : 'missing');
+  const locator = input.locator && typeof input.locator === 'object' ? input.locator : { scheme: 'unknown', value: '' };
+  const order = Math.max(0, Number(input.order) || 0);
+  return {
+    schema_version: BLOCK_SCHEMA_VERSION,
+    block_id: input.block_id || stableId(input.source_hash, order, locator, raw),
+    source_hash: String(input.source_hash || ''),
+    order,
+    parent_id: input.parent_id || null,
+    kind: String(input.kind || 'text'),
+    locator,
+    provenance: Array.isArray(input.provenance) ? input.provenance : [locator],
+    raw: { text: raw, fields: input.raw_fields && typeof input.raw_fields === 'object' ? input.raw_fields : {} },
+    inferred,
+    parse: {
+      method: String(input.parse_method || 'local-deterministic'),
+      quality: Number.isFinite(input.parse_quality) ? Math.max(0, Math.min(1, input.parse_quality)) : (raw ? 1 : 0),
+      status
+    },
+    card_eligible: input.card_eligible !== false && status === 'present',
+    exclusion_reason: input.card_eligible === false ? String(input.exclusion_reason || 'not_card_content') : null,
+    metadata: input.metadata && typeof input.metadata === 'object' && !Array.isArray(input.metadata) ? input.metadata : {}
+  };
+}
+function validateBlock(block) {
+  const errors = [];
+  if (block?.schema_version !== BLOCK_SCHEMA_VERSION) errors.push('schema_version');
+  if (!/^block-[a-f0-9]{24}$/.test(String(block?.block_id || ''))) errors.push('block_id');
+  if (!/^[a-f0-9]{64}$/.test(String(block?.source_hash || ''))) errors.push('source_hash');
+  if (!Number.isInteger(block?.order) || block.order < 0) errors.push('order');
+  if (!block?.locator?.scheme || typeof block.locator.value !== 'string') errors.push('locator');
+  if (!['present', 'missing', 'unsupported', 'extraction_failed'].includes(block?.parse?.status)) errors.push('parse.status');
+  return { valid: errors.length === 0, errors };
+}
+function redactQueryTokens(value) {
+  try {
+    const url = new URL(String(value));
+    for (const key of [...url.searchParams.keys()]) {
+      if (/(token|key|auth|sig|signature|uid|user|email|recipient|track|click|open|redirect|ref|utm_|fbclid|gclid)/i.test(key)) {
+        url.searchParams.set(key, '[REDACTED]');
+      }
+    }
+    return url.toString();
+  } catch {
+    return String(value).replace(/([?&](?:token|key|auth|sig|signature|uid|email|track|utm_[^=]*)=)[^&#\s]+/gi, '$1[REDACTED]');
+  }
+}
+function classifyContent(text, metadata = {}) {
+  const value = `${text || ''}\n${metadata.url || ''}`;
+  if (/(unsubscribe|取消订阅|退订|opt[ -]?out)/i.test(value)) return { kind: 'unsubscribe', eligible: false };
+  if (/(pixel|beacon|open\.gif|track(?:ing)?[./?]|utm_(?:source|campaign)|1x1)/i.test(value)) return { kind: 'tracking', eligible: false };
+  if (/(view (?:this )?email in browser|marketing preferences|推广|营销邮件)/i.test(value)) return { kind: 'marketing', eligible: false };
+  return { kind: '', eligible: true };
+}
+function estimateTokens(text) {
+  const s = String(text || '');
+  return Math.max(1, Math.ceil((s.match(/[\u3400-\u9fff]/g) || []).length + (s.replace(/[\u3400-\u9fff]/g, '').length / 4)));
+}
+function splitAtomic(block, hardBudget, tokenCounter) {
+  const text = block.raw.text;
+  const out = [];
+  let start = 0;
+  while (start < text.length) {
+    let low = start + 1, high = text.length, best = start + 1;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      if (tokenCounter(text.slice(start, mid)) <= hardBudget) { best = mid; low = mid + 1; } else high = mid - 1;
+    }
+    let end = best;
+    if (end < text.length) {
+      const natural = Math.max(text.lastIndexOf('\n', end), text.lastIndexOf('。', end), text.lastIndexOf(' ', end));
+      if (natural > start + Math.floor((end - start) / 2)) end = natural + 1;
+    }
+    out.push(createBlock(Object.assign({}, block, {
+      block_id: undefined, raw_text: text.slice(start, end), raw_fields: block.raw.fields,
+      locator: Object.assign({}, block.locator, { fragment: `chars=${start}-${end}` }),
+      provenance: block.provenance, metadata: Object.assign({}, block.metadata, { split_from: block.block_id, char_start: start, char_end: end })
+    })));
+    start = end;
+  }
+  return out;
+}
+function packBlocks(blocks, options = {}) {
+  const hardBudget = Math.max(16, Number(options.hardBudget) || 2000);
+  const softBudget = Math.min(hardBudget, Math.max(8, Number(options.softBudget) || Math.floor(hardBudget * 0.85)));
+  const tokenCounter = typeof options.tokenCounter === 'function' ? options.tokenCounter : estimateTokens;
+  const ordered = [...(blocks || [])].sort((a, b) => a.order - b.order);
+  const atomic = ordered.flatMap((block) => block.card_eligible !== false && tokenCounter(block.raw?.text || '') > hardBudget ? splitAtomic(block, hardBudget, tokenCounter) : [block]);
+  const packs = [];
+  let current = null;
+  for (const block of atomic) {
+    const text = block.card_eligible === false ? '' : String(block.raw?.text || '');
+    const tokens = text ? tokenCounter(text) : 0;
+    if (!current || (current.token_count + tokens > softBudget && current.block_ids.length)) {
+      if (current) packs.push(current);
+      current = { pack_id: '', text: '', token_count: 0, block_ids: [], locators: [], blocks: [] };
+    }
+    if (text) current.text += (current.text ? '\n\n' : '') + text;
+    current.token_count += tokens;
+    current.block_ids.push(block.block_id);
+    current.locators.push(...(block.provenance || [block.locator]));
+    current.blocks.push(block);
+  }
+  if (current) packs.push(current);
+  for (let i = 0; i < packs.length; i += 1) packs[i].pack_id = `pack-${hash(packs[i].block_ids.join('|')).slice(0, 20)}`;
+  const locatorCount = atomic.reduce((sum, b) => sum + (b.provenance || [b.locator]).length, 0);
+  return {
+    packs,
+    metrics: {
+      input_blocks: ordered.length, atomic_blocks: atomic.length, output_packs: packs.length,
+      split_atomic_blocks: atomic.filter((b) => b.metadata?.split_from).length,
+      max_pack_tokens: packs.reduce((m, p) => Math.max(m, p.token_count), 0),
+      locator_coverage: locatorCount ? packs.reduce((s, p) => s + p.locators.length, 0) / locatorCount : 1
+    }
+  };
+}
+
+function readCfb(buffer, limits = DEFAULT_LIMITS) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 512 || buffer.subarray(0, 8).toString('hex') !== 'd0cf11e0a1b11ae1') throw typed('unsupported', 'MSG_CFB_SIGNATURE');
+  if (buffer.length > limits.maxFileBytes) throw typed('limits_exceeded', 'MSG_FILE_LIMIT');
+  const sectorShift = buffer.readUInt16LE(30);
+  const sectorSize = 2 ** sectorShift;
+  if (![512, 4096].includes(sectorSize)) throw typed('unsupported', 'MSG_SECTOR_SIZE');
+  const sector = (id) => {
+    const start = 512 + id * sectorSize;
+    if (id < 0 || start + sectorSize > buffer.length) throw typed('extraction_failed', 'MSG_SECTOR_RANGE');
+    return buffer.subarray(start, start + sectorSize);
+  };
+  const difat = [];
+  for (let i = 0; i < 109; i += 1) { const id = buffer.readUInt32LE(76 + i * 4); if (id < 0xFFFFFFFA) difat.push(id); }
+  if (difat.length > limits.maxStreams) throw typed('limits_exceeded', 'MSG_FAT_LIMIT');
+  const fat = [];
+  for (const id of difat) for (let p = 0; p < sectorSize; p += 4) fat.push(sector(id).readUInt32LE(p));
+  const chain = (start, maxBytes = limits.maxStreamBytes) => {
+    const chunks = []; const seen = new Set(); let id = start; let size = 0;
+    while (id < 0xFFFFFFFA) {
+      if (seen.has(id) || seen.size >= limits.maxStreams) throw typed('extraction_failed', 'MSG_CHAIN_LOOP');
+      seen.add(id); const chunk = sector(id); size += chunk.length;
+      if (size > maxBytes) throw typed('limits_exceeded', 'MSG_STREAM_LIMIT');
+      chunks.push(chunk); id = fat[id];
+    }
+    return Buffer.concat(chunks);
+  };
+  const dir = chain(buffer.readUInt32LE(48));
+  const entries = [];
+  for (let off = 0; off + 128 <= dir.length && entries.length < limits.maxStreams; off += 128) {
+    const nameBytes = Math.min(64, Math.max(0, dir.readUInt16LE(off + 64) - 2));
+    const name = dir.subarray(off, off + nameBytes).toString('utf16le');
+    if (!name) continue;
+    const start = dir.readUInt32LE(off + 116); const size = Number(dir.readBigUInt64LE(off + 120));
+    entries.push({ name, type: dir[off + 66], start, size, id: off / 128 });
+  }
+  const root = entries.find((entry) => entry.type === 5);
+  let miniStream = Buffer.alloc(0); const miniFat = [];
+  try {
+    if (root && root.size > 0) miniStream = chain(root.start, limits.maxStreamBytes * 4).subarray(0, root.size);
+    const miniFatStart = buffer.readUInt32LE(60); const miniFatSectors = Math.min(buffer.readUInt32LE(64), limits.maxStreams);
+    if (miniFatSectors && miniFatStart < 0xFFFFFFFA) {
+      const miniFatBuffer = chain(miniFatStart, miniFatSectors * sectorSize);
+      for (let p = 0; p + 4 <= miniFatBuffer.length; p += 4) miniFat.push(miniFatBuffer.readUInt32LE(p));
+    }
+  } catch (_) { /* individual small streams remain typed unsupported */ }
+  const readMini = (entry) => {
+    const chunks = []; const seen = new Set(); let id = entry.start; let size = 0;
+    while (id < 0xFFFFFFFA) {
+      if (seen.has(id) || seen.size >= limits.maxStreams) throw typed('extraction_failed', 'MSG_MINI_CHAIN_LOOP');
+      seen.add(id); const start = id * 64;
+      if (start + 64 > miniStream.length) throw typed('extraction_failed', 'MSG_MINI_SECTOR_RANGE');
+      chunks.push(miniStream.subarray(start, start + 64)); size += 64;
+      if (size > limits.maxStreamBytes) throw typed('limits_exceeded', 'MSG_STREAM_LIMIT');
+      id = miniFat[id];
+    }
+    return Buffer.concat(chunks).subarray(0, entry.size);
+  };
+  const streams = new Map();
+  for (const entry of entries) {
+    if (entry.type !== 2 || entry.size <= 0 || entry.size >= 4096) continue;
+    try { streams.set(entry.name, { entry, status: 'present', data: readMini(entry) }); }
+    catch (error) { streams.set(entry.name, { entry, status: error.code === 'limits_exceeded' ? 'unsupported' : 'extraction_failed', data: null }); }
+  }
+  for (const entry of entries) {
+    if (entry.type !== 2 || entry.size <= 0 || entry.size < 4096) continue;
+    try { streams.set(entry.name, { entry, status: 'present', data: chain(entry.start).subarray(0, Math.min(entry.size, limits.maxStreamBytes)) }); }
+    catch (error) { streams.set(entry.name, { entry, status: error.code === 'limits_exceeded' ? 'unsupported' : 'extraction_failed', data: null }); }
+  }
+  return { entries, streams };
+}
+function typed(code, message) { const error = new Error(message); error.code = code; return error; }
+function decodeProperty(item, type) {
+  if (!item?.data) return '';
+  if (type === '001f') return item.data.toString('utf16le').replace(/\0+$/, '');
+  if (type === '001e') return item.data.toString('latin1').replace(/\0+$/, '');
+  return '';
+}
+function parseMsg(buffer, options = {}) {
+  const limits = Object.assign({}, DEFAULT_LIMITS, options.limits || {});
+  const sourceHash = hash(buffer);
+  let cfb;
+  try { cfb = readCfb(buffer, limits); } catch (error) {
+    return { status: error.code || 'extraction_failed', sourceType: 'outlook-msg', text: '', message: error.message, blocks: [] };
+  }
+  const find = (tag, types = ['001f', '001e']) => {
+    for (const type of types) {
+      const key = `__substg1.0_${tag}${type}`.toLowerCase();
+      const match = [...cfb.streams.entries()].find(([name]) => name.toLowerCase() === key);
+      if (match) {
+        let value = decodeProperty(match[1], type);
+        if (type === '0102' && match[1].data && tag === '1013') value = match[1].data.toString('utf8').replace(/\0+$/, '');
+        if (type === '0040' && match[1].data?.length >= 8) {
+          const ticks = match[1].data.readBigUInt64LE(0);
+          const millis = Number(ticks / 10000n) - 11644473600000;
+          if (Number.isFinite(millis)) value = new Date(millis).toISOString();
+        }
+        return { value, stream: match[0], status: match[1].status };
+      }
+    }
+    return { value: '', stream: `property:${tag}`, status: 'missing' };
+  };
+  const props = {
+    subject: find('0037'), sender: find('0c1a'), sender_email: find('5d01'), to: find('0e04'), cc: find('0e03'),
+    sent_at: find('0039', ['0040']), received_at: find('0e06', ['0040']), headers: find('007d'),
+    plain: find('1000'), html: find('1013', ['001f', '001e', '0102']), rtf: find('1009', ['0102'])
+  };
+  for (const field of ['headers', 'plain', 'html']) {
+    props[field].value = String(props[field].value || '').replace(/https?:\/\/[^\s"'<>]+/gi, (url) => redactQueryTokens(url));
+  }
+  const blocks = []; let order = 0;
+  for (const [field, prop] of Object.entries(props)) {
+    const status = prop.value ? 'present' : prop.status;
+    const classification = classifyContent(prop.value);
+    blocks.push(createBlock({
+      source_hash: sourceHash, order: order++, kind: field, raw_text: prop.value.slice(0, limits.maxTextChars),
+      locator: { scheme: 'mapi-stream', value: prop.stream }, parse_method: 'msg-cfb-mapi',
+      status, card_eligible: classification.eligible && !['headers', 'sent_at', 'received_at'].includes(field),
+      exclusion_reason: classification.kind || (!['headers', 'sent_at', 'received_at'].includes(field) ? '' : 'envelope_metadata'),
+      metadata: { property: field, raw_presence: status, redacted: false }
+    }));
+  }
+  const urls = [...new Set(`${props.html.value}\n${props.plain.value}`.match(/https?:\/\/[^\s"'<>]+/gi) || [])].slice(0, 512);
+  for (const url of urls) {
+    const classification = classifyContent('', { url });
+    blocks.push(createBlock({
+      source_hash: sourceHash, order: order++, kind: classification.kind || 'remote_asset', raw_text: redactQueryTokens(url),
+      locator: { scheme: 'mapi-derived-url', value: `url:${order}` }, parse_method: 'msg-url-inventory', status: 'present',
+      card_eligible: classification.eligible, exclusion_reason: classification.kind || 'remote_asset',
+      metadata: { remote: true, query_tokens_redacted: true }
+    }));
+  }
+  const body = props.plain.value || props.html.value.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  const replyClues = /(^|\n)(from:|sent:|to:|subject:|发件人：|发送时间：|-----original message-----)/im.test(body);
+  const attachments = cfb.entries.filter((e) => /^__attach_version1\.0_/i.test(e.name)).slice(0, limits.maxAttachments).map((e) => ({
+    locator: { scheme: 'cfb-directory', value: `entry:${e.id}` }, name: e.name, inline: 'unknown', status: 'unsupported'
+  }));
+  for (const attachment of attachments) {
+    blocks.push(createBlock({
+      source_hash: sourceHash, order: order++, kind: 'attachment', raw_text: '',
+      locator: attachment.locator, parse_method: 'msg-cfb-directory', status: attachment.status,
+      card_eligible: false, exclusion_reason: 'attachment_inventory',
+      metadata: { filename: attachment.name, inline: attachment.inline }
+    }));
+  }
+  return {
+    status: 'ok', sourceType: 'outlook-msg', text: body, blocks,
+    metadata: {
+      subject: props.subject.value, from: props.sender_email.value || props.sender.value, to: props.to.value, cc: props.cc.value,
+      headers: props.headers.value, body_presence: { plain: !!props.plain.value, html: !!props.html.value, rtf: props.rtf.status === 'present' },
+      reply_chain_clues: replyClues, attachments, parse_warnings: blocks.filter((b) => b.parse.status !== 'present').map((b) => `${b.kind}:${b.parse.status}`)
+    }
+  };
+}
+
+function inspectPdf(buffer, options = {}) {
+  const limits = Object.assign({}, DEFAULT_LIMITS, options.limits || {});
+  const sourceHash = hash(buffer);
+  if (!Buffer.isBuffer(buffer) || !buffer.subarray(0, 8).toString('latin1').startsWith('%PDF-')) return { status: 'unsupported', sourceType: 'pdf', message: 'PDF_SIGNATURE', blocks: [] };
+  if (buffer.length > limits.maxFileBytes) return { status: 'limits_exceeded', sourceType: 'pdf', message: 'PDF_FILE_LIMIT', blocks: [] };
+  const raw = buffer.toString('latin1');
+  const pageMatches = [...raw.matchAll(/\/Type\s*\/Page(?!s)\b/g)].slice(0, limits.maxPdfPages);
+  const imageMatches = [...raw.matchAll(/\/Subtype\s*\/Image\b/g)];
+  const fontMatches = [...raw.matchAll(/\/(?:Font|ToUnicode)\b/g)];
+  const textOps = [...raw.matchAll(/\b(?:BT|Tj|TJ)\b/g)];
+  const rotations = [...raw.matchAll(/\/Rotate\s+(-?\d+)/g)].map((m) => Number(m[1]));
+  const pages = []; const blocks = [];
+  const count = Math.max(1, pageMatches.length);
+  for (let i = 0; i < count; i += 1) {
+    const start = pageMatches[i]?.index || 0; const end = pageMatches[i + 1]?.index || raw.length;
+    const segment = raw.slice(start, end);
+    const hasImage = /\/Subtype\s*\/Image\b/.test(segment) || (count === 1 && imageMatches.length > 0);
+    const hasText = /\b(?:BT|Tj|TJ)\b/.test(segment) || (count === 1 && fontMatches.length > 0 && textOps.length > 0);
+    const classification = hasText && hasImage ? 'mixed' : hasText ? 'native' : hasImage ? 'scanned' : 'blank';
+    const rotation = rotations[i] ?? rotations[0] ?? 0;
+    const page = {
+      page: i + 1, classification, rotation, dpi: null,
+      image_locators: hasImage ? [{ scheme: 'pdf-object-scan', value: `page:${i + 1}:image` }] : [],
+      ocr: { required: classification === 'scanned' || classification === 'mixed', status: classification === 'native' ? 'not_required' : (classification === 'blank' ? 'not_applicable' : 'provider_required') },
+      visual: { stamp_visible: 'unknown', signature_visible: 'unknown', approval_status: 'unverified' }
+    };
+    pages.push(page);
+    blocks.push(createBlock({
+      source_hash: sourceHash, order: i, kind: 'pdf_page_inventory', raw_text: '',
+      locator: { scheme: 'pdf-page', value: `page:${i + 1}` }, parse_method: 'pdf-local-inventory',
+      status: classification === 'blank' ? 'missing' : 'present', card_eligible: false,
+      exclusion_reason: 'inventory_only', metadata: page
+    }));
+  }
+  const pureScan = pages.some((p) => p.classification === 'scanned') && pages.every((p) => ['scanned', 'blank'].includes(p.classification));
+  return {
+    status: 'ok', sourceType: 'pdf', blocks, pages, text: '',
+    metadata: { page_inventory_version: 'pdf_inventory_v0', pure_scan: pureScan, ocr_required: pages.some((p) => p.ocr.required), deterministic: true }
+  };
+}
+function blocksToMarkdown(blocks) {
+  return (blocks || []).filter((b) => b.parse.status === 'present' && b.raw.text).map((b) => b.raw.text).join('\n\n').trim();
+}
+module.exports = {
+  BLOCK_SCHEMA_VERSION, DEFAULT_LIMITS, blocksToMarkdown, classifyContent, createBlock, estimateTokens,
+  inspectPdf, packBlocks, parseMsg, redactQueryTokens, stableId, validateBlock
+};
+
+},
+/**
  * @module src/core/extractors
  * 二进制 / 纯文本文件解析入口；委托给 document-parser + external-pdf
  * @exports extractTextFromBuffer
@@ -4520,6 +5464,8 @@ module.exports = {
 "src/core/extractors.js": function(require, module, exports) {
 const { createParsePackage, documentPlan } = require("src/core/document-parser.js");
 const { extractDocumentWithApis } = require("src/core/external-pdf.js");
+const { blocksToMarkdown, createBlock, inspectPdf, packBlocks, parseMsg } = require("src/core/block-v0.js");
+const { probeLocalOcr, runLocalPdfOcr } = require("src/core/local-ocr.js");
 
 async function extractTextFromBuffer(filePath, buffer, options = {}) {
   const plan = documentPlan(filePath);
@@ -4576,15 +5522,79 @@ async function extractTextFromBuffer(filePath, buffer, options = {}) {
       metadata
     });
   }
+  if (plan.mode === 'msg') {
+    if (options.localMsgAdapter === false) return { status: 'unsupported_media', text: '', sourceType: 'outlook-msg', message: '本地 MSG 适配器已关闭。' };
+    const msg = parseMsg(buffer, options.msgAdapter || {});
+    if (msg.status !== 'ok') return msg;
+    const packed = options.blockPacking === false ? { packs: [], metrics: { disabled: true } } : packBlocks(msg.blocks, options.blockPacking || {});
+    const bodyText = msg.text || blocksToMarkdown(msg.blocks) || `Outlook 邮件正文为空。主题：${msg.metadata.subject || '(无主题)'}`;
+    const result = readableTextResult(bodyText, 'outlook-msg', { encoding: 'cfb-mapi' });
+    result.title = msg.metadata.subject;
+    result.metadata = Object.assign({}, msg.metadata, { block_metrics: packed.metrics });
+    result.blocks = msg.blocks;
+    result.attachments = [];
+    return withParsePackage(result, {
+      sourcePath: filePath, buffer, sourceType: 'outlook-msg', parser: 'msg-cfb-mapi',
+      metadata: result.metadata, blocks: msg.blocks, blockPacks: packed.packs
+    });
+  }
 
   const fileName = String(filePath || '').split(/[\\/]/).pop() || 'source';
+  const pdfInventory = plan.sourceType === 'pdf' && options.localPdfInventory !== false ? inspectPdf(buffer, options.pdfInventory || {}) : null;
   const config = Object.assign({}, options.pdfExtractor || {}, options.documentExtractor || {}, {
     fileName,
     order: plan.engines.join(','),
     mineruApiModel: plan.mineruModel
   });
+  if (pdfInventory?.status === 'ok' && pdfInventory.metadata?.ocr_required && options.localOcr?.enabled === true) {
+    const probe = await probeLocalOcr(options.localOcr, options.localOcrDependencies || {});
+    if (probe.available) {
+      const local = await runLocalPdfOcr({
+        pdfBuffer: buffer, pages: pdfInventory.pages, sourceHash: pdfInventory.blocks[0]?.source_hash || '',
+        settings: options.localOcr, probe, signal: options.signal,
+        loadCheckpoint: options.loadOcrCheckpoint, saveCheckpoint: options.saveOcrCheckpoint
+      }, options.localOcrDependencies || {});
+      const ocrBlocks = local.pages.flatMap((page) => page.blocks.map((block, index) => createBlock({
+        source_hash: pdfInventory.blocks[0]?.source_hash || '', order: (page.page * 100000) + index,
+        kind: block.visual_type || 'ocr_text', raw_text: block.text, raw_fields: block.raw_fields,
+        inferred: block.inferred, locator: block.locator, provenance: [block.locator],
+        parse_method: `local-ocr:${local.provider}`, parse_quality: block.confidence,
+        status: block.text ? 'present' : 'missing', card_eligible: block.card_eligible,
+        exclusion_reason: block.exclusion_reason,
+        metadata: { page: page.page, confidence: block.confidence, language: block.language,
+          visual_type: block.visual_type, approval_status: block.visual_type ? 'unverified' : undefined }
+      })));
+      const allBlocks = [...pdfInventory.blocks, ...ocrBlocks].sort((a, b) => a.order - b.order);
+      const packed = options.blockPacking === false ? { packs: [], metrics: { disabled: true } } : packBlocks(allBlocks, options.blockPacking || {});
+      const text = local.pages.map((page) => page.text).filter(Boolean).join('\n\n').trim();
+      if (text) {
+        return withParsePackage({
+          status: 'ok', text, sourceType: 'pdf', sourceEncoding: `local-ocr:${local.provider}`,
+          sourceLanguage: local.pages.find((page) => page.language)?.language || 'unknown',
+          extractor: `local-ocr:${local.provider}`,
+          metadata: { local_ocr: { provider: local.provider, provider_version: local.providerVersion, metrics: local.metrics } }
+        }, {
+          sourcePath: filePath, buffer, sourceType: 'pdf', parser: `local-ocr:${local.provider}`,
+          pages: mergeOcrPages(pdfInventory.pages, local.pages), blocks: allBlocks, blockPacks: packed.packs,
+          metadata: { pdf_inventory: pdfInventory.metadata, local_ocr: {
+            provider: local.provider, provider_version: local.providerVersion,
+            settings_fingerprint: local.settingsFingerprint, metrics: local.metrics, block_metrics: packed.metrics
+          }}
+        });
+      }
+    }
+  }
   const external = await extractDocumentWithApis(buffer, config);
   if (!external || external.status !== 'ok') {
+    if (pdfInventory?.status === 'ok' && pdfInventory.metadata?.pure_scan) {
+      return {
+        status: 'ocr_required', text: '', sourceType: 'pdf', sourceEncoding: 'pdf-local-inventory',
+        extractor: 'pdf-local-inventory',
+        message: 'PDF 为纯扫描件；本地页清单已完成，需要配置 OCR 提供方或明确授权现有远程解析。',
+        blocks: pdfInventory.blocks, pageInventory: pdfInventory.pages,
+        actionable: { code: 'PDF_OCR_PROVIDER_REQUIRED', retryable: true, external_upload_required: true }
+      };
+    }
     return {
       status: 'failed',
       text: '',
@@ -4613,7 +5623,29 @@ async function extractTextFromBuffer(filePath, buffer, options = {}) {
     remoteJobId: external.remoteJobId,
     pages: external.pages,
     images: external.images,
-    provenance: external.provenance
+    provenance: external.provenance,
+    blocks: pdfInventory?.blocks || [],
+    pageInventory: pdfInventory?.pages || [],
+    metadata: Object.assign({}, external.metadata || {}, pdfInventory ? { pdf_inventory: pdfInventory.metadata } : {})
+  });
+}
+
+function mergeOcrPages(inventoryPages, ocrPages) {
+  const byPage = new Map((ocrPages || []).map((page) => [Number(page.page), page]));
+  return (inventoryPages || []).map((page) => {
+    const ocr = byPage.get(Number(page.page));
+    if (!ocr) return page;
+    return Object.assign({}, page, {
+      text: ocr.text,
+      blocks: ocr.blocks.map((block, index) => ({
+        text: block.text, bbox: block.bbox, confidence: block.confidence,
+        language: block.language, line_id: index + 1, block_id: block.visual_type || 'ocr'
+      })),
+      ocr: Object.assign({}, page.ocr, {
+        status: ocr.status, provider: 'local', confidence: ocr.confidence,
+        language: ocr.language, block_count: ocr.blocks.length
+      })
+    });
   });
 }
 
@@ -6596,7 +7628,7 @@ function documentPlan(filePath) {
   if (/\.(ppt|pptx)$/.test(lower)) return plan('pptx', 'remote', ['mineru-api']);
   if (/\.(xls|xlsx)$/.test(lower)) return plan('xlsx', 'remote', ['mineru-api']);
   if (/\.(html|htm)$/.test(lower)) return Object.assign(plan('html', 'remote', ['mineru-api']), { mineruModel: 'MinerU-HTML' });
-  if (/\.msg$/.test(lower)) return plan('outlook-msg', 'unsupported');
+  if (/\.msg$/.test(lower)) return plan('outlook-msg', 'msg');
   if (/\.(mp4|mov|avi|mkv)$/.test(lower)) return plan('video', 'unsupported');
   if (/\.(mp3|wav|m4a)$/.test(lower)) return plan('audio', 'unsupported');
   return plan('unknown', 'unsupported');
@@ -6607,7 +7639,7 @@ function plan(sourceType, mode, engines = []) {
 }
 
 function createParsePackage(options) {
-  const isOcr = /^mineru-api|^paddleocr-api/.test(String(options.parser || ''));
+  const isOcr = /^mineru-api|^paddleocr-api|^local-ocr:/.test(String(options.parser || ''));
   const artifact = options.provenance && Array.isArray(options.provenance.spans)
     ? { markdown: String(options.markdown || ''), pages: options.pages || [], spans: options.provenance.spans, provenance_version: options.provenance.version || '1.0' }
     : isOcr ? normalizeLegacyArtifact(options.markdown, options.pages, normalizeParser(options.parser)) : null;
@@ -6624,22 +7656,28 @@ function createParsePackage(options) {
     markdown,
     pages: Array.isArray(artifact?.pages) && artifact.pages.length
       ? artifact.pages
-      : Array.isArray(options.pages) ? options.pages : [],
+      : Array.isArray(options.pages) && options.pages.length ? options.pages
+        : Array.isArray(options.pageInventory) ? options.pageInventory : [],
     ...(artifact ? { provenance: { version: artifact.provenance_version || '1.0', spans: artifact.spans || [] } } : {}),
     images: Array.isArray(options.images) ? options.images : [],
     quality,
     // v2.9.0: 透传解析元数据（邮件主题/发件人/附件清单等），供卡片链接与总结阶段使用。
     //   只接受纯 JSON 对象（附件二进制不进这里，见 extractTextFromBuffer email 分支）。
     metadata: options.metadata && typeof options.metadata === 'object' && !Array.isArray(options.metadata) ? options.metadata : {},
+    blocks: Array.isArray(options.blocks) ? options.blocks : [],
+    block_packs: Array.isArray(options.blockPacks) ? options.blockPacks : [],
     schema_version: '1.1'
   };
 }
 
 function normalizeParser(parser) {
   const value = String(parser || '');
+  if (value.startsWith('local-ocr:')) return value;
   if (value.startsWith('mineru-api')) return 'mineru-api';
   if (value.startsWith('paddleocr-api')) return 'paddleocr-api';
   if (value === 'eml-parser') return value;
+  if (value === 'msg-cfb-mapi') return value;
+  if (value === 'pdf-local-inventory') return value;
   return 'text-normalizer';
 }
 
@@ -7530,7 +8568,19 @@ function composePrompt(parts, commonRules = COMMON_PROMPT_RULES) {
 
 async function summarizeDocument(options) {
   // v2.7: 透传 WeKnora 式切片参数（重叠比例 + 小节合并开关）
-  const chunks = splitMarkdownSections(options.parsePackage.markdown, {
+  const packedChunks = Array.isArray(options.parsePackage.block_packs)
+    ? options.parsePackage.block_packs.filter((pack) => String(pack.text || '').trim()).map((pack, index) => ({
+      chunk_id: `block-pack-${String(index + 1).padStart(3, '0')}`,
+      stableChunkId: pack.pack_id,
+      markdown: pack.text,
+      headings: [],
+      breadcrumb: '',
+      headingPath: [],
+      provenanceSpanIds: pack.block_ids || [],
+      tokenEstimate: pack.token_count
+    }))
+    : [];
+  const chunks = packedChunks.length ? packedChunks : splitMarkdownSections(options.parsePackage.markdown, {
     maxChars: options.maxChunkChars,
     overlapRatio: options.chunkOverlapRatio,
     coalesceTiny: options.coalesceTinyChunks,
@@ -9504,6 +10554,12 @@ function classifyFailure(input = {}) {
   const status = Number(input.status || 0);
   const code = String(input.code || '').toUpperCase();
   const message = String(input.message || '');
+  if (code === 'OCR_CANCELLED') return result(code, 'cancelled', false, '本地 OCR 已取消', '如需继续，请重新将文件加入队列；有效页级检查点会复用。');
+  if (code === 'OCR_UNAVAILABLE') return result(code, 'local_ocr', true, '本地 OCR 不可用', '在设置中启用并检测本地 OCR，或配置绝对可执行文件路径。');
+  if (code === 'OCR_RENDER_FAILURE') return result(code, 'local_ocr', true, 'PDF 页面渲染失败', '确认 pdftoppm 可用后重试；已完成页面会复用。');
+  if (code === 'OCR_TIMEOUT') return result(code, 'local_ocr', true, '本地 OCR 超时', '提高单页超时或降低并发后重试。');
+  if (code === 'OCR_MALFORMED_OUTPUT') return result(code, 'local_ocr', false, '本地 OCR 输出格式无效', '检查自定义 provider 是否返回 local_ocr_v1 JSON 合同。');
+  if (code === 'OCR_LIMITS_EXCEEDED') return result(code, 'local_ocr', false, '本地 OCR 安全限制已超出', '拆分 PDF 或降低页面分辨率后重试。');
   if (code === 'TASK_CANCELLED' || /取消/.test(message)) return result('CANCELLED_BY_USER', 'cancelled', false, '任务已取消', '如需继续，请重新将文件加入队列。');
   if (status === 401 || status === 403 || /鉴权|unauthori[sz]ed|forbidden/i.test(message)) return result('AUTH_PROVIDER_REJECTED', 'auth', false, '外部服务鉴权失败', '请检查服务密钥和账号权限后测试连接。');
   if (status === 429 || /rate.?limit|限流/i.test(message)) return result('RATE_LIMIT_PROVIDER_BUSY', 'rate_limit', true, '外部服务限流', '稍后重试；插件会遵循 Retry-After 并退避。');
@@ -9523,7 +10579,7 @@ function userMessage(category) {
   return ({ auth: '外部服务鉴权失败', rate_limit: '外部服务限流', timeout: '处理阶段超时',
     network: '外部服务暂时不可用', json_parse: '服务返回格式无法解析', schema: '模型输出未通过结构校验',
     file: '找不到源文件', cancelled: '任务已取消', checkpoint: '已保存批次读取或写入失败',
-    ai_provider: '知识原子化批次未完整完成' })[category] || '工程知识切片处理失败';
+    ai_provider: '知识原子化批次未完整完成', local_ocr: '本地 OCR 处理失败' })[category] || '工程知识切片处理失败';
 }
 
 function redactText(value) {
@@ -9885,6 +10941,8 @@ async function runKnowledgeWorkflow(options) {
     : Number(options.parsePackage.total_pages || options.parsePackage.page_count || 0);
   const shortDocumentMaxCards = Math.max(5, Number(options.shortDocumentMaxCards) || 20);
   const quantityAnomaly = pageCount > 0 && pageCount <= 3 && (atomResult.atoms || []).length > shortDocumentMaxCards;
+  const noEligibleSourceBlocks = Array.isArray(options.parsePackage.blocks) && options.parsePackage.blocks.length > 0
+    && !options.parsePackage.blocks.some((block) => block?.card_eligible === true && String(block?.raw?.text || '').trim());
   const provenanceDiagnostics = {};
   for (const atom of atomResult.atoms || []) {
     atom.source = Object.assign({}, atom.source || {}, {
@@ -9907,6 +10965,13 @@ async function runKnowledgeWorkflow(options) {
     const labelsValid = typeof options.validateLabels === 'function' ? options.validateLabels(atom) : true;
     const routeValid = atom.library === classification.library && atom.folder_type === classification.folder_type;
     const duplicate = existingFingerprints.has(fingerprint);
+    const evidenceQuote = String(atom.source?.evidence_quote || '');
+    const excludedEvidenceBlock = (options.parsePackage.blocks || []).find((block) =>
+      block?.card_eligible === false && block?.raw?.text && evidenceQuote && String(block.raw.text).includes(evidenceQuote)
+    );
+    const unverifiedVisualApproval = options.parsePackage.source_type === 'pdf'
+      && /(批准|审批通过|已签署|approved|accepted)/i.test(`${atom.title || ''}\n${atom.content || ''}\n${evidenceQuote}`)
+      && (options.parsePackage.pages || []).some((page) => page?.visual?.approval_status === 'unverified');
     // Reserve every fingerprint immediately, including review/rejected atoms. Otherwise
     // identical atoms later in the same provider response can create duplicate review
     // items and may both be approved into the same stable file.
@@ -9943,10 +11008,13 @@ async function runKnowledgeWorkflow(options) {
       businessTimeZone: options.businessTimeZone
     });
     card.validation_report = validationReport;
-    if (confidence.decision === 'auto_ingest' && !quantityAnomaly) {
+    if (confidence.decision === 'auto_ingest' && !quantityAnomaly && !excludedEvidenceBlock && !unverifiedVisualApproval && !noEligibleSourceBlocks) {
       accepted.push(card);
     } else {
       const reasons = [...confidence.hard_rules, ...(atom.validation_issues || [])];
+      if (excludedEvidenceBlock) reasons.push(`来源块不可生成卡片：${excludedEvidenceBlock.exclusion_reason || 'not_card_content'} (${excludedEvidenceBlock.block_id})`);
+      if (unverifiedVisualApproval) reasons.push('视觉印章/签名仅记录可见性，未验证审批状态；禁止自动形成批准结论');
+      if (noEligibleSourceBlocks) reasons.push('来源只包含不可生成卡片的营销、退订、跟踪或清单块');
       if (quantityAnomaly) reasons.push(`短文档数量异常：${pageCount} 页生成 ${(atomResult.atoms || []).length} 张卡片，超过阈值 ${shortDocumentMaxCards}，需整批人工确认`);
       if (!labelsValid && !reasons.some((reason) => /标签/.test(reason))) reasons.push('标签字典校验未通过');
       if (!routeValid && !reasons.some((reason) => /目录/.test(reason))) reasons.push('知识原子目录与文档分类不一致');

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://engineering-knowledge-slicer.local/schemas/block-v0.schema.json",
+  "title": "Engineering Knowledge Slicer permissive block_v0",
+  "type": "object",
+  "required": ["schema_version", "block_id", "source_hash", "order", "parent_id", "kind", "locator", "provenance", "raw", "inferred", "parse", "card_eligible", "exclusion_reason", "metadata"],
+  "properties": {
+    "schema_version": { "const": "block_v0" },
+    "block_id": { "type": "string", "pattern": "^block-[a-f0-9]{24}$" },
+    "source_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "order": { "type": "integer", "minimum": 0 },
+    "parent_id": { "type": ["string", "null"] },
+    "kind": { "type": "string", "minLength": 1 },
+    "locator": { "$ref": "#/$defs/locator" },
+    "provenance": { "type": "array", "items": { "$ref": "#/$defs/locator" } },
+    "raw": {
+      "type": "object",
+      "required": ["text", "fields"],
+      "properties": { "text": { "type": "string" }, "fields": { "type": "object", "additionalProperties": true } },
+      "additionalProperties": true
+    },
+    "inferred": { "type": "object", "additionalProperties": true },
+    "parse": {
+      "type": "object",
+      "required": ["method", "quality", "status"],
+      "properties": {
+        "method": { "type": "string" },
+        "quality": { "type": "number", "minimum": 0, "maximum": 1 },
+        "status": { "enum": ["present", "missing", "unsupported", "extraction_failed"] }
+      },
+      "additionalProperties": true
+    },
+    "card_eligible": { "type": "boolean" },
+    "exclusion_reason": { "type": ["string", "null"] },
+    "metadata": { "type": "object", "additionalProperties": true }
+  },
+  "$defs": {
+    "locator": {
+      "type": "object",
+      "required": ["scheme", "value"],
+      "properties": { "scheme": { "type": "string", "minLength": 1 }, "value": { "type": "string" } },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

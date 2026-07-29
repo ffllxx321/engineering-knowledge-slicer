@@ -10,6 +10,12 @@
 | `UNSUPPORTED_*` | unsupported | 否 | 转为支持格式 |
 | `SIZE_LIMIT_*` | size_limit | 否 | 拆分文件或调整明确上限 |
 | `PARSER_*` / `OCR_*` | parser/ocr | 视状态 | 检查服务与解析质量 |
+| `OCR_UNAVAILABLE` | local_ocr | 是 | 启用并检测本地 OCR，或配置有效的绝对可执行文件 |
+| `OCR_RENDER_FAILURE` | local_ocr | 是 | 检查 `pdftoppm` 与 PDF 完整性 |
+| `OCR_TIMEOUT` | local_ocr | 是 | 提高单页超时或降低并发 |
+| `OCR_MALFORMED_OUTPUT` | local_ocr | 否 | 修复自定义 provider 的 `local_ocr_v1` JSON 输出 |
+| `OCR_CANCELLED` | cancelled | 否 | 用户取消；重试会复用有效页级 checkpoint |
+| `OCR_LIMITS_EXCEEDED` | local_ocr | 否 | 拆分 PDF 或降低渲染分辨率 |
 | `NETWORK_TRANSIENT_FAILURE` | network | 是 | 退避后重试 |
 | `AUTH_PROVIDER_REJECTED` | auth | 否 | 检查密钥/权限 |
 | `RATE_LIMIT_PROVIDER_BUSY` | rate_limit | 是 | 遵循 Retry-After |

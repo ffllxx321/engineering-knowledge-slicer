@@ -65,6 +65,17 @@ const {
   boundedDiagnosticJson
 } = require("src/core/diagnostic-report.js");
 const {
+  SHADOW_SCHEMA_VERSION,
+  aggregateShadowRuns,
+  boundedShadowStore,
+  buildShadowDocumentMetric,
+  compareShadowAggregates,
+  migrateShadowStore,
+  renderShadowMarkdown,
+  selectShadowCohort,
+  shadowPseudonym
+} = require("src/core/shadow-evaluation.js");
+const {
   formatBusinessDate,
   formatOperationalLocalDateTime,
   preciseIsoInstant,
@@ -577,6 +588,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.addCommand({ id: 'retry-failed-source-files', name: '重试失败任务并自动处理', callback: () => this.retryFailedAndAutoProcess(true) });
     this.addCommand({ id: 'rollback-last-batch', name: '回滚最近一批卡片', callback: () => this.rollbackLastBatch() });
     this.addCommand({ id: 'open-ai-settings', name: '打开工程知识切片 AI 设置', callback: () => this.activateView() });
+    this.addCommand({ id: 'run-shadow-evaluation', name: '运行本地影子评估', callback: () => this.runShadowEvaluation() });
+    this.addCommand({ id: 'export-shadow-evaluation', name: '导出影子评估诊断报告', callback: () => this.exportShadowReport() });
 
     this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
       if (!(file instanceof TFile)) return;
@@ -1408,6 +1421,249 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       this.taskControllers.delete(current.task_id);
       await this.refreshViews();
     }
+  }
+
+  shadowStorePath() {
+    return normalizeVaultPath(`${this.settings.logPath}/${this.settings.shadowStoreFileName || 'shadow-evaluation.json'}`);
+  }
+
+  async loadShadowStore() {
+    const file = this.app.vault.getAbstractFileByPath(this.shadowStorePath());
+    if (!(file instanceof TFile)) return migrateShadowStore({});
+    try { return migrateShadowStore(JSON.parse(await this.app.vault.read(file))); } catch (_) { return migrateShadowStore({}); }
+  }
+
+  async saveShadowStore(store) {
+    const bounded = boundedShadowStore(store, {
+      retentionDays: this.settings.shadowRetentionDays,
+      maxDocuments: this.settings.shadowSampleLimit
+    });
+    await writeFile(this.app, this.shadowStorePath(), JSON.stringify(bounded, null, 2));
+    return bounded;
+  }
+
+  async runShadowEvaluation(taskIds = null) {
+    if (this.settings.shadowEvaluationEnabled !== true) {
+      new Notice('影子评估默认关闭。请先在设置中明确启用。');
+      return null;
+    }
+    if (this._shadowRunning) {
+      new Notice('影子评估已在运行。');
+      return null;
+    }
+    const tasks = await this.loadTasks();
+    for (const task of tasks) {
+      const parsed = await this.loadArtifact(task, 'parsed');
+      const file = this.app.vault.getAbstractFileByPath(task.source_path);
+      task.shadow_metadata = {
+        parser: parsed?.parser || 'not-parsed',
+        size_bytes: Number(file?.stat?.size) || 0,
+        language: parsed?.metadata?.language || detectMetricLanguage(parsed?.markdown)
+      };
+    }
+    const requested = Array.isArray(taskIds) && taskIds.length
+      ? tasks.filter((task) => taskIds.includes(task.task_id))
+      : selectShadowCohort(tasks, { limit: this.settings.shadowCohortLimit, seed: this.settings.shadowCohortSeed });
+    if (!requested.length) {
+      new Notice('没有可评估的任务。请先扫描源文件。');
+      return null;
+    }
+    this._shadowRunning = true;
+    this._shadowController = new AbortController();
+    const store = await this.loadShadowStore();
+    const runId = `shadow-${Date.now().toString(36)}`;
+    let remainingBudget = Math.max(0, Number(this.settings.shadowProviderBudget) || 0);
+    try {
+      for (const task of requested) {
+        if (this._shadowController.signal.aborted) break;
+        const metric = await this.evaluateShadowTask(task, {
+          runId,
+          signal: this._shadowController.signal,
+          getRemainingBudget: () => remainingBudget,
+          consumeBudget: () => { remainingBudget -= 1; }
+        });
+        store.runs.push(metric);
+        await this.saveShadowStore(store);
+      }
+      await this.refreshViews();
+      const report = await this.shadowReport();
+      new Notice(`影子评估完成：${report.aggregate.documents} 条保留样本，本次剩余 provider 预算 ${remainingBudget}。`);
+      return report;
+    } finally {
+      this._shadowRunning = false;
+      this._shadowController = null;
+    }
+  }
+
+  cancelShadowEvaluation() {
+    this._shadowController?.abort();
+  }
+
+  async evaluateShadowTask(task, options) {
+    const started = Date.now();
+    const timings = {};
+    const cache = {};
+    const reasons = [];
+    let parsePackage = null;
+    let workflow = null;
+    let sizeBytes = 0;
+    let outcome = 'completed';
+    const shadowTask = Object.assign({}, task, { artifacts: Object.assign({}, task.artifacts || {}) });
+    const loadCheckpoint = async (name) => {
+      const normal = await this.loadArtifact(task, name);
+      if (normal) { cache.checkpointHits = (cache.checkpointHits || 0) + 1; return normal; }
+      const shadow = await this.loadArtifact(shadowTask, `shadow-${name}`);
+      if (shadow) cache.checkpointHits = (cache.checkpointHits || 0) + 1;
+      return shadow;
+    };
+    const saveCheckpoint = (name, value) => this.persistArtifact(shadowTask, `shadow-${name}`, value);
+    const counterBaseline = Object.assign({}, this.operationCounters);
+    try {
+      parsePackage = await this.loadArtifact(task, 'parsed');
+      cache.parseHit = Boolean(parsePackage);
+      if (!parsePackage) {
+        const parseStarted = Date.now();
+        const file = this.app.vault.getAbstractFileByPath(task.source_path);
+        if (!(file instanceof TFile)) { reasons.push('SOURCE_MISSING'); outcome = 'review'; }
+        else {
+          const buffer = Buffer.from(await this.app.vault.readBinary(file));
+          sizeBytes = buffer.length;
+          const extracted = await extractTextFromBuffer(task.source_path, buffer, {
+            pdfExtractor: { enabled: false, allowExternalUpload: false, confirmUploads: true },
+            localMsgAdapter: this.settings.localMsgAdapterEnabled !== false,
+            localOoxml: {
+              docxEnabled: this.settings.localDocxAdapterEnabled !== false,
+              xlsxEnabled: this.settings.localXlsxAdapterEnabled !== false,
+              pptxEnabled: this.settings.localPptxAdapterEnabled !== false,
+              limits: {
+                maxEntries: this.settings.ooxmlMaxEntries, maxUncompressedBytes: this.settings.ooxmlMaxUncompressedBytes,
+                maxXmlBytes: this.settings.ooxmlMaxXmlBytes, maxTextChars: this.settings.ooxmlMaxTextChars
+              }
+            },
+            localPdfInventory: this.settings.localPdfInventoryEnabled !== false,
+            blockPacking: this.settings.blockV0PackingEnabled === false ? false : { hardBudget: Math.max(128, Math.floor(Number(this.settings.aiChunkSize || 8000) / 4)) },
+            localOcr: {
+              enabled: this.settings.localOcrEnabled === true, provider: this.settings.localOcrProvider,
+              executable: this.settings.localOcrExecutable, languages: this.settings.localOcrLanguages,
+              concurrency: this.settings.localOcrConcurrency, timeoutMs: this.settings.localOcrTimeoutMs,
+              qualityThreshold: this.settings.localOcrQualityThreshold
+            },
+            signal: options.signal,
+            loadOcrCheckpoint: (key) => loadCheckpoint(key),
+            saveOcrCheckpoint: (key, value) => saveCheckpoint(key, value)
+          });
+          if (extracted.status === 'ok' && extracted.parsePackage) {
+            parsePackage = extracted.parsePackage;
+            await saveCheckpoint('parsed', parsePackage);
+          } else {
+            reasons.push(extracted.status === 'ocr_required' ? 'OCR_REQUIRED' : 'PARSER_REVIEW_REQUIRED');
+            outcome = 'review';
+          }
+        }
+        timings.parsing = Date.now() - parseStarted;
+      } else {
+        const file = this.app.vault.getAbstractFileByPath(task.source_path);
+        sizeBytes = Number(file?.stat?.size) || 0;
+      }
+      if (parsePackage && outcome === 'completed') {
+        const classification = await loadCheckpoint('classification');
+        const summary = await loadCheckpoint('summary');
+        const atomResult = await loadCheckpoint('atoms');
+        cache.classificationHit = Boolean(classification);
+        cache.summaryHit = Boolean(summary);
+        cache.atomsHit = Boolean(atomResult);
+        const workflowStarted = Date.now();
+        const contracts = await this.loadRuntimeContracts();
+        const tagLibrary = parseTagLibrary(await this.loadTagLibraryText());
+        const requestJson = async (prompt, context) => {
+          if (options.getRemainingBudget() <= 0) {
+            const error = new Error('Shadow provider budget exhausted');
+            error.code = 'PROVIDER_BUDGET_EXHAUSTED';
+            throw error;
+          }
+          options.consumeBudget();
+          this.operationCounters.apiRequests += 1;
+          this.operationCounters.promptCharacters += String(prompt || '').length;
+          const result = await requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest, signal: options.signal });
+          this.operationCounters.outputCharacters += JSON.stringify(result || {}).length;
+          return result;
+        };
+        workflow = await runKnowledgeWorkflow({
+          parsePackage, folderMap: contracts.folderMap, schemas: contracts.schemas, prompts: contracts.prompts,
+          classification, summary, atomResult, loadTypePrompt: (route) => this.loadComponentText(route.prompt),
+          sourceHash: task.source_hash, maxChunkChars: this.settings.aiChunkSize,
+          maxPointsPerRequest: this.settings.maxPointsPerRequest, summaryConcurrency: this.settings.summaryConcurrency,
+          atomizationConcurrency: this.settings.atomizationConcurrency, shortDocumentMaxCards: this.settings.shortDocumentMaxCards,
+          autoApproveConfidenceThreshold: this.settings.autoApproveConfidenceThreshold,
+          chunkOverlapRatio: this.settings.chunkOverlapRatio, coalesceTinyChunks: this.settings.coalesceTinyChunks,
+          loadSummaryMapChunk: (chunk) => loadCheckpoint(`summary-map-${chunk.stableChunkId || chunk.chunk_id}`),
+          saveSummaryMapChunk: (chunk, value) => saveCheckpoint(`summary-map-${chunk.stableChunkId || chunk.chunk_id}`, value),
+          loadSummaryReduceChunk: (checkpoint) => loadCheckpoint(`summary-reduce-${checkpoint.stableReduceId}`),
+          saveSummaryReduceChunk: (checkpoint, value) => saveCheckpoint(`summary-reduce-${checkpoint.stableReduceId}`, value),
+          loadAtomBatch: (batch) => loadCheckpoint(`atom-batch-${batch.stableBatchId}`),
+          saveAtomBatch: (batch, value) => saveCheckpoint(`atom-batch-${batch.stableBatchId}`, value),
+          versions: runtimeVersions(this.settings), businessTimeZone: resolveRuntimeTimeZone(this.settings.businessTimeZone),
+          existingCards: [], existingFingerprints: [], validateLabels: (atom) => validateAtomLabels(tagLibrary, atom),
+          signal: options.signal, requestJson, requestStream: null,
+          onArtifact: (name, value) => saveCheckpoint(name, value)
+        });
+        timings.workflow = Date.now() - workflowStarted;
+      }
+    } catch (error) {
+      if (error?.name === 'AbortError' || options.signal.aborted) { reasons.push('CANCELLED'); outcome = 'cancelled'; }
+      else if (error?.code === 'PROVIDER_BUDGET_EXHAUSTED') { reasons.push('PROVIDER_BUDGET_EXHAUSTED'); outcome = 'review'; }
+      else { reasons.push('INTERNAL'); outcome = 'failed'; }
+    }
+    timings.total = Date.now() - started;
+    const counters = Object.fromEntries(Object.entries(this.operationCounters).map(([key, value]) => [key, Math.max(0, Number(value) - Number(counterBaseline[key] || 0))]));
+    return buildShadowDocumentMetric({
+      runId: options.runId, sourceHash: task.source_hash, sourceType: task.source_type,
+      salt: this.manifest.id, sizeBytes, parsePackage, workflow, cache, timings, counters,
+      providerBudget: this.settings.shadowProviderBudget, reasons, outcome,
+      language: detectMetricLanguage(parsePackage?.markdown), resumable: true
+    });
+  }
+
+  async shadowReport() {
+    const store = await this.loadShadowStore();
+    const aggregate = aggregateShadowRuns(store.runs);
+    const baseline = store.baselines.at(-1);
+    return {
+      schema_version: SHADOW_SCHEMA_VERSION,
+      generated_at: new Date().toISOString(),
+      aggregate,
+      comparison: baseline ? compareShadowAggregates(aggregate, baseline.aggregate) : null,
+      documents: store.runs
+    };
+  }
+
+  async saveShadowBaseline() {
+    const store = await this.loadShadowStore();
+    const aggregate = aggregateShadowRuns(store.runs);
+    store.baselines.push({
+      baseline_id: `baseline-${Date.now().toString(36)}`,
+      created_at: new Date().toISOString(),
+      plugin_version: this.manifest.version,
+      pipeline_version: this.settings.pipelineVersion,
+      aggregate
+    });
+    await this.saveShadowStore(store);
+    new Notice('当前影子评估聚合结果已保存为基线。');
+  }
+
+  async exportShadowReport() {
+    const report = await this.shadowReport();
+    const { dialog } = require('electron');
+    const choice = await dialog.showSaveDialog({
+      title: '导出影子评估诊断报告',
+      defaultPath: `eks-shadow-evaluation-${new Date().toISOString().slice(0, 10)}.json`,
+      filters: [{ name: 'JSON', extensions: ['json'] }, { name: 'Markdown', extensions: ['md'] }]
+    });
+    if (choice.canceled || !choice.filePath) return;
+    const fs = require('fs');
+    const content = /\.md$/i.test(choice.filePath) ? renderShadowMarkdown(report) : JSON.stringify(report, null, 2);
+    fs.writeFileSync(choice.filePath, content, { encoding: 'utf8', mode: 0o600 });
+    new Notice('影子评估报告已在本地导出。');
   }
 
   async transitionCompletionUi(taskId) {
@@ -2947,7 +3203,8 @@ class SlicerDashboardView extends ItemView {
     const sections = [
       ['tasks', `任务 ${tasks.length}`],
       ['review', `审核 ${reviewCount}`],
-      ['errors', `错误 ${counts.failed}`]
+      ['errors', `错误 ${counts.failed}`],
+      ['shadow', '影子评估']
     ];
     for (const [id, label] of sections) {
       const tab = button(tabs, label, () => { this.activeSection = id; this.render(); });
@@ -2965,6 +3222,7 @@ class SlicerDashboardView extends ItemView {
     if (this.activeSection === 'tasks') this.renderTaskExplorer(panel, tasks);
     if (this.activeSection === 'review') await this.renderReview(panel, tasks, renderVersion);
     if (this.activeSection === 'errors') this.renderErrorCenter(panel, tasks);
+    if (this.activeSection === 'shadow') await this.renderShadowEvaluation(panel, tasks);
 
     const context = container.createEl('details', { cls: 'eks-context' });
     context.createEl('summary', { text: '路径与规则' });
@@ -3061,6 +3319,41 @@ class SlicerDashboardView extends ItemView {
     button(batch, '上一页', () => { this.taskPage = Math.max(0, this.taskPage - 1); this.render(); }, this.taskPage === 0);
     button(batch, '下一页', () => { this.taskPage = Math.min(maxPage, this.taskPage + 1); this.render(); }, this.taskPage >= maxPage);
     batch.createSpan({ cls: 'eks-task-meta', text: `第 ${this.taskPage + 1}/${maxPage + 1} 页 · 共 ${allFiltered.length} 项` });
+  }
+
+  async renderShadowEvaluation(parent, tasks) {
+    const report = await this.plugin.shadowReport();
+    parent.createEl('h3', { text: '生产影子评估' });
+    parent.createDiv({
+      cls: 'eks-task-meta',
+      text: this.plugin.settings.shadowEvaluationEnabled
+        ? `已启用 · provider 请求预算 ${this.plugin.settings.shadowProviderBudget} · 保留 ${report.aggregate.documents} 条`
+        : '默认关闭；启用前不会运行，也不会增加任何 provider 请求。'
+    });
+    const actions = parent.createDiv('eks-actions');
+    button(actions, '运行确定性代表队列', () => this.plugin.runShadowEvaluation());
+    if (this.selectedTaskIds.size) {
+      button(actions, `运行选中任务（${this.selectedTaskIds.size}）`, () => this.plugin.runShadowEvaluation([...this.selectedTaskIds]));
+    }
+    if (this.plugin._shadowRunning) button(actions, '取消影子评估', () => this.plugin.cancelShadowEvaluation());
+    button(actions, '保存当前基线', () => this.plugin.saveShadowBaseline());
+    button(actions, '导出 JSON / Markdown', () => this.plugin.exportShadowReport());
+    const aggregate = report.aggregate;
+    const grid = parent.createDiv('eks-summary-line');
+    grid.createSpan({ text: `文档 ${aggregate.documents}` });
+    grid.createSpan({ text: `卡片候选 ${aggregate.counts.cards}` });
+    grid.createSpan({ text: `审核 ${aggregate.counts.review}` });
+    grid.createSpan({ text: `请求 ${aggregate.provider.requests}` });
+    parent.createDiv({ cls: 'eks-task-meta', text: `证据定位核验率 ${formatMetricRate(aggregate.quality.locator_evidence_verification_rate)} · 总结覆盖率 ${formatMetricRate(aggregate.quality.summary_coverage_rate)} · 缓存命中 ${aggregate.cache_hits}` });
+    if (report.comparison) {
+      parent.createEl('h4', { text: '相对最近基线' });
+      parent.createEl('pre', { text: JSON.stringify(report.comparison.deltas, null, 2) });
+    }
+    if (Object.keys(aggregate.typed_reasons || {}).length) {
+      parent.createEl('h4', { text: '类型化失败 / 审核原因' });
+      parent.createEl('pre', { text: JSON.stringify(aggregate.typed_reasons, null, 2) });
+    }
+    parent.createDiv({ cls: 'eks-empty', text: '影子模式不写知识卡片、MOC 或索引，也不改变任务终态。当前版本不支持从影子结果直接提升；需回到正常任务显式处理。' });
   }
 
   renderErrorCenter(parent, tasks) {
@@ -3427,6 +3720,23 @@ class SlicerSettingTab extends PluginSettingTab {
             new Notice(`诊断日志路径：${logPath}\n请在系统文件管理器中手动打开。`);
           }
         }));
+    containerEl.createEl('h3', { text: '生产影子评估（本地优先）' });
+    new Setting(containerEl)
+      .setName('启用影子评估')
+      .setDesc('默认关闭。显式运行时复用正常解析/结构/质量逻辑和检查点，但不写卡片、MOC、索引，也不改变任务终态。')
+      .addToggle((toggle) => toggle.setValue(this.plugin.settings.shadowEvaluationEnabled === true).onChange(async (value) => {
+        this.plugin.settings.shadowEvaluationEnabled = value === true;
+        await this.plugin.saveSafeSettings();
+      }));
+    numberSetting(containerEl, this.plugin, '影子 provider 请求总预算', '每次运行的硬上限；0 表示只用本地解析和已有检查点，绝不发起 provider 请求。', 'shadowProviderBudget', 0, 1000);
+    numberSetting(containerEl, this.plugin, '代表队列样本上限', '按类型、解析器、大小、语言确定性分层轮询抽样。', 'shadowCohortLimit', 1, 500);
+    numberSetting(containerEl, this.plugin, '脱敏样本保留上限', '超过后按完成时间保留最新记录。', 'shadowSampleLimit', 1, 5000);
+    numberSetting(containerEl, this.plugin, '脱敏指标保留天数', '过期记录在下一次保存时清理。', 'shadowRetentionDays', 1, 3650);
+    new Setting(containerEl)
+      .setName('影子评估操作')
+      .setDesc('报告只含稳定来源伪名、计数、比率、耗时、成本计数和类型化原因。')
+      .addButton((control) => control.setButtonText('运行代表队列').onClick(() => this.plugin.runShadowEvaluation()))
+      .addButton((control) => control.setButtonText('导出报告').onClick(() => this.plugin.exportShadowReport()));
     pathSetting(containerEl, this.plugin, '招投标源文件路径', '固定读取招投标源文件。', 'bidIntakePath');
     pathSetting(containerEl, this.plugin, '业务库源文件路径', '固定读取业务库源文件。', 'businessIntakePath');
     pathSetting(containerEl, this.plugin, '招投标输出路径', '招投标知识卡片固定输出根目录。', 'bidOutputPath');
@@ -3875,6 +4185,17 @@ function textSetting(containerEl, plugin, name, desc, key, fallback = '') {
       }));
 }
 
+function numberSetting(containerEl, plugin, name, desc, key, min, max) {
+  new Setting(containerEl).setName(name).setDesc(desc).addText((text) => text
+    .setValue(String(plugin.settings[key]))
+    .onChange(async (value) => {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed)) return;
+      plugin.settings[key] = Math.max(min, Math.min(max, Math.round(parsed)));
+      await plugin.saveSafeSettings();
+    }));
+}
+
 function passwordSetting(containerEl, plugin, name, desc, key, placeholder = '') {
   new Setting(containerEl)
     .setName(name)
@@ -4191,6 +4512,22 @@ function runtimeVersions(settings) {
   };
 }
 
+function detectMetricLanguage(text) {
+  const sample = String(text || '').slice(0, 20000);
+  if (!sample) return 'unknown';
+  const han = (sample.match(/[\u3400-\u9fff]/g) || []).length;
+  const kana = (sample.match(/[\u3040-\u30ff]/g) || []).length;
+  const latin = (sample.match(/[A-Za-z]/g) || []).length;
+  if (kana > Math.max(10, han * 0.05)) return 'ja';
+  if (han > latin * 0.25) return 'zh';
+  if (latin > 20) return 'en';
+  return 'unknown';
+}
+
+function formatMetricRate(value) {
+  return Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(1)}%` : 'n/a';
+}
+
 function libraryForPath(filePath, settings) {
   const path = normalizeVaultPath(filePath);
   if (path.startsWith(`${normalizeVaultPath(settings.businessIntakePath)}/`)) return 'business';
@@ -4317,6 +4654,328 @@ function approvedStatus(library) {
 
 },
 /**
+ * @module src/core/shadow-evaluation
+ * Privacy-safe, bounded shadow evaluation records and deterministic cohorts.
+ */
+"src/core/shadow-evaluation.js": function(require, module, exports) {
+const crypto = require("crypto");
+
+const SHADOW_SCHEMA_VERSION = 'eks-shadow-evaluation/1.0';
+const STORE_SCHEMA_VERSION = 'eks-shadow-store/1.0';
+const SENSITIVE_KEYS = /(?:path|filename|content|markdown|text|quote|excerpt|credential|secret|token|api.?key|prompt|response)/i;
+const ALLOWED_REASONS = new Set([
+  'PROVIDER_BUDGET_EXHAUSTED', 'LOCAL_PARSER_UNAVAILABLE', 'OCR_REQUIRED',
+  'PARSER_REVIEW_REQUIRED', 'SOURCE_MISSING', 'CANCELLED', 'CHECKPOINT_MISSING',
+  'CLASSIFICATION_INVALID', 'SUMMARY_INCOMPLETE', 'ATOM_VALIDATION_FAILED',
+  'EVIDENCE_UNVERIFIED', 'DUPLICATE', 'REGENERATION', 'INTERNAL'
+]);
+
+function finite(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function clampInt(value, min, max, fallback) {
+  return Math.max(min, Math.min(max, Math.round(finite(value, fallback))));
+}
+
+function shadowPseudonym(sourceHash, salt = '') {
+  return `src_${crypto.createHash('sha256').update(`${salt}:${String(sourceHash || '')}`).digest('hex').slice(0, 20)}`;
+}
+
+function sizeBucket(bytes) {
+  const value = finite(bytes);
+  if (value < 100 * 1024) return 'small';
+  if (value < 5 * 1024 * 1024) return 'medium';
+  return 'large';
+}
+
+function safeReason(reason) {
+  const normalized = String(reason || 'INTERNAL').toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+  return ALLOWED_REASONS.has(normalized) ? normalized : 'INTERNAL';
+}
+
+function sanitize(value, key = '', depth = 0) {
+  if (depth > 8) return '[bounded]';
+  if (SENSITIVE_KEYS.test(key)) return undefined;
+  if (typeof value === 'string') {
+    if (/^eks-shadow-(?:evaluation|store)\/\d+\.\d+$/.test(value)) return value;
+    if (/[\\/]/.test(value) || value.length > 160 || /(?:bearer\s+|sk-|key-|ghp_|eyJ)[A-Za-z0-9_.-]{12,}/i.test(value)) return '[redacted]';
+    return value;
+  }
+  if (value === null || value === undefined || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.slice(0, 200).map((item) => sanitize(item, '', depth + 1)).filter((item) => item !== undefined);
+  const output = {};
+  for (const [childKey, item] of Object.entries(value)) {
+    const cleaned = sanitize(item, childKey, depth + 1);
+    if (cleaned !== undefined) output[childKey] = cleaned;
+  }
+  return output;
+}
+
+function typedReasons(items = []) {
+  const counts = {};
+  for (const item of items) {
+    const reason = safeReason(typeof item === 'string' ? item : item?.code || item?.reason);
+    counts[reason] = (counts[reason] || 0) + 1;
+  }
+  return counts;
+}
+
+function buildShadowDocumentMetric(input = {}) {
+  const parsePackage = input.parsePackage || {};
+  const blocks = Array.isArray(parsePackage.blocks) ? parsePackage.blocks : [];
+  const eligible = blocks.filter((block) => block?.card_eligible !== false
+    && String(block?.raw_text || block?.text || block?.content || '').trim().length >= 2);
+  const workflow = input.workflow || {};
+  const accepted = Array.isArray(workflow.accepted) ? workflow.accepted : [];
+  const review = Array.isArray(workflow.review) ? workflow.review : [];
+  const atoms = Array.isArray(workflow.atomResult?.atoms) ? workflow.atomResult.atoms : [];
+  const verification = [...accepted.map((card) => card.validation_report), ...review.map((item) => item.validation_report)]
+    .filter(Boolean);
+  const verified = verification.filter((item) => item.sourceLinkValid !== false && item.evidenceFound !== false).length;
+  const summaryPoints = Array.isArray(workflow.summary?.key_points) ? workflow.summary.key_points : [];
+  const covered = new Set(atoms.flatMap((atom) => atom.source_point_ids || (atom.source_point_id ? [atom.source_point_id] : []))).size;
+  const reasons = [
+    ...(input.reasons || []),
+    ...review.flatMap((item) => item.reasons || []),
+    ...atoms.filter((atom) => atom.duplicate_of).map(() => 'DUPLICATE'),
+    ...atoms.filter((atom) => atom.regeneration_reason).map(() => 'REGENERATION')
+  ];
+  const counters = input.counters || {};
+  return sanitize({
+    schema_version: SHADOW_SCHEMA_VERSION,
+    run_id: String(input.runId || ''),
+    source_pseudonym: shadowPseudonym(input.sourceHash, input.salt),
+    source: {
+      type: String(input.sourceType || 'unknown'),
+      parser: String(parsePackage.parser || input.parser || 'unknown'),
+      language: String(input.language || parsePackage.metadata?.language || 'unknown'),
+      size_bytes: Math.max(0, finite(input.sizeBytes)),
+      size_bucket: sizeBucket(input.sizeBytes)
+    },
+    counts: {
+      parse_blocks: blocks.length,
+      eligible_blocks: eligible.length,
+      summary_points: summaryPoints.length,
+      atoms: atoms.length,
+      cards: accepted.length,
+      review: review.length
+    },
+    quality: {
+      locator_evidence_verified: verified,
+      locator_evidence_total: verification.length,
+      locator_evidence_verification_rate: verification.length ? verified / verification.length : null,
+      summary_covered_points: covered,
+      summary_total_points: summaryPoints.length,
+      summary_coverage_rate: summaryPoints.length ? Math.min(1, covered / summaryPoints.length) : null
+    },
+    classification: workflow.classification ? {
+      route: String(workflow.route?.folder_type || workflow.classification.folder_type || 'unknown'),
+      confidence: Number.isFinite(Number(workflow.classification.confidence)) ? Number(workflow.classification.confidence) : null
+    } : null,
+    duplicate_regeneration_reasons: typedReasons(reasons.filter((reason) => /duplicate|regenerat/i.test(String(reason)))),
+    cache: {
+      parse_hit: input.cache?.parseHit === true,
+      classification_hit: input.cache?.classificationHit === true,
+      summary_hit: input.cache?.summaryHit === true,
+      atoms_hit: input.cache?.atomsHit === true,
+      checkpoint_hits: Math.max(0, finite(input.cache?.checkpointHits))
+    },
+    stage_timings_ms: Object.fromEntries(Object.entries(input.timings || {}).map(([key, value]) => [String(key), Math.max(0, finite(value))])),
+    provider: {
+      budget: Math.max(0, finite(input.providerBudget)),
+      requests: Math.max(0, finite(counters.apiRequests)),
+      input_tokens_estimated: Math.max(0, finite(counters.estimatedInputTokens || Math.ceil(finite(counters.promptCharacters) / 3))),
+      output_tokens_estimated: Math.max(0, finite(counters.estimatedOutputTokens || Math.ceil(finite(counters.outputCharacters) / 3))),
+      cost: Number.isFinite(Number(counters.cost)) ? Math.max(0, Number(counters.cost)) : null
+    },
+    outcome: String(input.outcome || 'completed'),
+    typed_reasons: typedReasons(reasons),
+    resumable: input.resumable !== false,
+    completed_at: String(input.completedAt || new Date().toISOString())
+  });
+}
+
+function stableRank(seed, item) {
+  return crypto.createHash('sha256').update(`${seed}:${item.source_hash || item.task_id || ''}`).digest('hex');
+}
+
+function stratum(task) {
+  const metadata = task.shadow_metadata || {};
+  return [
+    task.source_type || 'unknown',
+    metadata.parser || task.parser || 'unknown',
+    metadata.size_bucket || sizeBucket(metadata.size_bytes || task.size_bytes),
+    metadata.language || task.language || 'unknown'
+  ].join('|');
+}
+
+function selectShadowCohort(tasks = [], options = {}) {
+  const limit = clampInt(options.limit, 1, 500, 20);
+  const seed = String(options.seed || 'eks-shadow-v1');
+  const eligible = tasks.filter((task) => task && task.source_hash && task.task_id);
+  const groups = new Map();
+  for (const task of eligible) {
+    const key = stratum(task);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(task);
+  }
+  for (const rows of groups.values()) rows.sort((a, b) => stableRank(seed, a).localeCompare(stableRank(seed, b)));
+  const keys = [...groups.keys()].sort((a, b) => stableRank(seed, { source_hash: a }).localeCompare(stableRank(seed, { source_hash: b })));
+  const selected = [];
+  let round = 0;
+  while (selected.length < limit) {
+    let added = false;
+    for (const key of keys) {
+      const row = groups.get(key)?.[round];
+      if (!row) continue;
+      selected.push(row);
+      added = true;
+      if (selected.length >= limit) break;
+    }
+    if (!added) break;
+    round += 1;
+  }
+  return selected;
+}
+
+function aggregateShadowRuns(documents = []) {
+  const rows = documents.filter((row) => row?.schema_version === SHADOW_SCHEMA_VERSION);
+  const sum = (pick) => rows.reduce((total, row) => total + finite(pick(row)), 0);
+  const verified = sum((row) => row.quality?.locator_evidence_verified);
+  const verificationTotal = sum((row) => row.quality?.locator_evidence_total);
+  const covered = sum((row) => row.quality?.summary_covered_points);
+  const pointTotal = sum((row) => row.quality?.summary_total_points);
+  const timings = {};
+  for (const row of rows) for (const [stage, value] of Object.entries(row.stage_timings_ms || {})) {
+    if (!timings[stage]) timings[stage] = [];
+    timings[stage].push(finite(value));
+  }
+  return {
+    schema_version: SHADOW_SCHEMA_VERSION,
+    documents: rows.length,
+    by_type: countBy(rows, (row) => row.source?.type),
+    by_parser: countBy(rows, (row) => row.source?.parser),
+    by_language: countBy(rows, (row) => row.source?.language),
+    outcomes: countBy(rows, (row) => row.outcome),
+    counts: {
+      parse_blocks: sum((row) => row.counts?.parse_blocks),
+      eligible_blocks: sum((row) => row.counts?.eligible_blocks),
+      atoms: sum((row) => row.counts?.atoms),
+      cards: sum((row) => row.counts?.cards),
+      review: sum((row) => row.counts?.review)
+    },
+    quality: {
+      locator_evidence_verification_rate: verificationTotal ? verified / verificationTotal : null,
+      summary_coverage_rate: pointTotal ? covered / pointTotal : null
+    },
+    provider: {
+      requests: sum((row) => row.provider?.requests),
+      input_tokens_estimated: sum((row) => row.provider?.input_tokens_estimated),
+      output_tokens_estimated: sum((row) => row.provider?.output_tokens_estimated),
+      cost: rows.some((row) => row.provider?.cost !== null) ? sum((row) => row.provider?.cost) : null
+    },
+    cache_hits: sum((row) => Object.values(row.cache || {}).filter((value) => value === true).length + finite(row.cache?.checkpoint_hits)),
+    stage_timings_ms: Object.fromEntries(Object.entries(timings).map(([stage, values]) => [
+      stage, { total: values.reduce((a, b) => a + b, 0), mean: values.reduce((a, b) => a + b, 0) / values.length, max: Math.max(...values) }
+    ])),
+    typed_reasons: mergeCounts(rows.map((row) => row.typed_reasons || {}))
+  };
+}
+
+function countBy(rows, pick) {
+  const result = {};
+  for (const row of rows) {
+    const key = String(pick(row) || 'unknown');
+    result[key] = (result[key] || 0) + 1;
+  }
+  return result;
+}
+
+function mergeCounts(items) {
+  const result = {};
+  for (const item of items) for (const [key, count] of Object.entries(item || {})) result[key] = (result[key] || 0) + finite(count);
+  return result;
+}
+
+function migrateShadowStore(raw = {}) {
+  if (raw?.schema_version === STORE_SCHEMA_VERSION) {
+    return sanitize({ schema_version: STORE_SCHEMA_VERSION, runs: raw.runs || [], baselines: raw.baselines || [] });
+  }
+  const legacyRows = Array.isArray(raw) ? raw : (raw.documents || raw.runs || []);
+  return sanitize({
+    schema_version: STORE_SCHEMA_VERSION,
+    runs: legacyRows.map((row) => row.schema_version ? row : Object.assign({ schema_version: SHADOW_SCHEMA_VERSION }, row)),
+    baselines: Array.isArray(raw.baselines) ? raw.baselines : []
+  });
+}
+
+function boundedShadowStore(store, options = {}) {
+  const migrated = migrateShadowStore(store);
+  const maxDocuments = clampInt(options.maxDocuments, 1, 5000, 200);
+  const retentionDays = clampInt(options.retentionDays, 1, 3650, 30);
+  const cutoff = Date.now() - retentionDays * 86400000;
+  const runs = migrated.runs
+    .filter((row) => !row.completed_at || Date.parse(row.completed_at) >= cutoff)
+    .sort((a, b) => String(b.completed_at || '').localeCompare(String(a.completed_at || '')))
+    .slice(0, maxDocuments);
+  return { schema_version: STORE_SCHEMA_VERSION, runs, baselines: migrated.baselines.slice(-20) };
+}
+
+function compareShadowAggregates(current, baseline) {
+  const metric = (path) => path.split('.').reduce((value, key) => value?.[key], current);
+  const prior = (path) => path.split('.').reduce((value, key) => value?.[key], baseline);
+  const paths = [
+    'quality.locator_evidence_verification_rate', 'quality.summary_coverage_rate',
+    'provider.requests', 'provider.input_tokens_estimated', 'counts.cards', 'counts.review'
+  ];
+  return {
+    schema_version: SHADOW_SCHEMA_VERSION,
+    baseline_id: baseline?.baseline_id || null,
+    deltas: Object.fromEntries(paths.map((path) => [path, finite(metric(path)) - finite(prior(path))]))
+  };
+}
+
+function renderShadowMarkdown(report = {}) {
+  const aggregate = report.aggregate || aggregateShadowRuns(report.documents || []);
+  const comparison = report.comparison;
+  const lines = [
+    '# Engineering Knowledge Slicer Shadow Evaluation',
+    '',
+    `- Schema: ${SHADOW_SCHEMA_VERSION}`,
+    `- Documents: ${aggregate.documents || 0}`,
+    `- Provider requests: ${aggregate.provider?.requests || 0}`,
+    `- Evidence verification: ${formatRate(aggregate.quality?.locator_evidence_verification_rate)}`,
+    `- Summary coverage: ${formatRate(aggregate.quality?.summary_coverage_rate)}`,
+    `- Cards / review: ${aggregate.counts?.cards || 0} / ${aggregate.counts?.review || 0}`,
+    '',
+    '## Typed reasons',
+    '',
+    ...Object.entries(aggregate.typed_reasons || {}).map(([reason, count]) => `- ${reason}: ${count}`)
+  ];
+  if (comparison) lines.push('', '## Baseline deltas', '', '```json', JSON.stringify(comparison.deltas, null, 2), '```');
+  return `${lines.join('\n')}\n`;
+}
+
+function formatRate(value) {
+  return Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(1)}%` : 'n/a';
+}
+
+module.exports = {
+  SHADOW_SCHEMA_VERSION,
+  aggregateShadowRuns,
+  boundedShadowStore,
+  buildShadowDocumentMetric,
+  compareShadowAggregates,
+  migrateShadowStore,
+  renderShadowMarkdown,
+  selectShadowCohort,
+  shadowPseudonym
+};
+
+},
+/**
  * @module src/core/task
  * 任务默认配置 / 运行时 schema 版本号常量
  * @exports DEFAULT_SETTINGS
@@ -4327,7 +4986,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 23,
+  settingsVersion: 24,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -4419,7 +5078,15 @@ const DEFAULT_SETTINGS = {
   //   自动扫描会连带触发云端解析与 MiniMax 调用（计费），属于高成本行为，
   //   必须由用户在设置中明确开启；关闭时只能通过控制台「扫描并自动处理」
   //   按钮或「扫描源文件」命令手动触发。
-  autoScanOnStartup: false
+  autoScanOnStartup: false,
+  // v2.13: 生产影子评估默认关闭。providerBudget=0 是完全本地/检查点模式。
+  shadowEvaluationEnabled: false,
+  shadowProviderBudget: 0,
+  shadowCohortLimit: 20,
+  shadowRetentionDays: 30,
+  shadowSampleLimit: 200,
+  shadowCohortSeed: 'eks-shadow-v1',
+  shadowStoreFileName: 'shadow-evaluation.json'
 };
 
 function migrateSettings(stored = {}) {
@@ -4428,7 +5095,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 23;
+  migrated.settingsVersion = 24;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -4504,6 +5171,13 @@ function migrateSettings(stored = {}) {
   if (!Number(migrated.rateLimitBackoffMaxMs)) migrated.rateLimitBackoffMaxMs = DEFAULT_SETTINGS.rateLimitBackoffMaxMs;
   if (!Number(migrated.rateLimitWindowSize)) migrated.rateLimitWindowSize = DEFAULT_SETTINGS.rateLimitWindowSize;
   migrated.businessTimeZone = String(migrated.businessTimeZone || '');
+  migrated.shadowEvaluationEnabled = source.shadowEvaluationEnabled === true;
+  migrated.shadowProviderBudget = Math.max(0, Math.min(1000, Math.round(Number(migrated.shadowProviderBudget) || 0)));
+  migrated.shadowCohortLimit = Math.max(1, Math.min(500, Math.round(Number(migrated.shadowCohortLimit) || DEFAULT_SETTINGS.shadowCohortLimit)));
+  migrated.shadowRetentionDays = Math.max(1, Math.min(3650, Math.round(Number(migrated.shadowRetentionDays) || DEFAULT_SETTINGS.shadowRetentionDays)));
+  migrated.shadowSampleLimit = Math.max(1, Math.min(5000, Math.round(Number(migrated.shadowSampleLimit) || DEFAULT_SETTINGS.shadowSampleLimit)));
+  migrated.shadowCohortSeed = String(migrated.shadowCohortSeed || DEFAULT_SETTINGS.shadowCohortSeed).slice(0, 80);
+  migrated.shadowStoreFileName = DEFAULT_SETTINGS.shadowStoreFileName;
   return migrated;
 }
 

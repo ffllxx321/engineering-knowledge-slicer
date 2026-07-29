@@ -1,6 +1,6 @@
 # 工程知识切片（Engineering Knowledge Slicer）
 
-> 当前版本 **v2.12.0**（settingsVersion 23）· Obsidian Desktop 1.5.0+ · MIT
+> 当前版本 **v2.13.0**（settingsVersion 24）· Obsidian Desktop 1.5.0+ · MIT
 
 通过 **MinerU / PaddleOCR + MiniMax M3**，把工程资料（PDF、Word、PPT、图片、邮件等）批量转化为**中文、可追溯、固定目录归档**的 Obsidian 知识卡片。
 
@@ -19,6 +19,7 @@
 - **SSE 流式输出（POC）**：可选开启，AI 调用期间逐 token 回显
 - **密钥外部化**：API 密钥读取自 `~/.eks-secrets.json`，避免 OneDrive/iCloud 同步泄露
 - **诊断报告**：Dashboard 错误详情一键复制结构化脱敏报告（64 KiB JSON 硬上限），优先提交该报告而不是原始日志
+- **生产影子评估（v2.13）**：默认关闭；在插件内复用本地解析与已有检查点，以确定性分层队列采集脱敏质量/成本/时延指标，不写卡片、MOC、索引，也不改变任务终态。provider 请求有每次运行硬预算，设为 0 时绝不联网
 - **诊断日志**：全链路脱敏 diag 日志，默认写到 `~/.eks/logs/diag.log`，保留为本地深度排查兼容入口
 - **安全检查点与结构化错误**：阶段产物以 source/pipeline/prompt/schema 指纹校验后复用；错误提供稳定代码、可重试性和建议操作，日志递归脱敏 Header、JWT 和敏感 URL 参数
 - **可取消的外部工作**：取消会中止 MiniMax 排队/JSON/SSE 请求以及 MinerU/PaddleOCR 上传、轮询等待和下载，不再等当前远程阶段自然超时
@@ -33,7 +34,7 @@
 ```
 .
 ├── manifest.json            # Obsidian 插件元信息
-├── main.js                  # 插件主入口（自包含 bundle，23 个内嵌模块，可直接发布）
+├── main.js                  # 插件主入口（自包含 bundle，24 个内嵌模块，可直接发布）
 ├── styles.css               # 仪表盘 / 进度条样式
 ├── data.json                # 插件默认 settings（不含密钥）
 ├── LICENSE                  # MIT
@@ -106,12 +107,16 @@
 | `retry-failed-source-files` | 重试失败任务并自动处理 |
 | `rollback-last-batch` | 回滚最近一批卡片 |
 | `open-ai-settings` | 打开 AI 设置 |
+| `run-shadow-evaluation` | 运行本地影子评估（需先显式启用） |
+| `export-shadow-evaluation` | 本地导出影子评估 JSON / Markdown |
 
 ## 关键设置项
 
 | 设置 | 默认 | 说明 |
 |---|---|---|
 | **启动时自动扫描** | 关 | v2.8 新增，开启后每次打开 Obsidian 自动扫描源目录并开始处理；会触发云端解析与 AI 计费，默认关闭，建议手动点「扫描并自动处理」 |
+| **生产影子评估** | 关 | 只读候选输出；代表队列按类型/解析器/大小/语言确定性分层，脱敏指标受保留天数与样本数双重限制 |
+| **影子 provider 请求预算** | 0 | 单次运行硬上限；0 只允许本地解析与命中已有检查点，远程文档上传始终关闭 |
 | **本地 DOCX / XLSX / PPTX 适配器** | 开 | 在本机保留 Office 原生结构，不上传、不调用 AI；本地失败后的云端回退仍受显式外传授权控制 |
 | 自动入库置信度门槛 | 0.9 | 低于门槛的卡片进入审核台 |
 | 并发处理文档数 | 3 | 同时处理的源文件数 |

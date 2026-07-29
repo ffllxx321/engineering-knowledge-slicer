@@ -8,7 +8,7 @@
 | `SECRET_*` | secret | 否 | 配置密钥，禁止写日志 |
 | `FILE_NOT_FOUND` / `FILE_*` | file | 否 | 检查文件与路径 |
 | `COMPONENT_PATH_INVALID` | component_config | 否 | 相对路径必须指向组件包内 `.md`/`.json` 文件，不能为空、目录、根路径或穿越路径 |
-| `COMPONENT_NOT_FOUND` | component_config | 否 | 恢复或修正缺失组件文件；重试复用 parsed artifact |
+| `COMPONENT_NOT_FOUND` | component_config | 否 | 该组件没有可用的内置兼容回退；恢复缺失用户组件，重试复用 parsed artifact |
 | `COMPONENT_CONFIG_INVALID` | component_config | 否 | 修正 folder-map、Schema 或 Prompt 配置 |
 | `UNSUPPORTED_*` | unsupported | 否 | 转为支持格式 |
 | `SIZE_LIMIT_*` | size_limit | 否 | 拆分文件或调整明确上限 |

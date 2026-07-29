@@ -1,6 +1,6 @@
 # 工程知识切片（Engineering Knowledge Slicer）
 
-> 当前版本 **v2.17.0**（settingsVersion 29）· Obsidian Desktop 1.5.0+ · MIT
+> 当前版本 **v2.17.1**（settingsVersion 29）· Obsidian Desktop 1.5.0+ · MIT
 
 通过 **MinerU / PaddleOCR + MiniMax M3**，把工程资料（PDF、Word、PPT、图片、邮件等）批量转化为**中文、可追溯、固定目录归档**的 Obsidian 知识卡片。
 
@@ -173,6 +173,7 @@ node scripts/smoke-v292.js           # 诊断日志故障回归（v2.9.2，22 �
 - SSE 流式输出为 POC 状态，MiniMax 接口行为变化时可能回退为整包接收
 - 切分结果自 v2.7 起与旧版不再逐字节一致（按标题边界 + 合并 + 重叠重排），artifact 缓存在任务重跑时自动覆盖
 - 生产实现仍是自包含 JavaScript bundle；`npm run typecheck` 对新增 JSDoc 契约执行 strict TypeScript 检查，`npm run build` 在临时目录真实打包并断言不改写生产 bundle。
+- 发布 ZIP 始终只有 `main.js`、`manifest.json`、`styles.css`，不会携带组件包。用户组件包中的 folder-map、标签库、提示词、模板和业务配置仍是外部且优先；仅当 `schemas/block-v0.schema.json` 或 `schemas/parse-package.schema.json` 缺失时，运行时使用 `main.js` 内与仓库当前规范逐字节一致的兼容副本。已有但无效的文件不会被内置内容掩盖。
 - 远端供应商没有公开 cancel endpoint；本地取消会立即停止队列、请求等待和后续轮询。
 
 ## 优化与诊断文档

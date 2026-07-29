@@ -37,7 +37,9 @@ const { createFolderIndexMarkdown, folderIndexPath } = require("src/core/moc.js"
 const { parseTagLibrary, suggestMapIndex, validateCard } = require("src/core/tags.js");
 const { detectEcosystemPlugins } = require("src/core/ecosystem.js");
 const {
+  BUILTIN_INFRASTRUCTURE_SCHEMA_PATHS,
   ComponentError,
+  builtInInfrastructureSchema,
   normalizeComponentRelativePath,
   normalizeFolderMapConfig,
   resolveComponentFilePath,
@@ -2113,12 +2115,23 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const path = resolveComponentFilePath(this.settings.componentPackPath, normalizedRelative);
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) {
+      const builtIn = !(file instanceof TFolder) && builtInInfrastructureSchema(normalizedRelative);
+      if (builtIn) {
+        diag('component.builtinFallback', {
+          relativePath: builtIn.relativePath,
+          builtInVersion: builtIn.version,
+          hash: builtIn.hash,
+          reason: 'missing'
+        });
+        return builtIn.text;
+      }
       diag('component.cacheMiss', {
         relativePath: normalizedRelative, reason: file instanceof TFolder ? 'directory' : 'not_found'
       });
       throw new ComponentError('COMPONENT_NOT_FOUND', `组件文件不存在：${normalizedRelative}`, {
         reason: file instanceof TFolder ? 'path_is_directory' : 'not_found',
-        relativePath: normalizedRelative
+        relativePath: normalizedRelative,
+        builtInFallbackAvailable: BUILTIN_INFRASTRUCTURE_SCHEMA_PATHS.includes(normalizedRelative)
       });
     }
     const fingerprint = `${file.stat?.mtime || 0}:${file.stat?.size || 0}`;
@@ -2137,7 +2150,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const text = await this.loadComponentText(relativePath);
     try { return JSON.parse(text); } catch (error) {
       throw new ComponentError('COMPONENT_CONFIG_INVALID', `组件 JSON 配置无效：${relativePath}`, {
-        reason: 'invalid_json', relativePath: String(relativePath || ''), parseError: String(error.message || '').slice(0, 160)
+        reason: 'invalid_json',
+        relativePath: normalizeComponentRelativePath(relativePath),
+        builtInFallbackAvailable: BUILTIN_INFRASTRUCTURE_SCHEMA_PATHS.includes(normalizeComponentRelativePath(relativePath)),
+        builtInFallbackApplied: false,
+        parseError: String(error.message || '').slice(0, 160)
       });
     }
   }
@@ -2150,7 +2167,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         classification: await this.loadComponentJson('schemas/classification.schema.json'),
         summary: await this.loadComponentJson('schemas/structured-summary.schema.json'),
         atoms: await this.loadComponentJson('schemas/knowledge-atoms.schema.json'),
-        blockV0: await this.loadComponentJson('schemas/block-v0.schema.json')
+        blockV0: await this.loadComponentJson('schemas/block-v0.schema.json'),
+        parsePackage: await this.loadComponentJson('schemas/parse-package.schema.json')
       },
       prompts: {
         classifier: await this.loadComponentText('提示词/00-类型判定.md'),
@@ -9423,6 +9441,34 @@ module.exports = { extractZipEntryEndingWith };
  */
 "src/core/component-loader.js": function(require, module, exports) {
 const ALLOWED_EXTENSIONS = new Set(['.json', '.md']);
+const BUILTIN_SCHEMA_VERSION = '2.17.1';
+const BUILTIN_INFRASTRUCTURE_SCHEMAS = Object.freeze({
+  'schemas/block-v0.schema.json': Object.freeze({
+    version: BUILTIN_SCHEMA_VERSION,
+    hash: 'dfb742a17c699cadab370f8d9c3e3c741fd38b465652805338a539a0d63e514a',
+    base64: 'ewogICIkc2NoZW1hIjogImh0dHBzOi8vanNvbi1zY2hlbWEub3JnL2RyYWZ0LzIwMjAtMTIvc2NoZW1hIiwKICAiJGlkIjogImh0dHBzOi8vZW5naW5lZXJpbmcta25vd2xlZGdlLXNsaWNlci5sb2NhbC9zY2hlbWFzL2Jsb2NrLXYwLnNjaGVtYS5qc29uIiwKICAidGl0bGUiOiAiRW5naW5lZXJpbmcgS25vd2xlZGdlIFNsaWNlciBwZXJtaXNzaXZlIGJsb2NrX3YwIiwKICAidHlwZSI6ICJvYmplY3QiLAogICJyZXF1aXJlZCI6IFsic2NoZW1hX3ZlcnNpb24iLCAiYmxvY2tfaWQiLCAic291cmNlX2hhc2giLCAib3JkZXIiLCAicGFyZW50X2lkIiwgImtpbmQiLCAibG9jYXRvciIsICJwcm92ZW5hbmNlIiwgInJhdyIsICJpbmZlcnJlZCIsICJwYXJzZSIsICJjYXJkX2VsaWdpYmxlIiwgImV4Y2x1c2lvbl9yZWFzb24iLCAibWV0YWRhdGEiXSwKICAicHJvcGVydGllcyI6IHsKICAgICJzY2hlbWFfdmVyc2lvbiI6IHsgImNvbnN0IjogImJsb2NrX3YwIiB9LAogICAgImJsb2NrX2lkIjogeyAidHlwZSI6ICJzdHJpbmciLCAicGF0dGVybiI6ICJeYmxvY2stW2EtZjAtOV17MjR9JCIgfSwKICAgICJzb3VyY2VfaGFzaCI6IHsgInR5cGUiOiAic3RyaW5nIiwgInBhdHRlcm4iOiAiXlthLWYwLTldezY0fSQiIH0sCiAgICAib3JkZXIiOiB7ICJ0eXBlIjogImludGVnZXIiLCAibWluaW11bSI6IDAgfSwKICAgICJwYXJlbnRfaWQiOiB7ICJ0eXBlIjogWyJzdHJpbmciLCAibnVsbCJdIH0sCiAgICAia2luZCI6IHsgInR5cGUiOiAic3RyaW5nIiwgIm1pbkxlbmd0aCI6IDEgfSwKICAgICJsb2NhdG9yIjogeyAiJHJlZiI6ICIjLyRkZWZzL2xvY2F0b3IiIH0sCiAgICAicHJvdmVuYW5jZSI6IHsgInR5cGUiOiAiYXJyYXkiLCAiaXRlbXMiOiB7ICIkcmVmIjogIiMvJGRlZnMvbG9jYXRvciIgfSB9LAogICAgInJhdyI6IHsKICAgICAgInR5cGUiOiAib2JqZWN0IiwKICAgICAgInJlcXVpcmVkIjogWyJ0ZXh0IiwgImZpZWxkcyJdLAogICAgICAicHJvcGVydGllcyI6IHsgInRleHQiOiB7ICJ0eXBlIjogInN0cmluZyIgfSwgImZpZWxkcyI6IHsgInR5cGUiOiAib2JqZWN0IiwgImFkZGl0aW9uYWxQcm9wZXJ0aWVzIjogdHJ1ZSB9IH0sCiAgICAgICJhZGRpdGlvbmFsUHJvcGVydGllcyI6IHRydWUKICAgIH0sCiAgICAiaW5mZXJyZWQiOiB7ICJ0eXBlIjogIm9iamVjdCIsICJhZGRpdGlvbmFsUHJvcGVydGllcyI6IHRydWUgfSwKICAgICJwYXJzZSI6IHsKICAgICAgInR5cGUiOiAib2JqZWN0IiwKICAgICAgInJlcXVpcmVkIjogWyJtZXRob2QiLCAicXVhbGl0eSIsICJzdGF0dXMiXSwKICAgICAgInByb3BlcnRpZXMiOiB7CiAgICAgICAgIm1ldGhvZCI6IHsgInR5cGUiOiAic3RyaW5nIiB9LAogICAgICAgICJxdWFsaXR5IjogeyAidHlwZSI6ICJudW1iZXIiLCAibWluaW11bSI6IDAsICJtYXhpbXVtIjogMSB9LAogICAgICAgICJzdGF0dXMiOiB7ICJlbnVtIjogWyJwcmVzZW50IiwgIm1pc3NpbmciLCAidW5zdXBwb3J0ZWQiLCAiZXh0cmFjdGlvbl9mYWlsZWQiXSB9CiAgICAgIH0sCiAgICAgICJhZGRpdGlvbmFsUHJvcGVydGllcyI6IHRydWUKICAgIH0sCiAgICAiY2FyZF9lbGlnaWJsZSI6IHsgInR5cGUiOiAiYm9vbGVhbiIgfSwKICAgICJleGNsdXNpb25fcmVhc29uIjogeyAidHlwZSI6IFsic3RyaW5nIiwgIm51bGwiXSB9LAogICAgIm1ldGFkYXRhIjogeyAidHlwZSI6ICJvYmplY3QiLCAiYWRkaXRpb25hbFByb3BlcnRpZXMiOiB0cnVlIH0KICB9LAogICIkZGVmcyI6IHsKICAgICJsb2NhdG9yIjogewogICAgICAidHlwZSI6ICJvYmplY3QiLAogICAgICAicmVxdWlyZWQiOiBbInNjaGVtZSIsICJ2YWx1ZSJdLAogICAgICAicHJvcGVydGllcyI6IHsgInNjaGVtZSI6IHsgInR5cGUiOiAic3RyaW5nIiwgIm1pbkxlbmd0aCI6IDEgfSwgInZhbHVlIjogeyAidHlwZSI6ICJzdHJpbmciIH0gfSwKICAgICAgImFkZGl0aW9uYWxQcm9wZXJ0aWVzIjogdHJ1ZQogICAgfQogIH0sCiAgImFkZGl0aW9uYWxQcm9wZXJ0aWVzIjogdHJ1ZQp9Cg=='
+  }),
+  'schemas/parse-package.schema.json': Object.freeze({
+    version: BUILTIN_SCHEMA_VERSION,
+    hash: '3a1d2efe1a804834e7310b79161817888ff82ee2dbad15fad0c492a67570f31b',
+    base64: 'ewogICIkc2NoZW1hIjogImh0dHBzOi8vanNvbi1zY2hlbWEub3JnL2RyYWZ0LzIwMjAtMTIvc2NoZW1hIiwKICAiJGlkIjogImVuZ2luZWVyaW5nLWtub3dsZWRnZS1zbGljZXI6Ly9zY2hlbWEvcGFyc2UtcGFja2FnZS0xLjEiLAogICJ0eXBlIjogIm9iamVjdCIsCiAgImFkZGl0aW9uYWxQcm9wZXJ0aWVzIjogZmFsc2UsCiAgInJlcXVpcmVkIjogWyJzb3VyY2VfcGF0aCIsICJzb3VyY2VfaGFzaCIsICJzb3VyY2VfdHlwZSIsICJwYXJzZXIiLCAibGFuZ3VhZ2UiLCAibWFya2Rvd24iLCAicGFnZXMiLCAicXVhbGl0eSIsICJzY2hlbWFfdmVyc2lvbiJdLAogICJwcm9wZXJ0aWVzIjogewogICAgInNvdXJjZV9wYXRoIjogeyAidHlwZSI6ICJzdHJpbmciLCAibWluTGVuZ3RoIjogMSB9LAogICAgInNvdXJjZV9oYXNoIjogeyAidHlwZSI6ICJzdHJpbmciLCAicGF0dGVybiI6ICJeW2EtZjAtOV17NjR9JCIgfSwKICAgICJzb3VyY2VfdHlwZSI6IHsgInR5cGUiOiAic3RyaW5nIiwgIm1pbkxlbmd0aCI6IDEgfSwKICAgICJwYXJzZXIiOiB7ICJlbnVtIjogWyJtaW5lcnUtYXBpIiwgInBhZGRsZW9jci1hcGkiLCAidGV4dC1ub3JtYWxpemVyIiwgImVtbC1wYXJzZXIiXSB9LAogICAgInBhcnNlcl9tb2RlbCI6IHsgInR5cGUiOiAic3RyaW5nIiB9LAogICAgInJlbW90ZV9qb2JfaWQiOiB7ICJ0eXBlIjogInN0cmluZyIgfSwKICAgICJsYW5ndWFnZSI6IHsgImVudW0iOiBbInpoIiwgImVuIiwgImphIiwgIm1peGVkIiwgInVua25vd24iXSB9LAogICAgIm1hcmtkb3duIjogeyAidHlwZSI6ICJzdHJpbmciIH0sCiAgICAicGFnZXMiOiB7CiAgICAgICJ0eXBlIjogImFycmF5IiwKICAgICAgIml0ZW1zIjogewogICAgICAgICJ0eXBlIjogIm9iamVjdCIsCiAgICAgICAgInJlcXVpcmVkIjogWyJwYWdlIiwgInRleHQiXSwKICAgICAgICAicHJvcGVydGllcyI6IHsKICAgICAgICAgICJwYWdlIjogeyAidHlwZSI6ICJpbnRlZ2VyIiwgIm1pbmltdW0iOiAxIH0sCiAgICAgICAgICAidGV4dCI6IHsgInR5cGUiOiAic3RyaW5nIiB9LAogICAgICAgICAgInNwYW5faWRzIjogeyAidHlwZSI6ICJhcnJheSIsICJpdGVtcyI6IHsgInR5cGUiOiAic3RyaW5nIiB9IH0KICAgICAgICB9CiAgICAgIH0KICAgIH0sCiAgICAicHJvdmVuYW5jZSI6IHsKICAgICAgInR5cGUiOiAib2JqZWN0IiwKICAgICAgInJlcXVpcmVkIjogWyJ2ZXJzaW9uIiwgInNwYW5zIl0sCiAgICAgICJwcm9wZXJ0aWVzIjogewogICAgICAgICJ2ZXJzaW9uIjogeyAidHlwZSI6ICJzdHJpbmciIH0sCiAgICAgICAgInNwYW5zIjogewogICAgICAgICAgInR5cGUiOiAiYXJyYXkiLAogICAgICAgICAgIml0ZW1zIjogewogICAgICAgICAgICAidHlwZSI6ICJvYmplY3QiLAogICAgICAgICAgICAicmVxdWlyZWQiOiBbInNwYW5faWQiLCAic3RhcnQiLCAiZW5kIiwgInRleHQiLCAidGV4dF9oYXNoIl0sCiAgICAgICAgICAgICJwcm9wZXJ0aWVzIjogewogICAgICAgICAgICAgICJzcGFuX2lkIjogeyAidHlwZSI6ICJzdHJpbmciIH0sCiAgICAgICAgICAgICAgInBhZ2UiOiB7ICJ0eXBlIjogImludGVnZXIiLCAibWluaW11bSI6IDEgfSwKICAgICAgICAgICAgICAiYmxvY2tfaWQiOiB7ICJ0eXBlIjogInN0cmluZyIgfSwKICAgICAgICAgICAgICAibGluZV9pZCI6IHsgInR5cGUiOiAic3RyaW5nIiB9LAogICAgICAgICAgICAgICJiYm94IjogeyAidHlwZSI6ICJhcnJheSIsICJpdGVtcyI6IHsgInR5cGUiOiAibnVtYmVyIiB9LCAibWluSXRlbXMiOiA0IH0sCiAgICAgICAgICAgICAgInN0YXJ0IjogeyAidHlwZSI6ICJpbnRlZ2VyIiwgIm1pbmltdW0iOiAwIH0sCiAgICAgICAgICAgICAgImVuZCI6IHsgInR5cGUiOiAiaW50ZWdlciIsICJtaW5pbXVtIjogMCB9LAogICAgICAgICAgICAgICJ0ZXh0IjogeyAidHlwZSI6ICJzdHJpbmciIH0sCiAgICAgICAgICAgICAgInRleHRfaGFzaCI6IHsgInR5cGUiOiAic3RyaW5nIiB9CiAgICAgICAgICAgIH0KICAgICAgICAgIH0KICAgICAgICB9CiAgICAgIH0KICAgIH0sCiAgICAiaW1hZ2VzIjogeyAidHlwZSI6ICJhcnJheSIsICJpdGVtcyI6IHsgInR5cGUiOiAib2JqZWN0IiB9IH0sCiAgICAicXVhbGl0eSI6IHsKICAgICAgInR5cGUiOiAib2JqZWN0IiwKICAgICAgInJlcXVpcmVkIjogWyJyZWFkYWJsZSIsICJzY29yZSIsICJjb21wb25lbnRzIl0sCiAgICAgICJwcm9wZXJ0aWVzIjogewogICAgICAgICJyZWFkYWJsZSI6IHsgInR5cGUiOiAiYm9vbGVhbiIgfSwKICAgICAgICAic2NvcmUiOiB7ICJ0eXBlIjogIm51bWJlciIsICJtaW5pbXVtIjogMCwgIm1heGltdW0iOiAxIH0sCiAgICAgICAgImNvbXBvbmVudHMiOiB7ICJ0eXBlIjogIm9iamVjdCIgfQogICAgICB9CiAgICB9LAogICAgInNjaGVtYV92ZXJzaW9uIjogeyAiY29uc3QiOiAiMS4xIiB9CiAgfQp9Cg=='
+  })
+});
+const BUILTIN_INFRASTRUCTURE_SCHEMA_PATHS = Object.freeze(Object.keys(BUILTIN_INFRASTRUCTURE_SCHEMAS));
+
+function builtInInfrastructureSchema(relativePath) {
+  const normalized = normalizeComponentRelativePath(relativePath);
+  const entry = BUILTIN_INFRASTRUCTURE_SCHEMAS[normalized];
+  if (!entry) return null;
+  const text = Buffer.from(entry.base64, 'base64').toString('utf8');
+  const actualHash = require('crypto').createHash('sha256').update(text).digest('hex');
+  if (actualHash !== entry.hash) {
+    throw new ComponentError('COMPONENT_CONFIG_INVALID', '内置兼容 Schema 完整性校验失败。', {
+      reason: 'builtin_schema_integrity', relativePath: normalized
+    });
+  }
+  return Object.freeze({ relativePath: normalized, version: entry.version, hash: entry.hash, text });
+}
 const LEGACY_PROMPTS = Object.freeze({
   'bid:00-项目总览': '提示词/招投标/00-项目总览.md',
   'bid:01-营业与客户信息': '提示词/招投标/01-营业与客户信息.md',
@@ -9590,8 +9636,10 @@ function validateRuntimeContracts(contracts) {
 }
 
 module.exports = {
+  BUILTIN_INFRASTRUCTURE_SCHEMA_PATHS,
   ComponentError,
   LEGACY_PROMPTS,
+  builtInInfrastructureSchema,
   normalizeComponentRelativePath,
   normalizeFolderMapConfig,
   resolveComponentFilePath,
@@ -13072,8 +13120,8 @@ function classifyFailure(input = {}) {
   const code = String(input.code || '').toUpperCase();
   const message = String(input.message || '');
   if (code === 'COMPONENT_PATH_INVALID') return result(code, 'component_config', false, '组件路径配置无效', '修正组件相对路径后重试；路径必须是组件包内的 .md 或 .json 文件，不能是目录。');
-  if (code === 'COMPONENT_NOT_FOUND') return result(code, 'component_config', false, '找不到组件文件', '恢复或修正缺失的组件文件后重试；已有解析产物会复用，无需重新上传。');
-  if (code === 'COMPONENT_CONFIG_INVALID') return result(code, 'component_config', false, '组件配置无效', '修正 folder-map、Schema 或 Prompt 配置后重试；不会重新上传已解析文件。');
+  if (code === 'COMPONENT_NOT_FOUND') return result(code, 'component_config', false, '找不到组件文件', '该组件没有可用的内置兼容回退；恢复缺失的用户组件后重试，已有解析产物会复用，无需重新上传。');
+  if (code === 'COMPONENT_CONFIG_INVALID') return result(code, 'component_config', false, '组件配置无效', '内置兼容回退不会替换已存在但无效的自定义内容；修正 folder-map、Schema 或 Prompt 后重试，已有解析产物会复用。');
   if (code === 'OCR_CANCELLED') return result(code, 'cancelled', false, '本地 OCR 已取消', '如需继续，请重新将文件加入队列；有效页级检查点会复用。');
   if (code === 'OCR_UNAVAILABLE') return result(code, 'local_ocr', true, '本地 OCR 不可用', '在设置中启用并检测本地 OCR，或配置绝对可执行文件路径。');
   if (code === 'OCR_RENDER_FAILURE') return result(code, 'local_ocr', true, 'PDF 页面渲染失败', '确认 pdftoppm 可用后重试；已完成页面会复用。');

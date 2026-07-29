@@ -6,6 +6,8 @@ The copied Markdown starts with a short human-readable summary and contains one 
 
 The report includes plugin/runtime/platform versions, a non-secret settings allowlist, task/run IDs, source hashes and type, stage/status/timing, the stable final error and causal summary, last valid checkpoint, summary chunk and atom batch coverage, task-local cache/request/retry/rate-limit/backoff counts, a compact failure timeline, terminal persistence/UI state, validated artifact inventory, and concrete next actions. Component loading failures use the `component-contracts` stage and one of the three `COMPONENT_*` codes.
 
+Missing `schemas/block-v0.schema.json` and `schemas/parse-package.schema.json` may use the immutable built-in compatibility copies. The bounded `component.builtinFallback` event records only `relativePath`, `builtInVersion`, `hash`, and `reason=missing`. Existing invalid files never fall back; other missing components report that no built-in compatibility fallback was available.
+
 Privacy and bounds:
 
 - Source text, prompt text, provider response bodies, API keys, authorization headers, cookies, secrets, and full source/artifact paths are excluded or replaced with hashes.

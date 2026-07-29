@@ -1,5 +1,13 @@
 # 工程知识切片 变更记录
 
+## v2.17.1 — 2026-07-29 旧组件包基础设施 Schema 兼容
+
+- 修复旧组件包缺少新运行时基础设施契约时在 `component-contracts` 阶段失败的问题。仅对白名单 `schemas/block-v0.schema.json`、`schemas/parse-package.schema.json` 的“文件缺失”使用嵌入 `main.js`、与仓库当前规范逐字节一致且带 SHA-256 完整性检查的内置回退。
+- 用户文件始终优先；已有但 JSON/Schema 无效的文件继续明确失败。folder-map、分类/总结/知识原子 schema、Tag Library、业务提示词与模板均不回退，避免掩盖用户配置问题。
+- `loadRuntimeContracts` 补齐 parse-package 契约，回退内容与 vault 内容同样进入组件契约哈希；组件变化只失效 classification 及下游，parsed 与页级 OCR checkpoint 继续复用。
+- 新增真实内存 Vault 回归，覆盖旧包双缺失、零外呼续传、自定义优先、损坏硬失败、非白名单缺失、Windows 路径、确定性脱敏诊断、规范逐字节/hash 一致及选择性指纹失效。
+- 发布包仍严格只有 `main.js`、`manifest.json`、`styles.css`；组件包不进入 ZIP。
+
 ## v2.17.0 — 2026-07-29 阿里云百炼原生语义嵌入
 
 - 语义嵌入默认路径改为内置 `aliyun-bailian-qwen37`，固定使用阿里云百炼 Model Studio 北京公共同步 DashScope 端点与 `qwen3.7-text-embedding`（1024 维、dense、索引 `document`、最多 20 条）。

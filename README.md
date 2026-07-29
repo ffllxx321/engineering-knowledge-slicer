@@ -191,3 +191,10 @@ node scripts/smoke-v292.js           # 诊断日志故障回归（v2.9.2，22 �
 ## 质量门禁
 
 依次运行 `npm ci`、`npm run lint`、`npm run typecheck`、`npm test`、`npm run build`、`npm run benchmark`。
+# 可选语义嵌入（v2.16）
+
+插件可在最终卡片成功持久化后，异步调用用户自行配置的 OpenAI-compatible embeddings 服务。默认模型为 `Qwen3-Embedding-0.6B`、默认 1024 维、默认 Shadow 模式且关闭。必须在设置中明确同意并启用；端点没有默认值，密钥建议通过 `EKS_EMBEDDING_API_KEY`（环境变量名可配置）提供，密钥值不会写入插件设置或诊断。
+
+发送文本固定为标题、分类、标签和规范化主张摘要。源文件/卡片路径、原始证据、秘密、诊断、完整 Markdown 和易变运行数据不会发送。向量只保存在独立版本化 JSON 索引，不写入 Markdown。Shadow 结果仅提供脱敏指标和审核建议，不会自动删除、合并、改状态或写关系。提供“立即运行 / 重建索引 / 清空语义数据”显式控制。
+
+语义后处理不参与解析、OCR、Office 提取、结构切片、分类、原子生成或事实校验。任何配置、网络、鉴权、超时或响应结构错误都只记录稳定脱敏代码并计数，不阻塞或降级卡片入库。

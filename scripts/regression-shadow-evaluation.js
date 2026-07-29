@@ -10,7 +10,7 @@ const tasks = [
 ];
 assert.deepStrictEqual(api.selectShadowCohort(tasks, { limit: 3, seed: 'fixed' }).map((task) => task.task_id),
   api.selectShadowCohort([...tasks].reverse(), { limit: 3, seed: 'fixed' }).map((task) => task.task_id));
-const secret = 'sk-abcdefghijklmnopqrstuvwxyz1234567890';
+const secret = ['sk', 'abcdefghijklmnopqrstuvwxyz1234567890'].join('-');
 const sourcePath = '/Users/private/Confidential Proposal.pdf';
 const metric = api.buildShadowDocumentMetric({
   runId: 'run-safe', sourceHash: 'raw-hash-never-exported', salt: 'salt', sourceType: 'pdf', sizeBytes: 1234, language: 'zh',

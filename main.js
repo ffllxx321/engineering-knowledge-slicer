@@ -92,6 +92,10 @@ const {
   preciseIsoInstant,
   resolveRuntimeTimeZone
 } = require("src/core/time-policy.js");
+const {
+  SemanticPostProcessor,
+  semanticSettingsSnapshot
+} = require("src/core/semantic-embedding.js");
 
 // v1.1.9 / v1.1.10: 把诊断共享状态挂到 globalThis，让 src/core/ai-pipeline.js 等独立闭包模块也能调用 diag()
 // 历史背景：v1.1.6 起在 src/core/ai-pipeline.js（line 3928-4609）里加了 3 个 diag() 调用
@@ -594,6 +598,18 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.componentCache = new Map();
     this.operationCounters = { apiRequests: 0, aiRetries: 0, summaryReduceRequests: 0, promptCharacters: 0, outputCharacters: 0, bytesRead: 0, bytesWritten: 0, ledgerWrites: 0, artifactWrites: 0, uiFullRenders: 0, uiIncrementalRefreshes: 0, ocrPages: 0, ocrCacheHits: 0, ocrCacheMisses: 0, ocrLowConfidenceBlocks: 0 };
     this.sessionStats = { scanned: 0, processed: 0, written: 0, review: 0, failed: 0, skipped: 0, current: '', lastMessage: '等待开始处理' };
+    this.semanticProcessor = new SemanticPostProcessor({
+      settings: this.settings,
+      fetch: typeof fetch === 'function' ? fetch.bind(globalThis) : null,
+      readState: (name) => this.readSemanticState(name),
+      writeState: (name, value) => this.writeSemanticState(name, value),
+      diagnostics: (stage, event) => {
+        this.operationCounters.semanticFailures = Number(this.operationCounters.semanticFailures || 0) + (event?.ok === false ? 1 : 0);
+        diag(`semantic.${stage}`, event);
+      },
+      env: typeof process === 'object' && process?.env ? process.env : {}
+    });
+    await this.semanticProcessor.load().catch((error) => diag('semantic.load', { ok: false, code: error?.code || 'SEM_STATE_READ' }));
     this.registerView(VIEW_TYPE_SLICER, (leaf) => new SlicerDashboardView(leaf, this));
 
     this.addRibbonIcon('layers', '工程知识切片', () => this.activateView());
@@ -606,6 +622,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.addCommand({ id: 'open-ai-settings', name: '打开工程知识切片 AI 设置', callback: () => this.activateView() });
     this.addCommand({ id: 'run-shadow-evaluation', name: '运行本地影子评估', callback: () => this.runShadowEvaluation() });
     this.addCommand({ id: 'export-shadow-evaluation', name: '导出影子评估诊断报告', callback: () => this.exportShadowReport() });
+    this.addCommand({ id: 'run-semantic-shadow', name: '运行语义影子处理', callback: () => this.runSemanticIndex() });
+    this.addCommand({ id: 'rebuild-semantic-index', name: '重建语义向量索引', callback: () => this.rebuildSemanticIndex() });
 
     this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
       if (!(file instanceof TFile)) return;
@@ -657,6 +675,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   onunload() {
+    this.semanticProcessor?.abort();
     for (const controller of this.taskControllers?.values() || []) controller.abort();
     this.taskControllers?.clear();
     // v1.1.7: 卸载前最后 flush 一次，确保所有诊断日志落盘
@@ -668,6 +687,50 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveSafeSettings();
+    this.semanticProcessor?.configure(this.settings);
+  }
+
+  semanticStatePath(name) {
+    return normalizeVaultPath(`${this.settings.artifactsPath}/semantic/${name}`);
+  }
+
+  async readSemanticState(name) {
+    const path = this.semanticStatePath(name);
+    if (!(await this.app.vault.adapter.exists(path))) return null;
+    return JSON.parse(await this.app.vault.adapter.read(path));
+  }
+
+  async writeSemanticState(name, value) {
+    const folder = normalizeVaultPath(`${this.settings.artifactsPath}/semantic`);
+    if (!(await this.app.vault.adapter.exists(folder))) await this.app.vault.adapter.mkdir(folder);
+    await this.app.vault.adapter.write(this.semanticStatePath(name), JSON.stringify(value));
+  }
+
+  enqueueSemanticCard(card, path) {
+    if (!this.semanticProcessor) return;
+    this.semanticProcessor.enqueue(Object.assign({}, card, { persisted_path: path })).catch(() => {});
+  }
+
+  async runSemanticIndex() {
+    const cards = await this.loadExistingCards('');
+    const result = await this.semanticProcessor.run(cards);
+    new Notice(`语义影子处理完成：${result.processed}，缓存命中 ${result.cacheHits}，失败 ${result.failed}`);
+    await this.refreshViews();
+    return result;
+  }
+
+  async rebuildSemanticIndex() {
+    const cards = await this.loadExistingCards('');
+    const result = await this.semanticProcessor.rebuild(cards);
+    new Notice(`语义索引已重建：${result.processed} 张卡片`);
+    await this.refreshViews();
+    return result;
+  }
+
+  async clearSemanticIndex() {
+    await this.semanticProcessor.clear();
+    new Notice('语义缓存、索引与影子建议已清空。');
+    await this.refreshViews();
   }
 
   async testServiceConnection(service) {
@@ -1948,6 +2011,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           });
           writtenFiles.push(outputPath);
           await this.ensureMocForDraft(approved);
+          this.enqueueSemanticCard(card, outputPath);
         }
       }
 
@@ -2299,6 +2363,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       written_at: new Date().toISOString()
     });
     await this.ensureFolderIndex(route);
+    this.enqueueSemanticCard(card, path);
     return path;
   }
 
@@ -2601,6 +2666,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     await this.saveTasks(tasks);
     await this.appendRollback({ taskId, draftPath, writtenPath: outputPath, approvedAt: new Date().toISOString() });
     await this.ensureMocForDraft(approved);
+    this.enqueueSemanticCard(finalCard, outputPath);
     new Notice(`已批准入库：${outputPath}`);
     await this.refreshViews();
   }
@@ -3348,6 +3414,7 @@ class SlicerDashboardView extends ItemView {
       ['tasks', `任务 ${tasks.length}`],
       ['review', `审核 ${reviewCount}`],
       ['errors', `错误 ${counts.failed}`],
+      ['semantic', '语义影子'],
       ['shadow', '影子评估']
     ];
     for (const [id, label] of sections) {
@@ -3366,6 +3433,7 @@ class SlicerDashboardView extends ItemView {
     if (this.activeSection === 'tasks') this.renderTaskExplorer(panel, tasks);
     if (this.activeSection === 'review') await this.renderReview(panel, tasks, renderVersion);
     if (this.activeSection === 'errors') this.renderErrorCenter(panel, tasks);
+    if (this.activeSection === 'semantic') this.renderSemanticStatus(panel);
     if (this.activeSection === 'shadow') await this.renderShadowEvaluation(panel, tasks);
 
     const context = container.createEl('details', { cls: 'eks-context' });
@@ -3502,6 +3570,32 @@ class SlicerDashboardView extends ItemView {
       parent.createEl('pre', { text: JSON.stringify(aggregate.typed_reasons, null, 2) });
     }
     parent.createDiv({ cls: 'eks-empty', text: '影子模式不写知识卡片、MOC 或索引，也不改变任务终态。当前版本不支持从影子结果直接提升；需回到正常任务显式处理。' });
+  }
+
+  renderSemanticStatus(parent) {
+    const snapshot = semanticSettingsSnapshot(this.plugin.settings);
+    const metrics = this.plugin.semanticProcessor?.metrics || {};
+    parent.createEl('h3', { text: '语义嵌入影子处理' });
+    parent.createDiv({ cls: 'eks-task-meta', text: snapshot.enabled
+      ? `运行中/可运行 · ${snapshot.model} · ${snapshot.dimensions} 维 · 队列 ${this.plugin.semanticProcessor?.queue?.length || 0}`
+      : '默认关闭。需要先在设置中明确同意外部嵌入并启用。' });
+    const grid = parent.createDiv('eks-summary-line');
+    grid.createSpan({ text: `已处理 ${metrics.processed || 0}` });
+    grid.createSpan({ text: `缓存命中 ${metrics.cacheHits || 0}` });
+    grid.createSpan({ text: `建议 ${metrics.suggestions || 0}` });
+    grid.createSpan({ text: `非阻塞失败 ${metrics.failed || 0}` });
+    parent.createDiv({ cls: 'eks-task-meta', text: `相关阈值 ${snapshot.relatedThreshold} · 重复候选阈值 ${snapshot.duplicateThreshold} · 精确比较 ${metrics.comparisons || 0}` });
+    const actions = parent.createDiv('eks-actions');
+    button(actions, '立即运行', () => this.plugin.runSemanticIndex());
+    button(actions, '重建索引', async () => {
+      if (typeof window !== 'undefined' && !window.confirm('确认重建独立语义索引？')) return;
+      await this.plugin.rebuildSemanticIndex();
+    });
+    button(actions, '清空语义数据', async () => {
+      if (typeof window !== 'undefined' && !window.confirm('确认清空语义缓存、索引、队列和建议？')) return;
+      await this.plugin.clearSemanticIndex();
+    });
+    parent.createDiv({ cls: 'eks-empty', text: '输出仅为脱敏指标与审核建议；不会自动合并、删除、改状态、写关系或修改 Markdown。' });
   }
 
   renderErrorCenter(parent, tasks) {
@@ -3868,6 +3962,43 @@ class SlicerSettingTab extends PluginSettingTab {
             new Notice(`诊断日志路径：${logPath}\n请在系统文件管理器中手动打开。`);
           }
         }));
+    containerEl.createEl('h3', { text: '语义嵌入（可选 · 影子模式）' });
+    const semantic = semanticSettingsSnapshot(this.plugin.settings);
+    new Setting(containerEl)
+      .setName('外部嵌入明确同意')
+      .setDesc('开启表示同意将脱敏后的标题、分类、标签和规范化主张摘要发送到自配端点；不发送路径、原始证据、秘密、诊断或原文。')
+      .addToggle((toggle) => toggle.setValue(semantic.consent).onChange(async (value) => {
+        this.plugin.settings.semanticConsent = value === true;
+        if (!value) this.plugin.settings.semanticEnabled = false;
+        await this.plugin.saveSettings();
+        this.display();
+      }));
+    new Setting(containerEl)
+      .setName('启用卡片后处理')
+      .setDesc('默认关闭且仅影子模式。只处理已成功入库的最终卡片；失败不会阻塞、降级或回滚卡片摄取。')
+      .addToggle((toggle) => toggle.setValue(semantic.enabled).onChange(async (value) => {
+        this.plugin.settings.semanticEnabled = value === true && this.plugin.settings.semanticConsent === true;
+        await this.plugin.saveSettings();
+      }));
+    textSetting(containerEl, this.plugin, 'OpenAI-compatible embeddings 端点', '必须自行配置；插件没有硬编码端点。', 'embeddingEndpoint', '');
+    textSetting(containerEl, this.plugin, '嵌入模型', '默认 Qwen3-Embedding-0.6B。改变模型会自动启用新的缓存/索引签名。', 'embeddingModel', 'Qwen3-Embedding-0.6B');
+    textSetting(containerEl, this.plugin, 'API Key 环境变量名', '默认 EKS_EMBEDDING_API_KEY。密钥值不会写入 data.json、诊断或向量索引。', 'embeddingApiKeyEnv', 'EKS_EMBEDDING_API_KEY');
+    numberSetting(containerEl, this.plugin, '嵌入维度', '默认 1024；改变维度会使旧语义缓存和索引失效，但不影响解析/OCR/AI checkpoint。', 'embeddingDimensions', 64, 4096);
+    numberSetting(containerEl, this.plugin, '最大候选数', '精确余弦比较的硬上限，索引接口可替换为 ANN。', 'semanticMaxCandidates', 1, 5000);
+    numberSetting(containerEl, this.plugin, 'Top K', '每张卡保留的最多审核建议数。', 'semanticTopK', 1, 50);
+    new Setting(containerEl)
+      .setName('语义影子操作')
+      .setDesc(`状态：${semantic.enabled ? '已启用' : '未启用'}；模型 ${semantic.model}；${semantic.dimensions} 维；相关 ${semantic.relatedThreshold}；重复候选 ${semantic.duplicateThreshold}。建议不会自动写回 Markdown、关系、状态或合并。`)
+      .addButton((control) => control.setButtonText('立即运行').onClick(() => this.plugin.runSemanticIndex()))
+      .addButton((control) => control.setButtonText('重建索引').onClick(async () => {
+        if (typeof window !== 'undefined' && !window.confirm('确认重建独立语义向量索引？不会清除解析/OCR/AI 检查点。')) return;
+        await this.plugin.rebuildSemanticIndex();
+      }))
+      .addButton((control) => control.setButtonText('清空语义数据').setWarning().onClick(async () => {
+        if (typeof window !== 'undefined' && !window.confirm('确认清空语义缓存、索引、队列和影子建议？知识卡片不会被修改。')) return;
+        await this.plugin.clearSemanticIndex();
+      }));
+
     containerEl.createEl('h3', { text: '生产影子评估（本地优先）' });
     new Setting(containerEl)
       .setName('启用影子评估')
@@ -5192,7 +5323,7 @@ const TASK_STATUSES = new Set([
 const PROCESSING_STATUSES = new Set(['extracting', 'parsing', 'slicing', 'classifying', 'summarizing', 'atomizing', 'validating', 'writing']);
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 27,
+  settingsVersion: 28,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -5293,7 +5424,25 @@ const DEFAULT_SETTINGS = {
   shadowRetentionDays: 30,
   shadowSampleLimit: 200,
   shadowCohortSeed: 'eks-shadow-v1',
-  shadowStoreFileName: 'shadow-evaluation.json'
+  shadowStoreFileName: 'shadow-evaluation.json',
+  semanticConsent: false,
+  semanticEnabled: false,
+  semanticMode: 'shadow',
+  embeddingEndpoint: '',
+  embeddingModel: 'Qwen3-Embedding-0.6B',
+  embeddingApiKey: '',
+  embeddingApiKeyEnv: 'EKS_EMBEDDING_API_KEY',
+  embeddingDimensions: 1024,
+  embeddingTimeoutMs: 30000,
+  embeddingMaxAttempts: 3,
+  embeddingRetryBaseMs: 500,
+  embeddingRateLimitMs: 250,
+  embeddingBatchSize: 16,
+  embeddingConcurrency: 2,
+  semanticRelatedThreshold: 0.82,
+  semanticDuplicateThreshold: 0.92,
+  semanticMaxCandidates: 500,
+  semanticTopK: 8
 };
 
 function migrateSettings(stored = {}) {
@@ -5302,7 +5451,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 27;
+  migrated.settingsVersion = 28;
   // Runtime contract boundary changed in 2.14.1. Parsed artifacts use their own
   // parser fingerprint and remain reusable; only classification and later stages
   // receive the new pipeline fingerprint.
@@ -5393,6 +5542,25 @@ function migrateSettings(stored = {}) {
   migrated.shadowSampleLimit = Math.max(1, Math.min(5000, Math.round(Number(migrated.shadowSampleLimit) || DEFAULT_SETTINGS.shadowSampleLimit)));
   migrated.shadowCohortSeed = String(migrated.shadowCohortSeed || DEFAULT_SETTINGS.shadowCohortSeed).slice(0, 80);
   migrated.shadowStoreFileName = DEFAULT_SETTINGS.shadowStoreFileName;
+  migrated.semanticConsent = source.semanticConsent === true;
+  migrated.semanticEnabled = source.semanticEnabled === true && migrated.semanticConsent;
+  migrated.semanticMode = 'shadow';
+  migrated.embeddingEndpoint = String(migrated.embeddingEndpoint || '').trim();
+  migrated.embeddingModel = String(migrated.embeddingModel || DEFAULT_SETTINGS.embeddingModel).trim().slice(0, 160);
+  migrated.embeddingApiKey = String(migrated.embeddingApiKey || '').trim();
+  migrated.embeddingApiKeyEnv = /^[A-Z_][A-Z0-9_]{0,79}$/.test(String(migrated.embeddingApiKeyEnv || ''))
+    ? String(migrated.embeddingApiKeyEnv) : DEFAULT_SETTINGS.embeddingApiKeyEnv;
+  migrated.embeddingDimensions = Math.max(64, Math.min(4096, Math.round(Number(migrated.embeddingDimensions) || DEFAULT_SETTINGS.embeddingDimensions)));
+  migrated.embeddingTimeoutMs = Math.max(1000, Math.min(300000, Math.round(Number(migrated.embeddingTimeoutMs) || DEFAULT_SETTINGS.embeddingTimeoutMs)));
+  migrated.embeddingMaxAttempts = Math.max(1, Math.min(5, Math.round(Number(migrated.embeddingMaxAttempts) || DEFAULT_SETTINGS.embeddingMaxAttempts)));
+  migrated.embeddingRetryBaseMs = Math.max(100, Math.min(10000, Math.round(Number(migrated.embeddingRetryBaseMs) || DEFAULT_SETTINGS.embeddingRetryBaseMs)));
+  migrated.embeddingRateLimitMs = Math.max(0, Math.min(60000, Math.round(Number(migrated.embeddingRateLimitMs) || DEFAULT_SETTINGS.embeddingRateLimitMs)));
+  migrated.embeddingBatchSize = Math.max(1, Math.min(64, Math.round(Number(migrated.embeddingBatchSize) || DEFAULT_SETTINGS.embeddingBatchSize)));
+  migrated.embeddingConcurrency = Math.max(1, Math.min(4, Math.round(Number(migrated.embeddingConcurrency) || DEFAULT_SETTINGS.embeddingConcurrency)));
+  migrated.semanticRelatedThreshold = Math.max(0.5, Math.min(1, Number(migrated.semanticRelatedThreshold) || DEFAULT_SETTINGS.semanticRelatedThreshold));
+  migrated.semanticDuplicateThreshold = Math.max(migrated.semanticRelatedThreshold, Math.min(1, Number(migrated.semanticDuplicateThreshold) || DEFAULT_SETTINGS.semanticDuplicateThreshold));
+  migrated.semanticMaxCandidates = Math.max(1, Math.min(5000, Math.round(Number(migrated.semanticMaxCandidates) || DEFAULT_SETTINGS.semanticMaxCandidates)));
+  migrated.semanticTopK = Math.max(1, Math.min(50, Math.round(Number(migrated.semanticTopK) || DEFAULT_SETTINGS.semanticTopK)));
   return migrated;
 }
 
@@ -13748,6 +13916,389 @@ function hashCode(value) {
 
 module.exports = { applyBatchAction, groupReviewItems, pendingReviewItems, isApprovalEligible, reviewSelection };
 
+
+},
+"src/core/semantic-embedding.js": function(require, module, exports) {
+'use strict';
+const crypto = require('crypto');
+
+const INDEX_SCHEMA = 1;
+const CACHE_SCHEMA = 1;
+const SUGGESTION_SCHEMA = 1;
+const INDEX_FILE = 'vector-index.v1.json';
+const CACHE_FILE = 'embedding-cache.v1.json';
+const SUGGESTION_FILE = 'semantic-shadow.v1.json';
+const QUEUE_FILE = 'semantic-queue.v1.json';
+const SECRET_KEY = /(api.?key|token|secret|authorization|password|credential)/i;
+
+function stableHash(value) {
+  return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
+}
+function normalizeText(value, max = 800) {
+  return String(value || '').normalize('NFKC').replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ').trim().slice(0, max);
+}
+function compactList(value, maxItems = 12) {
+  const list = Array.isArray(value) ? value : String(value || '').split(/[,，;；]/);
+  return [...new Set(list.map((item) => normalizeText(item, 80)).filter(Boolean))].sort().slice(0, maxItems);
+}
+function privacyReducedPayload(card) {
+  const title = normalizeText(card.Title || card.title, 240);
+  const category = normalizeText(card.Category || card.category, 100);
+  const tags = compactList([card.TagL1, card.TagL2, ...(card.tags || [])]);
+  const summary = normalizeText(
+    card.claim_summary || card.Claim_Summary || card.claim || card.summary
+      || card.Fact || card.Conclusion || card.content_summary || '',
+    1200
+  );
+  return [`title: ${title}`, `category: ${category}`, `tags: ${tags.join(' | ')}`, `claim: ${summary}`].join('\n');
+}
+function cacheKey(model, dimensions, payload) {
+  return `${normalizeText(model, 160)}:${Number(dimensions)}:${stableHash(payload)}`;
+}
+function cosine(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length || !a.length) return -1;
+  let dot = 0, aa = 0, bb = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    const x = Number(a[i]), y = Number(b[i]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return -1;
+    dot += x * y; aa += x * x; bb += y * y;
+  }
+  return aa && bb ? dot / Math.sqrt(aa * bb) : -1;
+}
+function metadataOf(card) {
+  return {
+    library: normalizeText(card.library, 80),
+    category: normalizeText(card.Category || card.category, 100),
+    tagL1: normalizeText(card.TagL1 || card.tagL1, 100)
+  };
+}
+function privacyReducedCard(card) {
+  return {
+    card_id: cardId(card),
+    Title: normalizeText(card.Title || card.title, 240),
+    Category: normalizeText(card.Category || card.category, 100),
+    TagL1: normalizeText(card.TagL1 || card.tagL1, 100),
+    TagL2: normalizeText(card.TagL2 || card.tagL2, 100),
+    tags: compactList(card.tags || []),
+    library: normalizeText(card.library, 80),
+    claim_summary: normalizeText(card.claim_summary || card.Claim_Summary || card.claim || card.summary || card.Fact || card.Conclusion, 1200),
+    atom_fingerprint: normalizeText(card.atom_fingerprint, 180),
+    evidence_id: normalizeText(card.evidence_id, 180)
+  };
+}
+function cardId(card) {
+  return normalizeText(card.card_id || card.cardId || card.atom_fingerprint || stableHash(privacyReducedPayload(card)).slice(0, 24), 180);
+}
+function extractFacts(text) {
+  const value = normalizeText(text, 1600).toLowerCase();
+  return {
+    numbers: [...new Set(value.match(/\b\d+(?:\.\d+)?\s*(?:%|mm|cm|m|km|kg|t|mpa|kpa|v|kv|a|kw|mw|℃|°c)?\b/g) || [])].sort(),
+    dates: [...new Set(value.match(/\b(?:19|20)\d{2}(?:[-/.年]\d{1,2}(?:[-/.月]\d{1,2}日?)?)?\b/g) || [])].sort(),
+    versions: [...new Set(value.match(/\bv?\d+\.\d+(?:\.\d+)?(?:[-+][a-z0-9.-]+)?\b/g) || [])].sort(),
+    subjects: [...new Set(value.match(/(?:项目|公司|系统|设备|合同|标段)[:：]?\s*[\p{L}\p{N}_-]{2,30}/gu) || [])].sort()
+  };
+}
+function deterministicGuard(left, right) {
+  const a = extractFacts(privacyReducedPayload(left));
+  const b = extractFacts(privacyReducedPayload(right));
+  const mismatch = [];
+  for (const key of ['numbers', 'dates', 'versions', 'subjects']) {
+    if (a[key].length && b[key].length && JSON.stringify(a[key]) !== JSON.stringify(b[key])) mismatch.push(key);
+  }
+  const evidenceA = normalizeText(left.evidence_id || left.atom_fingerprint || '', 180);
+  const evidenceB = normalizeText(right.evidence_id || right.atom_fingerprint || '', 180);
+  const evidenceIdentity = Boolean(evidenceA && evidenceB && evidenceA === evidenceB);
+  return { compatible: mismatch.length === 0, mismatch, evidenceIdentity };
+}
+function inferRelation(left, right, guard) {
+  if (!guard.compatible) return 'related';
+  const combined = `${privacyReducedPayload(left)} ${privacyReducedPayload(right)}`.toLowerCase();
+  if (/(取代|替代|废止|supersed)/.test(combined)) return 'supersedes';
+  if (/(冲突|矛盾|不一致|conflict)/.test(combined)) return 'conflicts';
+  return 'related';
+}
+function redactDiagnostic(event) {
+  const output = {};
+  for (const [key, value] of Object.entries(event || {})) {
+    if (SECRET_KEY.test(key)) continue;
+    if (['payload', 'vector', 'response', 'body', 'text', 'path'].includes(key)) continue;
+    if (typeof value === 'string') output[key] = value.slice(0, 160).replace(/(?:sk-|Bearer\s+)[A-Za-z0-9._-]+/gi, '<redacted>');
+    else if (typeof value === 'number' || typeof value === 'boolean' || value === null) output[key] = value;
+  }
+  return output;
+}
+function semanticSettingsSnapshot(settings) {
+  return {
+    enabled: settings.semanticEnabled === true,
+    consent: settings.semanticConsent === true,
+    mode: 'shadow',
+    endpointConfigured: Boolean(String(settings.embeddingEndpoint || '').trim()),
+    keyConfigured: Boolean(String(settings.embeddingApiKey || '').trim() || String(settings.embeddingApiKeyEnv || '').trim()),
+    model: normalizeText(settings.embeddingModel || 'Qwen3-Embedding-0.6B', 160),
+    dimensions: Number(settings.embeddingDimensions || 1024),
+    relatedThreshold: Number(settings.semanticRelatedThreshold || 0.82),
+    duplicateThreshold: Number(settings.semanticDuplicateThreshold || 0.92)
+  };
+}
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(Object.assign(new Error('aborted'), { code: 'SEM_ABORTED' }));
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(Object.assign(new Error('aborted'), { code: 'SEM_ABORTED' }));
+    }, { once: true });
+  });
+}
+
+class OpenAICompatibleEmbeddingProvider {
+  constructor(options = {}) {
+    this.fetch = options.fetch;
+    this.env = options.env || {};
+  }
+  async embed(payloads, settings, signal) {
+    const endpoint = String(settings.embeddingEndpoint || '').trim();
+    const envName = String(settings.embeddingApiKeyEnv || 'EKS_EMBEDDING_API_KEY');
+    const key = String(settings.embeddingApiKey || this.env[envName] || '').trim();
+    if (!endpoint) throw Object.assign(new Error('endpoint required'), { code: 'SEM_CONFIG_ENDPOINT' });
+    if (!key) throw Object.assign(new Error('key required'), { code: 'SEM_AUTH_MISSING' });
+    if (!this.fetch) throw Object.assign(new Error('fetch unavailable'), { code: 'SEM_FETCH_UNAVAILABLE' });
+    const maxAttempts = Number(settings.embeddingMaxAttempts || 3);
+    let last;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), Number(settings.embeddingTimeoutMs || 30000));
+      const forward = () => controller.abort();
+      signal?.addEventListener('abort', forward, { once: true });
+      try {
+        const response = await this.fetch(endpoint, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+          body: JSON.stringify({
+            model: settings.embeddingModel,
+            input: payloads,
+            dimensions: Number(settings.embeddingDimensions || 1024)
+          }),
+          signal: controller.signal
+        });
+        if (response.status === 401 || response.status === 403) throw Object.assign(new Error('authentication failed'), { code: 'SEM_AUTH', retryable: false });
+        if (!response.ok) throw Object.assign(new Error(`http ${response.status}`), { code: response.status === 429 ? 'SEM_RATE_LIMIT' : 'SEM_HTTP', retryable: response.status === 429 || response.status >= 500 });
+        const json = await response.json();
+        const rows = Array.isArray(json?.data) ? json.data.slice().sort((a, b) => Number(a.index) - Number(b.index)) : [];
+        const vectors = rows.map((row) => row?.embedding);
+        const dimensions = Number(settings.embeddingDimensions || 1024);
+        if (vectors.length !== payloads.length || vectors.some((vector) => !Array.isArray(vector) || vector.length !== dimensions || vector.some((n) => !Number.isFinite(Number(n))))) {
+          throw Object.assign(new Error('invalid embedding schema'), { code: 'SEM_SCHEMA', retryable: false });
+        }
+        return vectors.map((vector) => vector.map(Number));
+      } catch (error) {
+        last = error;
+        if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'SEM_ABORTED' });
+        if (error?.name === 'AbortError') last = Object.assign(new Error('timeout'), { code: 'SEM_TIMEOUT', retryable: true });
+        if (last.retryable === false || attempt >= maxAttempts) throw last;
+        await sleep(Math.min(30000, Number(settings.embeddingRetryBaseMs || 500) * 2 ** (attempt - 1)), signal);
+      } finally {
+        clearTimeout(timeout);
+        signal?.removeEventListener('abort', forward);
+      }
+    }
+    throw last;
+  }
+}
+
+class ExactCosineIndex {
+  constructor(state, options = {}) {
+    this.state = state || { schema: INDEX_SCHEMA, signature: '', entries: {}, tombstones: {} };
+    this.maxCandidates = Number(options.maxCandidates || 500);
+    this.comparisons = 0;
+  }
+  upsert(id, vector, metadata, payloadHash) {
+    this.state.entries[id] = { vector, metadata, payloadHash, updatedAt: Date.now() };
+    delete this.state.tombstones[id];
+  }
+  tombstone(id) {
+    delete this.state.entries[id];
+    this.state.tombstones[id] = Date.now();
+  }
+  search(vector, filter = {}, topK = 8, excludeId = '') {
+    this.comparisons = 0;
+    const candidates = [];
+    for (const [id, entry] of Object.entries(this.state.entries)) {
+      if (id === excludeId) continue;
+      if (filter.library && entry.metadata.library !== filter.library) continue;
+      if (filter.category && entry.metadata.category !== filter.category) continue;
+      if (filter.tagL1 && entry.metadata.tagL1 !== filter.tagL1) continue;
+      candidates.push([id, entry]);
+      if (candidates.length >= this.maxCandidates) break;
+    }
+    return candidates.map(([id, entry]) => {
+      this.comparisons += 1;
+      return { id, score: cosine(vector, entry.vector), metadata: entry.metadata };
+    }).filter((item) => item.score >= 0).sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, topK);
+  }
+  rebuild(liveIds) {
+    const live = new Set(liveIds);
+    for (const id of Object.keys(this.state.entries)) if (!live.has(id)) this.tombstone(id);
+  }
+}
+
+class SemanticPostProcessor {
+  constructor(options = {}) {
+    this.settings = options.settings || {};
+    this.readState = options.readState || (async () => null);
+    this.writeState = options.writeState || (async () => {});
+    this.diagnostics = options.diagnostics || (() => {});
+    this.provider = options.provider || new OpenAICompatibleEmbeddingProvider({ fetch: options.fetch, env: options.env });
+    this.controller = new AbortController();
+    this.queue = [];
+    this.running = 0;
+    this.metrics = { queued: 0, processed: 0, failed: 0, cacheHits: 0, requests: 0, comparisons: 0, suggestions: 0 };
+  }
+  configure(settings) { this.settings = settings || {}; }
+  signature() { return `${this.settings.embeddingModel}:${Number(this.settings.embeddingDimensions || 1024)}`; }
+  emit(stage, event) { this.diagnostics(stage, redactDiagnostic(Object.assign({ stage }, event))); }
+  async load() {
+    const [cache, index, suggestions, queue] = await Promise.all([
+      this.readState(CACHE_FILE), this.readState(INDEX_FILE), this.readState(SUGGESTION_FILE), this.readState(QUEUE_FILE)
+    ]);
+    const signature = this.signature();
+    this.cache = cache?.schema === CACHE_SCHEMA && cache.signature === signature ? cache : { schema: CACHE_SCHEMA, signature, entries: {} };
+    this.indexState = index?.schema === INDEX_SCHEMA && index.signature === signature ? index : { schema: INDEX_SCHEMA, signature, entries: {}, tombstones: {} };
+    this.suggestions = suggestions?.schema === SUGGESTION_SCHEMA && suggestions.signature === signature ? suggestions : { schema: SUGGESTION_SCHEMA, signature, items: [], metrics: {} };
+    this.queue = Array.isArray(queue?.items) ? queue.items.map((item) => item.card).filter(Boolean) : [];
+    this.index = new ExactCosineIndex(this.indexState, { maxCandidates: this.settings.semanticMaxCandidates });
+    if (this.queue.length && this.isAllowed()) this.drain();
+  }
+  isAllowed() {
+    return this.settings.semanticConsent === true && this.settings.semanticEnabled === true && String(this.settings.semanticMode || 'shadow') === 'shadow';
+  }
+  async persist() {
+    await Promise.all([
+      this.writeState(CACHE_FILE, this.cache),
+      this.writeState(INDEX_FILE, this.indexState),
+      this.writeState(SUGGESTION_FILE, this.suggestions),
+      this.writeState(QUEUE_FILE, { schema: 1, items: this.queue.map((card) => ({ card })) })
+    ]);
+  }
+  async enqueue(card) {
+    if (!this.isAllowed()) return { queued: false, code: 'SEM_DISABLED' };
+    this.queue.push(privacyReducedCard(card));
+    this.metrics.queued += 1;
+    await this.writeState(QUEUE_FILE, { schema: 1, items: this.queue.map((item) => ({ card: item })) });
+    this.drain();
+    return { queued: true };
+  }
+  drain() {
+    const concurrency = Math.max(1, Number(this.settings.embeddingConcurrency || 2));
+    while (this.running < concurrency && this.queue.length && !this.controller.signal.aborted) {
+      const card = this.queue.shift();
+      this.running += 1;
+      this.processBatch([card]).catch(() => {}).finally(async () => {
+        this.running -= 1;
+        await this.persist().catch(() => {});
+        this.drain();
+      });
+    }
+  }
+  async processBatch(cards) {
+    if (!this.isAllowed()) return { processed: 0, failed: 0 };
+    const batch = cards.slice(0, Math.max(1, Number(this.settings.embeddingBatchSize || 16)));
+    const payloads = batch.map(privacyReducedPayload);
+    const keys = payloads.map((payload) => cacheKey(this.settings.embeddingModel, this.settings.embeddingDimensions, payload));
+    const vectors = new Array(batch.length);
+    const misses = [];
+    keys.forEach((key, index) => {
+      if (this.cache.entries[key]) {
+        vectors[index] = this.cache.entries[key].vector;
+        this.metrics.cacheHits += 1;
+      } else misses.push(index);
+    });
+    if (misses.length) {
+      try {
+        if (Number(this.settings.embeddingRateLimitMs || 0)) await sleep(Number(this.settings.embeddingRateLimitMs), this.controller.signal);
+        const embedded = await this.provider.embed(misses.map((index) => payloads[index]), this.settings, this.controller.signal);
+        this.metrics.requests += 1;
+        misses.forEach((index, offset) => {
+          vectors[index] = embedded[offset];
+          this.cache.entries[keys[index]] = { vector: embedded[offset], createdAt: Date.now() };
+        });
+      } catch (error) {
+        this.metrics.failed += batch.length;
+        this.emit('provider', { ok: false, code: error?.code || 'SEM_PROVIDER', count: batch.length });
+        return { processed: 0, failed: batch.length };
+      }
+    }
+    batch.forEach((card, index) => {
+      const id = cardId(card);
+      const metadata = metadataOf(card);
+      const candidates = this.index.search(vectors[index], metadata, Number(this.settings.semanticTopK || 8), id);
+      this.metrics.comparisons += this.index.comparisons;
+      for (const candidate of candidates) {
+        if (candidate.score < Number(this.settings.semanticRelatedThreshold || 0.82)) continue;
+        const existing = this.indexState.entries[candidate.id]?.card || {};
+        const guard = deterministicGuard(card, existing);
+        const duplicateCandidate = candidate.score >= Number(this.settings.semanticDuplicateThreshold || 0.92) && guard.compatible;
+        this.suggestions.items.push({
+          schema: SUGGESTION_SCHEMA,
+          left: stableHash(id).slice(0, 16),
+          right: stableHash(candidate.id).slice(0, 16),
+          score: Math.round(candidate.score * 10000) / 10000,
+          duplicateCandidate,
+          relation: inferRelation(card, existing, guard),
+          guards: { compatible: guard.compatible, mismatch: guard.mismatch, evidenceIdentity: guard.evidenceIdentity },
+          status: 'review_suggestion'
+        });
+        this.metrics.suggestions += 1;
+      }
+      this.index.upsert(id, vectors[index], metadata, stableHash(payloads[index]));
+      this.indexState.entries[id].card = {
+        card_id: id, Title: normalizeText(card.Title || card.title, 240),
+        Category: metadata.category, TagL1: metadata.tagL1,
+        claim_summary: normalizeText(card.claim_summary || card.claim || card.summary, 1200),
+        atom_fingerprint: normalizeText(card.atom_fingerprint, 180)
+      };
+      this.metrics.processed += 1;
+    });
+    this.suggestions.items = this.suggestions.items.slice(-5000);
+    this.suggestions.metrics = Object.assign({}, this.metrics);
+    this.emit('complete', { ok: true, count: batch.length, cacheHits: this.metrics.cacheHits, comparisons: this.metrics.comparisons });
+    return { processed: batch.length, failed: 0 };
+  }
+  async run(cards) {
+    if (!this.isAllowed()) return Object.assign({}, this.metrics, { code: 'SEM_CONSENT_REQUIRED' });
+    for (let i = 0; i < cards.length; i += Math.max(1, Number(this.settings.embeddingBatchSize || 16))) {
+      await this.processBatch(cards.slice(i, i + Number(this.settings.embeddingBatchSize || 16)));
+    }
+    await this.persist();
+    return Object.assign({}, this.metrics);
+  }
+  async rebuild(cards) {
+    this.indexState = { schema: INDEX_SCHEMA, signature: this.signature(), entries: {}, tombstones: {} };
+    this.index = new ExactCosineIndex(this.indexState, { maxCandidates: this.settings.semanticMaxCandidates });
+    this.suggestions = { schema: SUGGESTION_SCHEMA, signature: this.signature(), items: [], metrics: {} };
+    return this.run(cards);
+  }
+  async clear() {
+    this.cache = { schema: CACHE_SCHEMA, signature: this.signature(), entries: {} };
+    this.indexState = { schema: INDEX_SCHEMA, signature: this.signature(), entries: {}, tombstones: {} };
+    this.index = new ExactCosineIndex(this.indexState, { maxCandidates: this.settings.semanticMaxCandidates });
+    this.suggestions = { schema: SUGGESTION_SCHEMA, signature: this.signature(), items: [], metrics: {} };
+    this.queue = [];
+    await this.persist();
+  }
+  abort() {
+    this.controller.abort();
+    this.emit('lifecycle', { ok: true, code: 'SEM_ABORTED', remaining: this.queue.length });
+  }
+}
+
+module.exports = {
+  CACHE_SCHEMA, ExactCosineIndex, INDEX_SCHEMA, OpenAICompatibleEmbeddingProvider,
+  SemanticPostProcessor, cacheKey, cardId, cosine, deterministicGuard, extractFacts,
+  inferRelation, metadataOf, privacyReducedPayload, redactDiagnostic, semanticSettingsSnapshot,
+  privacyReducedCard, stableHash
+};
 
 }
 };

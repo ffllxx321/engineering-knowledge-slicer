@@ -16,3 +16,10 @@
 - parsed 指纹不包含 Prompt、Schema、folder-map 或输出根；下游修复不会重新上传或解析。组件内容变化从 classification 起失效，输出根变化只改变写入位置。
 
 回退旧插件前，如旧版本无法理解 v2 envelope，只删除目标 run 的 `_slicer_artifacts/<run_id>/` 中间产物并重新处理。不要删除来源文件、已入库卡片、任务备份或整个知识库。
+# v2.16 语义数据迁移边界
+
+- `settingsVersion` 从 27 升至 28；旧用户的语义同意和启用状态始终迁移为关闭，除非旧数据中已有严格布尔 `true`。
+- 新数据位于受管 artifacts 目录下的 `semantic/`，使用独立 schema 和 `模型:维度` 签名。签名变化会忽略旧语义缓存/索引。
+- 解析包、OCR、Office 提取、分类、总结、知识原子和审核 artifacts 的路径、版本、哈希与复用规则不变。
+- 清空/重建语义数据只处理 `semantic/` 下的缓存、索引、队列和建议，不删除卡片，也不触碰摄取 checkpoints。
+- 路径继续通过 vault 规范化和 adapter API 访问，兼容 `/` 分隔的 Windows vault 相对路径。

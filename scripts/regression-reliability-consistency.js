@@ -15,7 +15,7 @@ const custom = task.migrateSettings({
   artifactsPath: '系统\\产物', draftPath: '系统\\产物\\审核',
   logPath: '系统\\产物\\日志', componentPackPath: '系统\\组件'
 });
-assert.strictEqual(custom.settingsVersion, 27);
+assert.strictEqual(custom.settingsVersion, 28);
 assert.strictEqual(custom.bidIntakePath, '客户库/投标输入');
 assert.strictEqual(custom.businessOutputPath, '成果/业务');
 assert.strictEqual(custom.componentPackPath, '系统/组件');

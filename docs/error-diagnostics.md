@@ -39,3 +39,8 @@ Failed runs also best-effort persist `diagnostic-report.json` beside the run art
 { "...": "complete bounded eks-diagnostic-report/1.1 object" }
 ```
 ````
+# 语义后处理诊断（v2.16）
+
+语义阶段仅发出 `semantic.provider`、`semantic.complete`、`semantic.lifecycle` 等稳定阶段。常见代码包括 `SEM_CONFIG_ENDPOINT`、`SEM_AUTH_MISSING`、`SEM_AUTH`、`SEM_TIMEOUT`、`SEM_RATE_LIMIT`、`SEM_HTTP`、`SEM_SCHEMA`、`SEM_ABORTED`。
+
+事件只包含代码、成功标志和计数等有界字段；载荷、向量、HTTP 原始响应、路径和凭证字段会被删除。语义失败计入控制台“非阻塞失败”，不会改变卡片或摄取任务状态。

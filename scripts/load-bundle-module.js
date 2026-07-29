@@ -7,8 +7,12 @@ function loadBundleModule(id, dependencies = {}) {
   const start = code.indexOf(marker);
   if (start < 0) throw new Error(`找不到 bundle 模块：${id}`);
   const bodyStart = start + marker.length;
-  let end = code.indexOf('\n},\n/**', bodyStart);
-  if (end < 0) end = code.indexOf('\n}\n};', bodyStart);
+  const endings = [
+    code.indexOf('\n},\n/**', bodyStart),
+    code.indexOf('\n},\n"', bodyStart),
+    code.indexOf('\n}\n};', bodyStart)
+  ].filter((position) => position >= 0);
+  const end = endings.length ? Math.min(...endings) : -1;
   if (end < 0) throw new Error(`找不到 bundle 模块结尾：${id}`);
   const module = { exports: {} };
   new Function('require', 'module', 'exports', code.slice(bodyStart, end))(

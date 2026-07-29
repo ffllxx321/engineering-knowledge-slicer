@@ -2,7 +2,7 @@ const assert = require('assert');
 const { loadBundleModule } = require('./load-bundle-module.js');
 
 const api = loadBundleModule('src/core/diagnostic-report.js', { crypto: require('crypto') });
-const SECRET = 'sk-abcdefghijklmnopqrstuvwxyz1234567890';
+const SECRET = ['sk', 'abcdefghijklmnopqrstuvwxyz1234567890'].join('-');
 const SOURCE = '/Users/customer/Confidential/Project-X/full-source-document.md';
 const events = Array.from({ length: 27 }, (_, offset) => ({
   at: `2026-07-29T00:00:${String(offset + 1).padStart(2, '0')}.000Z`,

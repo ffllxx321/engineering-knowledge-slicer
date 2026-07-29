@@ -1,5 +1,13 @@
 # 工程知识切片 变更记录
 
+## v2.10.0 — 2026-07-29 本地 DOCX / XLSX 原生解析
+
+- 新增零运行时依赖的安全 OOXML ZIP 层：只信任中央目录并复核本地头，拒绝 traversal、重复条目、加密、多磁盘/ZIP64、未知压缩、DTD/实体，限制条目数、压缩/解压字节、压缩比、单 XML 大小、深度与文本量，并支持 `AbortSignal` 和 typed errors。
+- DOCX 默认本地优先，按正文、页眉、页脚、脚注、尾注、批注的包内顺序输出 `block_v0`；保留段落/样式/outline、编号层级、表格行列与合并、超链接、引用、媒体 relationship/锚点、分节/分页线索、语言以及 raw/inferred/presence 状态。
+- XLSX 默认本地优先，保留 workbook/sheet 顺序与可见性、used range、单元格坐标/类型/原值、共享/内联字符串、公式与缓存值分离、日期 serial、合并继承、隐藏行列、autofilter/table、drawing/image 锚点和安全的行身份推断；不移动列值、不虚构公式缓存。
+- DOCX/XLSX 本地失败或不支持时，只有现有 `pdfAllowExternalUpload` 显式外传门允许后才进入原远程路径；空但有效的 OOXML 返回 `OOXML_NO_ELIGIBLE_CONTENT` review state。
+- 新增默认开启的适配器设置迁移、最小 UI、确定性嵌入构建源、合成 golden/security/fallback/packing/locator 回归及只读真实样本 benchmark。发布仍严格只有 `main.js`、`manifest.json`、`styles.css`。
+
 ## Unreleased — 系统可靠性、检查点与可观测性优化
 
 - 新增宽松、版本化 `block_v0` 合同与结构优先 token packing，保留稳定 locator/provenance 并暴露覆盖率和预算指标。

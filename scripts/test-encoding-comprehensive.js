@@ -24,6 +24,7 @@ const extractors = loadModule(
   '"src/core/extractors.js": function(require, module, exports) {',
   (id) => {
     if (id === 'src/core/document-parser.js') return documentParser;
+    if (id === 'src/core/ooxml.js') return { parseOoxml: () => ({ status: 'unsupported' }) };
     if (id === 'src/core/external-pdf.js') return { extractDocumentWithApis: async () => ({ status: 'stub' }) };
     throw new Error('未预期的 require: ' + id);
   }

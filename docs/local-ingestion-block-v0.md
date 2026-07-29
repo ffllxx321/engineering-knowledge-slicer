@@ -10,6 +10,14 @@
 
 默认值：`localMsgAdapterEnabled=true`、`localPdfInventoryEnabled=true`、`blockV0PackingEnabled=true`、`localOcrEnabled=false`、`localOcrProvider=auto`、`localOcrLanguages=chi_sim+eng`、`localOcrConcurrency=2`、`localOcrTimeoutMs=120000`、`localOcrQualityThreshold=0.72`、`pdfAllowExternalUpload=false`。升级时本地 OCR 明确迁移为关闭，不会因机器上恰好存在引擎而开始处理或外传。
 
+## 本地 OOXML（DOCX / XLSX）
+
+`localDocxAdapterEnabled=true` 与 `localXlsxAdapterEnabled=true` 默认开启。两者使用内置安全 ZIP/XML 层，不读取临时目录、不加载 Office、不联网，也不引入发布时依赖。中央目录、entry 路径、压缩算法和声明大小会在解压前验证；默认限制为 4096 entries、256 MiB 压缩总量、768 MiB 声明/实际解压总量、128 MiB 单 entry、200 倍压缩比、64 MiB 单 XML、128 层 XML 深度、800 万文本字符。加密、ZIP64、多磁盘、DTD/实体、traversal、畸形 relationship/XML 和中止均返回稳定 `OOXML_*` code。
+
+DOCX locator 形如 `word/document.xml#section=1/p=4` 或 `word/document.xml#table=2/row=3/cell=1`；XLSX locator 形如 `xl/worksheets/sheet1.xml#sheet=1/cell=B7`。所有输出 blocks（包括 image metadata 和不可制卡 provenance）都必须有 locator。公式保存于 `metadata.formula`，缓存值独立保存于 `metadata.cached_value`；缺失缓存保持 missing，绝不计算或发明结果。合并区域的非 anchor cell 只记录继承关系与 header，不把 anchor 的值写入其 raw value。
+
+若本地适配器关闭、包不支持或解析失败，只在既有显式外传授权成立时尝试 MinerU；否则直接返回 typed error 与 `external_upload_required=true`，不会绕过确认。有效空文档返回 `review_required / OOXML_NO_ELIGIBLE_CONTENT`，而不是伪造正文。
+
 ## 本地 OCR provider 合同
 
 `auto` 会优先使用 PATH 中已安装的 Tesseract；插件不下载模型或依赖。`executable` 只接受可解析、可执行的绝对文件，使用 `spawn(executable, args, {shell:false})` 调用：

@@ -128,6 +128,7 @@ async function main() {
   const extractor = loadBundleModule('src/core/extractors.js', {
     'src/core/document-parser.js': parser,
     'src/core/block-v0.js': block,
+    'src/core/ooxml.js': { parseOoxml: () => ({ status: 'unsupported', code: 'OOXML_UNSUPPORTED' }) },
     'src/core/local-ocr.js': localOcr,
     'src/core/external-pdf.js': {
       extractDocumentWithApis: async () => {

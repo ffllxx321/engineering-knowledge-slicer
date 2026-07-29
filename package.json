@@ -1,15 +1,15 @@
 {
   "name": "engineering-knowledge-slicer",
-  "version": "2.9.3",
+  "version": "2.10.0",
   "description": "通过 MinerU/PaddleOCR 与 MiniMax M3，把工程资料转为中文、可追溯、固定目录归档的 Obsidian 知识卡片。",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs watch",
-    "build": "node scripts/embed-local-ocr.js --check && node scripts/validate-bundle-build.js",
+    "build": "node scripts/embed-local-ocr.js --check && node scripts/embed-ooxml.js --check && node scripts/validate-bundle-build.js",
     "lint": "node --check main.js && node --check scripts/*.js && node --check src/*.js",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node scripts/smoke-timestamp-policy.js && node scripts/smoke-split.js && node scripts/smoke-splitter-v26.js && node scripts/smoke-ratelimit.js && node scripts/smoke-json-repair.js && node scripts/smoke-v292.js && node scripts/smoke-performance-reliability.js && node scripts/smoke-reliability-v210.js && node scripts/regression-diagnostic-report.js && node scripts/smoke-summary-reduce-recovery.js && node scripts/integration-workflow-recovery.js && node scripts/gap-closure-tests.js && node scripts/regression-production-repair.js && node scripts/regression-production-ux.js && node scripts/regression-ocr-provenance.js && node scripts/regression-local-ocr.js && node scripts/regression-selected-regeneration.js && node scripts/regression-completion-transition.js",
-    "test:production-slice": "node scripts/regression-block-v0-adapters.js && node scripts/regression-local-ocr.js",
+    "test": "node scripts/smoke-timestamp-policy.js && node scripts/smoke-split.js && node scripts/smoke-splitter-v26.js && node scripts/smoke-ratelimit.js && node scripts/smoke-json-repair.js && node scripts/smoke-v292.js && node scripts/smoke-performance-reliability.js && node scripts/smoke-reliability-v210.js && node scripts/regression-diagnostic-report.js && node scripts/smoke-summary-reduce-recovery.js && node scripts/integration-workflow-recovery.js && node scripts/gap-closure-tests.js && node scripts/regression-production-repair.js && node scripts/regression-production-ux.js && node scripts/regression-ocr-provenance.js && node scripts/regression-local-ocr.js && node scripts/regression-ooxml.js && node scripts/regression-selected-regeneration.js && node scripts/regression-completion-transition.js",
+    "test:production-slice": "node scripts/regression-block-v0-adapters.js && node scripts/regression-local-ocr.js && node scripts/regression-ooxml.js",
     "benchmark": "node scripts/benchmark-optimization.js"
   },
   "keywords": [

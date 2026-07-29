@@ -59,6 +59,11 @@ const {
   toAppError
 } = require("src/core/reliability.js");
 const {
+  buildDiagnosticReport,
+  renderDiagnosticMarkdown,
+  boundedDiagnosticJson
+} = require("src/core/diagnostic-report.js");
+const {
   formatBusinessDate,
   formatOperationalLocalDateTime,
   preciseIsoInstant,
@@ -105,6 +110,25 @@ function normalizeUnicodeForm(value) {
   return str;
 }
 
+function errorCausalChain(error) {
+  const chain = [];
+  const seen = new Set();
+  let current = error;
+  while (current && !seen.has(current) && chain.length < 6) {
+    seen.add(current);
+    const rawCode = String(current.code || '').toUpperCase();
+    chain.push({
+      code: /^[A-Z][A-Z0-9_]+$/.test(rawCode) ? rawCode : (chain.length ? 'CAUSE_UNCLASSIFIED' : 'INTERNAL_UNEXPECTED'),
+      category: String(current.category || 'internal'),
+      retryable: current.retryable === true,
+      type: String(current.name || current.constructor?.name || 'Error'),
+      message: String(current.message || current)
+    });
+    current = current.cause;
+  }
+  return sanitizeForLog(chain);
+}
+
 // v1.1.6: 统一诊断日志入口。所有诊断输出都带 `[EKS diag]` 前缀，
 // 用户在 Obsidian DevTools Console 里 grep 一行就能定位。
 // v1.1.7: 同时写到 .obsidian/plugins/engineering-knowledge-slicer/diag.log 文件，
@@ -125,6 +149,11 @@ function diag(scope, payload) {
     console.log(line);
     // 写入文件：先入缓冲区，1 秒后批量 flush，避免每条诊断都同步 IO 卡 UI
     const state = globalThis.__eksDiag && globalThis.__eksDiag.state;
+    if (state) {
+      if (!Array.isArray(state.events)) state.events = [];
+      state.events.push({ at: new Date().toISOString(), scope: String(scope || 'unknown'), data: JSON.parse(serialized) });
+      if (state.events.length > 300) state.events.splice(0, state.events.length - 300);
+    }
     if (state && state.logPath) {
       state.buffer.push(new Date().toISOString() + ' ' + line);
       if (!state.flushTimer) {
@@ -965,6 +994,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const current = tasks.find((item) => item.task_id === task.task_id) || task;
     this._terminalTaskIds.delete(current.task_id);
     const startedAt = Date.now();
+    const counterBaseline = Object.assign({}, this.operationCounters);
+    current.diagnostic_started_at = new Date(startedAt).toISOString();
     const taskController = new AbortController();
     this.taskControllers.set(current.task_id, taskController);
     try {
@@ -1220,11 +1251,29 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           inputCharacters: this.operationCounters.promptCharacters,
           estimatedInputTokens: Math.ceil(this.operationCounters.promptCharacters / 3),
           outputCharacters: this.operationCounters.outputCharacters,
-          estimatedOutputTokens: Math.ceil(this.operationCounters.outputCharacters / 3)
+          estimatedOutputTokens: Math.ceil(this.operationCounters.outputCharacters / 3),
+          causalChain: errorCausalChain(error),
+          progress: current.progress ? {
+            stage: current.progress.stage,
+            batchIndex: current.progress.batchIndex,
+            batchTotal: current.progress.batchTotal,
+            chunkIndex: current.progress.chunkIndex,
+            chunkTotal: current.progress.chunkTotal,
+            at: current.progress.at,
+            elapsedMs: current.progress.elapsedMs
+          } : null
         },
         diagnosticMode: this.settings.diagnosticMode === true
       });
       current.errors = [...(current.errors || []), appError.toJSON()];
+      current.diagnostic_counters = Object.fromEntries(Object.entries(this.operationCounters).map(([key, value]) => [
+        key, Math.max(0, Number(value) - Number(counterBaseline[key] || 0))
+      ]));
+      current.diagnostic_terminal = {
+        ledgerPersisted: false,
+        errorArtifactPersisted: false,
+        uiTransition: 'pending'
+      };
       diag('performance.task', createStageMetric({
         taskId: current.task_id,
         runId: current.run_id,
@@ -1239,21 +1288,35 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       current.progress = null;
       await this.writeTaskLog(current);
       await this.persistArtifact(current, 'error', appError.toJSON());
+      current.diagnostic_terminal.errorArtifactPersisted = true;
       await this.saveTasks(upsertTask(await this.loadTasks(), current));
       // Failure is terminal only after both the error artifact and ledger are durable.
       // From this point stale heartbeats/progress callbacks must be ignored.
       this._terminalTaskIds.add(current.task_id);
       await this.flushSaveTasksImmediate();
-      await this.transitionFailureUi(current.task_id);
-      this.sessionStats.failed += 1;
-      this.sessionStats.lastMessage = `处理失败：${current.source_path}`;
-      // v1.1.6: 诊断日志 + 更明确的 Notice（带阶段名），避免错误被截图渲染误导
+      current.diagnostic_terminal.ledgerPersisted = true;
+      try {
+        const transitioned = await this.transitionFailureUi(current.task_id);
+        current.diagnostic_terminal.uiTransition = transitioned ? 'errors-visible' : 'no-dashboard';
+      } catch (_) {
+        current.diagnostic_terminal.uiTransition = 'failed';
+      }
       diag('processTask.failed', {
-        sourcePath: current.source_path,
+        taskId: current.task_id,
+        runId: current.run_id,
+        sourceHash: String(current.source_hash || '').slice(0, 24),
         stage: failedStage,
         errorClass: error && error.constructor ? error.constructor.name : typeof error,
         error: sanitizeForLog(appError.toJSON())
       });
+      try {
+        await this.persistDiagnosticReport(current);
+      } catch (diagnosticError) {
+        try { diag('diagnostic.report.failed', { taskId: current.task_id, message: String(diagnosticError?.message || diagnosticError) }); } catch (_) {}
+      }
+      this.sessionStats.failed += 1;
+      this.sessionStats.lastMessage = `处理失败：${current.source_path}`;
+      // v1.1.6: 更明确的 Notice（带阶段名），避免错误被截图渲染误导
       new Notice(`${appError.message} · ${appError.suggestedAction}`);
     } finally {
       this.taskControllers.delete(current.task_id);
@@ -1308,6 +1371,73 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     }
     diag('failure.ui.transition', { taskId, runId: failed.run_id || '', transitioned });
     return failed;
+  }
+
+  async diagnosticArtifactInventory(task) {
+    const inventory = [];
+    for (const [name, artifactPath] of Object.entries(task?.artifacts || {})) {
+      const item = { name, pathHash: sourceHash(String(artifactPath || '')).slice(0, 16), exists: false, validation: 'missing' };
+      try {
+        const file = this.app.vault.getAbstractFileByPath(artifactPath);
+        item.exists = file instanceof TFile;
+        if (item.exists && /\.json$/i.test(artifactPath)) {
+          const parsed = JSON.parse(await this.app.vault.read(file));
+          item.validation = parsed?.artifactVersion === 2
+            ? (parsed.validationState === 'valid' && Object.hasOwn(parsed, 'payload') ? 'valid' : 'invalid-envelope')
+            : 'legacy-readable';
+        } else if (item.exists) {
+          item.validation = 'present';
+        }
+      } catch (_) {
+        item.validation = 'unreadable';
+      }
+      inventory.push(item);
+    }
+    return inventory.sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  async createDiagnosticReport(task) {
+    const events = globalThis.__eksDiag?.state?.events || [];
+    return buildDiagnosticReport({
+      task,
+      error: task?.errors?.at(-1),
+      manifest: this.manifest || {},
+      settings: this.settings || {},
+      platform: {
+        os: typeof process !== 'undefined' ? process.platform : 'unknown',
+        arch: typeof process !== 'undefined' ? process.arch : 'unknown',
+        node: typeof process !== 'undefined' ? process.versions?.node : '',
+        electron: typeof process !== 'undefined' ? process.versions?.electron : '',
+        obsidian: this.app?.version || ''
+      },
+      counters: task?.diagnostic_counters || this.operationCounters,
+      events,
+      artifacts: await this.diagnosticArtifactInventory(task),
+      generatedAt: new Date().toISOString()
+    });
+  }
+
+  async persistDiagnosticReport(task) {
+    const report = await this.createDiagnosticReport(task);
+    const path = normalizeVaultPath(`${this.settings.artifactsPath}/${task.run_id}/diagnostic-report.json`);
+    await writeFile(this.app, path, boundedDiagnosticJson(report));
+    task.artifacts = Object.assign({}, task.artifacts || {}, { diagnostic_report: path });
+    await this.saveTasks(upsertTask(await this.loadTasks(), task));
+    await this.flushSaveTasksImmediate();
+    return report;
+  }
+
+  async copyDiagnosticReport(task) {
+    try {
+      const report = await this.createDiagnosticReport(task);
+      const markdown = renderDiagnosticMarkdown(report);
+      if (!globalThis.navigator?.clipboard?.writeText) throw new Error('当前环境不支持剪贴板');
+      await globalThis.navigator.clipboard.writeText(markdown);
+      new Notice('已复制脱敏诊断报告。请把完整内容发送给支持人员；无需发送源文件或 API Key。');
+    } catch (error) {
+      try { diag('diagnostic.copy.failed', { taskId: task?.task_id, message: String(error?.message || error) }); } catch (_) {}
+      new Notice(`复制诊断报告失败：${String(error?.message || error)}`);
+    }
   }
 
   async processTaskLegacy(task) {
@@ -2853,6 +2983,9 @@ class SlicerDashboardView extends ItemView {
         const technical = item.createEl('details', { cls: 'eks-technical-details' });
         technical.createEl('summary', { text: '技术详情' });
         technical.createEl('pre', { text: JSON.stringify({ code, task_id: task.task_id, run_id: task.run_id, error }, null, 2) });
+        const reportActions = item.createDiv('eks-row-actions');
+        button(reportActions, '复制脱敏诊断报告', () => this.plugin.copyDiagnosticReport(task));
+        reportActions.createSpan({ cls: 'eks-task-meta', text: '发送复制出的完整报告；不要发送源文件或 API Key。' });
       }
       if (entries.length > 20) details.createDiv({ cls: 'eks-task-meta', text: `当前显示前 20 项，其余 ${entries.length - 20} 项可通过任务筛选查看。` });
     }
@@ -7404,6 +7537,10 @@ async function summarizeDocument(options) {
     provenance: options.parsePackage.provenance
   });
   const partials = new Array(chunks.length);
+  diag('summary.map.plan', {
+    chunkTotal: chunks.length,
+    stableChunkIds: chunks.map((chunk) => chunk.stableChunkId || chunk.chunk_id).slice(0, 120)
+  });
   const concurrency = Math.max(1, Math.min(3, Number(options.summaryConcurrency) || 2));
   let nextChunkIndex = 0;
   async function summarizeChunk(index) {
@@ -7413,11 +7550,21 @@ async function summarizeDocument(options) {
       : null;
     if (cached && cached.coverage && exactCoverage(cached.coverage, 'chunk_ids', [chunk.chunk_id], '总结分块覆盖不完整').length === 0) {
       partials[index] = cached;
+      diag('summary.map.cacheHit', {
+        chunkIndex: index + 1, chunkTotal: chunks.length,
+        stableChunkId: chunk.stableChunkId || chunk.chunk_id
+      });
       await emitProgress(options.onProgress, {
         stage: 'summary-map', chunkIndex: index + 1, chunkTotal: chunks.length,
         cacheHit: true, message: `复用逐段总结 ${index + 1}/${chunks.length}`
       });
       return;
+    }
+    if (cached) {
+      diag('summary.map.cacheMiss', {
+        chunkIndex: index + 1, chunkTotal: chunks.length,
+        stableChunkId: chunk.stableChunkId || chunk.chunk_id, reason: 'checkpoint_invalid'
+      });
     }
     // v2.7: 把标题层级面包屑（WeKnora ContextHeader）注入 prompt，让 AI 拿到章节语境
     const chunkContext = chunk.breadcrumb
@@ -7450,6 +7597,10 @@ async function summarizeDocument(options) {
     if (typeof options.saveSummaryMapChunk === 'function') {
       await options.saveSummaryMapChunk(chunk, partials[index]);
     }
+    diag('summary.map.completed', {
+      chunkIndex: index + 1, chunkTotal: chunks.length,
+      stableChunkId: chunk.stableChunkId || chunk.chunk_id
+    });
   }
   async function summaryWorker() {
     while (true) {
@@ -8514,9 +8665,12 @@ async function fetchWithTransientRetry(fetcher, endpoint, options, settings) {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let retryAfterMs = 0;
+    let retryStatus = 0;
     try {
+      diag('outbound.request', { provider: 'minimax', attempt, maxAttempts });
       const response = await fetcher(endpoint, options);
       if (response.ok || !isTransientHttpStatus(response.status) || attempt === maxAttempts) return response;
+      retryStatus = Number(response.status) || 0;
       retryAfterMs = parseRetryAfterMs(response.headers?.get?.('retry-after'));
       await safeResponseText(response);
     } catch (error) {
@@ -8525,7 +8679,12 @@ async function fetchWithTransientRetry(fetcher, endpoint, options, settings) {
     }
     const exponentialMs = Math.min(30_000, baseMs * (2 ** (attempt - 1)));
     const jitterMs = Math.round(exponentialMs * (0.85 + Math.random() * 0.3));
-    await sleep(Math.max(retryAfterMs, jitterMs), options.signal);
+    const backoffMs = Math.max(retryAfterMs, jitterMs);
+    diag('outbound.retry', {
+      provider: 'minimax', attempt, nextAttempt: attempt + 1, status: retryStatus,
+      rateLimited: retryStatus === 429 || retryStatus === 529, retryAfterMs, backoffMs
+    });
+    await sleep(backoffMs, options.signal);
   }
 
   throw lastError || new Error('MiniMax request failed after retries');
@@ -8956,6 +9115,323 @@ function hasValue(value) {
 }
 
 module.exports = { buildCardRecord, cardFileName, renderKnowledgeCard, renderStructuredSummary, yamlValue };
+
+},
+/**
+ * @module src/core/diagnostic-report
+ * Bounded, redacted, troubleshooting-oriented failure reports.
+ */
+"src/core/diagnostic-report.js": function(require, module, exports) {
+const crypto = require("crypto");
+
+const REPORT_VERSION = '1.0';
+const SCHEMA_VERSION = 'eks-diagnostic-report/1.0';
+const MAX_JSON_BYTES = 64 * 1024;
+const MAX_MARKDOWN_BYTES = 72 * 1024;
+const SECRET_KEY = /^(?:sourcePath|artifactPath)$|(?:authorization|api[-_]?key|token|jwt|secret|password|cookie|prompt|source[_-]?(?:text|content|markdown)|body|response)/i;
+const CREDENTIAL = /(Bearer\s+)[^\s,;]+|((?:sk|key|paddle|gh[pousxr])[-_])[A-Za-z0-9._-]{12,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/gi;
+const SENSITIVE_QUERY = /([?&](?:api_?key|access_?token|token|jwt|secret|signature)=)[^&#\s]+/gi;
+
+function hash(value, length = 16) {
+  return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, length);
+}
+
+function redactString(value) {
+  let text = String(value || '').replace(CREDENTIAL, (_all, bearer, prefix) => bearer ? `${bearer}***` : `${prefix || ''}***`)
+    .replace(SENSITIVE_QUERY, '$1***');
+  text = text.replace(/(?:[A-Za-z]:)?[\\/](?:[^\\/\s]+[\\/]){2,}[^\\/\s]*/g, (match) => `<path:${hash(match)}>`);
+  if (text.length > 500) text = `${text.slice(0, 460)}…<truncated:${text.length}>`;
+  return text;
+}
+
+function redact(value, key = '', seen = new WeakSet()) {
+  if (SECRET_KEY.test(key)) return '<redacted>';
+  if (typeof value === 'string') return redactString(value);
+  if (value === null || value === undefined || typeof value !== 'object') return value;
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+  if (Array.isArray(value)) return value.slice(0, 100).map((item) => redact(item, '', seen));
+  const output = {};
+  for (const [childKey, childValue] of Object.entries(value)) {
+    output[childKey] = redact(childValue, childKey, seen);
+  }
+  return output;
+}
+
+function safeSettings(settings = {}) {
+  const keys = [
+    'aiProvider', 'minimaxModel', 'aiChunkSize', 'aiMaxChunks', 'maxPointsPerRequest',
+    'summaryConcurrency', 'atomizationConcurrency', 'aiRequestTimeoutMs', 'aiRequestMaxAttempts',
+    'aiRetryBaseMs', 'rateLimitMs', 'rateLimitMaxConcurrent', 'rateLimitBackoffMaxMs',
+    'useStreamingAi', 'useEnvKeys', 'targetLanguage', 'businessTimeZone', 'confirmUploads',
+    'pdfExtractionOrder'
+  ];
+  return Object.fromEntries(keys.filter((key) => Object.hasOwn(settings, key)).map((key) => [key, settings[key]]));
+}
+
+function compactReason(value) {
+  return redactString(String(value || 'unknown')).replace(/\s+/g, ' ').slice(0, 180);
+}
+
+function eventIdentity(event) {
+  const data = event?.data || {};
+  return data.stableBatchId || data.stableChunkId || data.stableReduceId || '';
+}
+
+function isRelevantEvent(event, input) {
+  const data = event?.data || {};
+  const task = input.task || {};
+  const started = Date.parse(task.diagnostic_started_at || task.created_at || 0);
+  const at = Date.parse(event?.at || 0);
+  if (Number.isFinite(started) && Number.isFinite(at) && at < started - 1000) return false;
+  if (data.taskId && task.task_id && data.taskId !== task.task_id) return false;
+  if (data.runId && task.run_id && data.runId !== task.run_id) return false;
+  return true;
+}
+
+function compactEvents(events = [], input = {}) {
+  const safe = events.filter((event) => isRelevantEvent(event, input)).slice(-160).map((event) => ({
+    at: event.at,
+    code: String(event.scope || 'unknown'),
+    data: redact(event.data || {})
+  }));
+  const output = [];
+  for (let index = 0; index < safe.length; index += 1) {
+    const first = safe[index];
+    if (!/cacheHit$/.test(first.code)) {
+      output.push(first);
+      continue;
+    }
+    const ids = [];
+    const indices = [];
+    let end = index;
+    while (end < safe.length && safe[end].code === first.code) {
+      const id = eventIdentity(safe[end]);
+      if (id) ids.push(id);
+      const batchIndex = Number(safe[end].data?.batchIndex);
+      if (Number.isInteger(batchIndex) && batchIndex > 0) indices.push(batchIndex);
+      end += 1;
+    }
+    const count = end - index;
+    output.push(count === 1 ? first : {
+      at: first.at,
+      endAt: safe[end - 1].at,
+      code: `${first.code}.range`,
+      count,
+      ids: ids.slice(0, 40),
+      indices: indices.slice(0, 120)
+    });
+    index = end - 1;
+  }
+  return output.slice(-80);
+}
+
+function workDiagnosis(events, artifacts, error) {
+  const atomEvents = events.filter((event) => /^atomization\.batch(?:\.cacheHit)?(?:\.range)?$/.test(event.code));
+  const atomFailures = events.filter((event) => event.code === 'atomization.batch.failed');
+  const atomExpected = Math.max(
+    Number(error?.details?.batchTotal) || 0,
+    ...events.map((event) => Number(event.data?.batchTotal) || 0),
+    0
+  );
+  const completedIds = [...new Set(atomEvents.flatMap((event) => [
+    eventIdentity(event),
+    ...(Array.isArray(event.ids) ? event.ids : [])
+  ]).filter(Boolean))].sort();
+  const failed = (error?.details?.failedBatches || atomFailures.map((event) => event.data || {})).map((item) => ({
+    id: item.stableBatchId || `batch-${item.batchIndex || '?'}`,
+    index: Number(item.batchIndex) || null,
+    code: item.code || 'ATOMIZATION_BATCH_FAILED',
+    reason: compactReason(item.message || item.reason)
+  }));
+  const failedIds = new Set(failed.map((item) => item.id));
+  const knownIds = [...new Set([
+    ...completedIds,
+    ...failed.map((item) => item.id),
+    ...artifacts.filter((item) => item.name.startsWith('atom-batch-')).map((item) => item.name.slice('atom-batch-'.length))
+  ])].sort();
+  const missing = atomExpected > knownIds.length
+    ? Array.from({ length: atomExpected }, (_, index) => index + 1)
+      .filter((index) => !failed.some((item) => item.index === index)
+        && !events.some((event) => /^atomization\.batch/.test(event.code)
+          && (Number(event.data?.batchIndex) === index || event.indices?.includes(index))))
+      .map((index) => `batch-index-${index}`)
+    : [];
+
+  const summaryArtifacts = artifacts.filter((item) => item.name.startsWith('summary-map-'));
+  const summaryEvents = events.filter((event) => /^summary\.map\.(?:cacheHit|completed)(?:\.range)?$/.test(event.code));
+  const summaryPlan = events.findLast?.((event) => event.code === 'summary.map.plan');
+  const plannedSummaryIds = Array.isArray(summaryPlan?.data?.stableChunkIds) ? summaryPlan.data.stableChunkIds : [];
+  const summaryExpected = Math.max(
+    Number(error?.details?.progress?.chunkTotal) || 0,
+    ...events.map((event) => Number(event.data?.chunkTotal) || 0),
+    plannedSummaryIds.length,
+    summaryArtifacts.length,
+    0
+  );
+  const summaryCompleted = [...new Set([
+    ...summaryArtifacts.filter((item) => item.exists && item.validation !== 'invalid-envelope').map((item) => item.name.slice('summary-map-'.length)),
+    ...summaryEvents.flatMap((event) => [eventIdentity(event), ...(event.ids || [])])
+  ])].sort();
+  const completedSummarySet = new Set(summaryCompleted);
+  const missingSummaryIds = plannedSummaryIds.filter((id) => !completedSummarySet.has(id));
+  return {
+    summaryChunks: {
+      expected: summaryExpected,
+      completed: summaryCompleted.length,
+      completedIds: summaryCompleted.slice(0, 120),
+      missingIds: missingSummaryIds.slice(0, 120),
+      missingCount: Math.max(missingSummaryIds.length, summaryExpected - summaryCompleted.length)
+    },
+    atomBatches: {
+      expected: atomExpected,
+      completed: Number(error?.details?.completedBatches) || completedIds.length,
+      completedIds: completedIds.slice(0, 120),
+      missing,
+      failed
+    }
+  };
+}
+
+function counterSummary(events, counters = {}) {
+  const count = (pattern) => events.reduce((sum, event) => sum + (pattern.test(event.code) ? Number(event.count) || 1 : 0), 0);
+  return {
+    outboundRequests: count(/^outbound\.request$/) || Number(counters.apiRequests) || count(/minimax\.(?:http|transport|timeout)/),
+    retries: count(/^outbound\.retry$/) || Number(counters.aiRetries) || count(/retry|checkpointRetry/i),
+    rateLimits: events.reduce((sum, event) => sum + (event.code === 'outbound.retry' && event.data?.rateLimited ? 1 : 0), 0),
+    backoffs: count(/backoff/i),
+    cache: {
+      hits: count(/cacheHit/),
+      misses: count(/cacheMiss/)
+    },
+    summaryReduceRequests: Number(counters.summaryReduceRequests) || 0
+  };
+}
+
+function nextActions(error, work) {
+  const actions = [];
+  if (error?.retryable) actions.push('从 Dashboard 重试该任务；有效检查点会复用，仅补失败或缺失批次。');
+  if (work.atomBatches.missing.length || work.atomBatches.failed.length) actions.push('核对 atomBatches 的稳定 ID；持续失败时连同本报告提交支持人员。');
+  if (error?.category === 'auth') actions.push('在设置中重新测试服务连接；不要在报告或消息中粘贴 API Key。');
+  if (error?.category === 'rate_limit') actions.push('等待服务限流窗口结束后重试，并检查报告中的 rateLimits/backoffs。');
+  if (!actions.length) actions.push(error?.suggestedAction || '按 finalError 建议处理后重试；若复现，请提交完整报告。');
+  actions.push('无需发送源文件、原始 diag.log、提示词、模型响应或密钥。');
+  return actions;
+}
+
+function buildDiagnosticReport(input = {}) {
+  const task = input.task || {};
+  const error = redact(input.error || task.errors?.at?.(-1) || {});
+  const events = compactEvents(input.events || [], input);
+  const artifacts = redact(input.artifacts || []);
+  const work = workDiagnosis(events, artifacts, error);
+  const startedAt = task.diagnostic_started_at || task.progress?.startedAt || task.created_at || '';
+  const endedAt = task.updated_at || input.generatedAt || '';
+  const sourcePath = String(task.source_path || '');
+  const causal = Array.isArray(error?.details?.causalChain) && error.details.causalChain.length
+    ? error.details.causalChain.map((item) => ({
+      code: item.code || 'CAUSE_UNCLASSIFIED',
+      category: item.category || 'internal',
+      retryable: item.retryable === true,
+      type: item.type || 'Error',
+      message: compactReason(item.message)
+    }))
+    : [{
+      code: error.code || 'INTERNAL_UNEXPECTED',
+      category: error.category || 'internal',
+      retryable: error.retryable === true,
+      message: compactReason(error.technicalMessage || error.message)
+    }];
+  return redact({
+    reportVersion: REPORT_VERSION,
+    schemaVersion: SCHEMA_VERSION,
+    generatedAt: input.generatedAt || new Date().toISOString(),
+    runtime: {
+      pluginId: input.manifest?.id || 'engineering-knowledge-slicer',
+      pluginVersion: input.manifest?.version || '',
+      pipelineVersion: task.pipeline_version || '',
+      promptBundleVersion: task.prompt_bundle_version || '',
+      platform: input.platform || {},
+      settings: safeSettings(input.settings)
+    },
+    identity: {
+      taskId: task.task_id || '',
+      runId: task.run_id || '',
+      sourceHash: String(task.source_hash || '').slice(0, 24),
+      sourcePathHash: hash(sourcePath, 24),
+      sourceType: task.source_type || sourcePath.split('.').pop()?.toLowerCase() || 'unknown'
+    },
+    execution: {
+      stage: error.stage || task.progress?.stage || task.status || 'unknown',
+      status: task.status || 'unknown',
+      attempt: Number(task.attempt || task.retry_count || 0),
+      startedAt,
+      endedAt,
+      elapsedMs: Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)) || Number(task.progress?.elapsedMs) || 0,
+      lastSuccessfulCheckpoint: [...artifacts].reverse().find((item) => item.exists && item.validation === 'valid' && !/^error|diagnostic/.test(item.name))?.name || null
+    },
+    finalError: error,
+    causalChain: causal,
+    work,
+    operations: counterSummary(events, input.counters),
+    timeline: events,
+    terminal: redact(task.diagnostic_terminal || { ledgerPersisted: task.status === 'failed', errorArtifactPersisted: !!task.artifacts?.error, uiTransition: 'unknown' }),
+    artifacts,
+    nextActions: nextActions(error, work),
+    sendToSupport: 'Send this complete report. Do not send the source document, API keys, prompts, or raw provider responses.'
+  });
+}
+
+function fitReport(report, maxBytes = MAX_JSON_BYTES) {
+  const output = JSON.parse(JSON.stringify(report));
+  const size = () => Buffer.byteLength(JSON.stringify(output, null, 2));
+  while (size() > maxBytes && output.timeline?.length > 20) output.timeline.shift();
+  while (size() > maxBytes && output.artifacts?.length > 30) output.artifacts.pop();
+  while (size() > maxBytes && output.work?.summaryChunks?.completedIds?.length > 20) output.work.summaryChunks.completedIds.pop();
+  while (size() > maxBytes && output.work?.atomBatches?.completedIds?.length > 20) output.work.atomBatches.completedIds.pop();
+  if (size() > maxBytes) {
+    output.timeline = output.timeline?.slice(-10) || [];
+    output.artifacts = output.artifacts?.slice(0, 15) || [];
+    output.truncated = true;
+  }
+  return output;
+}
+
+function boundedDiagnosticJson(report, maxBytes = MAX_JSON_BYTES) {
+  return JSON.stringify(fitReport(report, maxBytes), null, 2);
+}
+
+function renderDiagnosticMarkdown(report) {
+  const fitted = fitReport(report, MAX_JSON_BYTES);
+  const summary = [
+    '# Engineering Knowledge Slicer Diagnostic Report',
+    '',
+    `> Send this complete report to support. Do not send the source document, API keys, prompts, or raw provider responses.`,
+    '',
+    `- Report/schema: ${fitted.reportVersion} / ${fitted.schemaVersion}`,
+    `- Plugin: ${fitted.runtime.pluginId} ${fitted.runtime.pluginVersion}`,
+    `- Task/run: ${fitted.identity.taskId} / ${fitted.identity.runId}`,
+    `- Source: hash ${fitted.identity.sourceHash || fitted.identity.sourcePathHash}; type ${fitted.identity.sourceType}`,
+    `- Stage/status: ${fitted.execution.stage} / ${fitted.execution.status}`,
+    `- Error: ${fitted.finalError.code || 'INTERNAL_UNEXPECTED'} (${fitted.finalError.category || 'internal'}, retryable=${!!fitted.finalError.retryable})`,
+    `- Checkpoint: ${fitted.execution.lastSuccessfulCheckpoint || 'none'}`,
+    `- Summary chunks: ${fitted.work.summaryChunks.completed}/${fitted.work.summaryChunks.expected}; missing ${fitted.work.summaryChunks.missingCount}`,
+    `- Atom batches: ${fitted.work.atomBatches.completed}/${fitted.work.atomBatches.expected}; missing ${fitted.work.atomBatches.missing.length}; failed ${fitted.work.atomBatches.failed.length}`,
+    '',
+    '## Machine-readable report',
+    '',
+    '```json',
+    boundedDiagnosticJson(fitted),
+    '```'
+  ].join('\n');
+  if (Buffer.byteLength(summary) <= MAX_MARKDOWN_BYTES) return summary;
+  return summary.slice(0, MAX_MARKDOWN_BYTES - 80) + '\n```\n\n> Report truncated to hard size bound.\n';
+}
+
+module.exports = {
+  MAX_JSON_BYTES, MAX_MARKDOWN_BYTES, REPORT_VERSION, SCHEMA_VERSION,
+  boundedDiagnosticJson, buildDiagnosticReport, compactEvents, redact, renderDiagnosticMarkdown
+};
 
 },
 /**

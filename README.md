@@ -15,7 +15,8 @@
 - **并发 + 限流**：文档级并发（默认 3）+ AI 请求限流器（指数退避、遵循 Retry-After），原子化批次内支持有限并发（默认 2 路）
 - **SSE 流式输出（POC）**：可选开启，AI 调用期间逐 token 回显
 - **密钥外部化**：API 密钥读取自 `~/.eks-secrets.json`，避免 OneDrive/iCloud 同步泄露
-- **诊断日志**：全链路脱敏 diag 日志，默认写到 `~/.eks/logs/diag.log`
+- **诊断报告**：Dashboard 错误详情一键复制结构化脱敏报告（64 KiB JSON 硬上限），优先提交该报告而不是原始日志
+- **诊断日志**：全链路脱敏 diag 日志，默认写到 `~/.eks/logs/diag.log`，保留为本地深度排查兼容入口
 - **安全检查点与结构化错误**：阶段产物以 source/pipeline/prompt/schema 指纹校验后复用；错误提供稳定代码、可重试性和建议操作，日志递归脱敏 Header、JWT 和敏感 URL 参数
 - **可取消的外部工作**：取消会中止 MiniMax 排队/JSON/SSE 请求以及 MinerU/PaddleOCR 上传、轮询等待和下载，不再等当前远程阶段自然超时
 - **任务与错误中心**：状态卡可直接筛选，任务支持文件搜索、状态筛选、阶段时间线和折叠详情；错误按稳定代码分组并显示位置与建议操作
@@ -150,6 +151,7 @@ node scripts/smoke-v292.js           # 诊断日志故障回归（v2.9.2，22 �
 ## 诊断与排障
 
 - 诊断日志默认写到 vault 之外的 `~/.eks/logs/diag.log`（无法创建时回退到 `.obsidian/plugins/engineering-knowledge-slicer/diag.log`），覆盖切片画像（`splitter.profile`）、切片校验（`splitter.validate`）、AI 请求/限流、密钥指纹等全链路节点，统一脱敏
+- 任务失败后，在 Dashboard →「错误」展开任务并点击「复制脱敏诊断报告」。请发送复制出的完整 Markdown/JSON；无需且不应发送源文件、API Key、提示词或原始模型响应。字段与安全边界见 [`docs/error-diagnostics.md`](docs/error-diagnostics.md)
 - 时间语义：卡片与用户可见持久记录使用本地日历日期 `YYYY-MM-DD`；任务恢复、产物、回滚、服务测试与诊断日志保留内部精确 ISO instant。旧 ISO 卡片按运行时/配置时区惰性显示，不批量改写。详见 [时间戳策略](docs/timestamp-policy.md)。
 - 切片行为异常时先看 `splitter.profile` 确认走了哪条策略（heading / heuristic / legacy）
 - 设置面板「诊断日志」开关可控制采集

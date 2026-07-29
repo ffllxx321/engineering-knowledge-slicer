@@ -79,8 +79,9 @@ test('阶段指标不含正文且仅保留 source hash 前缀', () => {
 
 test('新检查点带指纹且旧检查点保持可读', () => {
   const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-  assert(main.includes('artifactVersion: 2'));
-  assert(main.includes("parsed.artifactVersion !== 2"));
+  assert(main.includes('artifactVersion: 3'));
+  assert(main.includes('[2, 3].includes(parsed.artifactVersion)'));
+  assert(main.includes("fingerprintVersion: 'parsed-input-v1'"));
   assert(main.includes("reason: 'fingerprint_changed'"));
 });
 

@@ -1,5 +1,13 @@
 # 工程知识切片 变更记录
 
+## v2.12.0 — 2026-07-29 block-native quality closure
+
+- `autoApproveConfidenceThreshold` 从迁移、UI、任务处理、工作流贯穿到评分；范围统一夹紧为 0.70–1.00，默认 0.90，不再使用硬编码 0.85。
+- `OOXML_NO_ELIGIBLE_CONTENT` 等 typed `review_required` 直接进入任务账本与审核台，不计作通用失败，也不调用 AI。
+- parsed artifact v3 指纹覆盖适配器、OOXML 限制、OCR、block packing、parser 与 block 合同；页级 OCR checkpoint 独立保留，AI 检查点绑定解析输入。
+- parse package 新增轻量 `block_id → locator → raw_text` 索引；block pack、总结证据与原子来源保持 block ID，逐字无法验证时禁止自动入库。旧 parse package/card 继续走原 provenance/markdown 兼容路径。
+- 分类抽样结构优先且预算确定，不增加请求数；新增 DOCX/XLSX/PPTX/MSG/PDF-style 跨层 fixture 和门槛、迁移、证据链回归。诊断不记录正文或密钥。
+
 ## v2.11.0 — 2026-07-29 本地 PPTX 原生结构解析
 
 - 补齐 Office Open XML 摄取矩阵：PPTX 默认本地优先，按 `presentation.xml` relationship 顺序处理幻灯片，不按文件名猜测顺序；保留标题/正文/项目符号、文本框占位符与 EMU 边界、表格单元格及合并、演讲者备注、隐藏页、转场/动画存在性、超链接、图片与图表锚点。

@@ -1073,6 +1073,31 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           this.sessionStats.lastMessage = `扫描件需要 OCR：${current.source_path}`;
           return;
         }
+        if (extracted.status === 'review_required' && extracted.parsePackage) {
+          parsePackage = extracted.parsePackage;
+          current.status = 'needs_review';
+          current.review_outcome = {
+            kind: 'review_required',
+            stage: 'parsing',
+            code: String(extracted.code || 'PARSER_REVIEW_REQUIRED'),
+            message: String(extracted.message || '解析结果需要人工审核。'),
+            retryable: false,
+            at: new Date().toISOString()
+          };
+          current.errors = [];
+          await this.persistArtifact(current, 'parsed', parsePackage);
+          await this.persistArtifact(current, 'review', {
+            version: '1.2', task_id: current.task_id, outcome: current.review_outcome, items: []
+          });
+          await this.saveTasks(upsertTask(await this.loadTasks(), current));
+          this.sessionStats.review += 1;
+          this.sessionStats.lastMessage = `解析结果需要审核：${current.source_path}`;
+          diag('parser.reviewRequired', {
+            taskId: current.task_id, code: current.review_outcome.code,
+            parser: parsePackage.parser, blockCount: Array.isArray(parsePackage.blocks) ? parsePackage.blocks.length : 0
+          });
+          return;
+        }
         if (extracted.status !== 'ok' || !extracted.parsePackage) throw new Error(extracted.message || '文档解析 API 未返回可用 Markdown');
         parsePackage = extracted.parsePackage;
         const localOcrMetrics = parsePackage.metadata?.local_ocr?.metrics;
@@ -1133,6 +1158,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         summaryConcurrency: this.settings.summaryConcurrency,
         atomizationConcurrency: this.settings.atomizationConcurrency,
         shortDocumentMaxCards: this.settings.shortDocumentMaxCards,
+        autoApproveConfidenceThreshold: this.settings.autoApproveConfidenceThreshold,
         chunkOverlapRatio: this.settings.chunkOverlapRatio,
         coalesceTinyChunks: this.settings.coalesceTinyChunks,
         loadSummaryMapChunk: (chunk) => this.loadArtifact(current, `summary-map-${chunk.stableChunkId || chunk.chunk_id}`),
@@ -1679,7 +1705,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const parsed = JSON.parse(await this.app.vault.read(file));
       // v2.10: 旧产物仍按原格式读取；新产物带输入指纹，只有来源与运行时契约
       // 完全一致才复用，避免 prompt/schema/pipeline 升级后误用旧 AI 结果。
-      if (!parsed || parsed.artifactVersion !== 2 || !Object.hasOwn(parsed, 'payload')) return parsed;
+      if (!parsed || ![2, 3].includes(parsed.artifactVersion) || !Object.hasOwn(parsed, 'payload')) return parsed;
       if (parsed.inputFingerprint !== this.artifactInputFingerprint(task, name)) {
         diag('artifact.cacheMiss', { taskId: task.task_id, stage: name, reason: 'fingerprint_changed' });
         return null;
@@ -1692,7 +1718,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   async persistArtifact(task, name, value) {
     const path = normalizeVaultPath(`${this.settings.artifactsPath}/${task.run_id}/${name}.json`);
     const envelope = {
-      artifactVersion: 2,
+      artifactVersion: 3,
       stage: name,
       inputFingerprint: this.artifactInputFingerprint(task, name),
       completedAt: new Date().toISOString(),
@@ -1717,11 +1743,37 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   artifactInputFingerprint(task, name) {
     const crypto = require('crypto');
     const versions = runtimeVersions(this.settings);
-    const versionScope = name === 'parsed' ? {} : versions;
+    const parsedScope = {
+      fingerprintVersion: 'parsed-input-v1',
+      blockContractVersion: 'block_v0',
+      parserContractVersion: 'document-parser-v2',
+      localMsgAdapterEnabled: this.settings.localMsgAdapterEnabled !== false,
+      localDocxAdapterEnabled: this.settings.localDocxAdapterEnabled !== false,
+      localXlsxAdapterEnabled: this.settings.localXlsxAdapterEnabled !== false,
+      localPptxAdapterEnabled: this.settings.localPptxAdapterEnabled !== false,
+      localPdfInventoryEnabled: this.settings.localPdfInventoryEnabled !== false,
+      blockV0PackingEnabled: this.settings.blockV0PackingEnabled !== false,
+      blockPackHardBudget: Math.max(128, Math.floor(Number(this.settings.aiChunkSize || 8000) / 4)),
+      ooxmlLimits: [
+        this.settings.ooxmlMaxEntries, this.settings.ooxmlMaxUncompressedBytes,
+        this.settings.ooxmlMaxXmlBytes, this.settings.ooxmlMaxTextChars
+      ],
+      localOcr: {
+        enabled: this.settings.localOcrEnabled === true,
+        provider: this.settings.localOcrProvider,
+        executable: this.settings.localOcrExecutable,
+        languages: this.settings.localOcrLanguages,
+        qualityThreshold: this.settings.localOcrQualityThreshold
+      }
+    };
+    const isPageOcrCheckpoint = String(name).startsWith('ocr-page-');
+    const versionScope = name === 'parsed' ? parsedScope : isPageOcrCheckpoint ? { checkpointContract: 'local-ocr-v1' } : versions;
     return crypto.createHash('sha256').update(JSON.stringify({
       sourceHash: task.source_hash || '',
       stage: name,
-      versions: versionScope
+      versions: versionScope,
+      parsedInputFingerprint: name === 'parsed' || isPageOcrCheckpoint ? '' :
+        crypto.createHash('sha256').update(JSON.stringify({ sourceHash: task.source_hash || '', parsedScope })).digest('hex')
     })).digest('hex');
   }
 
@@ -3222,6 +3274,16 @@ class SlicerDashboardView extends ItemView {
       const artifact = await this.plugin.loadArtifact(task, 'review');
       if (renderVersion !== this._renderVersion) return;
       if (!artifact) continue;
+      if (artifact.outcome?.kind === 'review_required') {
+        const block = parent.createDiv('eks-review-group');
+        block.createEl('h4', { text: `源文件需要审核 · ${artifact.outcome.code}` });
+        block.createDiv({ cls: 'eks-task-meta', text: task.source_path });
+        block.createDiv({ cls: 'eks-review-reason', text: artifact.outcome.message });
+        const details = block.createEl('details', { cls: 'eks-technical-details' });
+        details.createEl('summary', { text: '技术详情' });
+        details.createEl('pre', { text: JSON.stringify(artifact.outcome, null, 2) });
+        continue;
+      }
       for (const group of groupReviewItems(artifact.items)) {
         const block = parent.createDiv('eks-review-group');
         const header = block.createDiv('eks-review-group-header');
@@ -3380,8 +3442,8 @@ class SlicerSettingTab extends PluginSettingTab {
         .setValue(String(this.plugin.settings.autoApproveConfidenceThreshold || 0.9))
         .onChange(async (value) => {
           const threshold = Number(value);
-          if (Number.isFinite(threshold) && threshold >= 0 && threshold <= 1) {
-            this.plugin.settings.autoApproveConfidenceThreshold = threshold;
+          if (Number.isFinite(threshold)) {
+            this.plugin.settings.autoApproveConfidenceThreshold = Math.round(Math.max(0.7, Math.min(1, threshold)) * 1000) / 1000;
             await this.plugin.saveSettings();
           }
         }));
@@ -4265,7 +4327,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 22,
+  settingsVersion: 23,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -4340,7 +4402,7 @@ const DEFAULT_SETTINGS = {
   // 空值表示跟随 Obsidian / 操作系统运行时本地时区；可配置 IANA 时区以稳定跨设备日期语义。
   businessTimeZone: '',
   maxExcerptLength: 500,
-  pipelineVersion: '1.1.1',
+  pipelineVersion: '1.2.0',
   promptBundleVersion: '1.1',
   schemaVersion: '1.1',
   // v1.3: 诊断日志默认写到 vault 之外（~/.eks/logs/diag.log），
@@ -4366,7 +4428,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 22;
+  migrated.settingsVersion = 23;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -4378,17 +4440,11 @@ function migrateSettings(stored = {}) {
   migrated.draftPath = DEFAULT_SETTINGS.draftPath;
   migrated.logPath = DEFAULT_SETTINGS.logPath;
   migrated.pdfExtractionOrder = DEFAULT_SETTINGS.pdfExtractionOrder;
-  // v1.1.1 升级门槛：用户在 v1.1.0 之前 < 0.9 时全部提升到 0.9；用户主动调低的（< 0.85）保持原意
+  // v2.12：保留所有合法旧偏好；只迁移非法/缺失值，并与运行时评分使用同一安全范围。
   const storedThreshold = Number(source.autoApproveConfidenceThreshold);
-  if (Number.isFinite(storedThreshold) && storedThreshold < 0.9) {
-    migrated.autoApproveConfidenceThreshold = storedThreshold < 0.85
-      ? storedThreshold
-      : DEFAULT_SETTINGS.autoApproveConfidenceThreshold;
-  } else if (!Number.isFinite(storedThreshold)) {
-    migrated.autoApproveConfidenceThreshold = DEFAULT_SETTINGS.autoApproveConfidenceThreshold;
-  } else {
-    migrated.autoApproveConfidenceThreshold = storedThreshold;
-  }
+  migrated.autoApproveConfidenceThreshold = Number.isFinite(storedThreshold)
+    ? Math.round(Math.max(0.7, Math.min(1, storedThreshold)) * 1000) / 1000
+    : DEFAULT_SETTINGS.autoApproveConfidenceThreshold;
   if (!migrated.minimaxEndpoint
     || migrated.minimaxEndpoint === 'https://api.minimax.chat/v1/chat/completions'
     || migrated.minimaxEndpoint === 'https://api.minimaxi.com/v1/chat/completions') {
@@ -8535,6 +8591,15 @@ function createParsePackage(options) {
     : isOcr ? normalizeLegacyArtifact(options.markdown, options.pages, normalizeParser(options.parser)) : null;
   const markdown = String(artifact?.markdown ?? options.markdown ?? '').trim();
   const quality = markdownQuality(markdown);
+  const blocks = Array.isArray(options.blocks) ? options.blocks : [];
+  const evidenceIndex = Object.fromEntries(blocks
+    .filter((block) => block?.block_id && block?.locator && String(block?.raw?.text || '').trim())
+    .map((block) => [block.block_id, {
+      block_id: block.block_id,
+      locator: block.locator,
+      raw_text: String(block.raw.text),
+      card_eligible: block.card_eligible !== false
+    }]));
   return {
     source_path: String(options.sourcePath || '').replace(/\\/g, '/'),
     source_hash: crypto.createHash('sha256').update(options.buffer || Buffer.alloc(0)).digest('hex'),
@@ -8554,8 +8619,10 @@ function createParsePackage(options) {
     // v2.9.0: 透传解析元数据（邮件主题/发件人/附件清单等），供卡片链接与总结阶段使用。
     //   只接受纯 JSON 对象（附件二进制不进这里，见 extractTextFromBuffer email 分支）。
     metadata: options.metadata && typeof options.metadata === 'object' && !Array.isArray(options.metadata) ? options.metadata : {},
-    blocks: Array.isArray(options.blocks) ? options.blocks : [],
+    blocks,
     block_packs: Array.isArray(options.blockPacks) ? options.blockPacks : [],
+    evidence_index: evidenceIndex,
+    evidence_index_version: 'block-evidence-v1',
     schema_version: '1.1'
   };
 }
@@ -8907,7 +8974,7 @@ function buildClassificationPrompt({ classifierPrompt, folderMap, parsePackage }
   const fullEvidence = (parsePackage.sections || []).length
     ? parsePackage.sections.map((section) => `## ${section.heading || section.section_id}\n${section.markdown || ''}`).join('\n\n')
     : String(parsePackage.markdown || '');
-  const evidence = classificationSample(fullEvidence);
+  const evidence = classificationSample(parsePackage, 24000, fullEvidence);
   return [
     classifierPrompt,
     '以下目录是唯一合法白名单。library 与 folder_type 必须精确匹配其中一项，不得新建、翻译或改写目录名：',
@@ -8945,8 +9012,45 @@ function safeSlice(text, start, end) {
   return text.slice(from, to);
 }
 
-function classificationSample(markdown, maxChars = 24000) {
-  const text = String(markdown || '');
+function classificationSample(input, maxChars = 24000, fallbackMarkdown = '') {
+  const parsePackage = input && typeof input === 'object' ? input : null;
+  const text = String(parsePackage ? (fallbackMarkdown || parsePackage.markdown || '') : input || '');
+  const blocks = Array.isArray(parsePackage?.blocks) ? parsePackage.blocks.filter((block) =>
+    block?.card_eligible !== false && String(block?.raw?.text || '').trim()) : [];
+  if (blocks.length) {
+    const group = (block) => {
+      const kind = String(block.kind || '').toLowerCase();
+      if (/heading|title/.test(kind)) return 0;
+      if (/table_header/.test(kind)) return 1;
+      if (/table|cell/.test(kind)) return 2;
+      if (/list|bullet/.test(kind)) return 3;
+      return 4;
+    };
+    const buckets = [[], [], [], [], []];
+    for (const block of [...blocks].sort((a, b) =>
+      Number(a.order || 0) - Number(b.order || 0) || String(a.block_id).localeCompare(String(b.block_id)))) {
+      buckets[group(block)].push(block);
+    }
+    const ordered = [];
+    for (let index = 0; ordered.length < blocks.length; index += 1) {
+      let added = false;
+      for (const bucket of buckets) {
+        if (bucket[index]) { ordered.push(bucket[index]); added = true; }
+      }
+      if (!added) break;
+    }
+    const perBlock = Math.max(160, Math.min(1200, Math.floor(maxChars / Math.min(ordered.length, 20))));
+    const selected = [];
+    let used = 0;
+    for (const block of ordered) {
+      const locator = `${block.locator?.scheme || 'block'}:${block.locator?.value || block.block_id}`;
+      const piece = `[${block.kind || 'body'} | ${locator}]\n${safeSlice(String(block.raw.text), 0, perBlock)}\n`;
+      if (used + piece.length > maxChars) continue;
+      selected.push(piece); used += piece.length;
+      if (used >= maxChars - perBlock) break;
+    }
+    if (selected.length) return selected.join('\n');
+  }
   if (text.length <= maxChars) return text;
   const headingLines = safeSlice((text.match(/^#{1,6}\s+.+$/gm) || []).join('\n'), 0, 4000);
   const remaining = Math.max(6000, maxChars - headingLines.length - 120);
@@ -9582,7 +9686,11 @@ function normalizeSummaryReduce(value, requestedChunkIds, parsePackage) {
       coverage: { chunk_ids: expected, complete: true }
     });
   }
-  if (/^(mineru-api|paddleocr-api)$/.test(String(parsePackage?.parser || '')) && Array.isArray(result.evidence)) {
+  if (Array.isArray(result.evidence) && Object.keys(parsePackage?.evidence_index || {}).length) {
+    result = Object.assign({}, result, {
+      evidence: result.evidence.map((item) => reconcileBlockEvidence(parsePackage, item))
+    });
+  } else if (/^(mineru-api|paddleocr-api)$/.test(String(parsePackage?.parser || '')) && Array.isArray(result.evidence)) {
     result = Object.assign({}, result, {
       evidence: result.evidence.map((item) => {
         if (!item || typeof item !== 'object') return item;
@@ -9631,7 +9739,9 @@ function normalizeSummaryMap(value, options, chunk) {
         locator: item.locator || fallbackLocator,
         quote: item.quote || fallbackQuote
       });
-      if (/^(mineru-api|paddleocr-api)$/.test(String(options.parsePackage?.parser || ''))) {
+      if (Object.keys(options.parsePackage?.evidence_index || {}).length) {
+        normalized = reconcileBlockEvidence(options.parsePackage, normalized);
+      } else if (/^(mineru-api|paddleocr-api)$/.test(String(options.parsePackage?.parser || ''))) {
         var resolved = resolveEvidence(options.parsePackage, normalized.quote, {
           start: chunk.sourceStart,
           end: chunk.sourceEnd,
@@ -9652,6 +9762,32 @@ function normalizeSummaryMap(value, options, chunk) {
     });
   }
   return result;
+}
+
+function reconcileBlockEvidence(parsePackage, item) {
+  if (!item || typeof item !== 'object') return item;
+  const index = parsePackage?.evidence_index || {};
+  const requestedId = String(item.block_id || item.provenance?.block_id || '');
+  const quote = String(item.quote || '').trim();
+  let entry = requestedId ? index[requestedId] : null;
+  if (!entry && quote) {
+    const matches = Object.values(index).filter((candidate) =>
+      candidate.card_eligible !== false && String(candidate.raw_text || '').includes(quote));
+    if (matches.length === 1) entry = matches[0];
+  }
+  if (!entry || entry.card_eligible === false || !quote || !String(entry.raw_text || '').includes(quote)) {
+    return Object.assign({}, item, {
+      locator: '', block_id: requestedId || '',
+      provenance_resolution: { ok: false, reason: 'BLOCK_EVIDENCE_UNVERIFIED' }
+    });
+  }
+  return Object.assign({}, item, {
+    block_id: entry.block_id,
+    locator: `${entry.locator.scheme}:${entry.locator.value}`,
+    provenance: Object.assign({}, entry.locator, { block_id: entry.block_id, precision: 'block-exact' }),
+    locator_precision: 'block-exact',
+    provenance_resolution: { ok: true }
+  });
 }
 
 function mergeStructuredSummaries(partials, chunkIds, schema) {
@@ -10835,9 +10971,10 @@ function calculateConfidence(input) {
 
   score = round(clamp(score));
   const rejected = P < 0.7 || !hasSourceLink || !hasLocator || !evidenceQuote || !numbersGrounded;
+  const threshold = normalizeAutoApproveThreshold(input.autoApproveConfidenceThreshold);
   let decision;
   if (rejected) decision = 'reject';
-  else if (score >= 0.85 && hardRules.length === 0) decision = 'auto_ingest';
+  else if (score >= threshold && hardRules.length === 0) decision = 'auto_ingest';
   else if (score >= 0.7) decision = 'review';
   else decision = 'regenerate';
 
@@ -10846,8 +10983,15 @@ function calculateConfidence(input) {
     decision,
     components: Object.fromEntries(Object.entries(components).map(([key, value]) => [key, round(value)])),
     weights: WEIGHTS,
+    auto_approve_threshold: threshold,
     hard_rules: hardRules
   };
+}
+
+function normalizeAutoApproveThreshold(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0.9;
+  return Math.round(Math.max(0.7, Math.min(1, number)) * 1000) / 1000;
 }
 
 function extractedFacts(text) {
@@ -10885,7 +11029,7 @@ function round(value) {
   return Math.round(value * 1000) / 1000;
 }
 
-module.exports = { WEIGHTS, calculateConfidence, extractedFacts };
+module.exports = { WEIGHTS, calculateConfidence, extractedFacts, normalizeAutoApproveThreshold };
 
 },
 /**
@@ -11839,7 +11983,27 @@ async function runKnowledgeWorkflow(options) {
     atom.source = Object.assign({}, atom.source || {}, {
       source_link: `[[${options.parsePackage.source_path}]]`
     });
-    if (/^(mineru-api|paddleocr-api)$/.test(String(options.parsePackage?.parser || ''))) {
+    if (Object.keys(options.parsePackage?.evidence_index || {}).length) {
+      const requestedId = String(atom.source?.source_provenance?.block_id || atom.source?.block_id || '');
+      const quote = String(atom.source?.evidence_quote || '');
+      let entry = requestedId ? options.parsePackage.evidence_index[requestedId] : null;
+      if (!entry && quote) {
+        const matches = Object.values(options.parsePackage.evidence_index).filter((candidate) =>
+          candidate.card_eligible !== false && String(candidate.raw_text || '').includes(quote));
+        if (matches.length === 1) entry = matches[0];
+      }
+      const verified = !!entry && entry.card_eligible !== false && !!quote && String(entry.raw_text || '').includes(quote);
+      atom.source.provenance_verified = verified;
+      if (verified) {
+        atom.source.block_id = entry.block_id;
+        atom.source.source_provenance = Object.assign({}, entry.locator, { block_id: entry.block_id, precision: 'block-exact' });
+        atom.source.source_locator = `${entry.locator.scheme}:${entry.locator.value}`;
+        atom.source.locator_precision = 'block-exact';
+      } else {
+        atom.source.source_locator = '';
+        provenanceDiagnostics.BLOCK_EVIDENCE_UNVERIFIED = (provenanceDiagnostics.BLOCK_EVIDENCE_UNVERIFIED || 0) + 1;
+      }
+    } else if (/^(mineru-api|paddleocr-api)$/.test(String(options.parsePackage?.parser || ''))) {
       const verified = verifyLocator(options.parsePackage, atom.source.evidence_quote, atom.source.source_provenance);
       atom.source.provenance_verified = verified.ok;
       if (!verified.ok) {
@@ -11874,7 +12038,8 @@ async function runKnowledgeWorkflow(options) {
       schemaValid: true,
       routeValid,
       labelsValid,
-      duplicate
+      duplicate,
+      autoApproveConfidenceThreshold: options.autoApproveConfidenceThreshold
     });
     const validationReport = buildValidationReport({
       schemaValid: true,
@@ -11910,7 +12075,7 @@ async function runKnowledgeWorkflow(options) {
       if (!labelsValid && !reasons.some((reason) => /标签/.test(reason))) reasons.push('标签字典校验未通过');
       if (!routeValid && !reasons.some((reason) => /目录/.test(reason))) reasons.push('知识原子目录与文档分类不一致');
       if (duplicate && !reasons.some((reason) => /重复/.test(reason))) reasons.push('与已有知识卡片重复');
-      if (!reasons.length) reasons.push(`可信度 ${confidence.score} 低于自动入库阈值`);
+      if (!reasons.length) reasons.push(`可信度 ${confidence.score} 低于自动入库阈值 ${confidence.auto_approve_threshold}`);
       review.push({
         atom_id: atom.atom_id,
         library: atom.library,
@@ -11937,6 +12102,7 @@ async function runKnowledgeWorkflow(options) {
     atoms: (atomResult && Array.isArray(atomResult.atoms)) ? atomResult.atoms.length : 0,
     accepted: accepted.length,
     review: review.length,
+    autoApproveThreshold: Number(options.autoApproveConfidenceThreshold),
     truncated: !!(atomResult && atomResult._truncated)
   });
   // v1.4 (M-07): 透传截断标志，dashboard 可显示警告

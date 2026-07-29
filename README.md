@@ -1,6 +1,6 @@
 # 工程知识切片（Engineering Knowledge Slicer）
 
-> 当前版本 **v2.11.0**（settingsVersion 22）· Obsidian Desktop 1.5.0+ · MIT
+> 当前版本 **v2.12.0**（settingsVersion 23）· Obsidian Desktop 1.5.0+ · MIT
 
 通过 **MinerU / PaddleOCR + MiniMax M3**，把工程资料（PDF、Word、PPT、图片、邮件等）批量转化为**中文、可追溯、固定目录归档**的 Obsidian 知识卡片。
 
@@ -12,6 +12,8 @@
 - **固定目录归档**：业务库 / 招投标两条线，由 `组件包/folder-map.json` 唯一路由到 28 个固定目录
 - **v2.7 切片引擎**：借鉴 Tencent/WeKnora 的知识点切片思路——文档画像驱动策略选择、标题层级面包屑、受保护区域（表格/代码块/公式）永不切断、小节合并、切片重叠、覆盖校验
 - **可信度门槛**：五维加权（解析/类型/证据/结构/原子质量）+ 硬性门槛，低于 `autoApproveConfidenceThreshold`（默认 0.9）的卡片进入审核台
+- **Block-native 证据闭环**：本地 DOCX/XLSX/PPTX/MSG 与 PDF/OCR 块使用稳定 `block_id` 贯穿切片、总结、原子和卡片；逐字证据无法回到来源块时只进入审核
+- **选择性缓存失效**：解析缓存绑定全部 ingestion 设置与 parser/block 合同；页级 OCR checkpoint 可独立复用，后续阶段仅在输入指纹匹配时恢复
 - **进度可观察**：批次进度 + 1 秒心跳计时 + HTML5 进度条，长任务不再「无响应假死」
 - **并发 + 限流**：文档级并发（默认 3）+ AI 请求限流器（指数退避、遵循 Retry-After），原子化批次内支持有限并发（默认 2 路）
 - **SSE 流式输出（POC）**：可选开启，AI 调用期间逐 token 回显

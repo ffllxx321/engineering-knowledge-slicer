@@ -1,5 +1,12 @@
 # 工程知识切片 变更记录
 
+## v2.11.0 — 2026-07-29 本地 PPTX 原生结构解析
+
+- 补齐 Office Open XML 摄取矩阵：PPTX 默认本地优先，按 `presentation.xml` relationship 顺序处理幻灯片，不按文件名猜测顺序；保留标题/正文/项目符号、文本框占位符与 EMU 边界、表格单元格及合并、演讲者备注、隐藏页、转场/动画存在性、超链接、图片与图表锚点。
+- 输出稳定的 slide/shape/paragraph/table/cell/note `block_v0` locator；图片与图表作为不可直接制卡的 provenance metadata，alt text 仅保留为描述，不推断图像语义。有效空演示文稿进入 `OOXML_NO_ELIGIBLE_CONTENT` 审核态。
+- 复用 v2.10 安全 ZIP/XML 层与资源限制，新增缺失/越界 slide relationship、畸形包、取消、packing、locator、外传门回退的确定性回归。PPTX 本地关闭或解析失败时，仍只有既有 `pdfAllowExternalUpload` 显式授权才能走远程解析；旧 `.ppt` 保持远程路径。
+- 新增默认开启的 `localPptxAdapterEnabled` 兼容迁移和设置入口；无新增运行时依赖或 AI 调用。真实样本 benchmark 继续只读本机已有 DOCX/XLSX，未发现可用 PPTX 样本时不生成或提交替代文档。发布包仍严格只有 `main.js`、`manifest.json`、`styles.css`。
+
 ## v2.10.0 — 2026-07-29 本地 DOCX / XLSX 原生解析
 
 - 新增零运行时依赖的安全 OOXML ZIP 层：只信任中央目录并复核本地头，拒绝 traversal、重复条目、加密、多磁盘/ZIP64、未知压缩、DTD/实体，限制条目数、压缩/解压字节、压缩比、单 XML 大小、深度与文本量，并支持 `AbortSignal` 和 typed errors。

@@ -1032,6 +1032,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           localOoxml: {
             docxEnabled: this.settings.localDocxAdapterEnabled !== false,
             xlsxEnabled: this.settings.localXlsxAdapterEnabled !== false,
+            pptxEnabled: this.settings.localPptxAdapterEnabled !== false,
             limits: {
               maxEntries: this.settings.ooxmlMaxEntries,
               maxUncompressedBytes: this.settings.ooxmlMaxUncompressedBytes,
@@ -3447,7 +3448,7 @@ class SlicerSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    containerEl.createEl('h3', { text: '本地 Office 解析（DOCX / XLSX）' });
+    containerEl.createEl('h3', { text: '本地 Office 解析（DOCX / XLSX / PPTX）' });
 
     new Setting(containerEl)
       .setName('启用本地 DOCX 适配器')
@@ -3462,6 +3463,14 @@ class SlicerSettingTab extends PluginSettingTab {
       .setDesc('默认开启。保留单元格坐标、公式与缓存值的分离、合并及隐藏状态。')
       .addToggle((toggle) => toggle.setValue(this.plugin.settings.localXlsxAdapterEnabled !== false).onChange(async (value) => {
         this.plugin.settings.localXlsxAdapterEnabled = value === true;
+        await this.plugin.saveSafeSettings();
+      }));
+
+    new Setting(containerEl)
+      .setName('启用本地 PPTX 适配器')
+      .setDesc('默认开启。保留幻灯片顺序、文本框、表格、演讲者备注、图片/图表锚点和链接。')
+      .addToggle((toggle) => toggle.setValue(this.plugin.settings.localPptxAdapterEnabled !== false).onChange(async (value) => {
+        this.plugin.settings.localPptxAdapterEnabled = value === true;
         await this.plugin.saveSafeSettings();
       }));
 
@@ -4256,7 +4265,7 @@ const crypto = require("crypto");
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 21,
+  settingsVersion: 22,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
   bidIntakePath: '06-知识库/源文件/招投标',
@@ -4279,6 +4288,7 @@ const DEFAULT_SETTINGS = {
   localMsgAdapterEnabled: true,
   localDocxAdapterEnabled: true,
   localXlsxAdapterEnabled: true,
+  localPptxAdapterEnabled: true,
   ooxmlMaxEntries: 4096,
   ooxmlMaxUncompressedBytes: 805306368,
   ooxmlMaxXmlBytes: 67108864,
@@ -4356,7 +4366,7 @@ function migrateSettings(stored = {}) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (Object.hasOwn(source, key)) migrated[key] = source[key];
   }
-  migrated.settingsVersion = 21;
+  migrated.settingsVersion = 22;
   migrated.aiProvider = 'minimax';
   migrated.bidIntakePath = DEFAULT_SETTINGS.bidIntakePath;
   migrated.businessIntakePath = DEFAULT_SETTINGS.businessIntakePath;
@@ -4415,6 +4425,7 @@ function migrateSettings(stored = {}) {
   if (migrated.localMsgAdapterEnabled === undefined) migrated.localMsgAdapterEnabled = true;
   if (migrated.localDocxAdapterEnabled === undefined) migrated.localDocxAdapterEnabled = true;
   if (migrated.localXlsxAdapterEnabled === undefined) migrated.localXlsxAdapterEnabled = true;
+  if (migrated.localPptxAdapterEnabled === undefined) migrated.localPptxAdapterEnabled = true;
   migrated.ooxmlMaxEntries = Math.max(64, Math.min(16384, Math.round(Number(migrated.ooxmlMaxEntries) || DEFAULT_SETTINGS.ooxmlMaxEntries)));
   migrated.ooxmlMaxUncompressedBytes = Math.max(16 * 1024 * 1024, Math.min(2 * 1024 * 1024 * 1024, Math.round(Number(migrated.ooxmlMaxUncompressedBytes) || DEFAULT_SETTINGS.ooxmlMaxUncompressedBytes)));
   migrated.ooxmlMaxXmlBytes = Math.max(1024 * 1024, Math.min(256 * 1024 * 1024, Math.round(Number(migrated.ooxmlMaxXmlBytes) || DEFAULT_SETTINGS.ooxmlMaxXmlBytes)));
@@ -5599,6 +5610,169 @@ function parseXlsx(buffer, options = {}) {
   const markdown = blocksToMarkdown(blocks.filter(b => b.card_eligible && b.raw?.text));
   return finalize('xlsx', ctx, zip, blocks, markdown, { sheets, shared_strings: shared.length });
 }
+
+function parsePptx(buffer, options = {}) {
+  const lim = limits(options.limits);
+  const zip = new SafeZip(buffer, { limits: lim, signal: options.signal });
+  if (!zip.has('ppt/presentation.xml')) fail('OOXML_UNSUPPORTED', 'Package is not a supported PPTX');
+  const ctx = { hash: sourceHash(buffer), order: 0, parser: 'pptx-ooxml-local' };
+  const presentationRels = rels(zip, 'ppt/presentation.xml', { limits: lim, signal: options.signal });
+  const slides = [];
+  let size = {};
+  for (const e of xmlEvents(zip.xml('ppt/presentation.xml'), { limits: lim, signal: options.signal })) {
+    if (e.type === 'start' && e.name === 'sldSz') {
+      size = { width_emu: Number(attr(e.attrs, 'cx') || 0), height_emu: Number(attr(e.attrs, 'cy') || 0), type: attr(e.attrs, 'type') || '' };
+    } else if (e.type === 'start' && e.name === 'sldId') {
+      const relationshipId = e.attrs['r:id'] || e.attrs['relationships:id'] || '';
+      const relationship = presentationRels.get(relationshipId);
+      if (!relationship) fail('OOXML_MALFORMED_RELATIONSHIP', 'Slide relationship is missing', { relationship_id: relationshipId || '' });
+      const path = resolvePart('ppt/presentation.xml', relationship.target);
+      if (!/^ppt\/slides\/slide[^/]*\.xml$/i.test(path) || !zip.has(path)) {
+        fail('OOXML_MALFORMED_RELATIONSHIP', 'Slide relationship target is invalid', { relationship_id: relationshipId || '', target: path });
+      }
+      slides.push({ id: attr(e.attrs, 'id') || '', relationship_id: relationshipId || '', path });
+    }
+  }
+  const blocks = [], slideMetadata = [], warnings = [];
+  if ([...zip.entries.keys()].some(name => /vbaProject\.bin$|\/embeddings\//i.test(name))) {
+    warnings.push({ code: 'OOXML_PARTIAL_FEATURE_SUPPORT', feature: 'embedded-object-or-macro', status: 'unsupported' });
+  }
+  for (let i = 0; i < slides.length; i += 1) {
+    const parsed = parseSlide(zip, slides[i], i + 1, ctx, lim, options.signal);
+    blocks.push(...parsed.blocks);
+    slideMetadata.push(parsed.metadata);
+  }
+  const markdown = blocksToMarkdown(blocks.filter(block => block.card_eligible && block.raw?.text));
+  return finalize('pptx', ctx, zip, blocks, markdown, { slides: slideMetadata, slide_size: size, warnings });
+}
+
+function parseSlide(zip, slide, index, ctx, lim, signal) {
+  const xml = zip.xml(slide.path);
+  if (!xml) fail('OOXML_MALFORMED_RELATIONSHIP', 'Slide part is missing', { slide: index });
+  const rs = rels(zip, slide.path, { limits: lim, signal });
+  const blocks = [], images = [], charts = [], hyperlinks = [];
+  let shape = null, paragraph = null, table = null, row = null, cell = null, captureText = false;
+  let shapeIndex = 0, paragraphIndex = 0, tableIndex = 0, hidden = false, transition = '', hasTiming = false;
+  for (const e of xmlEvents(xml, { limits: lim, signal })) {
+    if (e.type === 'start' && e.name === 'sld') hidden = attr(e.attrs, 'show') === '0';
+    else if (e.type === 'start' && e.name === 'transition') transition = attr(e.attrs, 'spd') || 'present';
+    else if (e.type === 'start' && e.name === 'timing') hasTiming = true;
+    else if (e.type === 'start' && ['sp', 'pic', 'graphicFrame', 'cxnSp'].includes(e.name) && !shape) {
+      shape = { index: ++shapeIndex, kind: e.name, name: '', description: '', placeholder: '', x: null, y: null, cx: null, cy: null };
+    } else if (shape && e.type === 'start' && e.name === 'cNvPr') {
+      shape.name = attr(e.attrs, 'name') || '';
+      shape.description = attr(e.attrs, 'descr') || attr(e.attrs, 'title') || '';
+    } else if (shape && e.type === 'start' && e.name === 'ph') shape.placeholder = attr(e.attrs, 'type') || 'body';
+    else if (shape && e.type === 'start' && e.name === 'off') {
+      shape.x = numberOrNull(attr(e.attrs, 'x')); shape.y = numberOrNull(attr(e.attrs, 'y'));
+    } else if (shape && e.type === 'start' && e.name === 'ext') {
+      shape.cx = numberOrNull(attr(e.attrs, 'cx')); shape.cy = numberOrNull(attr(e.attrs, 'cy'));
+    } else if (shape && e.type === 'start' && e.name === 'p') {
+      paragraph = { text: '', level: Number(attr(e.attrs, 'lvl') || 0), bullets: false, hyperlinks: [] };
+    } else if (paragraph && e.type === 'start' && e.name === 'pPr') {
+      paragraph.level = Number(attr(e.attrs, 'lvl') || paragraph.level || 0);
+    } else if (paragraph && e.type === 'start' && ['buChar', 'buAutoNum'].includes(e.name)) paragraph.bullets = true;
+    else if (paragraph && e.type === 'start' && e.name === 'hlinkClick') {
+      const id = attr(e.attrs, 'id'); const relationship = rs.get(id);
+      const link = { relationship_id: id || '', target: relationship ? (relationship.external ? relationship.target : resolvePart(slide.path, relationship.target)) : '', external: relationship?.external === true };
+      paragraph.hyperlinks.push(link); hyperlinks.push(link);
+    } else if (e.type === 'start' && e.name === 'tbl') table = { index: ++tableIndex, rows: 0 };
+    else if (table && e.type === 'start' && e.name === 'tr') row = { index: ++table.rows, cells: [] };
+    else if (row && e.type === 'start' && e.name === 'tc') cell = {
+      index: row.cells.length + 1, text: '', row_span: Number(attr(e.attrs, 'rowSpan') || 1),
+      grid_span: Number(attr(e.attrs, 'gridSpan') || 1), h_merge: attr(e.attrs, 'hMerge') === '1', v_merge: attr(e.attrs, 'vMerge') === '1'
+    };
+    else if (cell && e.type === 'start' && e.name === 'tcPr') {
+      if (attr(e.attrs, 'rowSpan') !== undefined) cell.row_span = Number(attr(e.attrs, 'rowSpan') || 1);
+      if (attr(e.attrs, 'gridSpan') !== undefined) cell.grid_span = Number(attr(e.attrs, 'gridSpan') || 1);
+      if (attr(e.attrs, 'hMerge') !== undefined) cell.h_merge = attr(e.attrs, 'hMerge') === '1';
+      if (attr(e.attrs, 'vMerge') !== undefined) cell.v_merge = attr(e.attrs, 'vMerge') === '1';
+    } else if (e.type === 'start' && ['t', 'fld'].includes(e.name)) captureText = true;
+    else if (shape && e.type === 'start' && ['blip', 'imagedata'].includes(e.name)) {
+      const id = attr(e.attrs, 'embed') || attr(e.attrs, 'id'); const relationship = rs.get(id);
+      images.push({ relationship_id: id || '', target: relationship ? (relationship.external ? relationship.target : resolvePart(slide.path, relationship.target)) : '', external: relationship?.external === true, shape: shape.index, name: shape.name, description: shape.description });
+    } else if (shape && e.type === 'start' && e.name === 'chart') {
+      const id = attr(e.attrs, 'id'); const relationship = rs.get(id);
+      charts.push({ relationship_id: id || '', target: relationship ? resolvePart(slide.path, relationship.target) : '', shape: shape.index, name: shape.name });
+    } else if (e.type === 'text' && captureText) {
+      if (cell) cell.text += e.text;
+      if (paragraph) paragraph.text += e.text;
+    } else if (e.type === 'end' && ['t', 'fld'].includes(e.name)) captureText = false;
+    else if (e.type === 'end' && e.name === 'tc' && cell) {
+      row.cells.push(cell); cell = null;
+    } else if (e.type === 'end' && e.name === 'tr' && row) {
+      for (const current of row.cells) blocks.push(makeBlock(ctx, {
+        kind: 'table_cell', text: current.text.trim(),
+        locator: { scheme: 'ooxml', value: `${slide.path}#slide=${index}/table=${table.index}/row=${row.index}/cell=${current.index}` },
+        metadata: { slide: index, slide_id: slide.id, table: table.index, row: row.index, column: current.index,
+          merge: { row_span: current.row_span, grid_span: current.grid_span, horizontal_continuation: current.h_merge, vertical_continuation: current.v_merge },
+          shape: shapeMetadata(shape), hidden }
+      }));
+      row = null;
+    } else if (e.type === 'end' && e.name === 'p' && paragraph && shape) {
+      paragraphIndex += 1;
+      const text = paragraph.text.trim();
+      if (text && !table) blocks.push(makeBlock(ctx, {
+        kind: isTitleShape(shape) ? 'heading' : paragraph.bullets ? 'list_item' : 'paragraph', text,
+        locator: { scheme: 'ooxml', value: `${slide.path}#slide=${index}/shape=${shape.index}/p=${paragraphIndex}` },
+        inferred: isTitleShape(shape) ? { outline_level: 0 } : {},
+        metadata: { slide: index, slide_id: slide.id, paragraph: paragraphIndex, level: paragraph.level,
+          list: paragraph.bullets ? { level: paragraph.level, format: 'presentation-bullet' } : null,
+          hyperlinks: paragraph.hyperlinks, shape: shapeMetadata(shape), hidden,
+          raw_vs_inferred: { heading: isTitleShape(shape) ? 'inferred-from-placeholder' : 'not_applicable' } }
+      }));
+      paragraph = null;
+    } else if (e.type === 'end' && e.name === 'tbl') table = null;
+    else if (shape && e.type === 'end' && e.name === shape.kind) shape = null;
+  }
+  const note = parseSlideNotes(zip, slide, index, ctx, lim, signal);
+  blocks.push(...note.blocks);
+  for (const image of images) blocks.push(makeBlock(ctx, {
+    kind: 'image_metadata', text: image.description || '', card_eligible: false, exclusion_reason: 'non-card metadata',
+    locator: { scheme: 'ooxml', value: `${slide.path}#slide=${index}/image=${image.shape}` }, metadata: Object.assign({ slide: index }, image)
+  }));
+  for (const chart of charts) blocks.push(makeBlock(ctx, {
+    kind: 'chart_metadata', text: '', card_eligible: false, exclusion_reason: 'non-card metadata',
+    locator: { scheme: 'ooxml', value: `${slide.path}#slide=${index}/chart=${chart.shape}` }, metadata: Object.assign({ slide: index }, chart)
+  }));
+  return { blocks, metadata: { index, id: slide.id, path: slide.path, hidden, transition, has_timing: hasTiming,
+    images, charts, hyperlinks, notes_part: note.part, notes_blocks: note.blocks.length } };
+}
+
+function parseSlideNotes(zip, slide, index, ctx, lim, signal) {
+  const relationship = [...rels(zip, slide.path, { limits: lim, signal }).values()]
+    .find(item => /\/notesSlide$/i.test(item.type) || /notesSlides\/notesSlide[^/]*\.xml$/i.test(item.target));
+  if (!relationship) return { blocks: [], part: '' };
+  const part = resolvePart(slide.path, relationship.target);
+  const xml = zip.xml(part);
+  if (!xml) return { blocks: [], part };
+  const blocks = []; let paragraph = '', captureText = false, paragraphIndex = 0, placeholder = '', inShape = false;
+  for (const e of xmlEvents(xml, { limits: lim, signal })) {
+    if (e.type === 'start' && e.name === 'sp') { inShape = true; placeholder = ''; }
+    else if (inShape && e.type === 'start' && e.name === 'ph') placeholder = attr(e.attrs, 'type') || '';
+    else if (e.type === 'start' && e.name === 'p') paragraph = '';
+    else if (e.type === 'start' && ['t', 'fld'].includes(e.name)) captureText = true;
+    else if (e.type === 'text' && captureText) paragraph += e.text;
+    else if (e.type === 'end' && ['t', 'fld'].includes(e.name)) captureText = false;
+    else if (e.type === 'end' && e.name === 'p') {
+      paragraphIndex += 1;
+      const text = paragraph.trim();
+      if (text && !['sldNum', 'hdr', 'ftr', 'dt'].includes(placeholder)) blocks.push(makeBlock(ctx, {
+        kind: 'speaker_note', text,
+        locator: { scheme: 'ooxml', value: `${part}#slide=${index}/p=${paragraphIndex}` },
+        metadata: { slide: index, notes_part: part, placeholder }
+      }));
+      paragraph = '';
+    } else if (e.type === 'end' && e.name === 'sp') { inShape = false; placeholder = ''; }
+  }
+  return { blocks, part };
+}
+function isTitleShape(shape) { return ['title', 'ctrTitle'].includes(shape?.placeholder); }
+function numberOrNull(value) { const number = Number(value); return Number.isFinite(number) ? number : null; }
+function shapeMetadata(shape) {
+  return { index: shape?.index || 0, kind: shape?.kind || '', name: shape?.name || '', description: shape?.description || '',
+    placeholder: shape?.placeholder || '', bounds_emu: { x: shape?.x, y: shape?.y, width: shape?.cx, height: shape?.cy } };
+}
 function parseSharedStrings(zip, lim, signal) {
   const xml = zip.xml('xl/sharedStrings.xml');
   if (!xml) return [];
@@ -5781,7 +5955,7 @@ function finalize(type, ctx, zip, blocks, markdown, metadata) {
 }
 function parseOoxml(buffer, type, options = {}) {
   try {
-    return type === 'docx' ? parseDocx(buffer, options) : type === 'xlsx' ? parseXlsx(buffer, options) :
+    return type === 'docx' ? parseDocx(buffer, options) : type === 'xlsx' ? parseXlsx(buffer, options) : type === 'pptx' ? parsePptx(buffer, options) :
       fail('OOXML_UNSUPPORTED', 'Unsupported OOXML document type');
   } catch (error) {
     if (!(error instanceof OoxmlError)) return { status: 'failed', code: 'OOXML_EXTRACTION_FAILED', message: String(error.message || error) };
@@ -5792,7 +5966,7 @@ function parseOoxml(buffer, type, options = {}) {
   }
 }
 
-module.exports = { DEFAULT_LIMITS, OoxmlError, SafeZip, parseDocx, parseXlsx, parseOoxml, xmlEvents };
+module.exports = { DEFAULT_LIMITS, OoxmlError, SafeZip, parseDocx, parseXlsx, parsePptx, parseOoxml, xmlEvents };
 
 },
 /**
@@ -6222,7 +6396,9 @@ async function extractTextFromBuffer(filePath, buffer, options = {}) {
   if (plan.mode === 'ooxml') {
     const enabled = plan.sourceType === 'docx'
       ? options.localOoxml?.docxEnabled !== false
-      : options.localOoxml?.xlsxEnabled !== false;
+      : plan.sourceType === 'pptx'
+        ? options.localOoxml?.pptxEnabled !== false
+        : options.localOoxml?.xlsxEnabled !== false;
     if (enabled) {
       const local = parseOoxml(buffer, plan.sourceType, {
         limits: options.localOoxml?.limits || {}, signal: options.signal
@@ -8337,7 +8513,8 @@ function documentPlan(filePath) {
   if (/\.(png|jpe?g|webp|gif|bmp|tiff?)$/.test(lower)) return plan('image', 'remote', ['mineru-api', 'paddleocr-api']);
   if (/\.docx$/.test(lower)) return plan('docx', 'ooxml', ['mineru-api']);
   if (/\.doc$/.test(lower)) return plan('docx', 'remote', ['mineru-api']);
-  if (/\.(ppt|pptx)$/.test(lower)) return plan('pptx', 'remote', ['mineru-api']);
+  if (/\.pptx$/.test(lower)) return plan('pptx', 'ooxml', ['mineru-api']);
+  if (/\.ppt$/.test(lower)) return plan('pptx', 'remote', ['mineru-api']);
   if (/\.xlsx$/.test(lower)) return plan('xlsx', 'ooxml', ['mineru-api']);
   if (/\.xls$/.test(lower)) return plan('xlsx', 'remote', ['mineru-api']);
   if (/\.(html|htm)$/.test(lower)) return Object.assign(plan('html', 'remote', ['mineru-api']), { mineruModel: 'MinerU-HTML' });
@@ -8391,7 +8568,7 @@ function normalizeParser(parser) {
   if (value === 'eml-parser') return value;
   if (value === 'msg-cfb-mapi') return value;
   if (value === 'pdf-local-inventory') return value;
-  if (value === 'docx-ooxml-local' || value === 'xlsx-ooxml-local') return value;
+  if (value === 'docx-ooxml-local' || value === 'xlsx-ooxml-local' || value === 'pptx-ooxml-local') return value;
   return 'text-normalizer';
 }
 

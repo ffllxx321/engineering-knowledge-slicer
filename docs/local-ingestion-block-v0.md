@@ -10,11 +10,13 @@
 
 默认值：`localMsgAdapterEnabled=true`、`localPdfInventoryEnabled=true`、`blockV0PackingEnabled=true`、`localOcrEnabled=false`、`localOcrProvider=auto`、`localOcrLanguages=chi_sim+eng`、`localOcrConcurrency=2`、`localOcrTimeoutMs=120000`、`localOcrQualityThreshold=0.72`、`pdfAllowExternalUpload=false`。升级时本地 OCR 明确迁移为关闭，不会因机器上恰好存在引擎而开始处理或外传。
 
-## 本地 OOXML（DOCX / XLSX）
+## 本地 OOXML（DOCX / XLSX / PPTX）
 
-`localDocxAdapterEnabled=true` 与 `localXlsxAdapterEnabled=true` 默认开启。两者使用内置安全 ZIP/XML 层，不读取临时目录、不加载 Office、不联网，也不引入发布时依赖。中央目录、entry 路径、压缩算法和声明大小会在解压前验证；默认限制为 4096 entries、256 MiB 压缩总量、768 MiB 声明/实际解压总量、128 MiB 单 entry、200 倍压缩比、64 MiB 单 XML、128 层 XML 深度、800 万文本字符。加密、ZIP64、多磁盘、DTD/实体、traversal、畸形 relationship/XML 和中止均返回稳定 `OOXML_*` code。
+`localDocxAdapterEnabled=true`、`localXlsxAdapterEnabled=true` 与 `localPptxAdapterEnabled=true` 默认开启。三者使用内置安全 ZIP/XML 层，不读取临时目录、不加载 Office、不联网，也不引入发布时依赖。中央目录、entry 路径、压缩算法和声明大小会在解压前验证；默认限制为 4096 entries、256 MiB 压缩总量、768 MiB 声明/实际解压总量、128 MiB 单 entry、200 倍压缩比、64 MiB 单 XML、128 层 XML 深度、800 万文本字符。加密、ZIP64、多磁盘、DTD/实体、traversal、畸形 relationship/XML 和中止均返回稳定 `OOXML_*` code。
 
 DOCX locator 形如 `word/document.xml#section=1/p=4` 或 `word/document.xml#table=2/row=3/cell=1`；XLSX locator 形如 `xl/worksheets/sheet1.xml#sheet=1/cell=B7`。所有输出 blocks（包括 image metadata 和不可制卡 provenance）都必须有 locator。公式保存于 `metadata.formula`，缓存值独立保存于 `metadata.cached_value`；缺失缓存保持 missing，绝不计算或发明结果。合并区域的非 anchor cell 只记录继承关系与 header，不把 anchor 的值写入其 raw value。
+
+PPTX 严格按 `ppt/presentation.xml` 的 relationship 顺序解析，不按 `slide1.xml` 文件名排序。locator 形如 `ppt/slides/slide2.xml#slide=1/shape=3/p=2`、`#table=1/row=2/cell=3` 或 `ppt/notesSlides/notesSlide1.xml#slide=1/p=1`。标题/正文/项目符号、shape placeholder 与 EMU 边界、表格合并、演讲者备注、隐藏页、转场/动画存在性、超链接和图片/图表锚点均保留；媒体 alt text 不被当作图像内容或审批结论，图片/图表 metadata 默认不可直接制卡。
 
 若本地适配器关闭、包不支持或解析失败，只在既有显式外传授权成立时尝试 MinerU；否则直接返回 typed error 与 `external_upload_required=true`，不会绕过确认。有效空文档返回 `review_required / OOXML_NO_ELIGIBLE_CONTENT`，而不是伪造正文。
 

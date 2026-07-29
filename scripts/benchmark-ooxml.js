@@ -11,7 +11,9 @@ const ooxml = loadBundleModule('src/core/ooxml.js', { crypto, zlib, 'src/core/bl
 const candidates = [
   '/tmp/ventilation_preembedded.xlsx',
   '/tmp/alibaba_finish_material_schedule.xlsx',
-  '/tmp/bim_tender_requirements.docx'
+  '/tmp/bim_tender_requirements.docx',
+  '/tmp/engineering_project_report.pptx',
+  '/tmp/project_report.pptx'
 ];
 for (const file of candidates) {
   if (!fs.existsSync(file)) continue;
@@ -28,6 +30,7 @@ for (const file of candidates) {
     inflated_bytes: metrics.inflated_bytes || 0,
     locator_coverage: metrics.locator_coverage ?? null,
     sheets: result.metadata?.sheets?.length || 0,
+    slides: result.metadata?.slides?.length || 0,
     parts: result.metadata?.parts?.length || 0,
     warnings: result.metadata?.warnings || []
   }));

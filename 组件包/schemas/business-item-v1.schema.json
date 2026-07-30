@@ -3,14 +3,33 @@
   "$id": "engineering-knowledge-slicer://schema/business-item-1.0",
   "title": "业务条目",
   "type": "object",
-  "required": ["schema_version", "record_kind", "record_id", "title", "library", "category", "created_at", "updated_at"],
+  "required": ["schema_version", "record_kind", "record_id", "title", "library", "created_at", "updated_at"],
   "properties": {
     "schema_version": { "const": "1.0" },
     "record_kind": { "const": "business_item" },
     "record_id": { "type": "string", "minLength": 1 },
     "title": { "type": "string", "minLength": 1 },
     "library": { "enum": ["active_tender", "business"] },
-    "category": { "enum": ["historical_projects", "standards", "correspondence", "materials", "suppliers", "costs", "methods", "risks", "company_knowledge"] },
+    "category": {
+      "enum": [
+        "project_overview", "opportunity_customer", "tender_documents_interpretation",
+        "site_survey_original_materials", "bid_strategy_responsibilities", "technical_solution",
+        "design_optimization", "construction_organization_schedule", "technical_bid",
+        "commercial_quotation_cost", "procurement_subcontracting", "risk_deviation_compliance",
+        "internal_review_decision", "qa_addenda", "bid_document_submission_history",
+        "opening_evaluation_award_tracking", "contract_negotiation_signing",
+        "review_knowledge_candidates", "project_correspondence", "meeting_minutes_decisions",
+        "project_material_index", "business_common_knowledge_refs", "business_templates_tools_refs",
+        "customers", "complete_historical_projects", "proposals_cases", "quotation_cost",
+        "construction_organization_schedules", "risks_issues", "failures_terminated_lessons",
+        "talent_experts", "suppliers_subcontractors", "materials_equipment",
+        "standards_specifications", "contracts_legal", "technical_methods_workmanship",
+        "quality_acceptance", "safety_civilized_construction",
+        "correspondence_important_decisions", "company_systems_processes",
+        "market_competition_intelligence", "templates_tools", "terminology_general_knowledge"
+      ]
+    },
+    "item_type": { "enum": ["requirement", "decision", "commitment", "risk", "issue", "change", "action", "quotation", "material", "method", "acceptance_criterion", "clarification", "contract_obligation", "project_lesson"] },
     "summary": { "type": "string" },
     "project_ids": { "$ref": "#/$defs/ids" },
     "source_document_ids": { "$ref": "#/$defs/ids" },
@@ -23,6 +42,51 @@
     "updated_at": { "type": "string", "minLength": 1 },
     "extensions": { "type": "object", "additionalProperties": true }
   },
+  "allOf": [
+    {
+      "if": {
+        "required": ["category"],
+        "properties": { "library": { "const": "active_tender" } }
+      },
+      "then": {
+        "properties": {
+          "category": {
+            "enum": [
+              "project_overview", "opportunity_customer", "tender_documents_interpretation",
+              "site_survey_original_materials", "bid_strategy_responsibilities", "technical_solution",
+              "design_optimization", "construction_organization_schedule", "technical_bid",
+              "commercial_quotation_cost", "procurement_subcontracting", "risk_deviation_compliance",
+              "internal_review_decision", "qa_addenda", "bid_document_submission_history",
+              "opening_evaluation_award_tracking", "contract_negotiation_signing",
+              "review_knowledge_candidates", "project_correspondence", "meeting_minutes_decisions",
+              "project_material_index", "business_common_knowledge_refs", "business_templates_tools_refs"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["category"],
+        "properties": { "library": { "const": "business" } }
+      },
+      "then": {
+        "properties": {
+          "category": {
+            "enum": [
+              "customers", "complete_historical_projects", "proposals_cases", "quotation_cost",
+              "construction_organization_schedules", "risks_issues", "failures_terminated_lessons",
+              "talent_experts", "suppliers_subcontractors", "materials_equipment",
+              "standards_specifications", "contracts_legal", "technical_methods_workmanship",
+              "quality_acceptance", "safety_civilized_construction",
+              "correspondence_important_decisions", "company_systems_processes",
+              "market_competition_intelligence", "templates_tools", "terminology_general_knowledge"
+            ]
+          }
+        }
+      }
+    }
+  ],
   "additionalProperties": false,
   "$defs": { "ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true } }
 }

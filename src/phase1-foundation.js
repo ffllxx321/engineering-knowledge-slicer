@@ -38,46 +38,100 @@ const ALLOWED_TRANSITIONS = Object.freeze({
   archived: []
 });
 
+const ACTIVE_TENDER_CATEGORIES = Object.freeze([
+  ['project_overview', '项目概览'],
+  ['opportunity_customer', '商机与客户'],
+  ['tender_documents_interpretation', '招标文件与解读'],
+  ['site_survey_original_materials', '现场踏勘与原始资料'],
+  ['bid_strategy_responsibilities', '投标策略与职责分工'],
+  ['technical_solution', '技术方案'],
+  ['design_optimization', '设计与优化'],
+  ['construction_organization_schedule', '施工组织与进度计划'],
+  ['technical_bid', '技术标'],
+  ['commercial_quotation_cost', '商务报价与成本'],
+  ['procurement_subcontracting', '采购与分包'],
+  ['risk_deviation_compliance', '风险、偏差与合规'],
+  ['internal_review_decision', '内部评审与决策'],
+  ['qa_addenda', '答疑与补遗'],
+  ['bid_document_submission_history', '投标文件与提交历史'],
+  ['opening_evaluation_award_tracking', '开标、评标与中标跟踪'],
+  ['contract_negotiation_signing', '合同谈判与签约'],
+  ['review_knowledge_candidates', '复盘与知识候选'],
+  ['project_correspondence', '项目往来函件'],
+  ['meeting_minutes_decisions', '会议纪要与决议'],
+  ['project_material_index', '项目资料索引']
+].map(([key, label]) => Object.freeze({ key, label, storage: 'owned' })));
+
+const ACTIVE_TENDER_REFERENCE_CATEGORIES = Object.freeze([
+  Object.freeze({
+    key: 'business_common_knowledge_refs',
+    label: '引用业务库通用知识',
+    storage: 'reference',
+    target_library: 'business',
+    target_category: 'terminology_general_knowledge'
+  }),
+  Object.freeze({
+    key: 'business_templates_tools_refs',
+    label: '引用业务库模板与工具',
+    storage: 'reference',
+    target_library: 'business',
+    target_category: 'templates_tools'
+  })
+]);
+
 const BUSINESS_CATEGORIES = Object.freeze([
-  ['historical_projects', '历史项目'],
-  ['standards', '标准规范'],
-  ['correspondence', '往来函件'],
-  ['materials', '材料'],
-  ['suppliers', '供应商'],
-  ['costs', '成本'],
-  ['methods', '方法做法'],
-  ['risks', '风险'],
-  ['company_knowledge', '公司知识']
+  ['customers', '客户'],
+  ['complete_historical_projects', '完整历史项目'],
+  ['proposals_cases', '提案与案例'],
+  ['quotation_cost', '报价与成本'],
+  ['construction_organization_schedules', '施工组织与进度计划'],
+  ['risks_issues', '风险与问题'],
+  ['failures_terminated_lessons', '失败与终止项目教训'],
+  ['talent_experts', '人才与专家'],
+  ['suppliers_subcontractors', '供应商与分包商'],
+  ['materials_equipment', '材料与设备'],
+  ['standards_specifications', '标准与规范'],
+  ['contracts_legal', '合同与法务'],
+  ['technical_methods_workmanship', '技术方法与工艺'],
+  ['quality_acceptance', '质量与验收'],
+  ['safety_civilized_construction', '安全与文明施工'],
+  ['correspondence_important_decisions', '往来函件与重要决策'],
+  ['company_systems_processes', '公司制度与流程'],
+  ['market_competition_intelligence', '市场与竞争情报'],
+  ['templates_tools', '模板与工具'],
+  ['terminology_general_knowledge', '术语与通用知识']
+].map(([key, label]) => Object.freeze({ key, label })));
+
+const BUSINESS_ITEM_TYPES = Object.freeze([
+  ['requirement', '要求'],
+  ['decision', '决策'],
+  ['commitment', '承诺'],
+  ['risk', '风险'],
+  ['issue', '问题'],
+  ['change', '变更'],
+  ['action', '行动'],
+  ['quotation', '报价'],
+  ['material', '材料'],
+  ['method', '方法'],
+  ['acceptance_criterion', '验收标准'],
+  ['clarification', '澄清'],
+  ['contract_obligation', '合同义务'],
+  ['project_lesson', '项目教训']
 ].map(([key, label]) => Object.freeze({ key, label })));
 
 const DIRECTORY_PLAN = Object.freeze({
   version: SCHEMA_VERSION,
   mode: 'definitions_only',
-  roots: Object.freeze([
+  auto_create_or_move: false,
+  libraries: Object.freeze([
     Object.freeze({
-      library: 'active_tender',
+      key: 'active_tender',
       label: '在办投标库',
       suggested_path: '在办投标库',
-      categories: Object.freeze([
-        Object.freeze({ key: 'projects', label: '在办项目', storage: 'owned' }),
-        Object.freeze({
-          key: 'common_knowledge',
-          label: '通用知识',
-          storage: 'reference',
-          target_library: 'business',
-          target_category: 'company_knowledge'
-        }),
-        Object.freeze({
-          key: 'templates',
-          label: '模板',
-          storage: 'reference',
-          target_library: 'business',
-          target_category: 'company_knowledge'
-        })
-      ])
+      categories: Object.freeze([...ACTIVE_TENDER_CATEGORIES, ...ACTIVE_TENDER_REFERENCE_CATEGORIES])
     }),
     Object.freeze({
-      library: 'business',
+      key: 'business',
       label: '长期业务库',
       suggested_path: '长期业务库',
       categories: BUSINESS_CATEGORIES
@@ -95,7 +149,7 @@ const COMMON_FIELDS = new Set([
 const KIND_FIELDS = Object.freeze({
   project: new Set(['state', 'archive_outcome', 'archive_decided_at']),
   source_document: new Set(['source_path', 'source_hash', 'media_type']),
-  business_item: new Set(['category', 'summary']),
+  business_item: new Set(['category', 'item_type', 'summary']),
   company_knowledge: new Set(['category', 'summary', 'reuse_status'])
 });
 
@@ -158,7 +212,7 @@ function normalizeRecord(input) {
     if (value) output[field] = value;
   }
   for (const field of KIND_FIELDS[kind]) {
-    if (field === 'state' || field === 'archive_outcome' || field === 'category' || field === 'summary'
+    if (field === 'state' || field === 'archive_outcome' || field === 'category' || field === 'item_type' || field === 'summary'
       || field === 'reuse_status' || field === 'source_path' || field === 'source_hash'
       || field === 'media_type' || field === 'archive_decided_at') {
       const value = text(input[field]);
@@ -196,9 +250,17 @@ function validateRecord(input) {
   if (record.record_kind === 'source_document' && !record.source_path && !record.source_hash) {
     errors.push('来源文档至少需要 source_path 或 source_hash');
   }
-  if (record.record_kind === 'business_item'
-    && !BUSINESS_CATEGORIES.some((item) => item.key === record.category)) {
-    errors.push('category 不是有效业务分类');
+  if (record.record_kind === 'business_item' && record.category) {
+    const categories = record.library === 'active_tender'
+      ? [...ACTIVE_TENDER_CATEGORIES, ...ACTIVE_TENDER_REFERENCE_CATEGORIES]
+      : BUSINESS_CATEGORIES;
+    if (!categories.some((item) => item.key === record.category)) {
+      errors.push('category 不是所属库的有效目录分类');
+    }
+  }
+  if (record.record_kind === 'business_item' && record.item_type
+    && !BUSINESS_ITEM_TYPES.some((item) => item.key === record.item_type)) {
+    errors.push('item_type 不是有效业务条目类型');
   }
   if (record.record_kind === 'company_knowledge' && record.library !== 'business') {
     errors.push('公司知识只能存放在长期业务库');
@@ -320,7 +382,10 @@ module.exports = {
   ARCHIVE_OUTCOMES,
   STATE_LABELS,
   ALLOWED_TRANSITIONS,
+  ACTIVE_TENDER_CATEGORIES,
+  ACTIVE_TENDER_REFERENCE_CATEGORIES,
   BUSINESS_CATEGORIES,
+  BUSINESS_ITEM_TYPES,
   DIRECTORY_PLAN,
   normalizeRecord,
   validateRecord,

@@ -54,7 +54,7 @@ assert(structured.includes('正文代表块'));
 const main = require('fs').readFileSync(require('path').join(__dirname, '..', 'main.js'), 'utf8');
 assert(main.includes("extracted.status === 'review_required' && extracted.parsePackage"));
 assert(main.includes("kind: 'review_required'"));
-assert(main.includes("fingerprintVersion: 'parsed-input-v1'"));
+assert(main.includes("fingerprintVersion: 'parsed-input-v2'"));
 assert(main.includes("? { checkpointContract: 'local-ocr-v1' }"));
 assert(main.includes("parsedInputFingerprint: fingerprintName === 'parsed' || isPageOcrCheckpoint ? ''"));
 console.log('block-native quality closure regression passed');

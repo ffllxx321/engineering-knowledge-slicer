@@ -28,6 +28,7 @@
 | `SCHEMA_OUTPUT_INVALID` | schema | 否 | 检查 Schema/Prompt 版本 |
 | `ROUTING_*` / `TAG_*` | routing/tag | 否 | 保持白名单，进入审核 |
 | `EVIDENCE_*` | evidence | 否 | 补足来源证据 |
+| `LEGACY_PIPELINE_DISABLED` | migration | 否 | 使用当前 Dashboard 重试或显式本地重验证；生产环境禁止旧管线 |
 | `DUPLICATE_*` | duplicate | 否 | 合并或跳过 |
 | `WRITE_*` | write | 视错误 | 检查 vault 路径/权限 |
 | `MIGRATION_*` | migration | 否 | 保留原文件并从备份恢复 |

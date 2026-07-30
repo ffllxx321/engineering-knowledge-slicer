@@ -2,7 +2,9 @@
 
 迁移是惰性、幂等且无需用户操作的：
 
-- 历史 raw JSON artifact 仅在通过对应阶段的结构白名单时读取；无法验证的裸 payload 会安全失效。
+- v2.19 起，正常生产重试不会直接复用 raw classification/summary/atoms。只有通过 block/provenance 规范化的 parsed 可迁入当前 v3 envelope，以避免重复 OCR；下游从最早不可验证阶段重建当前 prompt/schema/component/input 指纹。
+- 显式“本地重验证”可读取旧 payload，但仍必须通过当前 schema、coverage、provenance 与逐卡证据门禁，且 provider 请求硬限制为 0。
+- review v1/v1.3 惰性迁移为 v2.0，保留 handled、rejected、manual/regeneration requests、reason_codes、metrics、warnings 与不可覆写门禁；重复迁移不改变 v2 数据。
 - 新写入 artifact 使用 `{ artifactVersion, stage, inputFingerprint, completedAt, validationState, payload }`。
 - source hash 或 pipeline/prompt/schema 版本变化时，新代码忽略不匹配的 v2 artifact 并重跑对应阶段，不覆盖源文件或历史卡片。
 - JSON 缺失/损坏只视为 cache miss；原文件不会被迁移器就地覆盖。

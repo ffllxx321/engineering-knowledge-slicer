@@ -31,3 +31,9 @@
 默认 provider 请求数和成本增量为 0；没有新增付费调用。`MiniMax-M3`、自动批准阈值 0.90、语义嵌入 `qwen3.7-text-embedding` 的端点、模型和启用策略均保持不变。
 
 诊断只记录阶段数量、原因直方图、请求/成本计数和匿名结构字段；禁止源文本、evidence quote、prompt、密钥和 provider 原始响应。
+# v2.19 一致性边界补充
+
+- Task ledger 的当前 schema 是可扩展持久化合同：已知字段在加载时规范化，未知 JSON 字段原样保留；旧别名记录才转换为规范形状。
+- 卡片事实的信任边界是已对齐的 `evidence_quote`，或经 block locator 明确绑定的同块 span。整篇文档、相邻表格行和同邮件线程的其他消息都不是隐式证据。
+- Artifact envelope v2/v3 使用同一识别 guard。生产恢复只复用匹配当前输入指纹的 envelope；legacy parsed 经验证可升级 envelope，legacy AI 下游必须重建。
+- Cardinality 使用 `candidateCards / autoApproved / reviewPending / hardRejected / alreadyPersisted / merged`；`cardsGenerated / cardsRejected` 仅为旧消费者兼容别名。

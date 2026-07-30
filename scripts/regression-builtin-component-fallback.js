@@ -158,6 +158,53 @@ async function main() {
   parsedTask.component_contract_hash = 'changed-downstream-contract';
   assert.deepStrictEqual(await harness.plugin.loadArtifact(parsedTask, 'parsed'), parsedPayload,
     'parsed fingerprint must stay independent of downstream component contracts');
+  const baseFingerprint = harness.plugin.artifactInputFingerprint(parsedTask, 'parsed');
+  for (const [key, value] of [
+    ['pdfMineruApiModel', 'different-mineru-model'],
+    ['pdfMineruApiLanguage', 'en'],
+    ['pdfExtractionOrder', 'paddleocr-api,mineru-api'],
+    ['pdfPaddleOcrApiModel', 'different-paddle-model']
+  ]) {
+    const previous = harness.plugin.settings[key];
+    harness.plugin.settings[key] = value;
+    assert.notStrictEqual(harness.plugin.artifactInputFingerprint(parsedTask, 'parsed'), baseFingerprint, `${key} must invalidate parsed`);
+    harness.plugin.settings[key] = previous;
+  }
+  for (const [key, value] of [
+    ['pdfMineruApiKey', 'secret-change'],
+    ['pdfExternalTimeoutMs', 1234],
+    ['summaryConcurrency', 99]
+  ]) {
+    const previous = harness.plugin.settings[key];
+    harness.plugin.settings[key] = value;
+    assert.strictEqual(harness.plugin.artifactInputFingerprint(parsedTask, 'parsed'), baseFingerprint, `${key} must not invalidate parsed`);
+    harness.plugin.settings[key] = previous;
+  }
+  harness.plugin.settings.pdfExtractionOrder = 'paddleocr-api,mineru-api';
+  harness.plugin.providerLimiters = { paddleocr: { run: () => {} }, mineru: { run: () => {} } };
+  assert.strictEqual((await harness.plugin.getPdfExtractorConfig()).order, 'paddleocr-api,mineru-api');
+
+  const legacyTask = {
+    task_id: 'legacy-selective', run_id: 'legacy-selective', source_hash: 'b'.repeat(64),
+    artifacts: { parsed: 'artifacts/legacy/parsed.json', classification: 'artifacts/legacy/classification.json' }
+  };
+  const rawParsed = {
+    parser: 'local-text', markdown: '可验证正文', blocks: [{
+      block_id: 'b1', block_type: 'paragraph', raw: { text: '可验证正文' },
+      locator: { scheme: 'line', value: '1' }, card_eligible: true
+    }],
+    evidence_index: { b1: { block_id: 'b1', raw_text: '可验证正文', locator: { scheme: 'line', value: '1' } } }
+  };
+  harness.entries.set(legacyTask.artifacts.parsed, new TFile(legacyTask.artifacts.parsed, JSON.stringify(rawParsed)));
+  harness.entries.set(legacyTask.artifacts.classification, new TFile(legacyTask.artifacts.classification,
+    JSON.stringify({ library: 'business', folder_type: '06-风险库', confidence: 1 })));
+  const migratedStages = [];
+  harness.plugin.persistArtifact = async (_task, stage, payload) => migratedStages.push({ stage, payload });
+  assert.deepStrictEqual(await harness.plugin.loadArtifact(legacyTask, 'parsed'), rawParsed);
+  assert.deepStrictEqual(migratedStages.map((item) => item.stage), ['parsed'],
+    'verified legacy parsed migrates once and can prevent repeated OCR');
+  assert.strictEqual(await harness.plugin.loadArtifact(legacyTask, 'classification'), null,
+    'raw legacy AI downstream must not bypass current fingerprints');
 
   const changedCanonical = JSON.parse(JSON.stringify(contracts));
   changedCanonical.schemas.parsePackage.title = 'canonical-content-change';

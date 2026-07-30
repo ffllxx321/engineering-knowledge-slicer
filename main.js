@@ -1926,8 +1926,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         item.exists = file instanceof TFile;
         if (item.exists && /\.json$/i.test(artifactPath)) {
           const parsed = JSON.parse(await this.app.vault.read(file));
-          item.validation = parsed?.artifactVersion === 2
-            ? (parsed.validationState === 'valid' && Object.hasOwn(parsed, 'payload') ? 'valid' : 'invalid-envelope')
+          item.validation = isCurrentArtifactEnvelope(parsed)
+            ? (parsed.validationState === 'valid' ? 'valid' : 'invalid-envelope')
             : 'legacy-readable';
         } else if (item.exists) {
           item.validation = 'present';
@@ -1985,6 +1985,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async processTaskLegacy(task) {
+    if (typeof process !== 'object' || process?.env?.EKS_ENABLE_NONPRODUCTION_LEGACY !== '1') {
+      throw new Error('LEGACY_PIPELINE_DISABLED: production tasks must use processTask');
+    }
     const tasks = await this.loadTasks();
     const current = tasks.find((item) => item.taskId === task.taskId) || task;
     try {
@@ -2218,10 +2221,23 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const parsed = JSON.parse(await this.app.vault.read(file));
       // v2.10: 旧产物仍按原格式读取；新产物带输入指纹，只有来源与运行时契约
       // 完全一致才复用，避免 prompt/schema/pipeline 升级后误用旧 AI 结果。
-      if (!parsed || ![2, 3].includes(parsed.artifactVersion) || !Object.hasOwn(parsed, 'payload')) {
+      if (!isCurrentArtifactEnvelope(parsed)) {
         const legacy = normalizeLegacyArtifact(name, parsed);
-        if (!legacy) diag('artifact.cacheMiss', { taskId: task.task_id, stage: name, reason: 'legacy_unverifiable' });
-        return legacy;
+        if (name === 'parsed' && legacy) {
+          // Parsed text may be reused after conservative normalization because it
+          // prevents repeated OCR.  Persist a current, fingerprinted envelope now;
+          // all AI-derived legacy stages are invalidated and rebuilt downstream.
+          await this.persistArtifact(task, 'parsed', legacy);
+          diag('artifact.migrated', { taskId: task.task_id, stage: name, from: 'legacy-raw' });
+          return legacy;
+        }
+        if (name === 'review' && legacy) return migrateReviewArtifact(legacy);
+        if (!legacy) {
+          diag('artifact.cacheMiss', { taskId: task.task_id, stage: name, reason: 'legacy_unverifiable' });
+        } else {
+          diag('artifact.cacheMiss', { taskId: task.task_id, stage: name, reason: 'legacy_downstream_invalidated' });
+        }
+        return null;
       }
       if ((parsed.stage && parsed.stage !== name) || (parsed.validationState && parsed.validationState !== 'valid')) return null;
       if (parsed.inputFingerprint !== this.artifactInputFingerprint(task, name)) {
@@ -2266,6 +2282,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       shortDocumentMaxCards: this.settings.shortDocumentMaxCards,
       autoApproveConfidenceThreshold: this.settings.autoApproveConfidenceThreshold,
       existingCards, existingFingerprints: existingCards.map((card) => card.atom_fingerprint).filter(Boolean),
+      persistedCardIds: task.written_card_ids || [],
       validateLabels: (atom) => validateAtomLabels(tagLibrary, atom),
       requestJson: forbidProvider, requestStream: forbidProvider
     });
@@ -2288,7 +2305,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     task.status = result.review.length ? 'needs_review' : 'written';
     task.updated_at = new Date().toISOString();
     await this.saveTasks(upsertTask(tasks, task));
-    new Notice(`本地重新校验完成：自动入库 ${result.accepted.length}，待确认 ${result.review.length}，拒绝 ${result.hardRejected.length}；模型调用 0`);
+    new Notice(`本地重新校验完成：新增入库 ${result.accepted.length}，已存在 ${result.alreadyPersisted.length}，待确认 ${result.review.length}，拒绝 ${result.hardRejected.length}；模型调用 0`);
     await this.refreshViews();
     return result;
   }
@@ -2336,9 +2353,28 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const fingerprintName = String(name || '').replace(/^shadow-/, '');
     const versions = runtimeVersions(this.settings);
     const parsedScope = {
-      fingerprintVersion: 'parsed-input-v1',
+      fingerprintVersion: 'parsed-input-v2',
       blockContractVersion: 'block_v0',
-      parserContractVersion: 'document-parser-v2',
+      parserContractVersion: 'document-parser-v3',
+      adapterContractVersions: {
+        text: 'local-text-block-v2', ooxml: 'ooxml-block-v2',
+        email: 'email-mime-block-v2', pdf: 'pdf-evidence-v2', ocr: 'ocr-provenance-v1'
+      },
+      pdfExtractionOrder: String(this.settings.pdfExtractionOrder || DEFAULT_SETTINGS.pdfExtractionOrder),
+      pdfProviders: {
+        mineru: {
+          endpoint: String(this.settings.pdfMineruApiEndpoint || 'https://mineru.net/api/v4'),
+          model: String(this.settings.pdfMineruApiModel || 'vlm'),
+          language: String(this.settings.pdfMineruApiLanguage || 'ch_server'),
+          contract: 'mineru-api-v4'
+        },
+        paddleocr: {
+          endpoint: String(this.settings.pdfPaddleOcrApiEndpoint || 'https://paddleocr.aistudio-app.com/api/v2/ocr/jobs'),
+          model: String(this.settings.pdfPaddleOcrApiModel || 'PaddleOCR-VL-1.6'),
+          language: String(this.settings.pdfPaddleOcrApiLanguage || this.settings.targetLanguage || 'zh'),
+          contract: 'paddleocr-jobs-v2'
+        }
+      },
       localMsgAdapterEnabled: this.settings.localMsgAdapterEnabled !== false,
       localTextBlockAdapterEnabled: this.settings.localTextBlockAdapterEnabled !== false,
       localDocxAdapterEnabled: this.settings.localDocxAdapterEnabled !== false,
@@ -3093,7 +3129,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   async getPdfExtractorConfig(task = null) {
     return {
       enabled: true,
-      order: 'mineru-api,paddleocr-api',
+      order: String(this.settings.pdfExtractionOrder || DEFAULT_SETTINGS.pdfExtractionOrder),
       // v2.8.1: 设置开关常开，或本次会话在确认弹窗点过"确认上传"，都视为已授权
       allowExternalUpload: this.settings.pdfAllowExternalUpload === true || eksSessionUploadApproved(),
       // v1.3: 上传前是否弹窗二次确认（默认开启）
@@ -3586,6 +3622,8 @@ class SlicerDashboardView extends ItemView {
     more.createEl('summary', { text: '更多操作', attr: { 'aria-label': '展开次要操作' } });
     const secondary = more.createDiv('eks-secondary-actions');
     button(secondary, '扫描源文件', () => this.plugin.scanSourceFiles(true));
+    button(secondary, '本地重验证最近任务（零模型调用）', () => this.plugin.revalidateLatestTaskLocal())
+      .setAttribute('title', '仅使用最近任务已有的解析/总结/原子产物；重新归并、质量校验与路由，不调用 provider，不重写已存在卡片');
     if (activeTask) {
       button(secondary, '完成当前阶段后暂停', () => this.plugin.pauseProcessing());
       button(secondary, '取消当前任务', () => this.plugin.cancelCurrentTask(activeTask.task_id));
@@ -4059,6 +4097,9 @@ class SlicerDashboardView extends ItemView {
   }
 
   async renderReviewLegacy(parent, tasks) {
+    if (typeof process !== 'object' || process?.env?.EKS_ENABLE_NONPRODUCTION_LEGACY !== '1') {
+      throw new Error('LEGACY_REVIEW_UI_DISABLED: production review must use v2 artifacts');
+    }
     const reviewTasks = tasks.filter((task) => task.status === 'needs_review' && task.draftFiles && task.draftFiles.length);
     if (!reviewTasks.length) {
       parent.createDiv({ cls: 'eks-empty', text: '暂无待审核草稿卡片。' });
@@ -4659,8 +4700,14 @@ function normalizeLegacyArtifact(stage, value) {
   if (name === 'parsed') {
     return typeof value.markdown === 'string' && typeof value.parser === 'string'
       && Array.isArray(value.blocks)
-      && value.blocks.every((block) => block && typeof block.text === 'string'
-        && typeof block.block_id === 'string' && typeof block.block_type === 'string') ? value : null;
+      && value.blocks.every((block) => block
+        && typeof (block.raw?.text ?? block.text) === 'string'
+        && typeof block.block_id === 'string'
+        && typeof block.block_type === 'string'
+        && block.locator && typeof block.locator === 'object')
+      && (!value.evidence_index || Object.values(value.evidence_index).every((entry) =>
+        entry && typeof entry.block_id === 'string' && typeof entry.raw_text === 'string'
+        && entry.locator && typeof entry.locator === 'object')) ? value : null;
   }
   if (name === 'classification') {
     return ['bid', 'business'].includes(value.library) && typeof value.folder_type === 'string'
@@ -4683,9 +4730,14 @@ function normalizeLegacyArtifact(stage, value) {
   return null;
 }
 
+function isCurrentArtifactEnvelope(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+    && [2, 3].includes(value.artifactVersion) && Object.hasOwn(value, 'payload');
+}
+
 function migrateReviewArtifact(value) {
   const artifact = JSON.parse(JSON.stringify(value || {}));
-  artifact.version = '1.3';
+  artifact.version = '2.0';
   artifact.items = (artifact.items || []).map((item) => {
     const atom = item.atom || {};
     const source = atom.source || {};
@@ -5289,7 +5341,7 @@ function buildShadowDocumentMetric(input = {}) {
   const parsePackage = input.parsePackage || {};
   const blocks = Array.isArray(parsePackage.blocks) ? parsePackage.blocks : [];
   const eligible = blocks.filter((block) => block?.card_eligible !== false
-    && String(block?.raw_text || block?.text || block?.content || '').trim().length >= 2);
+    && String(block?.raw?.text || block?.raw_text || block?.text || block?.content || '').trim().length >= 2);
   const workflow = input.workflow || {};
   const accepted = Array.isArray(workflow.accepted) ? workflow.accepted : [];
   const review = Array.isArray(workflow.review) ? workflow.review : [];
@@ -5298,7 +5350,8 @@ function buildShadowDocumentMetric(input = {}) {
     .filter(Boolean);
   const verified = verification.filter((item) => item.sourceLinkValid !== false && item.evidenceFound !== false).length;
   const summaryPoints = Array.isArray(workflow.summary?.key_points) ? workflow.summary.key_points : [];
-  const covered = new Set(atoms.flatMap((atom) => atom.source_point_ids || (atom.source_point_id ? [atom.source_point_id] : []))).size;
+  const covered = new Set(atoms.flatMap((atom) => atom.content?.point_ids
+    || atom.source_point_ids || (atom.source_point_id ? [atom.source_point_id] : []))).size;
   const reasons = [
     ...(input.reasons || []),
     ...review.flatMap((item) => item.reasons || []),
@@ -5705,7 +5758,12 @@ function migrateSettings(stored = {}) {
     if (error.reason === 'overlap') continue;
     migrated[error.key] = DEFAULT_SETTINGS[error.key];
   }
-  migrated.pdfExtractionOrder = DEFAULT_SETTINGS.pdfExtractionOrder;
+  const extractionOrder = String(source.pdfExtractionOrder || '').split(',').map((value) => value.trim()).filter(Boolean);
+  migrated.pdfExtractionOrder = extractionOrder.length
+    && extractionOrder.every((value) => ['mineru-api', 'paddleocr-api'].includes(value))
+    && new Set(extractionOrder).size === extractionOrder.length
+    ? extractionOrder.join(',')
+    : DEFAULT_SETTINGS.pdfExtractionOrder;
   // v2.12：保留所有合法旧偏好；只迁移非法/缺失值，并与运行时评分使用同一安全范围。
   const storedThreshold = Number(source.autoApproveConfidenceThreshold);
   migrated.autoApproveConfidenceThreshold = Number.isFinite(storedThreshold)
@@ -9935,7 +9993,7 @@ function migrateTaskLedgerV3(tasks, versions = {}) {
       });
     }
     const runId = task.run_id || stableId(`${library}:${sourceHash}:${pipelineVersion}:${promptBundleVersion}`);
-    return {
+    const normalized = {
       task_id: taskId,
       run_id: runId,
       source_path: sourcePath,
@@ -9960,6 +10018,14 @@ function migrateTaskLedgerV3(tasks, versions = {}) {
       created_at: task.created_at || task.createdAt || new Date().toISOString(),
       updated_at: task.updated_at || task.updatedAt || new Date().toISOString()
     };
+    // Current ledgers are an extensible persistence contract.  Reconstructing a
+    // canonical task from a whitelist silently discarded queue, regeneration,
+    // attachment-parent, review and retry state on every load/save cycle.
+    // Preserve every JSON-safe extension field for canonical records and only
+    // apply the destructive shape conversion above to genuinely old records.
+    // Known fields are still normalized by `normalized`, so aliases and unsafe
+    // stale values cannot override the current contract.
+    return canonical ? Object.assign({}, task, normalized) : normalized;
   });
 }
 
@@ -12725,7 +12791,13 @@ function calculateConfidence(input) {
   const hasParent = Boolean(String(source.parent_summary || '').trim());
   const provenanceVerified = source.provenance_verified !== false;
   const quoteFound = Boolean(evidenceQuote) && provenanceVerified && parseMarkdown.includes(evidenceQuote);
-  const numbersGrounded = extractedFacts(atomText).every((item) => evidenceQuote.includes(item) || parseMarkdown.includes(item));
+  // Facts are card-scoped: a value elsewhere in the document (another block,
+  // table row or email message) is not evidence for this card.  The aligned
+  // verbatim quote is the only default fact scope; callers may provide an
+  // explicitly bound same-block span after provenance verification.
+  const boundEvidence = normalizeText(source.bound_evidence_text || evidenceQuote);
+  const factConsistency = evidenceConsistency(atomText, boundEvidence);
+  const numbersGrounded = factConsistency.ok;
   const E = clamp((hasLocator ? 0.2 : 0) + (hasSourceLink ? 0.1 : 0) + (hasParent ? 0.1 : 0) + (quoteFound ? 0.4 : 0) + (numbersGrounded ? 0.2 : 0));
 
   const S = clamp((input.schemaValid ? 0.4 : 0) + (input.routeValid ? 0.3 : 0) + (input.labelsValid ? 0.3 : 0));
@@ -12742,7 +12814,7 @@ function calculateConfidence(input) {
     hardRules.push('逐字证据无法在解析文本中定位');
     score = Math.min(score, 0.59);
   }
-  if (!numbersGrounded) hardRules.push('知识卡片引入了证据中不存在的数字或日期');
+  if (!numbersGrounded) hardRules.push(`知识卡片引入了当前证据范围不支持的${factConsistency.failures.join('、')}`);
   if (!input.schemaValid || !input.routeValid || !input.labelsValid) {
     hardRules.push('Schema、固定目录或标签字典校验未通过');
     score = Math.min(score, 0.69);
@@ -12782,7 +12854,37 @@ function normalizeAutoApproveThreshold(value) {
 }
 
 function extractedFacts(text) {
-  return [...new Set(String(text || '').match(/\d+(?:\.\d+)?(?:%|‰|mm|cm|m²|m2|m³|m3|MPa|kN|元|万元|亿元|年|月|日)?/g) || [])];
+  return [...new Set((String(text || '').normalize('NFKC').match(
+    /(?:\b(?:19|20)\d{2}(?:[-/.年]\d{1,2}(?:[-/.月]\d{1,2}日?)?)?|\d+(?:[.,]\d+)?\s*(?:%|‰|mm|cm|km|m2|m3|m²|m³|pa|kpa|mpa|gpa|n|kn|kg|t|l|ml|℃|°c|元|万元|亿元|年|月|日|小时|分钟|秒)?)/giu
+  ) || []).map((value) => value.toLowerCase().replace(/[\s,]/g, '')))];
+}
+
+function evidenceConsistency(statement, evidence) {
+  const statementFacts = extractedFacts(statement);
+  const evidenceFacts = new Set(extractedFacts(evidence));
+  const failures = [];
+  if (!statementFacts.every((fact) => evidenceFacts.has(fact))) failures.push('数字、日期或单位');
+  const statementModality = explicitModality(statement);
+  const evidenceModality = explicitModality(evidence);
+  if (statementModality && statementModality !== evidenceModality) failures.push('语气/模态');
+  const conditions = conditionTokens(statement);
+  const evidenceConditions = conditionTokens(evidence);
+  if (conditions.length && !conditions.every((token) => evidenceConditions.includes(token))) failures.push('适用条件/例外');
+  return { ok: failures.length === 0, failures, statementFacts, evidenceFacts: [...evidenceFacts] };
+}
+
+function explicitModality(text) {
+  const value = String(text || '').toLowerCase();
+  if (/不得|禁止|严禁|must not|shall not|may not|prohibited/u.test(value)) return 'prohibited';
+  if (/必须|务必|须|应当|应予|must|shall|required/u.test(value)) return 'must';
+  if (/可以|允许|可选择|may|optional|permitted/u.test(value)) return 'may';
+  return '';
+}
+
+function conditionTokens(text) {
+  return (String(text || '').normalize('NFKC').match(
+    /(?:如果|若|当|除非|仅当|只在|不超过|不少于|大于|小于|if|when|unless|except|only if|provided that)[^。！？!?;；]{0,100}/giu
+  ) || []).map((value) => normalizeText(value).toLowerCase());
 }
 
 function flattenContent(value) {
@@ -12816,7 +12918,7 @@ function round(value) {
   return Math.round(value * 1000) / 1000;
 }
 
-module.exports = { WEIGHTS, calculateConfidence, extractedFacts, normalizeAutoApproveThreshold };
+module.exports = { WEIGHTS, calculateConfidence, evidenceConsistency, extractedFacts, normalizeAutoApproveThreshold };
 
 },
 /**
@@ -13807,6 +13909,7 @@ async function runKnowledgeWorkflow(options) {
     ...(options.existingCards || []).map((card) => card.atom_fingerprint).filter(Boolean)
   ]);
   const accepted = [];
+  const alreadyPersisted = [];
   const review = [];
   const hardRejected = [];
   const pageCount = Array.isArray(options.parsePackage.pages) && options.parsePackage.pages.length
@@ -13873,7 +13976,11 @@ async function runKnowledgeWorkflow(options) {
     const fingerprint = atomFingerprint(atom);
     const labelsValid = typeof options.validateLabels === 'function' ? options.validateLabels(atom) : true;
     const routeValid = atom.library === classification.library && atom.folder_type === classification.folder_type;
-    const duplicate = existingFingerprints.has(fingerprint);
+    const matchingExisting = (options.existingCards || []).filter((card) => card.atom_fingerprint === fingerprint);
+    const persistedIds = new Set(options.persistedCardIds || []);
+    const alreadyPersistedCard = matchingExisting.find((card) =>
+      card.source_hash === options.sourceHash && persistedIds.has(card.card_id));
+    const duplicate = !alreadyPersistedCard && existingFingerprints.has(fingerprint);
     const evidenceQuote = String(atom.source?.evidence_quote || '');
     const resolvedBlockId = String(atom.source?.source_provenance?.block_id || atom.source?.block_id || '');
     const excludedEvidenceBlock = resolvedBlockId
@@ -13921,6 +14028,15 @@ async function runKnowledgeWorkflow(options) {
       businessTimeZone: options.businessTimeZone
     });
     card.validation_report = validationReport;
+    if (alreadyPersistedCard) {
+      alreadyPersisted.push({
+        atom_id: atom.atom_id,
+        card_id: alreadyPersistedCard.card_id,
+        path: alreadyPersistedCard.path,
+        status: 'already_persisted'
+      });
+      continue;
+    }
     const rejectCodes = [];
     if (duplicate) rejectCodes.push('DUPLICATE_CONFLICT');
     if (excludedEvidenceBlock || noEligibleSourceBlocks) rejectCodes.push('UNSUPPORTED_SOURCE_BLOCK');
@@ -13984,6 +14100,7 @@ async function runKnowledgeWorkflow(options) {
     summary,
     atomResult,
     accepted,
+    alreadyPersisted,
     review,
     hardRejected,
     documentWarnings: quantityAnomaly ? [{
@@ -14004,7 +14121,12 @@ async function runKnowledgeWorkflow(options) {
       autoApproved: accepted.length,
       reviewPending: review.length,
       hardRejected: consolidation.metrics.dropped_no_knowledge + hardRejected.length,
+      alreadyPersisted: alreadyPersisted.length,
       merged: consolidation.metrics.merged,
+      // Compatibility aliases for pre-v2.18 consumers.  New UI and diagnostics
+      // must use candidateCards/hardRejected.
+      cardsGenerated: accepted.length + review.length,
+      cardsRejected: consolidation.metrics.dropped_no_knowledge + hardRejected.length,
       automaticallyRepaired: (atomResult.atoms || []).filter((atom) => atom.source?.evidence_repair?.repaired).length,
       reasonHistograms: {
         review: histogram(review.flatMap((item) => item.reason_codes || [])),

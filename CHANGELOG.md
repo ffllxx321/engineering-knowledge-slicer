@@ -1,5 +1,16 @@
 # 工程知识切片 变更记录
 
+## v2.19.0 — 2026-07-30 v2.18 一致性与迁移安全
+
+- 当前 task ledger 改为扩展字段无损持久化：规范化已知字段，同时保留 regeneration、邮件附件父链、队列 cohort、审核结果、重试计数及安全未知字段；仅真正旧格式执行破坏性形状迁移。
+- 数字、日期、单位、模态与条件/例外改为逐卡证据范围校验，移除整篇 Markdown 事实兜底；跨 block、表格行和邮件消息的相同值不能支持当前卡片。
+- 本地重验证区分 `alreadyPersisted` 与外部重复；既有同任务卡片不重写、不拒绝、不删除，新增卡片仍可零 provider 入库。
+- 生产重试拒绝裸 legacy classification/summary/atoms 绕过当前合同；经保守规范化的 parsed 会迁入 v3 envelope 并复用，避免重复 OCR，下游按最早不可验证阶段选择性重建。
+- review v1/v1.3 显式、幂等迁移到 v2.0，保留处理决定、审计原因、硬门禁、原因码、指标、拒绝项、文档警告和重生成请求，绝不降级 v2.0。
+- parsed 指纹加入 PDF 提取顺序、MinerU/Paddle 模型与语言、非秘密 endpoint/engine 合同和 adapter/parser 合同版本；API key、超时、并发仍排除。运行时 PDF 提取尊重已验证顺序。
+- shadow、诊断、任务/UI 指标统一读取当前 block/point/envelope 与 cardinality 字段；旧计数只保留兼容别名。
+- 旧生产/审核管线默认硬禁用并仅可由明确非生产环境变量打开；Dashboard 新增范围清晰的零模型本地重验证动作。默认 provider 请求计划、0.90 门槛、MiniMax M3 与 Qwen embedding 配置不变。
+
 ## v2.18.0 — 2026-07-30 通用知识单元与异常队列架构
 
 - 删除 v2.17.2 归并中的房间/构件硬编码词表与“一知识点一卡”归一化；point 与 card 改为多对多，兼容一对多要求拆分和多对一语义归并。

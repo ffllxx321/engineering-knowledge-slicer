@@ -177,7 +177,9 @@ function serializeRecord(record) {
 }
 
 function routeRecord(record, route, registryEntry, settings) {
-  const category = safeSegment(route.directory_category || record.category || 'project_overview');
+  const categoryValue = route.directory_category || record.category;
+  if (!categoryValue) throw new Error('结构化路由分类未确定，禁止使用默认目录');
+  const category = safeSegment(categoryValue);
   if (record.library === 'active_tender') {
     if (!registryEntry) throw new Error('在办库记录缺少唯一项目登记');
     return joinPath(settings.activeRoot, safeSegment(registryEntry.project_id), category,
@@ -244,6 +246,11 @@ function buildRecords(input, settings) {
   const phase3 = input.phase3Result || {};
   const document = input.document || {};
   const route = phase2.route || {};
+  const categories = route.library === 'active_tender' ? ACTIVE_TENDER_CATEGORIES
+    : route.library === 'business' ? BUSINESS_CATEGORIES : null;
+  if (!categories || !categories.some((entry) => entry.key === route.directory_category)) {
+    throw Object.assign(new Error('结构化路由缺少明确且类型兼容的两库分类'), { code: 'STRUCTURED_ROUTE_UNRESOLVED' });
+  }
   const registryMatches = (input.projectRegistry || []).filter((entry) => entry.project_id === route.project_id);
   if (route.project_id && registryMatches.length !== 1) throw new Error('项目路由不是登记表中的唯一精确匹配');
   const registry = registryMatches[0];
@@ -253,7 +260,7 @@ function buildRecords(input, settings) {
   const source = {
     schema_version: '1.0', record_kind: 'source_document', record_id: sourceId,
     title: clean(document.title || document.filename || '来源文档', 300),
-    library: route.library || 'business', created_at: now, updated_at: now,
+    library: route.library, created_at: now, updated_at: now,
     source_path: clean(document.source_path, 800), source_hash: sourceHash,
     source_version: clean(document.source_version || document.metadata?.version_label, 100),
     media_type: clean(document.media_type || document.source_type, 100),
@@ -289,7 +296,7 @@ function buildRecords(input, settings) {
     const item = {
       schema_version: '1.0', record_kind: 'business_item', record_id: itemId,
       title: clean(candidate.title || candidate.summary, 120) || '业务事项',
-      library: route.library || 'business', created_at: now, updated_at: now,
+      library: route.library, created_at: now, updated_at: now,
       category: route.directory_category, item_type: candidate.item_type,
       summary: clean(candidate.summary, 8000), evidence: candidate.evidence,
       owner_source_id: sourceId, source_document_ids: [sourceId],
@@ -310,7 +317,7 @@ function buildRecords(input, settings) {
       schema_version: '1.0', record_kind: 'company_knowledge', record_id: knowledgeId,
       title: clean(candidate.title || candidate.summary, 120) || '公司知识',
       library: 'business', created_at: now, updated_at: now,
-      category: input.companyKnowledgeCategory || 'terminology_general_knowledge',
+      category: input.companyKnowledgeCategory || route.directory_category,
       summary: clean(candidate.summary, 8000), evidence: candidate.evidence,
       reuse_status: 'approved', owner_source_id: sourceId, source_document_ids: [sourceId],
       requested_relations: [{ type: 'derived_from', target_id: sourceId }]

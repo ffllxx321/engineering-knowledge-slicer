@@ -119,6 +119,12 @@ async function main() {
   harness = runtime(oldPack({ 'legacy/pack/schemas/block-v0.schema.json': customBlock }));
   const customContracts = await harness.plugin.loadRuntimeContracts();
   assert.strictEqual(customContracts.schemas.blockV0.custom_wins, true);
+  const difference = globalThis.__eksDiag.state.events
+    .map((event) => event.data)
+    .find((event) => event.relativePath === 'schemas/block-v0.schema.json' && event.effectiveSource);
+  assert.strictEqual(difference.differs, true);
+  assert.strictEqual(difference.replacementApplied, false);
+  assert.match(difference.effectiveHash, /^[a-f0-9]{64}$/);
 
   harness = runtime(oldPack({ 'legacy/pack/schemas/block-v0.schema.json': '{malformed' }));
   await assert.rejects(() => harness.plugin.loadRuntimeContracts(),

@@ -4,6 +4,7 @@ const { loadBundleModule } = require('./load-bundle-module');
 const block = loadBundleModule('src/core/block-v0.js', { crypto });
 const parser = loadBundleModule('src/core/document-parser.js', {
   crypto,
+  'src/core/block-v0.js': block,
   'src/core/provenance.js': { normalizeLegacyArtifact: (markdown, pages) => ({ markdown, pages, spans: [], provenance_version: '1.0' }) }
 });
 

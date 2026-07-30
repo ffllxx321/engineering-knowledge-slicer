@@ -1536,22 +1536,33 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         current.review_atom_ids = workflow.review.map((item) => item.atom_id);
       }
       if (workflow.accepted.length && !structuredWriteMode) await this.rebuildKnowledgeIndexes();
-      if (!workflow.accepted.length && !workflow.review.length && !workflow.hardRejected.length
-        && !(workflow.metrics?.hardRejected > 0)) {
-        // v2.8.1: 错误信息带上下文计数，告诉用户去 diag.log 看哪几个事件
-        const pointCount = (workflow.summary && Array.isArray(workflow.summary.key_points)) ? workflow.summary.key_points.length : 0;
-        const atomCount = (workflow.atomResult && Array.isArray(workflow.atomResult.atoms)) ? workflow.atomResult.atoms.length : 0;
-        throw new Error(`MiniMax 未生成任何可用知识原子（总结含 ${pointCount} 个知识点，原子化产出 ${atomCount} 个原子）。请查看诊断日志中的 summary.merged / atomization.batch / atomization.normalize 事件定位丢点位置后重试。`);
-      }
-
-      current.status = workflow.review.length || structuredHandlingGroups.length ? 'needs_review' : 'written';
+      const structuredWrites = Number(structured.commit?.writes_performed
+        ?? structured.plan?.writes_performed ?? 0);
+      const persistedCount = current.written_card_ids.length + structuredWrites;
+      const generatedCount = Number(workflow.metrics?.generated ?? workflow.atomResult?.atoms?.length ?? 0);
+      const hardRejectedCount = Number(workflow.metrics?.hardRejected ?? workflow.hardRejected?.length ?? 0);
+      current.terminal_outcome = persistedCount > 0
+        ? 'completed_with_output'
+        : (workflow.review.length || structuredHandlingGroups.length ? 'needs_attention' : 'completed_no_output');
+      current.status = persistedCount > 0
+        ? (workflow.review.length || structuredHandlingGroups.length ? 'needs_review' : 'written')
+        : 'completed_no_output';
+      current.result_counts = {
+        generated: generatedCount,
+        written: persistedCount,
+        review: workflow.review.length,
+        hard_rejected: hardRejectedCount,
+        structured_commits: structuredWrites
+      };
       delete current.regeneration_mode;
       current.updated_at = new Date().toISOString();
       current.progress = {
         stage: 'complete',
-        message: structured.plan?.summary
-          ? `结构化处理完成：${structured.plan.summary}`
-          : `处理完成：自动入库 ${workflow.accepted.length} 张，异常 ${workflow.review.length} 项`,
+        message: persistedCount === 0
+          ? `处理完成但未写入：生成 ${generatedCount}，写入 0，硬拒绝 ${hardRejectedCount}。请查看按根因分组的诊断并修复来源解析/证据定位后重试。`
+          : (structured.plan?.summary
+            ? `结构化处理完成：${structured.plan.summary}`
+            : `处理完成：写入 ${persistedCount} 张，异常 ${workflow.review.length} 项`),
         elapsedMs: Date.now() - startedAt,
         at: current.updated_at
       };
@@ -2249,6 +2260,19 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const text = await this.app.vault.read(file);
     this.componentCache.set(path, { fingerprint, text });
     diag('component.cacheMiss', { relativePath: normalizedRelative, reason: 'read' });
+    const builtIn = builtInInfrastructureSchema(normalizedRelative);
+    if (builtIn) {
+      const installedHash = require('crypto').createHash('sha256').update(text).digest('hex');
+      diag('component.schemaDifference', {
+        relativePath: normalizedRelative,
+        effectiveSource: 'installed-component-pack',
+        effectiveHash: installedHash,
+        builtInVersion: builtIn.version,
+        builtInHash: builtIn.hash,
+        differs: installedHash !== builtIn.hash,
+        replacementApplied: false
+      });
+    }
     return text;
   }
 
@@ -2650,8 +2674,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       '08-人才能力库': 'talent_experts', '09-政府申请（报批报建）': 'company_systems_processes'
     };
     if (!metadata.directory_category) {
-      metadata.directory_category = legacyCategoryMap[workflow.route?.folder_type]
-        || (routeLibrary === 'active_tender' ? 'project_overview' : 'terminology_general_knowledge');
+      const mapped = legacyCategoryMap[workflow.route?.folder_type];
+      const activeCategories = new Set(ACTIVE_TENDER_CATEGORIES.map((entry) => entry.key));
+      const businessCategories = new Set(BUSINESS_CATEGORIES.map((entry) => entry.key));
+      const compatible = routeLibrary === 'active_tender' ? activeCategories.has(mapped)
+        : routeLibrary === 'business' ? businessCategories.has(mapped) : false;
+      if (mapped && compatible) metadata.directory_category = mapped;
     }
     if (!metadata.document_role) metadata.document_role = 'source_record';
     const document = {
@@ -4271,7 +4299,7 @@ class SlicerDashboardView extends ItemView {
         button(actions, '移除', () => this.plugin.dismissTask(task.task_id));
       }
     }
-    const reviewTasks = tasks.filter((task) => task.status === 'needs_review' && task.artifacts?.review);
+    const reviewTasks = tasks.filter((task) => ['needs_review', 'completed_no_output'].includes(task.status) && task.artifacts?.review);
     if (!reviewTasks.length) {
       if (!failedTasks.length) {
         parent.createDiv({ cls: 'eks-empty', text: '暂无异常项。可信结果会自动入库，不需要逐条审核。' });
@@ -4305,6 +4333,17 @@ class SlicerDashboardView extends ItemView {
       const originalCandidates = Number(taskMetrics.stageCardinalities?.atom_candidates)
         || Number(taskMetrics.candidateCards || 0) + Number(taskMetrics.merged || 0) + Number(taskMetrics.hardRejected || 0);
       documentSummary.createDiv({ text: `原始候选 ${originalCandidates} → 归并后 ${taskMetrics.stageCardinalities?.consolidated ?? taskMetrics.candidateCards} → 自动通过 ${taskMetrics.autoApproved} · 定向审核 ${taskMetrics.reviewPending} · 拒绝 ${taskMetrics.hardRejected || 0} · 合并 ${taskMetrics.merged || 0}` });
+      if (Array.isArray(artifact.rejected) && artifact.rejected.length) {
+        const grouped = {};
+        for (const item of artifact.rejected) {
+          const code = String(item?.reason_codes?.[0] || 'UNKNOWN_HARD_REJECT');
+          grouped[code] = (grouped[code] || 0) + 1;
+        }
+        documentSummary.createDiv({
+          cls: 'eks-review-reason',
+          text: `硬拒绝（无需逐条人工审核）：${Object.entries(grouped).map(([code, count]) => `${code} ${count}`).join('；')}。建议先修复来源解析或证据定位，再从检查点重试。`
+        });
+      }
       for (const group of groupReviewItems(artifact.items)) {
         const block = parent.createDiv('eks-review-group');
         const header = block.createDiv('eks-review-group-header');
@@ -7390,7 +7429,9 @@ function serializeRecord(record) {
 }
 
 function routeRecord(record, route, registryEntry, settings) {
-  const category = safeSegment(route.directory_category || record.category || 'project_overview');
+  const categoryValue = route.directory_category || record.category;
+  if (!categoryValue) throw new Error('结构化路由分类未确定，禁止使用默认目录');
+  const category = safeSegment(categoryValue);
   if (record.library === 'active_tender') {
     if (!registryEntry) throw new Error('在办库记录缺少唯一项目登记');
     return joinPath(settings.activeRoot, safeSegment(registryEntry.project_id), category,
@@ -7457,6 +7498,11 @@ function buildRecords(input, settings) {
   const phase3 = input.phase3Result || {};
   const document = input.document || {};
   const route = phase2.route || {};
+  const categories = route.library === 'active_tender' ? ACTIVE_TENDER_CATEGORIES
+    : route.library === 'business' ? BUSINESS_CATEGORIES : null;
+  if (!categories || !categories.some((entry) => entry.key === route.directory_category)) {
+    throw Object.assign(new Error('结构化路由缺少明确且类型兼容的两库分类'), { code: 'STRUCTURED_ROUTE_UNRESOLVED' });
+  }
   const registryMatches = (input.projectRegistry || []).filter((entry) => entry.project_id === route.project_id);
   if (route.project_id && registryMatches.length !== 1) throw new Error('项目路由不是登记表中的唯一精确匹配');
   const registry = registryMatches[0];
@@ -7466,7 +7512,7 @@ function buildRecords(input, settings) {
   const source = {
     schema_version: '1.0', record_kind: 'source_document', record_id: sourceId,
     title: clean(document.title || document.filename || '来源文档', 300),
-    library: route.library || 'business', created_at: now, updated_at: now,
+    library: route.library, created_at: now, updated_at: now,
     source_path: clean(document.source_path, 800), source_hash: sourceHash,
     source_version: clean(document.source_version || document.metadata?.version_label, 100),
     media_type: clean(document.media_type || document.source_type, 100),
@@ -7502,7 +7548,7 @@ function buildRecords(input, settings) {
     const item = {
       schema_version: '1.0', record_kind: 'business_item', record_id: itemId,
       title: clean(candidate.title || candidate.summary, 120) || '业务事项',
-      library: route.library || 'business', created_at: now, updated_at: now,
+      library: route.library, created_at: now, updated_at: now,
       category: route.directory_category, item_type: candidate.item_type,
       summary: clean(candidate.summary, 8000), evidence: candidate.evidence,
       owner_source_id: sourceId, source_document_ids: [sourceId],
@@ -7523,7 +7569,7 @@ function buildRecords(input, settings) {
       schema_version: '1.0', record_kind: 'company_knowledge', record_id: knowledgeId,
       title: clean(candidate.title || candidate.summary, 120) || '公司知识',
       library: 'business', created_at: now, updated_at: now,
-      category: input.companyKnowledgeCategory || 'terminology_general_knowledge',
+      category: input.companyKnowledgeCategory || route.directory_category,
       summary: clean(candidate.summary, 8000), evidence: candidate.evidence,
       reuse_status: 'approved', owner_source_id: sourceId, source_document_ids: [sourceId],
       requested_relations: [{ type: 'derived_from', target_id: sourceId }]
@@ -7808,7 +7854,7 @@ const TASK_STATUSES = new Set([
   'classifying', 'classified', 'summarizing', 'summarized', 'atomizing',
   'validating', 'writing', 'written', 'paused', 'cancelled', 'failed',
   'needs_review', 'needs_ocr', 'skipped', 'unsupported', 'unsupported_media',
-  'archived', 'rolled_back'
+  'archived', 'rolled_back', 'completed_no_output'
 ]);
 const PROCESSING_STATUSES = new Set(['extracting', 'parsing', 'slicing', 'classifying', 'summarizing', 'atomizing', 'validating', 'writing']);
 
@@ -12178,7 +12224,7 @@ module.exports = {
 const crypto = require("crypto");
 
 const LEGACY_ACTIVE = new Set(['extracting', 'parsing', 'classifying', 'summarizing', 'slicing', 'atomizing', 'validating', 'writing']);
-const VALID_TERMINAL = new Set(['queued', 'written', 'needs_review', 'needs_ocr', 'failed', 'skipped', 'cancelled', 'unsupported', 'unsupported_media', 'paused', 'rolled_back']);
+const VALID_TERMINAL = new Set(['queued', 'written', 'needs_review', 'completed_no_output', 'needs_ocr', 'failed', 'skipped', 'cancelled', 'unsupported', 'unsupported_media', 'paused', 'rolled_back']);
 
 // v1.1.3: bundle 内每个模块都是独立作用域，main.js 顶层定义进不来。
 // 这里保留一份与主定义完全一致的局部副本，专门给 migrateTaskLedgerV3 用。
@@ -12491,48 +12537,48 @@ function reconcileEvidence(parsePackage, quote, hint = {}) {
       });
       exact.label = locatorLabel(exact.locator);
     }
-    return Object.assign({ method: 'exact', repaired: false, quote: verbatim }, exact);
+    const repaired = verbatim !== String(quote || '');
+    return Object.assign({ method: repaired ? 'normalized-contiguous' : 'exact', repaired, quote: verbatim }, exact);
   }
-  const query = comparable(quote);
-  if (query.length < 4) return Object.assign({ attempted: true }, exact);
+  const query = normalizeEvidenceWithMap(quote).text;
+  if (query.length < 2) return Object.assign({ attempted: true }, exact);
   const indexed = Object.values(parsePackage?.evidence_index || {});
   const entries = (indexed.length ? indexed : (parsePackage?.blocks || []).map((block) => ({
     block_id: block.block_id, locator: block.locator, raw_text: block.raw?.text || block.text,
     card_eligible: block.card_eligible
   }))).filter((entry) => entry.card_eligible !== false && String(entry.raw_text || '').trim())
-    .flatMap((entry) => {
-      const rows = String(entry.raw_text).split(/\n/).map((row) => row.trim()).filter(Boolean);
-      return rows.length > 1 ? [entry, ...rows.map((row) => Object.assign({}, entry, { raw_text: row }))] : [entry];
-    });
-  const queryFacts = factSet(query);
-  const ranked = entries.map((entry) => {
-    const candidate = comparable(evidenceSearchText(entry, parsePackage));
-    const token = dice(tokenSet(query), tokenSet(candidate));
-    const chars = dice(grams(query), grams(candidate));
-    const numeric = queryFacts.size ? subset(queryFacts, factSet(candidate)) : 1;
-    const structural = hint.block_id && String(hint.block_id) === String(entry.block_id) ? 0.08
-      : (positiveInteger(hint.page) && positiveInteger(entry.locator?.page) === positiveInteger(hint.page) ? 0.04 : 0);
-    return { entry, token, chars, numeric, score: Math.min(1, 0.48 * chars + 0.36 * token + 0.16 * numeric + structural) };
-  }).sort((a, b) => b.score - a.score || String(a.entry.block_id).localeCompare(String(b.entry.block_id)));
-  const winner = ranked[0];
-  const runner = winner && ranked.find((item) => String(item.entry.block_id) !== String(winner.entry.block_id));
-  const margin = winner ? winner.score - (runner?.score || 0) : 0;
-  if (!winner || winner.score < 0.72 || margin < 0.08 || winner.numeric < 1 || (winner.token < 0.45 && winner.chars < 0.58)) {
-    return { ok: false, attempted: true, reason: winner && margin < 0.08 ? 'ambiguous_alignment' : 'alignment_below_threshold',
-      candidate_count: ranked.length, best_score: round3(winner?.score), margin: round3(margin) };
+    .filter((entry) => !hint.block_id || String(entry.block_id) === String(hint.block_id));
+  const matches = [];
+  for (const entry of entries) {
+    const raw = String(entry.raw_text || '');
+    const normalized = normalizeEvidenceWithMap(raw);
+    for (const start of allIndexes(normalized.text, query)) {
+      const rawStart = normalized.map[start];
+      const rawEnd = (normalized.map[start + query.length - 1] ?? rawStart) + 1;
+      if (Number.isInteger(rawStart) && rawEnd > rawStart) {
+        matches.push({ entry, rawStart, rawEnd, quote: raw.slice(rawStart, rawEnd) });
+      }
+    }
   }
-  const raw = String(winner.entry.raw_text || '').trim();
-  const excerpts = raw.split(/(?<=[。！？!?；;\n])|\s{2,}/).map((value) => value.trim()).filter(Boolean);
-  const quoteResult = (excerpts.length ? excerpts : [raw]).map((value) => ({
-    value, score: dice(grams(comparable(value)), grams(query))
-  })).sort((a, b) => b.score - a.score || a.value.length - b.value.length)[0];
-  const verbatim = quoteResult?.value?.slice(0, 800) || '';
-  const direct = resolveEvidence(parsePackage, verbatim, { page: winner.entry.locator?.page });
-  if (!verbatim || !direct.ok) return { ok: false, attempted: true, reason: 'alignment_locator_missing' };
-  direct.locator.block_id = winner.entry.block_id || direct.locator.block_id;
-  direct.locator.precision = 'block-exact';
-  return Object.assign({}, direct, { quote: verbatim, repaired: true, attempted: true, method: 'local-alignment',
-    score: round3(winner.score), margin: round3(margin), context: evidenceContext(winner.entry, parsePackage) });
+  if (!matches.length) return { ok: false, attempted: true, reason: 'quote_not_found', candidate_count: entries.length };
+  if (matches.length !== 1) return { ok: false, attempted: true, reason: 'ambiguous_quote', matches: matches.length };
+  const winner = matches[0];
+  const entryLocator = winner.entry.locator && typeof winner.entry.locator === 'object' ? winner.entry.locator : null;
+  if (!entryLocator || !entryLocator.scheme || typeof entryLocator.value !== 'string') {
+    return { ok: false, attempted: true, reason: 'locator_missing' };
+  }
+  const locator = Object.assign({}, entryLocator, {
+    block_id: winner.entry.block_id,
+    precision: 'block-exact',
+    block_text_start: winner.rawStart,
+    block_text_end: winner.rawEnd,
+    quote_hash: hashText(normalizeText(winner.quote))
+  });
+  return {
+    ok: true, quote: winner.quote, locator, label: locatorLabel(locator),
+    repaired: true, attempted: true, method: 'normalized-contiguous',
+    context: evidenceContext(winner.entry, parsePackage)
+  };
 }
 function evidenceContext(entry, parsePackage) {
   const block = (parsePackage?.blocks || []).find((item) => String(item.block_id) === String(entry.block_id)) || {};
@@ -12602,6 +12648,20 @@ function normalizeWithMap(value) {
   return { text: text.trim(), map };
 }
 
+function normalizeEvidenceWithMap(value) {
+  const source = String(value || '');
+  let text = '';
+  const map = [];
+  for (let index = 0; index < source.length; index += 1) {
+    for (const char of source[index].normalize('NFKC')) {
+      if (/\s/u.test(char)) continue;
+      text += char;
+      map.push(index);
+    }
+  }
+  return { text, map };
+}
+
 function normalizeText(value) { return String(value || '').normalize('NFKC').replace(/\s+/gu, ' ').trim(); }
 function allIndexes(haystack, needle) {
   const out = [];
@@ -12635,6 +12695,7 @@ module.exports = {
 "src/core/document-parser.js": function(require, module, exports) {
 const crypto = require("crypto");
 const { normalizeLegacyArtifact } = require("src/core/provenance.js");
+const { createBlock } = require("src/core/block-v0.js");
 
 const MAX_MINERU_FILE_BYTES = 200 * 1024 * 1024;
 
@@ -12669,7 +12730,28 @@ function createParsePackage(options) {
     : isOcr ? normalizeLegacyArtifact(options.markdown, options.pages, normalizeParser(options.parser)) : null;
   const markdown = String(artifact?.markdown ?? options.markdown ?? '').trim();
   const quality = markdownQuality(markdown);
-  const blocks = Array.isArray(options.blocks) ? options.blocks : [];
+  const sourceHash = crypto.createHash('sha256').update(options.buffer || Buffer.alloc(0)).digest('hex');
+  let blocks = Array.isArray(options.blocks) ? options.blocks.filter(Boolean) : [];
+  // Every parser crosses the same block-v0 boundary before any AI work. Remote
+  // markdown-only parsers do not get invented page metadata: page locators are
+  // emitted only when the parser supplied page text.
+  if (!blocks.length && markdown) {
+    const suppliedPages = Array.isArray(artifact?.pages) ? artifact.pages : [];
+    const textPages = suppliedPages.filter((page) => positivePage(page?.page) && typeof page?.text === 'string' && page.text.trim());
+    if (textPages.length) {
+      blocks = textPages.map((page, index) => createBlock({
+        source_hash: sourceHash, order: index, kind: 'page-text', raw_text: page.text,
+        locator: { scheme: 'page', value: String(page.page), page: positivePage(page.page) },
+        parse_method: normalizeParser(options.parser), metadata: { generated_fallback: true }
+      }));
+    } else {
+      blocks = [createBlock({
+        source_hash: sourceHash, order: 0, kind: 'parsed-markdown', raw_text: markdown,
+        locator: { scheme: 'parsed-text-span', value: `chars:0-${markdown.length}`, text_start: 0, text_end: markdown.length },
+        parse_method: normalizeParser(options.parser), metadata: { generated_fallback: true, page_claimed: false }
+      })];
+    }
+  }
   const evidenceIndex = Object.fromEntries(blocks
     .filter((block) => block?.block_id && block?.locator && String(block?.raw?.text || '').trim())
     .map((block) => [block.block_id, {
@@ -12680,7 +12762,7 @@ function createParsePackage(options) {
     }]));
   return {
     source_path: String(options.sourcePath || '').replace(/\\/g, '/'),
-    source_hash: crypto.createHash('sha256').update(options.buffer || Buffer.alloc(0)).digest('hex'),
+    source_hash: sourceHash,
     source_type: options.sourceType || 'unknown',
     parser: normalizeParser(options.parser),
     parser_model: options.parserModel || '',
@@ -12703,6 +12785,11 @@ function createParsePackage(options) {
     evidence_index_version: 'block-evidence-v1',
     schema_version: '1.1'
   };
+}
+
+function positivePage(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : 0;
 }
 
 function normalizeParser(parser) {
@@ -13031,7 +13118,7 @@ module.exports = { validateSchema };
  */
 "src/core/ai-pipeline.js": function(require, module, exports) {
 const { validateSchema } = require("src/core/schema-validator.js");
-const { resolveEvidence, verifyLocator } = require("src/core/provenance.js");
+const { reconcileEvidence, resolveEvidence, verifyLocator } = require("src/core/provenance.js");
 
 // v1.1.9: ai-pipeline.js 是独立 bundle 模块闭包，main.js 里的本地 function diag 对它不可见。
 // 通过 globalThis.__eksDiag 委托到唯一的诊断入口，确保 minimax.timeout/transport/http 等
@@ -13719,7 +13806,10 @@ async function summarizeDocument(options) {
       onProgress: options.onProgress,
       context: { chunk, chunkIndex: index + 1, chunkTotal: chunks.length },
       normalizeValue: (value) => normalizeSummaryMap(value, options, chunk),
-      extraValidation: (value) => exactCoverage(value.coverage, 'chunk_ids', [chunk.chunk_id], '总结分块覆盖不完整')
+      extraValidation: (value) => [
+        ...exactCoverage(value.coverage, 'chunk_ids', [chunk.chunk_id], '总结分块覆盖不完整'),
+        ...summaryEvidenceErrors(value, options.parsePackage)
+      ]
     });
     if (typeof options.saveSummaryMapChunk === 'function') {
       await options.saveSummaryMapChunk(chunk, partials[index]);
@@ -13811,15 +13901,12 @@ function normalizeSummaryMap(value, options, chunk) {
       .map(function(line) { return line.replace(/^#{1,6}\s+/, '').trim(); })
       .filter(Boolean)
       .join(' > ');
-    var fallbackLocator = breadcrumbPath
-      || ((chunk.headings && chunk.headings.length) ? chunk.headings[0] : chunk.chunk_id);
-    var fallbackQuote = safeSlice(String(chunk.markdown || ''), 0, 200).replace(/\n/g, ' ').trim() || fallbackLocator;
     result.evidence = result.evidence.map(function(item, index) {
       if (!item || typeof item !== 'object') return item;
       var normalized = Object.assign({}, item, {
         evidence_id: item.evidence_id || ('evidence-' + (index + 1)),
-        locator: item.locator || fallbackLocator,
-        quote: item.quote || fallbackQuote
+        locator: item.locator || '',
+        quote: item.quote || ''
       });
       if (Object.keys(options.parsePackage?.evidence_index || {}).length) {
         normalized = reconcileBlockEvidence(options.parsePackage, normalized);
@@ -13851,25 +13938,40 @@ function reconcileBlockEvidence(parsePackage, item) {
   const index = parsePackage?.evidence_index || {};
   const requestedId = String(item.block_id || item.provenance?.block_id || '');
   const quote = String(item.quote || '').trim();
-  let entry = requestedId ? index[requestedId] : null;
-  if (!entry && quote) {
-    const matches = Object.values(index).filter((candidate) =>
-      candidate.card_eligible !== false && String(candidate.raw_text || '').includes(quote));
-    if (matches.length === 1) entry = matches[0];
-  }
-  if (!entry || entry.card_eligible === false || !quote || !String(entry.raw_text || '').includes(quote)) {
+  const repaired = reconcileEvidence(parsePackage, quote, requestedId ? { block_id: requestedId } : {});
+  const entry = repaired.ok ? index[repaired.locator.block_id] : null;
+  if (!entry || entry.card_eligible === false || !repaired.ok) {
     return Object.assign({}, item, {
       locator: '', block_id: requestedId || '',
-      provenance_resolution: { ok: false, reason: 'BLOCK_EVIDENCE_UNVERIFIED' }
+      provenance_resolution: { ok: false, reason: repaired.reason || 'BLOCK_EVIDENCE_UNVERIFIED' }
     });
   }
   return Object.assign({}, item, {
+    quote: repaired.quote,
     block_id: entry.block_id,
     locator: `${entry.locator.scheme}:${entry.locator.value}`,
-    provenance: Object.assign({}, entry.locator, { block_id: entry.block_id, precision: 'block-exact' }),
+    provenance: repaired.locator,
     locator_precision: 'block-exact',
-    provenance_resolution: { ok: true }
+    provenance_resolution: { ok: true, method: repaired.repaired ? 'reconciled' : 'exact' }
   });
+}
+
+function summaryEvidenceErrors(summary) {
+  const evidence = Array.isArray(summary?.evidence) ? summary.evidence : [];
+  const byId = new Map(evidence.map((item) => [String(item?.evidence_id || ''), item]));
+  const errors = [];
+  for (const item of evidence) {
+    if (!item?.provenance_resolution?.ok || !item?.provenance?.block_id || !item?.quote) {
+      errors.push(`证据 ${item?.evidence_id || 'unknown'} 缺少唯一来源块的逐字引文与定位`);
+    }
+  }
+  for (const point of summary?.key_points || []) {
+    const ids = Array.isArray(point?.evidence_ids) ? point.evidence_ids.map(String) : [];
+    if (!ids.length || ids.some((id) => !byId.get(id)?.provenance_resolution?.ok)) {
+      errors.push(`知识点 ${point?.point_id || 'unknown'} 缺少已验证证据归属`);
+    }
+  }
+  return errors;
 }
 
 function mergeStructuredSummaries(partials, chunkIds, schema) {
@@ -13915,13 +14017,12 @@ function mergeStructuredSummaries(partials, chunkIds, schema) {
     schema_version: '1.1'
   });
   if (Array.isArray(merged.evidence)) {
-    var fbTitle = first.document_title || '文档内容';
     merged.evidence = merged.evidence.map(function(item, index) {
       if (!item || typeof item !== 'object') return item;
       return Object.assign({}, item, {
         evidence_id: item.evidence_id || ('evidence-' + (index + 1)),
-        locator: item.locator || fbTitle,
-        quote: item.quote || fbTitle
+        locator: item.locator || '',
+        quote: item.quote || ''
       });
     });
   }
@@ -14055,7 +14156,10 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
           onProgress: options.onProgress,
           context: { chunkIds, partialCount: group.length, reduceRound: round, reduceGroup: groupIndex + 1, reduceGroupTotal: groups.length },
           normalizeValue: (value) => normalizeSummaryReduce(value, chunkIds, options.parsePackage),
-          extraValidation: (value) => exactCoverage(value.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整')
+          extraValidation: (value) => [
+            ...exactCoverage(value.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整'),
+            ...summaryEvidenceErrors(value)
+          ]
         });
       } catch (error) {
         if (error?.code !== 'AI_OUTPUT_TRUNCATED') throw error;
@@ -14393,15 +14497,10 @@ function normalizeAtomBatch(value, summary, pointIds) {
     matched.forEach((pointId) => covered.add(pointId));
   }
 
-  // 批量输出最常见的失败形态是“原子数量正确、顺序正确，但漏写 point_ids”。
-  // 只对尚未归属的原子按剩余 point 顺序补齐；显式写错的原子不会进入这里。
-  const remainingPointIds = pointIds.filter((pointId) => !covered.has(pointId));
-  if (unassigned.length === remainingPointIds.length) {
-    unassigned.forEach((atom, index) => assigned.push({ atom, pointIds: [remainingPointIds[index]] }));
-  } else if (pointIds.length === 1 && unassigned.length) {
-    unassigned.forEach((atom) => assigned.push({ atom, pointIds: [pointIds[0]] }));
-  }
-  droppedNoPoint = Math.max(0, unassigned.length - remainingPointIds.length);
+  // Never infer attribution from provider array order. Missing point_ids is a
+  // contract error and receives the single bounded repair already provided by
+  // requestWithContract. If repair still fails, the batch remains unresolved.
+  droppedNoPoint = unassigned.length;
 
   const keptAtoms = assigned.map(({ atom, pointIds: attributedIds }) => {
     const attributedPoints = attributedIds.map((pointId) => points.get(pointId)).filter(Boolean);
@@ -14412,11 +14511,11 @@ function normalizeAtomBatch(value, summary, pointIds) {
       content: Object.assign({}, atom.content || {}, { point_ids: [...new Set(attributedIds)] }),
       source: Object.assign({}, atom.source || {}, {
         source_link: '[[source]]',
-        source_locator: evidenceItem.locator || attributedIds.join(','),
+        source_locator: evidenceItem.locator || '',
         source_page: evidenceItem.source_page || evidenceItem.provenance?.page || '',
         source_provenance: evidenceItem.provenance || null,
         locator_precision: evidenceItem.locator_precision || evidenceItem.provenance?.precision || '',
-        evidence_quote: evidenceItem.quote || attributedPoints.map((point) => point.content).join('；'),
+        evidence_quote: evidenceItem.quote || '',
         evidence_ids: evidenceItems.map((item) => item.evidence_id).filter(Boolean),
         parent_summary: '[[summary]]'
       })
@@ -16150,6 +16249,7 @@ async function runKnowledgeWorkflow(options) {
   const noEligibleSourceBlocks = Array.isArray(options.parsePackage.blocks) && options.parsePackage.blocks.length > 0
     && !options.parsePackage.blocks.some((block) => block?.card_eligible === true && String(block?.raw?.text || '').trim());
   const provenanceDiagnostics = {};
+  const evidenceReconciliationMetrics = { exact: 0, reconciled: 0, ambiguous: 0, not_found: 0, missing_locator: 0 };
   for (const atom of atomResult.atoms || []) {
     atom.source = Object.assign({}, atom.source || {}, {
       source_link: `[[${options.parsePackage.source_path}]]`
@@ -16160,6 +16260,15 @@ async function runKnowledgeWorkflow(options) {
     atom.source.evidence_repair = alignment.ok
       ? { attempted: true, repaired: !!alignment.repaired, method: alignment.method, score: alignment.score, margin: alignment.margin }
       : { attempted: true, repaired: false, reason: alignment.reason, best_score: alignment.best_score, margin: alignment.margin };
+    if (alignment.ok) {
+      evidenceReconciliationMetrics[alignment.repaired ? 'reconciled' : 'exact'] += 1;
+    } else if (/ambiguous/.test(String(alignment.reason))) {
+      evidenceReconciliationMetrics.ambiguous += 1;
+    } else if (/locator_missing/.test(String(alignment.reason))) {
+      evidenceReconciliationMetrics.missing_locator += 1;
+    } else {
+      evidenceReconciliationMetrics.not_found += 1;
+    }
     if (alignment.ok) {
       atom.source.evidence_quote = alignment.quote;
       atom.source.source_provenance = alignment.locator;
@@ -16308,6 +16417,7 @@ async function runKnowledgeWorkflow(options) {
       reasons: provenanceDiagnostics
     });
   }
+  workflowDiag('provenance.reconciliation', evidenceReconciliationMetrics);
   // v2.8.1: 工作流最终产出诊断——accepted/review 全空时，这条日志直接说明原子在哪一步丢的
   workflowDiag('workflow.result', {
     title: summary && summary.document_title,
@@ -16603,7 +16713,7 @@ function pipelineProgress(task, progress = task?.progress || {}) {
   const fraction = total > 0 ? Math.max(0, Math.min(1, done / total)) : 0;
   const calculated = (STAGE_BASE[stage] || 0) + (STAGE_SPAN[stage] || 0) * fraction;
   const previous = Number(progress.completedWork ?? task?.progress?.completedWork) || 0;
-  const durable = ['written', 'needs_review'].includes(task?.status) && stage === 'complete';
+  const durable = ['written', 'needs_review', 'completed_no_output'].includes(task?.status) && stage === 'complete';
   return { completedWork: durable ? 100 : Math.min(99, Math.max(previous, calculated)), durable };
 }
 
@@ -16628,12 +16738,13 @@ module.exports = { explainIssue, pipelineProgress, queuePosition };
  */
 "src/core/completion-ui.js": function(require, module, exports) {
 const { PROCESSING_STATUSES: PROCESSING } = require("src/core/task.js");
-const TERMINAL = new Set(['written', 'needs_review', 'needs_ocr', 'skipped', 'unsupported', 'unsupported_media', 'cancelled', 'rolled_back']);
+const TERMINAL = new Set(['written', 'needs_review', 'completed_no_output', 'needs_ocr', 'skipped', 'unsupported', 'unsupported_media', 'cancelled', 'rolled_back']);
 
 function pendingReviewCount(tasks) {
   return (tasks || []).reduce((sum, task) => {
-    if (task.status !== 'needs_review') return sum;
-    return sum + (Array.isArray(task.review_atom_ids) ? task.review_atom_ids.length : 0);
+    if (!['needs_review', 'completed_no_output'].includes(task.status)) return sum;
+    const pending = Array.isArray(task.review_atom_ids) ? task.review_atom_ids.length : 0;
+    return sum + (pending || (task.status === 'completed_no_output' ? 1 : 0));
   }, 0);
 }
 

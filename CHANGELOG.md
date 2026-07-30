@@ -1082,6 +1082,17 @@ v1.1.8 给出三件东西：
 - 语义设置、缓存和索引签名与解析/OCR/AI 原子 checkpoint 完全分离；升级、清空或改变模型/维度不会使既有摄取检查点失效。
 # 未发布
 
+- 修复跨解析器 provenance 断链：所有 Markdown-only/PDF/OCR/OOXML/邮件输入在 AI 前均具有稳定
+  `block_v0`、原文与真实 locator；未提供页码/行号的解析器不会被补造定位。
+- summary map/reduce 与 atom batch 攓约改为“逐字引文 + block_id + locator”；删除标题、摘要文本和
+  数组顺序补证据/补归因。仅允许单个合格块内的空白、全半角与安全 OCR 换行规范化回填，歧义和跨块
+  匹配继续失败关闭；新增 exact/reconciled/ambiguous/not_found/missing_locator 指标。
+- 修复结构化流继承旧目录默认值的问题：仅接受明确且类型兼容的 route/category；未知路由进入处理组，
+  不再默认项目总览或术语通用知识，legacy writer 关闭结构化模式时行为不变。
+- 新增 `completed_no_output` 兼容终态。处理完成但写入为 0 时不再显示“入库成功”，文档结果显示生成、
+  写入、硬拒绝和按根因分组的下一步；旧 ledger 仍可读取。
+- 内置 block-v0/parse-package fallback 保持非破坏性：继续报告有效内置版本、哈希、缺失/差异原因，
+  不覆盖用户自定义组件包。
 - 新增默认关闭的 Phase 3 影子审核闸：正常条目自动通过，轻微问题仅提示，只有项目归属冲突、
   关键金额/日期/单位/状态矛盾、证据缺失或不可核验、来源不支持的模型事实、公司通用知识提升
   才要求人工处理；不使用统一置信度门槛。

@@ -37,7 +37,7 @@ for (const [sourceType, kind] of [['docx', 'paragraph'], ['xlsx', 'table_cell'],
   assert.equal(summary.evidence[0].provenance.block_id, block.block_id);
   const unverifiable = ai.normalizeSummaryReduce({ evidence: [{ evidence_id: 'bad', quote: '来源中不存在的证据', block_id: block.block_id }],
     coverage: { chunk_ids: ['c1'], complete: true } }, ['c1'], parsePackage);
-  assert.equal(unverifiable.evidence[0].provenance_resolution.reason, 'BLOCK_EVIDENCE_UNVERIFIED');
+  assert.equal(unverifiable.evidence[0].provenance_resolution.reason, 'quote_not_found');
   assert.equal(unverifiable.evidence[0].locator, '');
   const atoms = ai.normalizeAtomBatch({ atoms: [{ atom_id: `a-${sourceType}`, title: `${sourceType} 证据`, library: 'business', folder_type: 'project',
     content: { statement: raw, point_ids: ['p1'] }, source: {}, model_confidence: 1 }], coverage: { point_ids: ['p1'], complete: true } },

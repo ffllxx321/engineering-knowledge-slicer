@@ -35,6 +35,14 @@ assert.strictEqual(snapshot.reviewCount, 11);
 assert.strictEqual(snapshot.overallPercent, 100);
 assert.strictEqual(snapshot.activeCount, 0);
 assert.strictEqual(pendingReviewCount([reviewComplete]), 11);
+const noOutput = task({
+  status: 'completed_no_output',
+  progress: { stage: 'complete', completedWork: 100 },
+  result_counts: { generated: 42, written: 0, hard_rejected: 42 }
+});
+snapshot = completionUiSnapshot([noOutput], noOutput.task_id);
+assert.strictEqual(snapshot.reviewCount, 1);
+assert.strictEqual(snapshot.overallPercent, 100);
 
 // Terminal state always wins over a late heartbeat/progress callback.
 assert.strictEqual(shouldAcceptIncrementalProgress(reviewComplete, new Set()), false);
@@ -95,8 +103,8 @@ assert.strictEqual(snapshot.reviewCount, 2);
 // Structural regression for the durability boundary and dashboard-only navigation.
 const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 const terminalBlock = main.slice(
-  main.indexOf("current.status = workflow.review.length ? 'needs_review' : 'written';"),
-  main.indexOf("diag('performance.task'", main.indexOf("current.status = workflow.review.length ? 'needs_review' : 'written';"))
+  main.indexOf("current.terminal_outcome = persistedCount > 0"),
+  main.indexOf("diag('performance.task'", main.indexOf("current.terminal_outcome = persistedCount > 0"))
 );
 const saveAt = terminalBlock.indexOf('await this.saveTasks');
 const flushAt = terminalBlock.indexOf('await this.flushSaveTasksImmediate()');

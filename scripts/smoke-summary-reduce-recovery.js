@@ -123,9 +123,7 @@ async function testProduction8192HierarchyAndReduceCheckpointResume() {
       mapCalls += 1;
       mappedChunkIds.add(context.chunk.chunk_id);
       return summary([context.chunk.chunk_id], {
-        executive_summary: `分块 ${context.chunk.chunk_id}`,
-        key_points: [{ point_id: 'P1', content: context.chunk.chunk_id, evidence_ids: ['E1'] }],
-        evidence: [{ evidence_id: 'E1', locator: context.chunk.chunk_id, quote: context.chunk.markdown.slice(0, 20) }]
+        executive_summary: `分块 ${context.chunk.chunk_id}`
       });
     }
     reduceCalls += 1;

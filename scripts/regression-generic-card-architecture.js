@@ -66,7 +66,7 @@ const parsed = parsedFixture([
 const manual = provenance.reconcileEvidence(parsed, 'If pressure exceeds 2.5MPa, stop the pump unless the bypass valve is open.');
 assert(manual.ok && manual.quote === parsed.evidence_index.manual.raw_text);
 assert(provenance.reconcileEvidence(parsed, '検査間隔は30日とする。').ok);
-const table = provenance.reconcileEvidence(parsed, 'Item A-17 | Mass 6.0kg | Received 2026-07-20');
+const table = provenance.reconcileEvidence(parsed, 'A-17 | 6.0kg | 2026-07-20');
 assert(table.ok && table.context.table.headers.includes('Mass'));
 const email = provenance.reconcileEvidence(parsed, 'Please submit the signed record by 17:00UTC.');
 assert(email.ok && email.context.message.thread_id === 't1');

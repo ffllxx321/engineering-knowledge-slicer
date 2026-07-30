@@ -122,7 +122,8 @@ const packed = block.packBlocks(xlsx.blocks, { hardBudget: 12, softBudget: 8, to
 assert(packed.packs.every(p => p.token_count <= 12)); assert.equal(packed.metrics.locator_coverage, 1);
 async function fallbackGate() {
   const parser = loadBundleModule('src/core/document-parser.js', {
-    crypto, 'src/core/provenance.js': { normalizeLegacyArtifact: (markdown, pages) => ({ markdown, pages, spans: [], provenance_version: '1.0' }) }
+    crypto, 'src/core/block-v0.js': block,
+    'src/core/provenance.js': { normalizeLegacyArtifact: (markdown, pages) => ({ markdown, pages, spans: [], provenance_version: '1.0' }) }
   });
   let uploads = 0;
   const extractor = loadBundleModule('src/core/extractors.js', {

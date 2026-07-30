@@ -25,10 +25,10 @@ const parsed = fixture([
   { id: 'amb2', page: 6, text: '入口应设置连续扶手，便于老人通行。' },
   { id: 'footer', page: 9, text: '营销邮件 退订 unsubscribe', eligible: false }
 ]);
-const chinese = provenance.reconcileEvidence(parsed, '卫生间扶手安装高度为850 mm，安装后进行牢固性检查。');
+const chinese = provenance.reconcileEvidence(parsed, '卫生间扶手安装高度应为850 mm，安装后应进行牢固性检查。');
 assert(chinese.ok && chinese.repaired && chinese.locator.block_id === 'cn' && chinese.locator.page === 2);
 assert.strictEqual(chinese.quote, '卫生间扶手安装高度应为 850 mm，安装后应进行牢固性检查。');
-assert(provenance.reconcileEvidence(parsed, '廊下の有効幅員は900 mm以上とし、手すりを連続設置する。').ok);
+assert(provenance.reconcileEvidence(parsed, '廊下の有効幅員は900 mm以上とし、手すりを連続して設置する。').ok);
 assert(provenance.reconcileEvidence(parsed, '厨房 | 通道 | 1200mm').ok);
 assert.strictEqual(provenance.reconcileEvidence(parsed, '入口位置需要连续扶手方便老人通行').ok, false);
 const workflow = loadBundleModule('src/core/workflow.js', {

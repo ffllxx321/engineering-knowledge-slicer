@@ -2,8 +2,10 @@ const assert = require('assert');
 const crypto = require('crypto');
 const { loadBundleModule } = require('./load-bundle-module');
 const provenance = { normalizeLegacyArtifact: (markdown, pages) => ({ markdown, pages: pages || [], spans: [], provenance_version: '1.0' }) };
-const parser = loadBundleModule('src/core/document-parser.js', { crypto, 'src/core/provenance.js': provenance });
 const block = loadBundleModule('src/core/block-v0.js', { crypto });
+const parser = loadBundleModule('src/core/document-parser.js', {
+  crypto, 'src/core/provenance.js': provenance, 'src/core/block-v0.js': block
+});
 let externalCalls = 0;
 const extractors = loadBundleModule('src/core/extractors.js', {
   'src/core/document-parser.js': parser, 'src/core/block-v0.js': block,
@@ -45,7 +47,8 @@ async function run() {
   assert(email.parsePackage.blocks.some((item) => item.kind === 'email_from' && !item.card_eligible));
   const legacy = await extractors.extractTextFromBuffer('drop/legacy.txt', Buffer.from('兼容旧文本解析路径，内容足够长。'), { localTextBlockAdapter: false });
   assert.equal(legacy.parsePackage.parser, 'text-normalizer');
-  assert.equal(legacy.parsePackage.blocks.length, 0);
+  assert.equal(legacy.parsePackage.blocks.length, 1);
+  assert.equal(legacy.parsePackage.blocks[0].locator.scheme, 'parsed-text-span');
   assert.equal(externalCalls, 0);
   const migrated = loadBundleModule('src/core/task.js', { crypto, path: require('path') }).migrateSettings({ settingsVersion: 24 });
   assert.equal(migrated.settingsVersion, 29);

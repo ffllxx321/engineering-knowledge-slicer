@@ -122,7 +122,7 @@ async function main() {
   const block = loadBundleModule('src/core/block-v0.js', { crypto });
   const provenance = loadBundleModule('src/core/provenance.js', { crypto });
   const parser = loadBundleModule('src/core/document-parser.js', {
-    crypto, 'src/core/provenance.js': provenance
+    crypto, 'src/core/provenance.js': provenance, 'src/core/block-v0.js': block
   });
   let externalCalls = 0;
   const extractor = loadBundleModule('src/core/extractors.js', {

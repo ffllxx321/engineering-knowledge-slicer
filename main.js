@@ -4197,14 +4197,27 @@ class SlicerSettingTab extends PluginSettingTab {
     }
 
     containerEl.createEl('p', {
-      text: '密钥不会写入知识库、诊断报告或日志。需要调整功能开关时，请使用产品中已有的对应功能入口。'
+      text: '密钥不会写入知识库、诊断报告或日志。'
     });
+
+    new Setting(containerEl)
+      .setName('高级设置')
+      .setDesc('默认关闭。开启后显示功能开关、解析参数、性能与维护选项；关闭不会清除已保存的配置。')
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.advancedSettingsEnabled === true)
+        .onChange(async (value) => {
+          this.plugin.settings.advancedSettingsEnabled = value === true;
+          await this.plugin.saveSafeSettings();
+          this.display();
+        }));
+
+    if (this.plugin.settings.advancedSettingsEnabled === true) {
+      this.renderAdvancedSettings(containerEl);
+    }
   }
 
-  displayAdvancedLegacy() {
-    const { containerEl } = this;
-    containerEl.empty();
-    containerEl.createEl('h2', { text: '工程知识切片设置' });
+  renderAdvancedSettings(containerEl) {
+    containerEl.createEl('h2', { text: '高级设置' });
     // v1.2: 一键打开诊断日志，方便没 DevTools 环境的用户直接查看文件路径
     // v1.3: 默认日志在 vault 之外（~/.eks/logs/diag.log），避开同步冲突；
     //       勾选"写到 vault 内"则回退到 .obsidian/plugins/engineering-knowledge-slicer/diag.log。
@@ -4282,12 +4295,8 @@ class SlicerSettingTab extends PluginSettingTab {
       .addToggle((toggle) => toggle.setValue(semantic.enabled).onChange(async (value) => {
         this.plugin.settings.semanticEnabled = value === true && this.plugin.settings.semanticConsent === true;
         await this.plugin.saveSettings();
+        this.display();
       }));
-    passwordSetting(containerEl, this.plugin, '阿里云百炼 API Key', '标准 Model Studio API Key。保存在本机 ~/.eks-secrets.json（用户权限），不会写入 vault 的 data.json、诊断、报告或语义数据；也可用 EKS_EMBEDDING_API_KEY 环境变量。', 'embeddingApiKey', 'DashScope API Key');
-    new Setting(containerEl)
-      .setName('测试阿里云嵌入连接')
-      .setDesc('仅发送固定的隐私中性探针，不使用用户卡片或文档内容；会产生 1 次外部配额/可能计费请求，且必须先明确同意。')
-      .addButton((control) => control.setButtonText('测试连接').onClick(() => this.plugin.testSemanticConnection()));
     numberSetting(containerEl, this.plugin, '最大候选数', '精确余弦比较的硬上限，索引接口可替换为 ANN。', 'semanticMaxCandidates', 1, 5000);
     numberSetting(containerEl, this.plugin, 'Top K', '每张卡保留的最多审核建议数。', 'semanticTopK', 1, 50);
     new Setting(containerEl)
@@ -4378,7 +4387,6 @@ class SlicerSettingTab extends PluginSettingTab {
 
     containerEl.createEl('h3', { text: 'MiniMax 结构化处理' });
 
-    passwordSetting(containerEl, this.plugin, 'MiniMax API Key', '用于调用 MiniMax 国内版。仅保存在本地插件设置中，不写入 Markdown 或任务日志。', 'minimaxApiKey', 'MiniMax API Key');
     textSetting(containerEl, this.plugin, 'MiniMax 模型', '默认使用 MiniMax-M3，可按账户实际可用模型修改。', 'minimaxModel', 'MiniMax-M3');
     textSetting(containerEl, this.plugin, 'MiniMax M3 接口地址', '国内版默认使用 Anthropic 兼容接口，以支持更长的结构化输出。', 'minimaxEndpoint', 'https://api.minimaxi.com/anthropic/v1/messages');
     new Setting(containerEl)
@@ -4390,8 +4398,6 @@ class SlicerSettingTab extends PluginSettingTab {
           this.plugin.settings.useStreamingAi = Boolean(value);
           await this.plugin.saveSafeSettings();
         }));
-    connectionTestSetting(containerEl, this.plugin, '测试 MiniMax 连接', 'minimax');
-
     new Setting(containerEl)
       .setName('知识卡片输出语言')
       .setDesc('源文件可为中文、英文或日文；调用 AI 时，标题、摘要和摘录统一生成中文。')
@@ -4536,6 +4542,7 @@ class SlicerSettingTab extends PluginSettingTab {
         .onChange(async (value) => {
           this.plugin.settings.pdfAllowExternalUpload = value;
           await this.plugin.saveSettings();
+          this.display();
         }));
 
     // v1.3: 上传前是否弹窗二次确认。
@@ -4549,10 +4556,8 @@ class SlicerSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    passwordSetting(containerEl, this.plugin, 'MinerU API Token', '精准解析 API Token，仅保存在本地插件设置中。', 'pdfMineruApiKey', 'MinerU Token');
     textSetting(containerEl, this.plugin, 'MinerU API 端点', '国内精准解析 API 基础地址。', 'pdfMineruApiEndpoint', 'https://mineru.net/api/v4');
     textSetting(containerEl, this.plugin, 'MinerU API 模型', '建议使用 vlm；复杂版面、表格和扫描件解析更完整。', 'pdfMineruApiModel', 'vlm');
-    connectionTestSetting(containerEl, this.plugin, '测试 MinerU 连接', 'mineru');
 
     new Setting(containerEl)
       .setName('MinerU 文档语言')
@@ -4568,10 +4573,8 @@ class SlicerSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    passwordSetting(containerEl, this.plugin, 'PaddleOCR API Token', 'AI Studio 文档解析 Token，仅保存在本地插件设置中。', 'pdfPaddleOcrApiKey', 'PaddleOCR Token');
     textSetting(containerEl, this.plugin, 'PaddleOCR API 端点', '国内 PaddleOCR 异步任务接口。', 'pdfPaddleOcrApiEndpoint', 'https://paddleocr.aistudio-app.com/api/v2/ocr/jobs');
     textSetting(containerEl, this.plugin, 'PaddleOCR API 模型', '用于扫描件和 MinerU 低质量结果补盲。', 'pdfPaddleOcrApiModel', 'PaddleOCR-VL-1.6');
-    connectionTestSetting(containerEl, this.plugin, '测试 PaddleOCR 连接', 'paddleocr');
 
     new Setting(containerEl)
       .setName('云端解析轮询间隔')
@@ -5713,6 +5716,7 @@ const TASK_STATUSES = new Set([
 const PROCESSING_STATUSES = new Set(['extracting', 'parsing', 'slicing', 'classifying', 'summarizing', 'atomizing', 'validating', 'writing']);
 
 const DEFAULT_SETTINGS = {
+  advancedSettingsEnabled: false,
   settingsVersion: 29,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
@@ -5842,6 +5846,8 @@ function migrateSettings(stored = {}) {
   // Keep every stored field, including advanced/legacy fields no longer shown in
   // the ordinary settings UI. Hidden settings must survive load/save unchanged.
   const migrated = Object.assign({}, DEFAULT_SETTINGS, source);
+  // Advanced controls are opt-in. Only a persisted boolean true may reveal them.
+  migrated.advancedSettingsEnabled = source.advancedSettingsEnabled === true;
   migrated.settingsVersion = 29;
   // Runtime contract boundary changed in 2.14.1. Parsed artifacts use their own
   // parser fingerprint and remain reusable; only classification and later stages

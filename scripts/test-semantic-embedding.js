@@ -57,7 +57,8 @@ async function main() {
   assert.strictEqual(migrated.semanticEnabled, true);
   const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
   const semanticUi = source.slice(source.indexOf("text: '语义嵌入（可选 · 影子模式）'"), source.indexOf("text: '生产影子评估（本地优先）'"));
-  assert(semanticUi.includes("'阿里云百炼 API Key'"));
+  assert(source.includes("name: '阿里云百炼密钥'"));
+  assert(!semanticUi.includes("'embeddingApiKey'"), 'advanced controls must reuse the canonical credential editor');
   for (const hidden of ["'embeddingEndpoint'", "'embeddingModel'", "'embeddingApiKeyEnv'", "'embeddingDimensions'"]) assert(!semanticUi.includes(hidden));
   assert(source.includes("['Engineering knowledge connection probe.']"));
   assert(!source.includes('provider.embed([privacyReducedPayload'));

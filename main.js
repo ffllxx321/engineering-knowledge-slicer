@@ -101,6 +101,15 @@ const {
   SemanticPostProcessor,
   semanticSettingsSnapshot
 } = require("src/core/semantic-embedding.js");
+const { runPhase2CandidatePipeline } = require("src/phase2-candidate-pipeline.js");
+const { evaluatePhase3 } = require("src/phase3-review-gate.js");
+const {
+  buildPlan: buildStructuredPlan,
+  commitPlan: commitStructuredPlan,
+  rollbackTransaction: rollbackStructuredTransaction,
+  emptyIndex: emptyStructuredIndex,
+  hash: structuredHash
+} = require("src/structured-writer.js");
 
 // v1.1.9 / v1.1.10: 把诊断共享状态挂到 globalThis，让 src/core/ai-pipeline.js 等独立闭包模块也能调用 diag()
 // 历史背景：v1.1.6 起在 src/core/ai-pipeline.js（line 3928-4609）里加了 3 个 diag() 调用
@@ -627,6 +636,17 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.pauseRequested = false;
     this.cancelRequestedTaskId = '';
     this.taskControllers = new Map();
+    this.structuredWriterLock = {
+      tail: Promise.resolve(),
+      acquire: async () => {
+        let release;
+        const next = new Promise((resolve) => { release = resolve; });
+        const previous = this.structuredWriterLock.tail;
+        this.structuredWriterLock.tail = previous.then(() => next);
+        await previous;
+        return release;
+      }
+    };
     this._terminalTaskIds = new Set();
     this.componentCache = new Map();
     this.operationCounters = { apiRequests: 0, aiRetries: 0, summaryReduceRequests: 0, promptCharacters: 0, outputCharacters: 0, bytesRead: 0, bytesWritten: 0, ledgerWrites: 0, artifactWrites: 0, uiFullRenders: 0, uiIncrementalRefreshes: 0, ocrPages: 0, ocrCacheHits: 0, ocrCacheMisses: 0, ocrLowConfidenceBlocks: 0 };
@@ -1119,7 +1139,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   async rollbackLastBatch() {
     const tasks = await this.loadTasks();
     const candidates = tasks.filter((t) => ['written', 'archived', 'rolled_back'].includes(t.status)
-      && ((t.writtenFiles && t.writtenFiles.length) || (t.written_card_ids && t.written_card_ids.length)));
+      && (t.structured_transaction_id || (t.writtenFiles && t.writtenFiles.length)
+        || (t.written_card_ids && t.written_card_ids.length)));
     if (!candidates.length) {
       new Notice('没有可回滚的已入库卡片批次。');
       return;
@@ -1127,6 +1148,43 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const lastBatch = candidates[candidates.length - 1];
     if (lastBatch.status === 'rolled_back') {
       new Notice('最近批次已经回滚；未改动任何文件。');
+      return;
+    }
+    if (lastBatch.structured_transaction_id) {
+      const reference = await this.loadArtifact(lastBatch, 'structured-transaction');
+      const manifestPath = normalizeVaultPath(reference?.manifest_path || '');
+      if (!manifestPath || !(await this.app.vault.adapter.exists(manifestPath))) {
+        throw new Error('找不到结构化事务清单，未改动任何文件。');
+      }
+      const manifest = JSON.parse(await this.app.vault.adapter.read(manifestPath));
+      const adapter = this.app.vault.adapter;
+      const vault = {
+        readIfExists: async (path) => adapter.exists(path) ? adapter.read(path) : null,
+        write: async (path, content) => writeFile(this.app, normalizeVaultPath(path), content),
+        rename: async (from, to) => adapter.rename(normalizeVaultPath(from), normalizeVaultPath(to)),
+        mkdirp: async (folder) => {
+          const parts = normalizeVaultPath(folder).split('/');
+          let current = '';
+          for (const part of parts) {
+            current = current ? `${current}/${part}` : part;
+            if (!(await adapter.exists(current))) await adapter.mkdir(current);
+          }
+        }
+      };
+      const indexPath = normalizeVaultPath(`${this.settings.artifactsPath}/structured-writer/id-path-index.v1.json`);
+      await rollbackStructuredTransaction(manifest, {
+        vault, lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
+        saveIndex: (index) => writeFile(this.app, indexPath, JSON.stringify(index, null, 2))
+      });
+      manifest.status = 'rolled_back';
+      manifest.rolled_back_at = new Date().toISOString();
+      await writeFile(this.app, manifestPath, JSON.stringify(manifest, null, 2));
+      lastBatch.status = 'rolled_back';
+      lastBatch.updated_at = manifest.rolled_back_at;
+      await this.saveTasks(tasks);
+      await this.flushSaveTasksImmediate();
+      new Notice('最近结构化文档事务已回滚；原始资料和其他文件未改动。');
+      await this.refreshViews();
       return;
     }
     const journal = await this.loadRollbackJournal();
@@ -1448,22 +1506,36 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         }
       }
 
+      const structured = await this.runStructuredWriterPhase(current, parsePackage, workflow);
+      const structuredWriteMode = structured.mode === 'structured-write';
       current.status = 'writing';
-      await this.setTaskProgress(current, `正在写入 ${workflow.accepted.length} 张可信知识卡片`, {
+      await this.setTaskProgress(current, structuredWriteMode
+        ? `正在提交结构化计划（${structured.plan?.actions?.length || 0} 项）`
+        : `正在写入 ${workflow.accepted.length} 张可信知识卡片`, {
         stage: 'writing', cardCount: workflow.accepted.length, reviewCount: workflow.review.length, elapsedMs: Date.now() - startedAt
       });
-      for (const card of workflow.accepted) {
-        await this.writeAcceptedCard(current, card, workflow.route);
-        current.written_card_ids.push(card.card_id);
+      if (!structuredWriteMode) {
+        for (const card of workflow.accepted) {
+          await this.writeAcceptedCard(current, card, workflow.route);
+          current.written_card_ids.push(card.card_id);
+        }
       }
-      if (workflow.review.length || workflow.hardRejected.length || workflow.documentWarnings.length || workflow.metrics?.hardRejected) {
+      const structuredHandlingGroups = [
+        ...(structured.plan?.phase3_handling_groups || []),
+        ...(structured.plan?.review_groups || []),
+        ...(structured.plan?.conflicts || [])
+      ];
+      if (workflow.review.length || workflow.hardRejected.length || workflow.documentWarnings.length
+        || workflow.metrics?.hardRejected || structuredHandlingGroups.length) {
         await this.persistArtifact(current, 'review', {
           version: '2.0', task_id: current.task_id, metrics: workflow.metrics,
-          documentWarnings: workflow.documentWarnings, items: workflow.review, rejected: workflow.hardRejected
+          documentWarnings: workflow.documentWarnings, items: workflow.review, rejected: workflow.hardRejected,
+          structured_summary: structured.plan?.summary || '',
+          structured_handling_groups: structuredHandlingGroups
         });
         current.review_atom_ids = workflow.review.map((item) => item.atom_id);
       }
-      if (workflow.accepted.length) await this.rebuildKnowledgeIndexes();
+      if (workflow.accepted.length && !structuredWriteMode) await this.rebuildKnowledgeIndexes();
       if (!workflow.accepted.length && !workflow.review.length && !workflow.hardRejected.length
         && !(workflow.metrics?.hardRejected > 0)) {
         // v2.8.1: 错误信息带上下文计数，告诉用户去 diag.log 看哪几个事件
@@ -1472,12 +1544,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         throw new Error(`MiniMax 未生成任何可用知识原子（总结含 ${pointCount} 个知识点，原子化产出 ${atomCount} 个原子）。请查看诊断日志中的 summary.merged / atomization.batch / atomization.normalize 事件定位丢点位置后重试。`);
       }
 
-      current.status = workflow.review.length ? 'needs_review' : 'written';
+      current.status = workflow.review.length || structuredHandlingGroups.length ? 'needs_review' : 'written';
       delete current.regeneration_mode;
       current.updated_at = new Date().toISOString();
       current.progress = {
         stage: 'complete',
-        message: `处理完成：自动入库 ${workflow.accepted.length} 张，异常 ${workflow.review.length} 项`,
+        message: structured.plan?.summary
+          ? `结构化处理完成：${structured.plan.summary}`
+          : `处理完成：自动入库 ${workflow.accepted.length} 张，异常 ${workflow.review.length} 项`,
         elapsedMs: Date.now() - startedAt,
         at: current.updated_at
       };
@@ -2537,6 +2611,173 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       });
     }
     return cards;
+  }
+
+  async runStructuredWriterPhase(task, parsePackage, workflow) {
+    if (this.settings.controlledWriterEnabled !== true
+      || !['structured-pilot', 'structured-write'].includes(this.settings.structuredWriterMode)) {
+      return { mode: 'legacy', plan: null };
+    }
+    const mode = this.settings.structuredWriterMode;
+    const stateFolder = normalizeVaultPath(`${this.settings.artifactsPath}/structured-writer`);
+    const indexPath = normalizeVaultPath(`${stateFolder}/id-path-index.v1.json`);
+    const registryPath = normalizeVaultPath(`${stateFolder}/project-registry.v1.json`);
+    const readJson = async (path, fallback) => {
+      if (!(await this.app.vault.adapter.exists(path))) return fallback;
+      try { return JSON.parse(await this.app.vault.adapter.read(path)); } catch (error) {
+        throw new Error(`结构化状态文件损坏：${path}（${error.message}）`);
+      }
+    };
+    const index = await readJson(indexPath, emptyStructuredIndex());
+    const projectRegistry = await readJson(registryPath, []);
+    if (!Array.isArray(projectRegistry)) throw new Error('项目登记表必须是数组');
+    const blocks = Array.isArray(parsePackage?.blocks) ? parsePackage.blocks
+      : Array.isArray(parsePackage?.normalized_blocks) ? parsePackage.normalized_blocks : [];
+    const metadata = Object.assign({}, parsePackage?.metadata || {});
+    const routeLibrary = workflow.route?.library === 'bid' ? 'active_tender'
+      : workflow.route?.library === 'business' ? 'business' : metadata.library;
+    if (!metadata.library && routeLibrary) metadata.library = routeLibrary;
+    const legacyCategoryMap = {
+      '00-项目总览': 'project_overview', '02-招标文件解读': 'tender_documents_interpretation',
+      '06-技术标': 'technical_bid', '07-商务报价': 'commercial_quotation_cost',
+      '08-采购与分包': 'procurement_subcontracting', '09-风险评估与合规': 'risk_deviation_compliance',
+      '10-内部会议与评审': 'internal_review_decision', '11-答疑澄清与投标过程': 'qa_addenda',
+      '12-开标评标与中标跟踪': 'opening_evaluation_award_tracking',
+      '13-合同谈判与签约': 'contract_negotiation_signing', '15-复盘与知识沉淀': 'review_knowledge_candidates',
+      '01-客户库': 'customers', '02-案例库': 'proposals_cases', '03-提案库': 'proposals_cases',
+      '04-报价库': 'quotation_cost', '05-施工计划库': 'construction_organization_schedules',
+      '06-风险库': 'risks_issues', '07-失败中成长': 'failures_terminated_lessons',
+      '08-人才能力库': 'talent_experts', '09-政府申请（报批报建）': 'company_systems_processes'
+    };
+    if (!metadata.directory_category) {
+      metadata.directory_category = legacyCategoryMap[workflow.route?.folder_type]
+        || (routeLibrary === 'active_tender' ? 'project_overview' : 'terminology_general_knowledge');
+    }
+    if (!metadata.document_role) metadata.document_role = 'source_record';
+    const document = {
+      source_identity: task.source_identity || task.task_id,
+      source_document_id: task.task_id,
+      source_path: task.source_path,
+      source_hash: task.source_hash,
+      source_version: task.source_version || task.parser_fingerprint || '',
+      filename: task.source_path?.split('/').pop() || '',
+      title: parsePackage?.title || task.source_path?.split('/').pop() || '来源文档',
+      source_type: task.source_type,
+      media_type: task.source_type,
+      ingested_at: task.created_at || task.discovered_at || '1970-01-01T00:00:00.000Z',
+      metadata,
+      blocks
+    };
+    let phase2 = await runPhase2CandidatePipeline({
+      document, projectRegistry, requestJson: null,
+      limits: {
+        max_extraction_requests: 0,
+        max_blocks_per_batch: Math.max(1, Math.min(50, Number(this.settings.structuredPhase2BatchSize) || 12))
+      }
+    });
+    // The production workflow has already paid for and checkpointed atomization.
+    // Reuse those normalized results instead of issuing a duplicate provider call.
+    const cards = [
+      ...(workflow.accepted || []),
+      ...(workflow.review || []).map((item) => item.proposed_card).filter(Boolean)
+    ];
+    const candidates = cards.slice(0, Number(this.settings.structuredMaxRecords || 100)).map((card, index) => {
+      const quote = String(card.source_excerpt || card.evidence_quote || card.summary || card.content || '').trim().slice(0, 2000);
+      const locator = card.source_locator && typeof card.source_locator === 'object'
+        ? card.source_locator : { scheme: 'artifact', value: card.card_id || `card-${index}` };
+      return {
+        schema_version: '2.0',
+        candidate_id: `bic-${structuredHash([task.task_id, card.card_id || index]).slice(0, 24)}`,
+        source_document_id: task.task_id,
+        item_type: card.item_type || 'requirement',
+        summary: String(card.summary || card.title || card.content || '业务事项').slice(0, 1000),
+        evidence: {
+          block_id: String(card.block_id || card.atom_id || `workflow-${index}`).slice(0, 100),
+          locator, provenance: Array.isArray(card.provenance) ? card.provenance.slice(0, 20) : [locator],
+          verbatim: quote
+        },
+        applicable_conditions: [],
+        reusable_knowledge_candidate: card.reusable_knowledge_candidate === true,
+        reuse_reasons: [],
+        review_reasons: quote ? [] : ['missing_evidence']
+      };
+    });
+    phase2 = Object.assign({}, phase2, {
+      mode: 'production_reused_artifacts',
+      business_item_batch: Object.assign({}, phase2.business_item_batch, { items: candidates }),
+      diagnostics: [...(phase2.diagnostics || []), {
+        code: 'REUSED_NORMALIZED_WORKFLOW_ARTIFACTS',
+        provider_requests_added: 0,
+        candidate_count: candidates.length
+      }]
+    });
+    const phase3 = evaluatePhase3(phase2);
+    await this.persistArtifact(task, 'phase2-structured', phase2);
+    await this.persistArtifact(task, 'phase3-structured', phase3);
+    const settings = Object.assign({}, this.settings, {
+      controlledWriterEnabled: true,
+      structuredWriterMode: mode
+    });
+    const existingFiles = {};
+    const structuredRoots = [
+      normalizeVaultPath(this.settings.structuredActiveRoot),
+      normalizeVaultPath(this.settings.structuredBusinessRoot)
+    ];
+    const generatedFiles = this.app.vault.getMarkdownFiles()
+      .filter((file) => structuredRoots.some((root) => file.path.startsWith(`${root}/`)))
+      .slice(0, Number(this.settings.structuredMaxActions || 300) * 2);
+    for (const file of generatedFiles) existingFiles[file.path] = await this.app.vault.read(file);
+    let plan = buildStructuredPlan({
+      settings, document, projectRegistry, phase2Result: phase2, phase3Result: phase3,
+      index, existingFiles, logicalTime: task.created_at || '1970-01-01T00:00:00.000Z'
+    });
+    for (const action of plan.actions || []) {
+      for (const path of [action.path, action.from_path].filter(Boolean)) {
+        if (Object.hasOwn(existingFiles, path)) continue;
+        existingFiles[path] = await this.app.vault.adapter.exists(path)
+          ? await this.app.vault.adapter.read(path) : undefined;
+      }
+    }
+    for (const entry of Object.values(index.records || {})) {
+      if (entry?.path && !Object.hasOwn(existingFiles, entry.path)) {
+        existingFiles[entry.path] = await this.app.vault.adapter.exists(entry.path)
+          ? await this.app.vault.adapter.read(entry.path) : undefined;
+      }
+    }
+    plan = buildStructuredPlan({
+      settings, document, projectRegistry, phase2Result: phase2, phase3Result: phase3,
+      index, existingFiles, logicalTime: task.created_at || '1970-01-01T00:00:00.000Z'
+    });
+    await this.persistArtifact(task, 'structured-write-plan', Object.assign({}, plan, {
+      actions: plan.actions.map(({ prior_content, content, ...action }) => action)
+    }));
+    if (mode === 'structured-pilot') return { mode, plan };
+    if (plan.blocked) return { mode, plan, blocked: true };
+    const adapter = this.app.vault.adapter;
+    const vault = {
+      readIfExists: async (path) => adapter.exists(path) ? adapter.read(path) : null,
+      write: async (path, content) => writeFile(this.app, normalizeVaultPath(path), content),
+      rename: async (from, to) => adapter.rename(normalizeVaultPath(from), normalizeVaultPath(to)),
+      mkdirp: async (folder) => {
+        const parts = normalizeVaultPath(folder).split('/');
+        let current = '';
+        for (const part of parts) {
+          current = current ? `${current}/${part}` : part;
+          if (!(await adapter.exists(current))) await adapter.mkdir(current);
+        }
+      }
+    };
+    const committed = await commitStructuredPlan(plan, {
+      vault, lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
+      index, logicalTime: new Date().toISOString(),
+      saveIndex: async (next) => writeFile(this.app, indexPath, JSON.stringify(next, null, 2))
+    });
+    await this.persistArtifact(task, 'structured-transaction', {
+      transaction_id: committed.transactionId, manifest_path: committed.manifestPath,
+      index_revision: committed.index.revision
+    });
+    task.structured_transaction_id = committed.transactionId;
+    return { mode, plan, transaction: committed };
   }
 
   async writeAcceptedCard(task, card, route) {
@@ -4218,6 +4459,33 @@ class SlicerSettingTab extends PluginSettingTab {
 
   renderAdvancedSettings(containerEl) {
     containerEl.createEl('h2', { text: '高级设置' });
+    new Setting(containerEl)
+      .setName('受控结构化写入器')
+      .setDesc('默认关闭。仅显式开启后运行 Phase 2/3；现有用户不会被自动启用。')
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.controlledWriterEnabled === true)
+        .onChange(async (value) => {
+          this.plugin.settings.controlledWriterEnabled = value === true;
+          if (!value) this.plugin.settings.structuredWriterMode = 'legacy';
+          await this.plugin.saveSafeSettings();
+          this.display();
+        }));
+    if (this.plugin.settings.controlledWriterEnabled === true) {
+      new Setting(containerEl)
+        .setName('结构化写入模式')
+        .setDesc('Pilot 只生成可检查计划且不写结构化记录；正式写入与旧卡写入互斥，并受冲突、审核、限额和事务回滚门禁保护。')
+        .addDropdown((dropdown) => dropdown
+          .addOption('structured-pilot', 'Pilot：只生成计划')
+          .addOption('structured-write', 'Cutover：结构化事务写入')
+          .setValue(this.plugin.settings.structuredWriterMode === 'structured-write' ? 'structured-write' : 'structured-pilot')
+          .onChange(async (value) => {
+            this.plugin.settings.structuredWriterMode = value;
+            await this.plugin.saveSafeSettings();
+          }));
+      new Setting(containerEl)
+        .setName('两库根目录')
+        .setDesc(`在办：${this.plugin.settings.structuredActiveRoot}；长期：${this.plugin.settings.structuredBusinessRoot}。仅允许 vault 内安全相对路径，首次运行前仍会再次校验。`);
+    }
     // v1.2: 一键打开诊断日志，方便没 DevTools 环境的用户直接查看文件路径
     // v1.3: 默认日志在 vault 之外（~/.eks/logs/diag.log），避开同步冲突；
     //       勾选"写到 vault 内"则回退到 .obsidian/plugins/engineering-knowledge-slicer/diag.log。
@@ -5697,6 +5965,1835 @@ module.exports = {
 };
 
 },
+/** STRUCTURED_PHASE_MODULES_START */
+"src/phase1-foundation.js": function(require, module, exports) {
+/**
+ * Phase 1 的纯本地并行基础。
+ * 本模块不接入生产切片流程、不访问文件系统，也不包含网络或供应商调用。
+ */
+
+/** @typedef {Record<string, any>} AnyRecord */
+
+const SCHEMA_VERSION = '1.0';
+const RECORD_KINDS = Object.freeze(['project', 'source_document', 'business_item', 'company_knowledge']);
+const LIBRARIES = Object.freeze(['active_tender', 'business']);
+const PROJECT_STATES = Object.freeze([
+  'lead', 'approved', 'bidding', 'submitted', 'evaluating', 'won', 'lost',
+  'paused', 'terminated', 'contracted', 'archived'
+]);
+const ARCHIVE_OUTCOMES = Object.freeze(['won_completed', 'lost', 'terminated', 'paused_by_decision']);
+
+/** @type {Readonly<Record<string, string>>} */
+const STATE_LABELS = Object.freeze({
+  lead: '线索', approved: '已批准', bidding: '投标准备中', submitted: '已提交',
+  evaluating: '评审中', won: '已中标', lost: '未中标', paused: '已暂停',
+  terminated: '已终止', contracted: '已签约', archived: '已归档'
+});
+
+/** @type {Readonly<Record<string, string[]>>} */
+const ALLOWED_TRANSITIONS = Object.freeze({
+  lead: ['approved', 'lost', 'paused', 'terminated'],
+  approved: ['bidding', 'paused', 'terminated'],
+  bidding: ['submitted', 'paused', 'terminated'],
+  submitted: ['evaluating', 'won', 'lost', 'paused', 'terminated'],
+  evaluating: ['won', 'lost', 'paused', 'terminated'],
+  won: ['contracted', 'archived'],
+  lost: ['archived'],
+  paused: ['approved', 'bidding', 'submitted', 'evaluating', 'terminated', 'archived'],
+  terminated: ['archived'],
+  contracted: ['archived'],
+  archived: []
+});
+
+const ACTIVE_TENDER_CATEGORIES = Object.freeze([
+  ['project_overview', '项目概览'],
+  ['opportunity_customer', '商机与客户'],
+  ['tender_documents_interpretation', '招标文件与解读'],
+  ['site_survey_original_materials', '现场踏勘与原始资料'],
+  ['bid_strategy_responsibilities', '投标策略与职责分工'],
+  ['technical_solution', '技术方案'],
+  ['design_optimization', '设计与优化'],
+  ['construction_organization_schedule', '施工组织与进度计划'],
+  ['technical_bid', '技术标'],
+  ['commercial_quotation_cost', '商务报价与成本'],
+  ['procurement_subcontracting', '采购与分包'],
+  ['risk_deviation_compliance', '风险、偏差与合规'],
+  ['internal_review_decision', '内部评审与决策'],
+  ['qa_addenda', '答疑与补遗'],
+  ['bid_document_submission_history', '投标文件与提交历史'],
+  ['opening_evaluation_award_tracking', '开标、评标与中标跟踪'],
+  ['contract_negotiation_signing', '合同谈判与签约'],
+  ['review_knowledge_candidates', '复盘与知识候选'],
+  ['project_correspondence', '项目往来函件'],
+  ['meeting_minutes_decisions', '会议纪要与决议'],
+  ['project_material_index', '项目资料索引']
+].map(([key, label]) => Object.freeze({ key, label, storage: 'owned' })));
+
+const ACTIVE_TENDER_REFERENCE_CATEGORIES = Object.freeze([
+  Object.freeze({
+    key: 'business_common_knowledge_refs',
+    label: '引用业务库通用知识',
+    storage: 'reference',
+    target_library: 'business',
+    target_category: 'terminology_general_knowledge'
+  }),
+  Object.freeze({
+    key: 'business_templates_tools_refs',
+    label: '引用业务库模板与工具',
+    storage: 'reference',
+    target_library: 'business',
+    target_category: 'templates_tools'
+  })
+]);
+
+const BUSINESS_CATEGORIES = Object.freeze([
+  ['customers', '客户'],
+  ['complete_historical_projects', '完整历史项目'],
+  ['proposals_cases', '提案与案例'],
+  ['quotation_cost', '报价与成本'],
+  ['construction_organization_schedules', '施工组织与进度计划'],
+  ['risks_issues', '风险与问题'],
+  ['failures_terminated_lessons', '失败与终止项目教训'],
+  ['talent_experts', '人才与专家'],
+  ['suppliers_subcontractors', '供应商与分包商'],
+  ['materials_equipment', '材料与设备'],
+  ['standards_specifications', '标准与规范'],
+  ['contracts_legal', '合同与法务'],
+  ['technical_methods_workmanship', '技术方法与工艺'],
+  ['quality_acceptance', '质量与验收'],
+  ['safety_civilized_construction', '安全与文明施工'],
+  ['correspondence_important_decisions', '往来函件与重要决策'],
+  ['company_systems_processes', '公司制度与流程'],
+  ['market_competition_intelligence', '市场与竞争情报'],
+  ['templates_tools', '模板与工具'],
+  ['terminology_general_knowledge', '术语与通用知识']
+].map(([key, label]) => Object.freeze({ key, label })));
+
+const BUSINESS_ITEM_TYPES = Object.freeze([
+  ['requirement', '要求'],
+  ['decision', '决策'],
+  ['commitment', '承诺'],
+  ['risk', '风险'],
+  ['issue', '问题'],
+  ['change', '变更'],
+  ['action', '行动'],
+  ['quotation', '报价'],
+  ['material', '材料'],
+  ['method', '方法'],
+  ['acceptance_criterion', '验收标准'],
+  ['clarification', '澄清'],
+  ['contract_obligation', '合同义务'],
+  ['project_lesson', '项目教训']
+].map(([key, label]) => Object.freeze({ key, label })));
+
+const DIRECTORY_PLAN = Object.freeze({
+  version: SCHEMA_VERSION,
+  mode: 'definitions_only',
+  auto_create_or_move: false,
+  libraries: Object.freeze([
+    Object.freeze({
+      key: 'active_tender',
+      label: '在办投标库',
+      suggested_path: '在办投标库',
+      categories: Object.freeze([...ACTIVE_TENDER_CATEGORIES, ...ACTIVE_TENDER_REFERENCE_CATEGORIES])
+    }),
+    Object.freeze({
+      key: 'business',
+      label: '长期业务库',
+      suggested_path: '长期业务库',
+      categories: BUSINESS_CATEGORIES
+    })
+  ])
+});
+
+const COMMON_FIELDS = new Set([
+  'schema_version', 'record_kind', 'record_id', 'title', 'library', 'created_at', 'updated_at',
+  'project_ids', 'source_document_ids', 'business_item_ids', 'company_knowledge_ids',
+  'supersedes_id', 'replaces_id', 'derived_from_ids', 'related_item_ids', 'extensions'
+]);
+
+/** @type {Readonly<Record<string, Set<string>>>} */
+const KIND_FIELDS = Object.freeze({
+  project: new Set(['state', 'archive_outcome', 'archive_decided_at']),
+  source_document: new Set(['source_path', 'source_hash', 'media_type']),
+  business_item: new Set(['category', 'item_type', 'summary']),
+  company_knowledge: new Set(['category', 'summary', 'reuse_status'])
+});
+
+/** @param {unknown} value */
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** @param {any} value */
+function cloneJson(value) {
+  if (value === undefined) return undefined;
+  return JSON.parse(JSON.stringify(value));
+}
+
+/** @param {any} value */
+function text(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/** @param {any} value */
+function uniqueStrings(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(text).filter(Boolean))].sort();
+}
+
+/** @param {AnyRecord} input @param {Set<string>} known */
+function normalizeExtensions(input, known) {
+  const extensions = isPlainObject(input.extensions) ? cloneJson(input.extensions) : {};
+  for (const key of Object.keys(input).sort()) {
+    if (!known.has(key)) extensions[key] = cloneJson(input[key]);
+  }
+  return extensions;
+}
+
+/** @param {AnyRecord} input @returns {AnyRecord} */
+function normalizeRecord(input) {
+  if (!isPlainObject(input)) throw new TypeError('记录必须是对象');
+  const kind = text(input.record_kind);
+  if (!RECORD_KINDS.includes(kind)) throw new Error(`不支持的记录类型：${kind || '空'}`);
+  const known = new Set([...COMMON_FIELDS, ...KIND_FIELDS[kind]]);
+  /** @type {AnyRecord} */
+  const output = {
+    schema_version: SCHEMA_VERSION,
+    record_kind: kind,
+    record_id: text(input.record_id),
+    title: text(input.title),
+    library: text(input.library),
+    created_at: text(input.created_at),
+    updated_at: text(input.updated_at)
+  };
+  for (const field of [
+    'project_ids', 'source_document_ids', 'business_item_ids', 'company_knowledge_ids',
+    'derived_from_ids', 'related_item_ids'
+  ]) {
+    const values = uniqueStrings(input[field]);
+    if (values.length) output[field] = values;
+  }
+  for (const field of ['supersedes_id', 'replaces_id']) {
+    const value = text(input[field]);
+    if (value) output[field] = value;
+  }
+  for (const field of KIND_FIELDS[kind]) {
+    if (field === 'state' || field === 'archive_outcome' || field === 'category' || field === 'item_type' || field === 'summary'
+      || field === 'reuse_status' || field === 'source_path' || field === 'source_hash'
+      || field === 'media_type' || field === 'archive_decided_at') {
+      const value = text(input[field]);
+      if (value) output[field] = value;
+    }
+  }
+  const extensions = normalizeExtensions(input, known);
+  if (Object.keys(extensions).length) output.extensions = extensions;
+  return output;
+}
+
+/** @param {AnyRecord} input */
+function validateRecord(input) {
+  let record;
+  try {
+    record = normalizeRecord(input);
+  } catch (error) {
+    return { valid: false, errors: [error instanceof Error ? error.message : String(error)] };
+  }
+  const errors = [];
+  if (!record.record_id) errors.push('record_id 不能为空');
+  if (!record.title) errors.push('title 不能为空');
+  if (!LIBRARIES.includes(record.library)) errors.push('library 必须是在办投标库或长期业务库');
+  if (!record.created_at) errors.push('created_at 不能为空');
+  if (!record.updated_at) errors.push('updated_at 不能为空');
+  if (record.record_kind === 'project') {
+    if (!PROJECT_STATES.includes(record.state)) errors.push('state 不是有效项目状态');
+    if (record.state === 'archived' && !ARCHIVE_OUTCOMES.includes(record.archive_outcome)) {
+      errors.push('归档项目必须说明 archive_outcome');
+    }
+    if (record.state !== 'archived' && record.archive_outcome) {
+      errors.push('未归档项目不能设置 archive_outcome');
+    }
+  }
+  if (record.record_kind === 'source_document' && !record.source_path && !record.source_hash) {
+    errors.push('来源文档至少需要 source_path 或 source_hash');
+  }
+  if (record.record_kind === 'business_item' && record.category) {
+    const categories = record.library === 'active_tender'
+      ? [...ACTIVE_TENDER_CATEGORIES, ...ACTIVE_TENDER_REFERENCE_CATEGORIES]
+      : BUSINESS_CATEGORIES;
+    if (!categories.some((item) => item.key === record.category)) {
+      errors.push('category 不是所属库的有效目录分类');
+    }
+  }
+  if (record.record_kind === 'business_item' && record.item_type
+    && !BUSINESS_ITEM_TYPES.some((item) => item.key === record.item_type)) {
+    errors.push('item_type 不是有效业务条目类型');
+  }
+  if (record.record_kind === 'company_knowledge' && record.library !== 'business') {
+    errors.push('公司知识只能存放在长期业务库');
+  }
+  return { valid: errors.length === 0, errors, value: record };
+}
+
+/** @param {AnyRecord} input */
+function migrateRecord(input) {
+  const migrated = normalizeRecord(input);
+  const result = validateRecord(migrated);
+  if (!result.valid) throw new Error(result.errors.join('；'));
+  return result.value;
+}
+
+/** @param {string} fromState */
+function expectedArchiveOutcome(fromState) {
+  if (fromState === 'won' || fromState === 'contracted') return 'won_completed';
+  if (fromState === 'lost') return 'lost';
+  if (fromState === 'terminated') return 'terminated';
+  if (fromState === 'paused') return 'paused_by_decision';
+  return '';
+}
+
+/**
+ * @param {string} fromState
+ * @param {string} toState
+ * @param {{archive_outcome?: string, explicit_decision?: boolean}} options
+ */
+function validateProjectTransition(fromState, toState, options = {}) {
+  if (!PROJECT_STATES.includes(fromState) || !PROJECT_STATES.includes(toState)) {
+    return { allowed: false, reason: '项目状态无效' };
+  }
+  if (!ALLOWED_TRANSITIONS[fromState].includes(toState)) {
+    return { allowed: false, reason: `不允许从“${STATE_LABELS[fromState]}”转为“${STATE_LABELS[toState]}”` };
+  }
+  if (toState !== 'archived') return { allowed: true };
+  const expected = expectedArchiveOutcome(fromState);
+  if (!expected || options.archive_outcome !== expected) {
+    return { allowed: false, reason: '归档结果与当前项目状态不匹配' };
+  }
+  if (fromState === 'paused' && options.explicit_decision !== true) {
+    return { allowed: false, reason: '暂停项目只能在明确作出归档决定后归档' };
+  }
+  return { allowed: true, archive_outcome: expected };
+}
+
+/** @param {string} prefix @param {any} value @param {number} index */
+function legacyId(prefix, value, index) {
+  const candidate = text(value).replace(/[^A-Za-z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '');
+  return `${prefix}:${candidate || String(index + 1)}`;
+}
+
+/**
+ * 只读迁移规划：仅消费调用方提供的旧卡片和任务快照，返回计划，不写文件。
+ */
+/** @param {AnyRecord} legacy */
+function planLegacyMigration(legacy = {}) {
+  const cards = Array.isArray(legacy.cards) ? legacy.cards : [];
+  const tasks = Array.isArray(legacy.tasks) ? legacy.tasks : [];
+  /** @type {AnyRecord[]} */
+  const actions = [];
+  cards.forEach((card, index) => {
+    const projectName = text(card.project);
+    const cardId = legacyId('legacy-card', card.card_id || card.title, index);
+    actions.push({
+      action: 'extract_reusable_knowledge',
+      source_ref: cardId,
+      target_kind: 'company_knowledge',
+      project_ref: projectName || undefined,
+      preserves_source: true,
+      reason: '旧卡片先作为可复用知识候选审阅，不等同于完整项目归档'
+    });
+  });
+  tasks.forEach((task, index) => {
+    const taskId = legacyId('legacy-task', task.task_id || task.taskId || task.source_path || task.sourcePath, index);
+    actions.push({
+      action: 'register_source_once',
+      source_ref: taskId,
+      target_kind: 'source_document',
+      source_path: text(task.source_path || task.sourcePath),
+      preserves_source: true
+    });
+  });
+  const projects = Array.isArray(legacy.projects) ? legacy.projects : [];
+  projects.forEach((project, index) => {
+    const state = text(project.state || project.status);
+    const outcome = text(project.archive_outcome);
+    const check = validateProjectTransition(state, 'archived', {
+      archive_outcome: outcome,
+      explicit_decision: project.explicit_archival_decision === true
+    });
+    actions.push({
+      action: 'archive_complete_project',
+      source_ref: legacyId('legacy-project', project.record_id || project.project_id || project.title, index),
+      target_kind: 'project',
+      archive_outcome: outcome || undefined,
+      ready: check.allowed,
+      reason: check.allowed ? '完整项目资料可整体进入历史项目' : check.reason,
+      preserves_source: true
+    });
+  });
+  return {
+    plan_version: SCHEMA_VERSION,
+    mode: 'dry_run',
+    writes_performed: 0,
+    deletes_performed: 0,
+    provider_calls: 0,
+    input_counts: { cards: cards.length, tasks: tasks.length, projects: projects.length },
+    actions
+  };
+}
+
+module.exports = {
+  SCHEMA_VERSION,
+  RECORD_KINDS,
+  LIBRARIES,
+  PROJECT_STATES,
+  ARCHIVE_OUTCOMES,
+  STATE_LABELS,
+  ALLOWED_TRANSITIONS,
+  ACTIVE_TENDER_CATEGORIES,
+  ACTIVE_TENDER_REFERENCE_CATEGORIES,
+  BUSINESS_CATEGORIES,
+  BUSINESS_ITEM_TYPES,
+  DIRECTORY_PLAN,
+  normalizeRecord,
+  validateRecord,
+  migrateRecord,
+  validateProjectTransition,
+  planLegacyMigration
+};
+},
+"src/phase2-candidate-pipeline.js": function(require, module, exports) {
+/**
+ * Phase 2 shadow candidate pipeline.
+ * Pure computation only: no filesystem, vault, project-state, or release mutations.
+ */
+
+const crypto = require('crypto');
+const {
+  ACTIVE_TENDER_CATEGORIES,
+  ACTIVE_TENDER_REFERENCE_CATEGORIES,
+  BUSINESS_CATEGORIES,
+  BUSINESS_ITEM_TYPES
+} = require("src/phase1-foundation.js");
+
+const SCHEMA_VERSION = '2.0';
+const LIBRARIES = Object.freeze(['active_tender', 'business']);
+const ITEM_TYPES = Object.freeze(BUSINESS_ITEM_TYPES.map(({ key }) => key));
+const CATEGORY_BY_LIBRARY = Object.freeze({
+  active_tender: Object.freeze(
+    [...ACTIVE_TENDER_CATEGORIES, ...ACTIVE_TENDER_REFERENCE_CATEGORIES].map(({ key }) => key)
+  ),
+  business: Object.freeze(BUSINESS_CATEGORIES.map(({ key }) => key))
+});
+const DOCUMENT_ROLES = Object.freeze([
+  'source_record', 'instruction', 'submission', 'correspondence', 'meeting_record',
+  'commercial_record', 'technical_record', 'contract_record', 'reference', 'unknown'
+]);
+const REVIEW_REASONS = Object.freeze([
+  'ambiguous_project', 'ambiguous_category', 'conflicting_facts', 'missing_evidence',
+  'unsupported_invented_facts', 'reuse_promotion'
+]);
+const DEFAULT_LIMITS = Object.freeze({
+  max_blocks_per_batch: 12,
+  max_extraction_requests: 8,
+  max_text_per_block: 6000,
+  max_evidence_text: 2000,
+  max_items_per_batch: 40,
+  max_reasons: 8,
+  max_reason_text: 300
+});
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function cleanText(value, max = 1000) {
+  return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ').slice(0, max) : '';
+}
+
+function verbatimText(value, max = 2000) {
+  return typeof value === 'string' ? value.trim().slice(0, max) : '';
+}
+
+function normalizeIdentity(value) {
+  return cleanText(value, 500).normalize('NFKC').toLocaleLowerCase()
+    .replace(/[\s\-_.:/\\()[\]{}]+/g, '');
+}
+
+function stableId(prefix, parts) {
+  const material = parts.map((part) => typeof part === 'string' ? part : JSON.stringify(part)).join('\u241f');
+  return `${prefix}-${crypto.createHash('sha256').update(material).digest('hex').slice(0, 24)}`;
+}
+
+function uniqueTexts(value, maxItems, maxText) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((item) => cleanText(item, maxText)).filter(Boolean))].slice(0, maxItems);
+}
+
+function locatorKey(locator) {
+  if (!isObject(locator)) return '';
+  return `${cleanText(locator.scheme, 80)}:${cleanText(locator.value, 500)}`;
+}
+
+function normalizeLocator(locator) {
+  if (!isObject(locator)) return null;
+  const scheme = cleanText(locator.scheme, 80);
+  const value = cleanText(locator.value, 500);
+  if (!scheme || !value) return null;
+  const output = { scheme, value };
+  for (const key of ['page', 'sheet', 'range', 'row', 'message_id', 'attachment_id', 'heading_path']) {
+    if (typeof locator[key] === 'number' && Number.isFinite(locator[key])) output[key] = locator[key];
+    else if (typeof locator[key] === 'string' && locator[key].trim()) output[key] = cleanText(locator[key], 500);
+    else if (Array.isArray(locator[key])) output[key] = uniqueTexts(locator[key], 20, 200);
+  }
+  return output;
+}
+
+function blockBoundary(block) {
+  const locator = normalizeLocator(block && block.locator);
+  const metadata = isObject(block && block.metadata) ? block.metadata : {};
+  return {
+    locator,
+    locator_key: locatorKey(locator),
+    table_row_id: cleanText(metadata.table_row_id || metadata.row_id, 200),
+    email_message_id: cleanText(metadata.email_message_id || metadata.message_id, 300),
+    explicit_same_item_id: cleanText(metadata.same_item_id, 200)
+  };
+}
+
+function eligibleBlocks(blocks, limits = DEFAULT_LIMITS) {
+  if (!Array.isArray(blocks)) return [];
+  return blocks.filter((block) => {
+    if (!isObject(block) || block.card_eligible !== true) return false;
+    if (!isObject(block.parse) || block.parse.status !== 'present') return false;
+    if (block.metadata && (block.metadata.noise === true || block.metadata.structural_noise === true)) return false;
+    return Boolean(cleanText(block.raw && block.raw.text, limits.max_text_per_block));
+  });
+}
+
+function normalizeRegistry(registry) {
+  if (!Array.isArray(registry)) return [];
+  return registry.map((entry) => {
+    if (!isObject(entry)) return null;
+    const projectId = cleanText(entry.project_id, 200);
+    if (!projectId) return null;
+    const identities = [
+      entry.name,
+      ...(Array.isArray(entry.aliases) ? entry.aliases : []),
+      ...(Array.isArray(entry.references) ? entry.references : [])
+    ].map(normalizeIdentity).filter(Boolean);
+    return { project_id: projectId, identities: [...new Set(identities)] };
+  }).filter(Boolean);
+}
+
+function explicitProjectEvidence(document, blocks) {
+  const values = [];
+  const metadata = isObject(document.metadata) ? document.metadata : {};
+  for (const key of ['project_id', 'project_name', 'project_reference']) {
+    if (metadata[key]) values.push({ value: metadata[key], source: `document.metadata.${key}` });
+  }
+  if (document.filename) {
+    const filename = cleanText(document.filename, 500);
+    values.push({ value: filename.replace(/\.[^.]+$/, ''), source: 'filename' });
+    filename.replace(/\.[^.]+$/, '').split(/[\s\-_.:/\\()[\]{}]+/)
+      .filter(Boolean).forEach((value) => values.push({ value, source: 'filename_token' }));
+  }
+  for (const block of blocks) {
+    const meta = isObject(block.metadata) ? block.metadata : {};
+    for (const key of ['project_id', 'project_name', 'project_reference']) {
+      if (meta[key]) values.push({
+        value: meta[key],
+        source: `${cleanText(block.block_id, 100) || 'block'}.metadata.${key}`
+      });
+    }
+  }
+  return values.map((item) => ({ ...item, normalized: normalizeIdentity(item.value) }))
+    .filter((item) => item.normalized);
+}
+
+function matchProjects(document, blocks, projectRegistry) {
+  const registry = normalizeRegistry(projectRegistry);
+  const evidence = explicitProjectEvidence(document, blocks);
+  const matches = [];
+  for (const project of registry) {
+    const hits = evidence.filter(({ normalized }) =>
+      project.identities.some((identity) => normalized === identity));
+    if (hits.length) matches.push({ project_id: project.project_id, hits });
+  }
+  return matches;
+}
+
+function validCategory(library, category) {
+  return LIBRARIES.includes(library) && CATEGORY_BY_LIBRARY[library].includes(category);
+}
+
+function localRoute(document, blocks, projectRegistry) {
+  const metadata = isObject(document.metadata) ? document.metadata : {};
+  const matches = matchProjects(document, blocks, projectRegistry);
+  const route = {
+    schema_version: SCHEMA_VERSION,
+    source_document_id: cleanText(document.source_document_id, 200),
+    confidence: 0,
+    reasons: [],
+    review_reasons: []
+  };
+  if (matches.length === 1) {
+    route.project_id = matches[0].project_id;
+    route.confidence = 1;
+    route.reasons.push('项目仅由注入登记表中的精确名称、别名或编号证据匹配');
+  } else if (matches.length > 1) {
+    route.review_reasons.push('ambiguous_project');
+    route.reasons.push('显式项目证据同时匹配多个登记项目');
+  }
+  const library = cleanText(metadata.library, 80);
+  const category = cleanText(metadata.directory_category || metadata.category, 120);
+  if (LIBRARIES.includes(library)) {
+    route.library = library;
+    route.confidence = Math.max(route.confidence, 1);
+    route.reasons.push('采用来源适配器提供的显式库元数据');
+  }
+  if (route.library && validCategory(route.library, category)) {
+    route.directory_category = category;
+    route.reasons.push('采用 Phase 1 定义内的显式目录分类元数据');
+  } else if (category) {
+    route.review_reasons.push('ambiguous_category');
+  }
+  const role = cleanText(metadata.document_role, 120);
+  if (DOCUMENT_ROLES.includes(role) && role !== 'unknown') {
+    route.document_role = role;
+    route.reasons.push('采用来源适配器提供的显式文档角色');
+  }
+  for (const field of ['supersedes_document_id', 'replaces_document_id', 'version_label']) {
+    const value = cleanText(metadata[field], 300);
+    if (value) route[field] = value;
+  }
+  route.resolved = Boolean(route.library && route.directory_category && route.document_role)
+    && !route.review_reasons.length;
+  return route;
+}
+
+function routingInput(document, blocks, registry) {
+  return {
+    source_document_id: cleanText(document.source_document_id, 200),
+    filename: cleanText(document.filename || document.source_path, 500),
+    source_type: cleanText(document.source_type, 100),
+    metadata: isObject(document.metadata) ? document.metadata : {},
+    project_registry: normalizeRegistry(registry),
+    blocks: blocks.slice(0, 30).map((block) => ({
+      block_id: cleanText(block.block_id, 100),
+      kind: cleanText(block.kind, 100),
+      locator: normalizeLocator(block.locator),
+      heading: block.inferred && cleanText(block.inferred.heading, 500),
+      metadata: isObject(block.metadata) ? block.metadata : {}
+    })),
+    allowed: { libraries: LIBRARIES, categories: CATEGORY_BY_LIBRARY, document_roles: DOCUMENT_ROLES }
+  };
+}
+
+function normalizeRoute(raw, document, local, projectRegistry) {
+  const candidate = isObject(raw) ? raw : {};
+  const route = {
+    schema_version: SCHEMA_VERSION,
+    source_document_id: cleanText(document.source_document_id, 200),
+    confidence: Math.max(0, Math.min(1, Number(candidate.confidence) || local.confidence || 0)),
+    reasons: uniqueTexts([...(local.reasons || []), ...(candidate.reasons || [])],
+      DEFAULT_LIMITS.max_reasons, DEFAULT_LIMITS.max_reason_text),
+    review_reasons: uniqueTexts(local.review_reasons, 8, 80)
+  };
+  const registryIds = new Set(normalizeRegistry(projectRegistry).map(({ project_id }) => project_id));
+  const proposedProject = cleanText(candidate.project_id || local.project_id, 200);
+  const evidencedProjectIds = new Set(
+    matchProjects(document, Array.isArray(document.blocks) ? document.blocks : [], projectRegistry)
+      .map(({ project_id }) => project_id)
+  );
+  if (proposedProject && registryIds.has(proposedProject) && evidencedProjectIds.has(proposedProject)) {
+    route.project_id = proposedProject;
+  }
+  else if (proposedProject) route.review_reasons.push('unsupported_invented_facts');
+  const library = cleanText(candidate.library || local.library, 80);
+  if (LIBRARIES.includes(library)) route.library = library;
+  const category = cleanText(candidate.directory_category || local.directory_category, 120);
+  if (route.library && validCategory(route.library, category)) route.directory_category = category;
+  else if (category) route.review_reasons.push('ambiguous_category');
+  const role = cleanText(candidate.document_role || local.document_role, 120);
+  route.document_role = DOCUMENT_ROLES.includes(role) ? role : 'unknown';
+  for (const field of ['supersedes_document_id', 'replaces_document_id', 'version_label']) {
+    const value = cleanText(candidate[field] || local[field], 300);
+    if (value) route[field] = value;
+  }
+  route.review_reasons = [...new Set(route.review_reasons)];
+  route.resolved = Boolean(route.library && route.directory_category && route.document_role !== 'unknown')
+    && !route.review_reasons.length;
+  return route;
+}
+
+function extractionInput(document, route, batch, limits) {
+  return {
+    source_document_id: cleanText(document.source_document_id, 200),
+    route: {
+      project_id: route.project_id,
+      library: route.library,
+      directory_category: route.directory_category,
+      document_role: route.document_role
+    },
+    allowed_item_types: ITEM_TYPES,
+    blocks: batch.map((block) => ({
+      block_id: cleanText(block.block_id, 100),
+      kind: cleanText(block.kind, 100),
+      locator: normalizeLocator(block.locator),
+      provenance: Array.isArray(block.provenance)
+        ? block.provenance.map(normalizeLocator).filter(Boolean).slice(0, 20) : [],
+      boundary: blockBoundary(block),
+      text: cleanText(block.raw && block.raw.text, limits.max_text_per_block),
+      fields: isObject(block.raw && block.raw.fields) ? block.raw.fields : {},
+      inferred: isObject(block.inferred) ? block.inferred : {},
+      metadata: isObject(block.metadata) ? block.metadata : {}
+    }))
+  };
+}
+
+function evidenceWithinBlock(evidence, sourceBlock, limits) {
+  const text = verbatimText(evidence && evidence.verbatim, limits.max_evidence_text);
+  const sourceText = verbatimText(
+    sourceBlock.text || (sourceBlock.raw && sourceBlock.raw.text),
+    limits.max_text_per_block
+  );
+  return Boolean(text && sourceText.includes(text));
+}
+
+function normalizeFacts(value) {
+  if (!isObject(value)) return undefined;
+  const output = {};
+  for (const key of ['actors', 'status', 'dates', 'units', 'numbers', 'modality']) {
+    const values = uniqueTexts(Array.isArray(value[key]) ? value[key] : [value[key]], 20, 300);
+    if (values.length) output[key] = values;
+  }
+  return Object.keys(output).length ? output : undefined;
+}
+
+function validateCandidate(raw, context, index, limits) {
+  if (!isObject(raw)) return { error: '候选不是对象' };
+  const itemType = cleanText(raw.item_type, 80);
+  if (!ITEM_TYPES.includes(itemType)) return { error: '业务条目类型不在 Phase 1 定义中' };
+  const blockId = cleanText(raw.block_id || (raw.evidence && raw.evidence.block_id), 100);
+  const sourceBlock = context.blocks.find((block) => block.block_id === blockId);
+  if (!sourceBlock) return { error: '证据块不在当前批次' };
+  if (!normalizeLocator(sourceBlock.locator)) return { error: '证据块缺少有效定位' };
+  if (!evidenceWithinBlock(raw.evidence, sourceBlock, limits)) return { error: '逐字证据不在指定块中' };
+  const boundary = blockBoundary(sourceBlock);
+  const verbatim = verbatimText(raw.evidence.verbatim, limits.max_evidence_text);
+  const applicableConditions = uniqueTexts(raw.applicable_conditions, 20, 500);
+  const candidate = {
+    schema_version: SCHEMA_VERSION,
+    candidate_id: stableId('bic', [
+      context.source_document_id, blockId, boundary.locator_key, itemType,
+      normalizeIdentity(verbatim), applicableConditions
+    ]),
+    source_document_id: context.source_document_id,
+    item_type: itemType,
+    summary: cleanText(raw.summary, 1000) || verbatim,
+    evidence: {
+      block_id: blockId,
+      locator: boundary.locator,
+      provenance: Array.isArray(sourceBlock.provenance)
+        ? sourceBlock.provenance.map(normalizeLocator).filter(Boolean).slice(0, 20) : [],
+      verbatim
+    },
+    applicable_conditions: applicableConditions,
+    reusable_knowledge_candidate: raw.reusable_knowledge_candidate === true,
+    reuse_reasons: uniqueTexts(raw.reuse_reasons, 5, 300),
+    review_reasons: []
+  };
+  if (context.route.project_id) candidate.project_id = context.route.project_id;
+  if (context.route.directory_category) candidate.directory_category = context.route.directory_category;
+  const facts = normalizeFacts(raw.facts);
+  if (facts) candidate.facts = facts;
+  if (candidate.reusable_knowledge_candidate) candidate.review_reasons.push('reuse_promotion');
+  if (raw.project_id && raw.project_id !== candidate.project_id) {
+    candidate.review_reasons.push('unsupported_invented_facts');
+  }
+  if (raw.directory_category && raw.directory_category !== candidate.directory_category) {
+    candidate.review_reasons.push('unsupported_invented_facts');
+  }
+  candidate._boundary = boundary;
+  candidate._index = index;
+  return { candidate };
+}
+
+function validateBatch(raw, context, limits) {
+  if (!isObject(raw) || !Array.isArray(raw.items) || raw.items.length > limits.max_items_per_batch) {
+    return { valid: false, errors: ['批次必须包含有界 items 数组'], candidates: [] };
+  }
+  const candidates = [];
+  const errors = [];
+  raw.items.forEach((item, index) => {
+    const result = validateCandidate(item, context, index, limits);
+    if (result.error) errors.push(`items[${index}]: ${result.error}`);
+    else candidates.push(result.candidate);
+  });
+  return { valid: errors.length === 0, errors, candidates };
+}
+
+function sameBoundary(a, b) {
+  if (a._boundary.explicit_same_item_id && b._boundary.explicit_same_item_id) {
+    return a._boundary.explicit_same_item_id === b._boundary.explicit_same_item_id;
+  }
+  if (a._boundary.table_row_id || b._boundary.table_row_id) {
+    return a._boundary.table_row_id === b._boundary.table_row_id && a._boundary.locator_key === b._boundary.locator_key;
+  }
+  if (a._boundary.email_message_id || b._boundary.email_message_id) {
+    return a._boundary.email_message_id === b._boundary.email_message_id;
+  }
+  return a.evidence.block_id === b.evidence.block_id;
+}
+
+function conflictSignature(candidate) {
+  const facts = candidate.facts || {};
+  return JSON.stringify({
+    numbers: facts.numbers || [], dates: facts.dates || [], units: facts.units || [],
+    modality: facts.modality || [], conditions: candidate.applicable_conditions || [],
+    item_type: candidate.item_type
+  });
+}
+
+function consolidateCandidates(candidates) {
+  const output = [];
+  for (const candidate of candidates) {
+    const contentKey = normalizeIdentity(candidate.evidence.verbatim || candidate.summary);
+    const existing = output.find((item) =>
+      item.source_document_id === candidate.source_document_id
+      && item.item_type === candidate.item_type
+      && sameBoundary(item, candidate)
+      && normalizeIdentity(item.evidence.verbatim || item.summary) === contentKey
+      && conflictSignature(item) === conflictSignature(candidate));
+    if (!existing) {
+      output.push(candidate);
+      continue;
+    }
+    existing.reuse_reasons = [...new Set([...existing.reuse_reasons, ...candidate.reuse_reasons])];
+    existing.review_reasons = [...new Set([...existing.review_reasons, ...candidate.review_reasons])];
+  }
+  const groups = new Map();
+  for (const candidate of output) {
+    const key = `${candidate.source_document_id}|${candidate.item_type}|${normalizeIdentity(candidate.summary)}`;
+    const group = groups.get(key) || [];
+    group.push(candidate);
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) {
+    if (group.length > 1 && new Set(group.map(conflictSignature)).size > 1) {
+      group.forEach((candidate) => candidate.review_reasons.push('conflicting_facts'));
+    }
+  }
+  return output.map((candidate) => {
+    const clean = { ...candidate, review_reasons: [...new Set(candidate.review_reasons)] };
+    delete clean._boundary;
+    delete clean._index;
+    return clean;
+  });
+}
+
+function buildReviewSummary(route, candidates, extraReviewReasons = []) {
+  const lines = [];
+  const reviewItems = candidates.filter((item) => item.review_reasons.length);
+  lines.push(`发现 ${candidates.length} 条可审阅业务候选。`);
+  if (route.project_id) lines.push(`文档关联到登记项目“${route.project_id}”。`);
+  else lines.push('项目关联尚未确定。');
+  if (route.library && route.directory_category) {
+    lines.push(`建议目录为 ${route.library} / ${route.directory_category}。`);
+  } else {
+    lines.push('建议目录尚未确定。');
+  }
+  for (const item of candidates.slice(0, 8)) {
+    const place = item.evidence.locator
+      ? `${item.evidence.locator.scheme} ${item.evidence.locator.value}` : `块 ${item.evidence.block_id}`;
+    lines.push(`- ${item.summary}（来源：${place}）`);
+  }
+  const reasons = new Set([
+    ...route.review_reasons,
+    ...reviewItems.flatMap((item) => item.review_reasons),
+    ...extraReviewReasons
+  ]);
+  if (reasons.size) {
+    const labels = {
+      ambiguous_project: '项目证据有歧义',
+      ambiguous_category: '目录判断有歧义',
+      conflicting_facts: '数字、日期、单位、语气或适用条件存在冲突',
+      missing_evidence: '缺少可核对的原文证据',
+      unsupported_invented_facts: '候选包含来源不支持的补充事实',
+      reuse_promotion: '标记为可复用知识仍需人工批准'
+    };
+    lines.push(`需要复核：${[...reasons].map((reason) => labels[reason]).filter(Boolean).join('；')}。`);
+  } else {
+    lines.push('当前候选没有触发人工复核条件。');
+  }
+  lines.push('可选操作：确认候选；修改项目或目录；退回并保留来源不入库。');
+  return lines.join('\n');
+}
+
+async function callJson(requestJson, request, counters, kind) {
+  counters.total_provider_requests += 1;
+  counters[`${kind}_requests`] += 1;
+  return requestJson(request);
+}
+
+async function runPhase2CandidatePipeline(options = {}) {
+  const document = isObject(options.document) ? options.document : {};
+  const limits = {
+    ...DEFAULT_LIMITS,
+    ...(isObject(options.limits) ? options.limits : {})
+  };
+  limits.max_blocks_per_batch = Math.max(1, Math.min(50, Number(limits.max_blocks_per_batch) || 12));
+  limits.max_extraction_requests = Math.max(0, Math.min(100, Number(limits.max_extraction_requests) || 0));
+  const requestJson = typeof options.requestJson === 'function' ? options.requestJson : null;
+  const counters = {
+    routing_requests: 0,
+    extraction_requests: 0,
+    repair_requests: 0,
+    total_provider_requests: 0,
+    eligible_blocks: 0,
+    skipped_blocks: 0,
+    planned_batches: 0,
+    processed_batches: 0
+  };
+  const blocks = Array.isArray(document.blocks) ? document.blocks : [];
+  const eligible = eligibleBlocks(blocks, limits);
+  counters.eligible_blocks = eligible.length;
+  counters.skipped_blocks = blocks.length - eligible.length;
+  const local = localRoute(document, blocks, options.projectRegistry);
+  let route = normalizeRoute({}, document, local, options.projectRegistry);
+  if (requestJson && !local.resolved) {
+    const rawRoute = await callJson(requestJson, {
+      kind: 'phase2_document_route',
+      prompt: 'phase2/document-router-v1',
+      input: routingInput(document, blocks, options.projectRegistry)
+    }, counters, 'routing');
+    route = normalizeRoute(rawRoute, document, local, options.projectRegistry);
+  }
+  const batches = [];
+  for (let index = 0; index < eligible.length; index += limits.max_blocks_per_batch) {
+    batches.push(eligible.slice(index, index + limits.max_blocks_per_batch));
+  }
+  counters.planned_batches = batches.length;
+  const allCandidates = [];
+  const diagnostics = [];
+  if (requestJson) {
+    const startBatch = Math.max(0, Number(options.resumeFromBatch) || 0);
+    const allowedBatches = Math.min(batches.length - startBatch, limits.max_extraction_requests);
+    for (let offset = 0; offset < allowedBatches; offset += 1) {
+      const batchIndex = startBatch + offset;
+      const input = extractionInput(document, route, batches[batchIndex], limits);
+      let raw = await callJson(requestJson, {
+        kind: 'phase2_business_item_extract',
+        prompt: 'phase2/business-item-extractor-v1',
+        batch_index: batchIndex,
+        input
+      }, counters, 'extraction');
+      let checked = validateBatch(raw, { ...input, route }, limits);
+      if (!checked.valid) {
+        diagnostics.push({ batch_index: batchIndex, errors: checked.errors });
+        raw = await callJson(requestJson, {
+          kind: 'phase2_quality_repair',
+          prompt: 'phase2/quality-repair-v1',
+          batch_index: batchIndex,
+          invalid_output: raw,
+          validation_errors: checked.errors,
+          input
+        }, counters, 'repair');
+        checked = validateBatch(raw, { ...input, route }, limits);
+      }
+      if (checked.valid) allCandidates.push(...checked.candidates);
+      else diagnostics.push({ batch_index: batchIndex, errors: checked.errors, repair_failed: true });
+      counters.processed_batches += 1;
+    }
+  }
+  const candidates = consolidateCandidates(allCandidates);
+  const diagnosticReviewReasons = [];
+  for (const diagnostic of diagnostics) {
+    const joined = (diagnostic.errors || []).join(' ');
+    if (joined.includes('证据')) diagnosticReviewReasons.push('missing_evidence');
+    if (joined.includes('类型') || joined.includes('批次')) {
+      diagnosticReviewReasons.push('unsupported_invented_facts');
+    }
+  }
+  return {
+    schema_version: SCHEMA_VERSION,
+    mode: 'shadow_candidate',
+    provider_enabled: Boolean(requestJson),
+    writes_performed: 0,
+    deletes_performed: 0,
+    state_transitions_performed: 0,
+    route,
+    business_item_batch: {
+      schema_version: SCHEMA_VERSION,
+      batch_id: stableId('bib', [cleanText(document.source_document_id, 200), candidates.map((item) => item.candidate_id)]),
+      source_document_id: cleanText(document.source_document_id, 200),
+      items: candidates
+    },
+    review_summary: buildReviewSummary(route, candidates, [...new Set(diagnosticReviewReasons)]),
+    counters,
+    diagnostics
+  };
+}
+
+module.exports = {
+  SCHEMA_VERSION,
+  LIBRARIES,
+  ITEM_TYPES,
+  CATEGORY_BY_LIBRARY,
+  DOCUMENT_ROLES,
+  REVIEW_REASONS,
+  DEFAULT_LIMITS,
+  normalizeIdentity,
+  normalizeLocator,
+  eligibleBlocks,
+  localRoute,
+  normalizeRoute,
+  validateBatch,
+  consolidateCandidates,
+  buildReviewSummary,
+  runPhase2CandidatePipeline
+};
+},
+"src/phase3-review-gate.js": function(require, module, exports) {
+/**
+ * Phase 3 shadow review gate.
+ * Pure computation: it never writes, deletes, moves files, or changes project state.
+ */
+
+const crypto = require('crypto');
+
+const PHASE3_SCHEMA_VERSION = '3.0';
+const PHASE3_SETTINGS_DEFAULTS = Object.freeze({
+  phase3_shadow_enabled: false,
+  phase3_pilot_enabled: false,
+  phase3_write_enabled: false
+});
+const OUTCOMES = Object.freeze({
+  PASS: 'automatic_pass',
+  NOTICE: 'automatic_pass_with_notice',
+  MANUAL: 'mandatory_human_handling'
+});
+const HARD_RISKS = Object.freeze([
+  'project_ownership_conflict',
+  'critical_fact_conflict',
+  'missing_or_unverifiable_evidence',
+  'unsupported_model_fact',
+  'company_reuse_promotion'
+]);
+const NOTICE_REASONS = Object.freeze([
+  'category_unresolved',
+  'noncritical_difference',
+  'route_incomplete'
+]);
+
+const text = (value, max = 500) =>
+  typeof value === 'string' ? value.trim().replace(/\s+/g, ' ').slice(0, max) : '';
+const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const sortedUnique = (values) => [...new Set(values.filter(Boolean))].sort();
+const digest = (value) => crypto.createHash('sha256')
+  .update(JSON.stringify(value)).digest('hex');
+const id = (prefix, value) => `${prefix}-${digest(value).slice(0, 24)}`;
+
+function evidenceIsVerifiable(candidate) {
+  if (!object(candidate.evidence)) return false;
+  const evidence = candidate.evidence;
+  const quote = text(evidence.verbatim, 4000);
+  const blockId = text(evidence.block_id || candidate.block_id, 300);
+  const locator = object(evidence.locator) &&
+    text(evidence.locator.scheme, 80) && text(evidence.locator.value, 500);
+  return Boolean(quote && blockId && locator);
+}
+
+function conflictSignature(candidate) {
+  const facts = object(candidate.facts) ? candidate.facts : {};
+  const critical = {};
+  for (const field of ['amounts', 'numbers', 'dates', 'units', 'statuses', 'status']) {
+    const value = facts[field];
+    if (Array.isArray(value) && value.length) critical[field] = sortedUnique(value.map(String));
+    else if (value !== undefined && value !== null && text(String(value))) critical[field] = text(String(value));
+  }
+  const explicit = text(candidate.conflict_id || candidate.conflict_signature, 300);
+  return explicit || (Object.keys(critical).length ? digest(critical).slice(0, 20) : '');
+}
+
+function classifyCandidate(candidate, route = {}) {
+  const reasons = new Set(Array.isArray(candidate.review_reasons) ? candidate.review_reasons : []);
+  const hardRisks = [];
+  const notices = [];
+
+  if (reasons.has('ambiguous_project') || reasons.has('conflicting_project_ownership')
+      || (Array.isArray(route.review_reasons) && route.review_reasons.includes('ambiguous_project'))) {
+    hardRisks.push('project_ownership_conflict');
+  }
+  if (reasons.has('missing_evidence') || !evidenceIsVerifiable(candidate)) {
+    hardRisks.push('missing_or_unverifiable_evidence');
+  }
+  if (reasons.has('unsupported_invented_facts') || reasons.has('unsupported_model_fact')) {
+    hardRisks.push('unsupported_model_fact');
+  }
+  if (candidate.reusable_knowledge_candidate === true || reasons.has('reuse_promotion')) {
+    hardRisks.push('company_reuse_promotion');
+  }
+  if (reasons.has('critical_fact_conflict')
+      || (reasons.has('conflicting_facts') && conflictSignature(candidate))) {
+    hardRisks.push('critical_fact_conflict');
+  } else if (reasons.has('conflicting_facts')) {
+    notices.push('noncritical_difference');
+  }
+  if (reasons.has('ambiguous_category')) notices.push('category_unresolved');
+  if (!route.library || !route.directory_category || !route.document_role
+      || route.document_role === 'unknown') notices.push('route_incomplete');
+
+  const hard = sortedUnique(hardRisks);
+  const note = sortedUnique(notices);
+  return {
+    candidate_id: text(candidate.candidate_id, 300),
+    source_document_id: text(candidate.source_document_id, 300),
+    outcome: hard.length ? OUTCOMES.MANUAL : note.length ? OUTCOMES.NOTICE : OUTCOMES.PASS,
+    hard_risks: hard,
+    notices: note,
+    conflict_signature: hard.includes('critical_fact_conflict') ? conflictSignature(candidate) : ''
+  };
+}
+
+function actionFor(reason) {
+  return {
+    project_ownership_conflict: '请选择该资料实际所属的项目；如证据互相冲突，请分别处理。',
+    critical_fact_conflict: '请对照原文确认金额、日期、单位或状态，并选择正确事实。',
+    missing_or_unverifiable_evidence: '请补充可定位的原文证据，或退回该条目。',
+    unsupported_model_fact: '请删除来源没有写明的内容，或提供支持它的原文证据。',
+    company_reuse_promotion: '请确认是否把这条项目资料提升为公司可复用知识。'
+  }[reason];
+}
+
+function groupMandatory(classifications) {
+  const groups = new Map();
+  for (const item of classifications) {
+    for (const reason of item.hard_risks) {
+      const conflictPart = reason === 'critical_fact_conflict'
+        ? `:${item.conflict_signature || item.candidate_id}` : '';
+      const key = `${item.source_document_id}:${reason}${conflictPart}`;
+      if (!groups.has(key)) groups.set(key, {
+        group_id: id('review', key),
+        source_document_id: item.source_document_id,
+        root_cause: reason,
+        action: actionFor(reason),
+        candidate_ids: []
+      });
+      groups.get(key).candidate_ids.push(item.candidate_id);
+    }
+  }
+  return [...groups.values()].map((group) => ({
+    ...group,
+    candidate_ids: sortedUnique(group.candidate_ids)
+  })).sort((a, b) => a.group_id.localeCompare(b.group_id));
+}
+
+function plainSummary(counters, groups) {
+  const first = `本次生成 ${counters.generated} 条：自动通过 ${counters.auto_passed} 条，`
+    + `通过并提示 ${counters.notices} 条，需要处理 ${counters.needs_handling} 条。`;
+  if (!groups.length) return `${first} 无需逐条确认。`;
+  return `${first} 请按 ${groups.length} 个问题组处理：确认正确内容、补充证据，或退回有问题的条目。`;
+}
+
+function evaluatePhase3(phase2Result) {
+  const route = object(phase2Result && phase2Result.route) ? phase2Result.route : {};
+  const candidates = phase2Result && phase2Result.business_item_batch
+    && Array.isArray(phase2Result.business_item_batch.items)
+    ? phase2Result.business_item_batch.items : [];
+  const classifications = candidates.map((candidate) => classifyCandidate(candidate, route));
+  const groups = groupMandatory(classifications);
+  const counters = {
+    generated: classifications.length,
+    auto_passed: classifications.filter((item) => item.outcome === OUTCOMES.PASS).length,
+    notices: classifications.filter((item) => item.outcome === OUTCOMES.NOTICE).length,
+    needs_handling: classifications.filter((item) => item.outcome === OUTCOMES.MANUAL).length,
+    handling_groups: groups.length
+  };
+  return {
+    schema_version: PHASE3_SCHEMA_VERSION,
+    mode: 'shadow_review',
+    classifications,
+    handling_groups: groups,
+    summary: plainSummary(counters, groups),
+    counters,
+    diagnostics: {
+      rules: { hard_risks: HARD_RISKS, notice_reasons: NOTICE_REASONS },
+      phase2_schema_version: phase2Result && phase2Result.schema_version
+    },
+    writes_performed: 0,
+    deletes_performed: 0,
+    state_transitions_performed: 0
+  };
+}
+
+function runPhase3Shadow(phase2Result, settings = {}) {
+  const effective = { ...PHASE3_SETTINGS_DEFAULTS, ...(object(settings) ? settings : {}) };
+  if (effective.phase3_shadow_enabled !== true) {
+    return {
+      schema_version: PHASE3_SCHEMA_VERSION,
+      mode: 'feature_off',
+      summary: '第三阶段试运行未开启。',
+      classifications: [],
+      handling_groups: [],
+      counters: { generated: 0, auto_passed: 0, notices: 0, needs_handling: 0, handling_groups: 0 },
+      writes_performed: 0, deletes_performed: 0, state_transitions_performed: 0
+    };
+  }
+  return evaluatePhase3(phase2Result);
+}
+
+function createDecisionEntry(input, previousEntry = null) {
+  const candidateIds = Object.freeze(sortedUnique(
+    Array.isArray(input.candidate_ids) ? input.candidate_ids.map(String) : []
+  ));
+  const payload = {
+    schema_version: PHASE3_SCHEMA_VERSION,
+    decision_id: text(input.decision_id, 300) || id('decision', input),
+    decided_at: text(input.decided_at, 80),
+    decided_by: text(input.decided_by, 200),
+    source_document_id: text(input.source_document_id, 300),
+    group_id: text(input.group_id, 300),
+    decision: text(input.decision, 80),
+    candidate_ids: candidateIds,
+    reason: text(input.reason, 1000),
+    previous_entry_hash: previousEntry ? previousEntry.entry_hash : null
+  };
+  return Object.freeze({ ...payload, entry_hash: digest(payload) });
+}
+
+function verifyDecisionLedger(entries) {
+  if (!Array.isArray(entries)) return false;
+  let previous = null;
+  for (const entry of entries) {
+    const { entry_hash: entryHash, ...payload } = entry;
+    if (payload.previous_entry_hash !== (previous ? previous.entry_hash : null)) return false;
+    if (digest(payload) !== entryHash) return false;
+    previous = entry;
+  }
+  return true;
+}
+
+function planDocumentWithdrawal(sourceDocumentId, affectedRecordIds = []) {
+  const documentId = text(sourceDocumentId, 300);
+  if (!documentId) throw new Error('缺少来源文档编号');
+  const recordIds = Object.freeze(sortedUnique(affectedRecordIds.map(String)));
+  return Object.freeze({
+    schema_version: PHASE3_SCHEMA_VERSION,
+    plan_id: id('withdraw', [documentId, recordIds]),
+    source_document_id: documentId,
+    affected_record_ids: recordIds,
+    status: 'planned_not_executed',
+    steps: Object.freeze([
+      '标记该来源文档产生的记录为待撤回',
+      '在受控写入阶段反向应用该文档的写入清单',
+      '保留原文件、项目状态和完整决策记录'
+    ]),
+    deletes_user_files: false,
+    changes_project_status: false,
+    writes_performed: 0
+  });
+}
+
+module.exports = {
+  PHASE3_SCHEMA_VERSION,
+  PHASE3_SETTINGS_DEFAULTS,
+  OUTCOMES,
+  HARD_RISKS,
+  NOTICE_REASONS,
+  evidenceIsVerifiable,
+  conflictSignature,
+  classifyCandidate,
+  groupMandatory,
+  evaluatePhase3,
+  runPhase3Shadow,
+  createDecisionEntry,
+  verifyDecisionLedger,
+  planDocumentWithdrawal
+};
+},
+"src/structured-writer.js": function(require, module, exports) {
+/**
+ * Phase 2/3 controlled structured writer.
+ * All planning is deterministic and local. Vault mutation is isolated in
+ * commitPlan/rollbackTransaction and guarded by an injected adapter.
+ */
+const crypto = require('crypto');
+const {
+  ACTIVE_TENDER_CATEGORIES,
+  BUSINESS_CATEGORIES,
+  validateRecord,
+  validateProjectTransition
+} = require("src/phase1-foundation.js");
+
+const WRITER_VERSION = '1.0';
+const INDEX_VERSION = '1.0';
+const PLAN_LIMITS = Object.freeze({ max_records: 250, max_actions: 600, max_links_per_record: 40 });
+const MODES = Object.freeze(['legacy', 'structured-pilot', 'structured-write']);
+const KIND_PREFIX = Object.freeze({
+  project: 'prj', source_document: 'src', business_item: 'bi', company_knowledge: 'ck'
+});
+const KIND_FOLDER = Object.freeze({
+  project: '项目', source_document: '来源', business_item: '业务事项', company_knowledge: '公司知识'
+});
+const RELATION_TYPES = Object.freeze({
+  derived_from: { from: ['business_item', 'company_knowledge'], to: ['source_document'] },
+  belongs_to: { from: ['source_document', 'business_item'], to: ['project'] },
+  contains: { from: ['project', 'source_document'], to: ['source_document', 'business_item'] },
+  related: { from: ['project', 'source_document', 'business_item', 'company_knowledge'], to: ['project', 'source_document', 'business_item', 'company_knowledge'] },
+  supersedes: { from: ['source_document', 'business_item', 'company_knowledge'], to: ['source_document', 'business_item', 'company_knowledge'] },
+  replaces: { from: ['source_document', 'business_item', 'company_knowledge'], to: ['source_document', 'business_item', 'company_knowledge'] }
+});
+
+const clean = (value, max = 500) => typeof value === 'string'
+  ? value.trim().replace(/[\u0000-\u001f\u007f]/g, '').slice(0, max) : '';
+const stableJson = (value) => {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort()
+    .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+};
+const hash = (value) => crypto.createHash('sha256')
+  .update(typeof value === 'string' ? value : stableJson(value)).digest('hex');
+const stableId = (kind, identity) => `${KIND_PREFIX[kind]}-${hash(identity).slice(0, 24)}`;
+const uniq = (values) => [...new Set((values || []).filter(Boolean))].sort();
+const safeSegment = (value) => clean(value, 120).normalize('NFC')
+  .replace(/[\\/:*?"<>|#[\]^]/g, '-').replace(/\.\./g, '-').replace(/\s+/g, ' ').replace(/^[. ]+|[. ]+$/g, '') || '未命名';
+const pathSafe = (value) => {
+  const raw = clean(value, 1000).replace(/\\/g, '/');
+  if (!raw || raw.startsWith('/') || /^[A-Za-z]:\//.test(raw)) return false;
+  const path = raw.replace(/\/+$/g, '');
+  return Boolean(path && !path.split('/').some((part) => !part || part === '.' || part === '..')
+    && !/[\u0000-\u001f\u007f:*?"<>|]/.test(path));
+};
+const joinPath = (...parts) => parts.map((part) => String(part || '').replace(/^\/+|\/+$/g, ''))
+  .filter(Boolean).join('/');
+
+function normalizeSettings(settings = {}) {
+  const mode = MODES.includes(settings.structuredWriterMode) ? settings.structuredWriterMode : 'legacy';
+  const enabled = settings.controlledWriterEnabled === true;
+  return {
+    enabled,
+    mode: enabled ? mode : 'legacy',
+    activeRoot: clean(settings.structuredActiveRoot || '在办投标库', 400),
+    businessRoot: clean(settings.structuredBusinessRoot || '长期业务库', 400),
+    stateRoot: clean(settings.artifactsPath || '06-知识库/源文件/_slicer_artifacts', 600),
+    limits: {
+      max_records: Math.max(1, Math.min(PLAN_LIMITS.max_records, Number(settings.structuredMaxRecords) || 100)),
+      max_actions: Math.max(1, Math.min(PLAN_LIMITS.max_actions, Number(settings.structuredMaxActions) || 300)),
+      max_links_per_record: Math.max(1, Math.min(PLAN_LIMITS.max_links_per_record, Number(settings.structuredMaxLinkFanout) || 20))
+    }
+  };
+}
+
+function sourceIdentity(document) {
+  const explicit = clean(document.source_identity || document.source_document_id, 300);
+  if (explicit) return `explicit:${explicit}`;
+  const ingestion = clean(document.ingestion_id || document.metadata?.ingestion_id, 300);
+  if (ingestion) return `ingestion:${ingestion}`;
+  const immutable = clean(document.metadata?.message_id || document.metadata?.file_id, 500);
+  if (immutable) return `provider:${immutable}`;
+  const initialHash = clean(document.initial_source_hash || document.source_hash, 128);
+  if (initialHash) return `initial-hash:${initialHash}`;
+  throw new Error('来源缺少稳定身份；不能用可变标题或路径生成 ID');
+}
+
+function projectIdentity(entry) {
+  const id = clean(entry?.project_id || entry?.registry_id, 300);
+  if (!id) throw new Error('项目必须来自精确登记表且包含稳定 project_id');
+  return `registry:${id}`;
+}
+
+function candidateIdentity(candidate, sourceId) {
+  const evidence = candidate?.evidence || {};
+  const locator = evidence.locator || {};
+  const explicit = clean(candidate?.stable_item_key || candidate?.candidate_id, 300);
+  return explicit
+    ? `${sourceId}:candidate:${explicit}`
+    : `${sourceId}:evidence:${clean(evidence.block_id || candidate?.block_id, 200)}:${stableJson(locator)}:${hash(clean(evidence.verbatim, 4000))}`;
+}
+
+function emptyIndex() {
+  return { version: INDEX_VERSION, revision: 0, records: {}, source_versions: {}, updated_at: '' };
+}
+
+function validateIndex(raw) {
+  const index = raw && typeof raw === 'object' ? raw : emptyIndex();
+  const conflicts = [];
+  const paths = new Map();
+  for (const [id, entry] of Object.entries(index.records || {})) {
+    if (!entry || !pathSafe(entry.path) || entry.record_id !== id) {
+      conflicts.push({ cause: 'malformed_index', record_id: id });
+      continue;
+    }
+    if (!paths.has(entry.path)) paths.set(entry.path, []);
+    paths.get(entry.path).push(id);
+  }
+  for (const [path, ids] of paths) {
+    if (ids.length > 1) conflicts.push({ cause: 'path_indexed_by_multiple_ids', path, record_ids: ids.sort() });
+  }
+  return { index, conflicts };
+}
+
+function yamlScalar(value) {
+  return JSON.stringify(String(value ?? ''), null, 0);
+}
+
+function yamlArray(values) {
+  return `[${uniq(values).map(yamlScalar).join(', ')}]`;
+}
+
+function relationLink(relation) {
+  // Generated filenames are globally unique stable IDs. Basename links survive
+  // archive moves without rewriting user-facing titles or depending on aliases.
+  return `[[${relation.target_id}|${relation.target_title || relation.target_id}]]`;
+}
+
+function serializeRecord(record) {
+  const check = validateRecord(record);
+  if (!check.valid) throw new Error(`记录 ${record.record_id} 不符合 schema：${check.errors.join('；')}`);
+  const relations = (record.relations || []).slice().sort((a, b) =>
+    `${a.type}:${a.target_id}`.localeCompare(`${b.type}:${b.target_id}`));
+  const frontmatter = [
+    '---',
+    `schema_version: ${yamlScalar(record.schema_version || '1.0')}`,
+    `record_kind: ${yamlScalar(record.record_kind)}`,
+    `record_id: ${yamlScalar(record.record_id)}`,
+    `title: ${yamlScalar(record.title)}`,
+    `aliases: ${yamlArray([record.title])}`,
+    `library: ${yamlScalar(record.library)}`,
+    `created_at: ${yamlScalar(record.created_at)}`,
+    `updated_at: ${yamlScalar(record.updated_at)}`
+  ];
+  for (const key of ['state', 'archive_outcome', 'source_path', 'source_hash', 'source_version', 'media_type', 'category', 'item_type', 'reuse_status']) {
+    if (record[key]) frontmatter.push(`${key}: ${yamlScalar(record[key])}`);
+  }
+  for (const key of ['project_ids', 'source_document_ids', 'business_item_ids', 'company_knowledge_ids']) {
+    if (record[key]?.length) frontmatter.push(`${key}: ${yamlArray(record[key])}`);
+  }
+  frontmatter.push('---', '', `# ${record.title}`, '');
+  const body = [];
+  if (record.summary) body.push('## 内容', '', record.summary, '');
+  if (record.evidence?.verbatim) {
+    body.push('## 来源证据', '', `> ${clean(record.evidence.verbatim, 4000).replace(/\n/g, '\n> ')}`, '',
+      `定位：${yamlScalar(stableJson(record.evidence.locator || {}))}`, '');
+  }
+  if (relations.length) body.push('## 关系', '', ...relations.map((relation) =>
+    `- ${relation.type}：${relationLink(relation)}`), '');
+  if (record.unresolved_relations?.length) body.push('## 待处理关系', '',
+    ...record.unresolved_relations.map((item) =>
+      `- ${item.type || 'related'}：${item.source_candidate || '未命名'}（${item.reason}；定位 ${stableJson(item.evidence_locator || {})}）`), '');
+  body.push('## 追溯', '', `- 记录编号：${record.record_id}`);
+  if (record.owner_source_id) body.push(`- 归属来源：${record.owner_source_id}`);
+  if (record.source_hash) body.push(`- 来源哈希：${record.source_hash}`);
+  return `${frontmatter.concat(body).join('\n')}\n`;
+}
+
+function routeRecord(record, route, registryEntry, settings) {
+  const category = safeSegment(route.directory_category || record.category || 'project_overview');
+  if (record.library === 'active_tender') {
+    if (!registryEntry) throw new Error('在办库记录缺少唯一项目登记');
+    return joinPath(settings.activeRoot, safeSegment(registryEntry.project_id), category,
+      KIND_FOLDER[record.record_kind], `${record.record_id}.md`);
+  }
+  return joinPath(settings.businessRoot, category, KIND_FOLDER[record.record_kind], `${record.record_id}.md`);
+}
+
+function resolveRelations(records, index, limits) {
+  const byId = new Map(records.map((record) => [record.record_id, record]));
+  const pathEntries = Object.values(index.records || {});
+  for (const entry of pathEntries) if (!byId.has(entry.record_id)) byId.set(entry.record_id, entry);
+  const unresolved = [];
+  for (const record of records) {
+    const resolved = [];
+    const seen = new Set();
+    for (const relation of record.requested_relations || []) {
+      const type = clean(relation.type, 40);
+      const rule = RELATION_TYPES[type];
+      const candidates = uniq(relation.target_ids || (relation.target_id ? [relation.target_id] : []));
+      const compatible = candidates.map((id) => byId.get(id)).filter((target) =>
+        target && rule && rule.from.includes(record.record_kind) && rule.to.includes(target.record_kind));
+      let reason = '';
+      if (!rule) reason = 'unsupported_relation_type';
+      else if (!candidates.length) reason = 'unresolved_target';
+      else if (compatible.length !== 1) reason = compatible.length ? 'ambiguous_target' : 'type_mismatch_or_missing';
+      if (reason) {
+        const issue = {
+          source_document_id: record.owner_source_id,
+          source_record_id: record.record_id,
+          type,
+          source_candidate: clean(relation.source_candidate, 300),
+          candidate_ids: candidates,
+          evidence_locator: relation.evidence_locator || {},
+          reason
+        };
+        record.unresolved_relations = [...(record.unresolved_relations || []), issue];
+        unresolved.push(issue);
+        continue;
+      }
+      const target = compatible[0];
+      const key = `${type}:${target.record_id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      resolved.push({
+        type, target_id: target.record_id, target_title: target.title,
+        target_path: target.path || index.records?.[target.record_id]?.path
+      });
+      if (resolved.length >= limits.max_links_per_record) break;
+    }
+    record.relations = resolved.filter((relation) => relation.target_path);
+  }
+  const groups = new Map();
+  for (const issue of unresolved) {
+    const key = `${issue.source_document_id}:${issue.reason}`;
+    if (!groups.has(key)) groups.set(key, { source_document_id: issue.source_document_id, cause: issue.reason, issues: [] });
+    groups.get(key).issues.push(issue);
+  }
+  return [...groups.values()].sort((a, b) => `${a.source_document_id}:${a.cause}`.localeCompare(`${b.source_document_id}:${b.cause}`));
+}
+
+function buildRecords(input, settings) {
+  const phase2 = input.phase2Result || {};
+  const phase3 = input.phase3Result || {};
+  const document = input.document || {};
+  const route = phase2.route || {};
+  const registryMatches = (input.projectRegistry || []).filter((entry) => entry.project_id === route.project_id);
+  if (route.project_id && registryMatches.length !== 1) throw new Error('项目路由不是登记表中的唯一精确匹配');
+  const registry = registryMatches[0];
+  const now = clean(input.logicalTime || document.ingested_at || '1970-01-01T00:00:00.000Z', 80);
+  const sourceId = stableId('source_document', sourceIdentity(document));
+  const sourceHash = clean(document.source_hash, 128);
+  const source = {
+    schema_version: '1.0', record_kind: 'source_document', record_id: sourceId,
+    title: clean(document.title || document.filename || '来源文档', 300),
+    library: route.library || 'business', created_at: now, updated_at: now,
+    source_path: clean(document.source_path, 800), source_hash: sourceHash,
+    source_version: clean(document.source_version || document.metadata?.version_label, 100),
+    media_type: clean(document.media_type || document.source_type, 100),
+    owner_source_id: sourceId, summary: '原始资料的结构化来源记录。'
+  };
+  const records = [];
+  let project = null;
+  if (registry) {
+    const projectId = stableId('project', projectIdentity(registry));
+    project = {
+      schema_version: '1.0', record_kind: 'project', record_id: projectId,
+      title: clean(registry.name || registry.project_id, 300), library: 'active_tender',
+      created_at: now, updated_at: now, state: clean(registry.state || 'lead', 40),
+      owner_source_id: sourceId, source_document_ids: [sourceId]
+    };
+    source.project_ids = [projectId];
+    source.requested_relations = [{ type: 'belongs_to', target_id: projectId }];
+    records.push(project);
+  }
+  records.push(source);
+  const decisions = new Map((phase3.classifications || []).map((item) => [item.candidate_id, item]));
+  const seen = new Set();
+  for (const candidate of phase2.business_item_batch?.items || []) {
+    const decision = decisions.get(candidate.candidate_id);
+    if (!decision || decision.outcome === 'mandatory_human_handling') continue;
+    const itemId = stableId('business_item', candidateIdentity(candidate, sourceId));
+    const fingerprint = hash({
+      type: candidate.item_type, summary: clean(candidate.summary, 4000),
+      evidence: candidate.evidence
+    });
+    if (seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+    const item = {
+      schema_version: '1.0', record_kind: 'business_item', record_id: itemId,
+      title: clean(candidate.title || candidate.summary, 120) || '业务事项',
+      library: route.library || 'business', created_at: now, updated_at: now,
+      category: route.directory_category, item_type: candidate.item_type,
+      summary: clean(candidate.summary, 8000), evidence: candidate.evidence,
+      owner_source_id: sourceId, source_document_ids: [sourceId],
+      project_ids: project ? [project.record_id] : [],
+      requested_relations: [
+        { type: 'derived_from', target_id: sourceId },
+        ...(project ? [{ type: 'belongs_to', target_id: project.record_id }] : []),
+        ...(candidate.relations || [])
+      ]
+    };
+    records.push(item);
+  }
+  const approvedPromotions = new Set(input.approvedCompanyKnowledgeCandidateIds || []);
+  for (const candidate of phase2.business_item_batch?.items || []) {
+    if (!candidate.reusable_knowledge_candidate || !approvedPromotions.has(candidate.candidate_id)) continue;
+    const knowledgeId = stableId('company_knowledge', `approved:${candidateIdentity(candidate, sourceId)}`);
+    records.push({
+      schema_version: '1.0', record_kind: 'company_knowledge', record_id: knowledgeId,
+      title: clean(candidate.title || candidate.summary, 120) || '公司知识',
+      library: 'business', created_at: now, updated_at: now,
+      category: input.companyKnowledgeCategory || 'terminology_general_knowledge',
+      summary: clean(candidate.summary, 8000), evidence: candidate.evidence,
+      reuse_status: 'approved', owner_source_id: sourceId, source_document_ids: [sourceId],
+      requested_relations: [{ type: 'derived_from', target_id: sourceId }]
+    });
+  }
+  if (records.length > settings.limits.max_records) throw new Error('结构化记录数量超过安全上限');
+  return { records, registry, route, sourceId };
+}
+
+function buildPlan(input) {
+  const settings = normalizeSettings(input.settings);
+  if (!settings.enabled || settings.mode === 'legacy') return {
+    version: WRITER_VERSION, mode: 'feature_off', actions: [], conflicts: [], review_groups: [],
+    summary: '结构化写入未开启。', writes_performed: 0
+  };
+  for (const root of [settings.activeRoot, settings.businessRoot, settings.stateRoot]) {
+    if (!pathSafe(root)) throw new Error(`未通过 vault 路径安全校验：${root}`);
+  }
+  const roots = [settings.activeRoot, settings.businessRoot];
+  if (roots[0] === roots[1] || roots.some((a) => roots.some((b) => a !== b
+    && (a.startsWith(`${b}/`) || b.startsWith(`${a}/`))))) {
+    throw new Error('两库根目录不能相同或互相嵌套');
+  }
+  for (const protectedRoot of [
+    settings.stateRoot, clean(input.settings?.intakePath, 600),
+    clean(input.settings?.bidIntakePath, 600), clean(input.settings?.businessIntakePath, 600)
+  ].filter(Boolean)) {
+    if (roots.some((root) => root === protectedRoot || root.startsWith(`${protectedRoot}/`)
+      || protectedRoot.startsWith(`${root}/`))) {
+      throw new Error('结构化输出根目录不得与来源或插件状态目录重叠');
+    }
+  }
+  const { index, conflicts: indexConflicts } = validateIndex(input.index);
+  const { records, registry, route, sourceId } = buildRecords(input, settings);
+  const conflicts = [...indexConflicts];
+  const physicalIds = new Map();
+  for (const [path, content] of Object.entries(input.existingFiles || {})) {
+    if (typeof content !== 'string') continue;
+    const id = clean((content.match(/^record_id:\s*["']?([^"'\n]+)/m) || [])[1], 300);
+    if (!id) continue;
+    if (!physicalIds.has(id)) physicalIds.set(id, []);
+    physicalIds.get(id).push(path);
+  }
+  for (const [recordId, paths] of physicalIds) {
+    if (new Set(paths).size > 1) conflicts.push({
+      cause: 'same_id_multiple_paths', record_id: recordId, paths: uniq(paths)
+    });
+  }
+  if (route.library === 'active_tender' && !registry) {
+    conflicts.push({ cause: 'active_project_unresolved', source_document_id: sourceId });
+    return {
+      version: WRITER_VERSION, mode: settings.mode, source_document_id: sourceId,
+      generator: 'structured-writer', actions: [], conflicts, review_groups: [],
+      phase3_handling_groups: input.phase3Result?.handling_groups || [],
+      counts: {}, source_hash: clean(input.document?.source_hash, 128),
+      source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
+      index_revision: Number(index.revision || 0), blocked: true, writes_performed: 0,
+      plan_id: `plan-${hash([sourceId, 'active_project_unresolved']).slice(0, 24)}`,
+      summary: '新建 0，更新 0，不变 0，移动 0，需要处理 1。'
+    };
+  }
+  for (const record of records) {
+    record.path = routeRecord(record, route, registry, settings);
+    const existingIndex = index.records?.[record.record_id];
+    if (existingIndex && existingIndex.path !== record.path && input.archiveTransition !== true) {
+      record.path = existingIndex.path; // rename/title changes never move identity
+    }
+  }
+  const reviewGroups = resolveRelations(records, index, settings.limits);
+  const byPath = input.existingFiles || {};
+  const actions = [];
+  for (const record of records.sort((a, b) => a.record_id.localeCompare(b.record_id))) {
+    const indexed = index.records?.[record.record_id];
+    const occupied = byPath[record.path];
+    if (indexed && indexed.path !== record.path && byPath[indexed.path] !== undefined) {
+      conflicts.push({ cause: 'same_id_multiple_paths', record_id: record.record_id, paths: uniq([indexed.path, record.path]) });
+      continue;
+    }
+    if (occupied !== undefined) {
+      const occupiedId = clean((occupied.match(/^record_id:\s*["']?([^"'\n]+)/m) || [])[1], 300);
+      if (occupiedId && occupiedId !== record.record_id) {
+        conflicts.push({ cause: 'path_occupied_by_different_id', path: record.path, record_id: record.record_id, occupied_id: occupiedId });
+        continue;
+      }
+    }
+    const content = serializeRecord(record);
+    const contentHash = hash(content);
+    const prior = byPath[record.path];
+    const priorHash = prior === undefined ? null : hash(prior);
+    const indexedHash = indexed?.content_hash || null;
+    if (prior !== undefined && indexedHash && priorHash !== indexedHash) {
+      conflicts.push({ cause: 'optimistic_hash_mismatch', record_id: record.record_id, path: record.path, expected: indexedHash, actual: priorHash });
+      continue;
+    }
+    const action = priorHash === contentHash ? 'noop' : prior === undefined ? 'create' : 'update';
+    actions.push({
+      action, record_id: record.record_id, record_kind: record.record_kind, path: record.path,
+      content, content_hash: contentHash, prior_hash: priorHash, prior_content: prior,
+      owner_source_id: sourceId, source_hash: clean(input.document?.source_hash, 128),
+      source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100)
+    });
+  }
+  if (input.archiveTransition) {
+    const transition = validateProjectTransition(input.archiveTransition.from, 'archived', input.archiveTransition);
+    if (!transition.allowed) conflicts.push({ cause: 'archive_transition_blocked', reason: transition.reason });
+    else {
+      for (const action of actions) {
+        if (!action.path.startsWith(`${settings.activeRoot}/`)) continue;
+        const to = joinPath(settings.businessRoot, 'complete_historical_projects', action.path.slice(settings.activeRoot.length + 1));
+        if (action.prior_hash === null) {
+          action.action = 'create';
+        } else {
+          action.action = action.action === 'noop' ? 'move' : `${action.action}_and_move`;
+          action.from_path = action.path;
+        }
+        action.path = to;
+      }
+    }
+  }
+  if (actions.length > settings.limits.max_actions) throw new Error('写入计划超过安全上限');
+  const counts = {};
+  for (const action of actions) counts[action.action] = (counts[action.action] || 0) + 1;
+  const blocked = conflicts.length > 0 || reviewGroups.length > 0
+    || (input.phase3Result?.handling_groups || []).length > 0;
+  const planCore = {
+    version: WRITER_VERSION, mode: settings.mode, source_document_id: sourceId,
+    generator: 'structured-writer', actions, conflicts, review_groups: reviewGroups,
+    phase3_handling_groups: input.phase3Result?.handling_groups || [], counts,
+    source_hash: clean(input.document?.source_hash, 128),
+    source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
+    index_revision: Number(index.revision || 0), blocked,
+    writes_performed: 0
+  };
+  planCore.plan_id = `plan-${hash({ ...planCore, actions: actions.map(({ prior_content, ...item }) => item) }).slice(0, 24)}`;
+  planCore.summary = `新建 ${counts.create || 0}，更新 ${counts.update || 0}，不变 ${counts.noop || 0}，移动 ${counts.move || 0}，需要处理 ${conflicts.length + reviewGroups.length + planCore.phase3_handling_groups.length}。`;
+  return planCore;
+}
+
+async function ensureParent(vault, path) {
+  const parent = path.split('/').slice(0, -1).join('/');
+  if (parent) await vault.mkdirp(parent);
+}
+
+async function commitPlan(plan, options) {
+  if (!plan || plan.mode !== 'structured-write') throw new Error('只有 structured-write 计划可提交');
+  if (plan.blocked) throw new Error('计划包含冲突或待处理项，禁止提交');
+  const vault = options.vault;
+  const release = await options.lock.acquire('structured-writer');
+  const transactionId = `txn-${hash([plan.plan_id, options.logicalTime || '']).slice(0, 24)}`;
+  const quarantine = joinPath(options.stateRoot, 'structured-writer', 'quarantine', transactionId);
+  const manifestPath = joinPath(options.stateRoot, 'structured-writer', 'transactions', `${transactionId}.json`);
+  const manifest = {
+    version: WRITER_VERSION, transaction_id: transactionId, plan_id: plan.plan_id,
+    source_document_id: plan.source_document_id, status: 'staging', steps: [], created_at: options.logicalTime || ''
+  };
+  manifest.previous_index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
+  let indexSaved = false;
+  try {
+    await ensureParent(vault, manifestPath);
+    await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+    for (const action of plan.actions.filter((item) => item.action !== 'noop')) {
+      const current = await vault.readIfExists(action.from_path || action.path);
+      if ((current === null ? null : hash(current)) !== action.prior_hash) throw new Error(`提交前内容已变化：${action.record_id}`);
+      const step = { ...action, prior_content: current, status: 'started' };
+      manifest.steps.push(step);
+      await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+      if (action.from_path && action.from_path !== action.path) {
+        await ensureParent(vault, action.path);
+        await vault.rename(action.from_path, action.path);
+        step.moved = true;
+      }
+      await ensureParent(vault, action.path);
+      await vault.write(action.path, action.content);
+      step.status = 'committed';
+      await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+    }
+    const index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
+    index.version = INDEX_VERSION;
+    index.revision = Number(index.revision || 0) + 1;
+    index.updated_at = options.logicalTime || '';
+    for (const action of plan.actions) index.records[action.record_id] = {
+      record_id: action.record_id, record_kind: action.record_kind, path: action.path,
+      content_hash: action.content_hash, owner_source_id: action.owner_source_id,
+      source_hash: action.source_hash, source_version: action.source_version
+    };
+    index.source_versions[plan.source_document_id] = { source_hash: plan.source_hash, source_version: plan.source_version };
+    await options.saveIndex(index);
+    indexSaved = true;
+    manifest.status = 'committed';
+    manifest.index_revision = index.revision;
+    await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+    return { transactionId, manifestPath, manifest, index };
+  } catch (error) {
+    manifest.status = 'recovering';
+    manifest.error = String(error?.message || error);
+    for (const step of manifest.steps.slice().reverse()) {
+      try {
+        if (step.prior_content === null) {
+          const current = await vault.readIfExists(step.path);
+          if (current !== null && hash(current) === step.content_hash) {
+            await ensureParent(vault, joinPath(quarantine, step.path));
+            await vault.rename(step.path, joinPath(quarantine, step.path));
+          }
+        } else {
+          if (step.moved && step.from_path) {
+            await ensureParent(vault, step.from_path);
+            if (await vault.readIfExists(step.path) !== null) await vault.rename(step.path, step.from_path);
+            await vault.write(step.from_path, step.prior_content);
+          } else {
+            await vault.write(step.path, step.prior_content);
+          }
+        }
+        step.rollback_status = 'restored';
+      } catch (rollbackError) {
+        step.rollback_status = 'failed';
+        step.rollback_error = String(rollbackError?.message || rollbackError);
+      }
+    }
+    if (indexSaved) {
+      try { await options.saveIndex(manifest.previous_index); manifest.index_rollback_status = 'restored'; }
+      catch (indexError) {
+        manifest.index_rollback_status = 'failed';
+        manifest.index_rollback_error = String(indexError?.message || indexError);
+      }
+    }
+    manifest.status = manifest.steps.every((step) => step.rollback_status === 'restored') ? 'rolled_back' : 'recovery_required';
+    try { await vault.write(manifestPath, JSON.stringify(manifest, null, 2)); } catch (_) {}
+    error.transactionManifest = manifest;
+    throw error;
+  } finally {
+    release();
+  }
+}
+
+async function rollbackTransaction(manifest, options) {
+  if (!manifest || manifest.status !== 'committed') throw new Error('只能回滚已提交的结构化事务');
+  const release = await options.lock.acquire('structured-writer');
+  try {
+    for (const step of (manifest.steps || []).slice().reverse()) {
+      const current = await options.vault.readIfExists(step.path);
+      if (current !== null && hash(current) !== step.content_hash) throw new Error(`文件已被后续修改，停止回滚：${step.path}`);
+      if (step.prior_content === null) {
+        const target = joinPath(options.stateRoot, 'structured-writer', 'quarantine', `rollback-${manifest.transaction_id}`, step.path);
+        await ensureParent(options.vault, target);
+        if (current !== null) await options.vault.rename(step.path, target);
+      } else if (step.from_path && step.from_path !== step.path) {
+        await ensureParent(options.vault, step.from_path);
+        if (current !== null) await options.vault.rename(step.path, step.from_path);
+        await options.vault.write(step.from_path, step.prior_content);
+      } else {
+        await options.vault.write(step.path, step.prior_content);
+      }
+    }
+    if (typeof options.saveIndex === 'function' && manifest.previous_index) {
+      await options.saveIndex(manifest.previous_index);
+    }
+    return { status: 'rolled_back', transaction_id: manifest.transaction_id };
+  } finally {
+    release();
+  }
+}
+
+module.exports = {
+  WRITER_VERSION, INDEX_VERSION, PLAN_LIMITS, MODES, RELATION_TYPES,
+  stableJson, hash, stableId, pathSafe, normalizeSettings, sourceIdentity,
+  candidateIdentity, emptyIndex, validateIndex, serializeRecord, resolveRelations,
+  buildPlan, commitPlan, rollbackTransaction
+};
+},
+/* STRUCTURED_PHASE_MODULES_END */
 /**
  * @module src/core/task
  * 任务默认配置 / 运行时 schema 版本号常量
@@ -5717,6 +7814,14 @@ const PROCESSING_STATUSES = new Set(['extracting', 'parsing', 'slicing', 'classi
 
 const DEFAULT_SETTINGS = {
   advancedSettingsEnabled: false,
+  controlledWriterEnabled: false,
+  structuredWriterMode: 'legacy',
+  structuredActiveRoot: '在办投标库',
+  structuredBusinessRoot: '长期业务库',
+  structuredMaxRecords: 100,
+  structuredMaxActions: 300,
+  structuredMaxLinkFanout: 20,
+  structuredPhase2BatchSize: 12,
   settingsVersion: 29,
   intakePath: '06-知识库/源文件',
   outputPath: '06-知识库/wiki',
@@ -5848,6 +7953,16 @@ function migrateSettings(stored = {}) {
   const migrated = Object.assign({}, DEFAULT_SETTINGS, source);
   // Advanced controls are opt-in. Only a persisted boolean true may reveal them.
   migrated.advancedSettingsEnabled = source.advancedSettingsEnabled === true;
+  migrated.controlledWriterEnabled = source.controlledWriterEnabled === true;
+  migrated.structuredWriterMode = ['legacy', 'structured-pilot', 'structured-write'].includes(source.structuredWriterMode)
+    ? source.structuredWriterMode : 'legacy';
+  if (!migrated.controlledWriterEnabled) migrated.structuredWriterMode = 'legacy';
+  migrated.structuredActiveRoot = normalizeConfiguredPath(source.structuredActiveRoot, DEFAULT_SETTINGS.structuredActiveRoot);
+  migrated.structuredBusinessRoot = normalizeConfiguredPath(source.structuredBusinessRoot, DEFAULT_SETTINGS.structuredBusinessRoot);
+  migrated.structuredMaxRecords = Math.max(1, Math.min(250, Math.round(Number(source.structuredMaxRecords) || DEFAULT_SETTINGS.structuredMaxRecords)));
+  migrated.structuredMaxActions = Math.max(1, Math.min(600, Math.round(Number(source.structuredMaxActions) || DEFAULT_SETTINGS.structuredMaxActions)));
+  migrated.structuredMaxLinkFanout = Math.max(1, Math.min(40, Math.round(Number(source.structuredMaxLinkFanout) || DEFAULT_SETTINGS.structuredMaxLinkFanout)));
+  migrated.structuredPhase2BatchSize = Math.max(1, Math.min(50, Math.round(Number(source.structuredPhase2BatchSize) || DEFAULT_SETTINGS.structuredPhase2BatchSize)));
   migrated.settingsVersion = 29;
   // Runtime contract boundary changed in 2.14.1. Parsed artifacts use their own
   // parser fingerprint and remain reusable; only classification and later stages

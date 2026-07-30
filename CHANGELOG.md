@@ -1,5 +1,14 @@
 # 工程知识切片 变更记录
 
+## 未发布 — Phase 2/3 受控生产接线
+
+- 新增默认关闭且仅在“高级设置”可见的结构化 writer；`legacy`、`structured-pilot`、`structured-write` 形成明确边界，Pilot 只保存计划，Cutover 不再执行旧卡写入。
+- 真实生产解析后复用 normalized block 与既有 workflow/checkpoint 产物进入 Phase 2/3，不新增关系/写入 AI 请求；Phase 2、Phase 3、计划与事务引用均保存为任务 artifact。
+- 新增四类中文 Markdown、稳定 ID、版本化 ID→路径索引、精确项目登记路由、两库计划及稳定 ID wikilink。
+- 新增确定性 dry-run、内容/prior hash、冲突/限额门禁、串行事务、manifest、失败恢复和可恢复隔离区；来源文件与旧卡保持不动。
+- 未解析关系按“文档 + 原因”归组；公司知识必须经 Phase 3 批准，暂停项目归档仍需人工明确决定。
+- 未提升版本、未打 tag、未发布。
+
 ## v2.19.0 — 2026-07-30 v2.18 一致性与迁移安全
 
 - 当前 task ledger 改为扩展字段无损持久化：规范化已知字段，同时保留 regeneration、邮件附件父链、队列 cohort、审核结果、重试计数及安全未知字段；仅真正旧格式执行破坏性形状迁移。

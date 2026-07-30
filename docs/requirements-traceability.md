@@ -2,6 +2,20 @@
 
 审计基点 `a42cd418`，2026-07-27。完成只表示生产路径和确定性自动化证据同时存在；外部供应商效果不以本地测试冒充。
 
+## 未发布 Phase 2/3 生产阶段
+
+| 能力 | 状态 | 生产证据 |
+|---|---|---|
+| 默认关闭、Advanced 可见、Pilot/Cutover 互斥 | 完成 | settings/migration/UI 与 `runStructuredWriterPhase` |
+| 真实 normalized block → Phase 2 → Phase 3 → plan | 完成 | 复用 workflow artifact；新增 provider 请求为 0 |
+| 四类稳定 ID、中文 Markdown、版本化 ID→path | 完成 | `src/structured-writer.js` |
+| 精确项目登记与确定性两库路由 | 完成 | `project-registry.v1.json`、Phase 1 category |
+| 类型关系、稳定 wikilink、分组待处理 | 完成 | `RELATION_TYPES`、`resolveRelations` |
+| CompanyKnowledge 人工批准 | 完成 | 未传批准 decision 不生成 |
+| dry-run、锁、事务、隔离恢复、文档回滚 | 完成 | `buildPlan`、`commitPlan`、`rollbackTransaction` |
+| 幂等、归档移动链接、旧卡/来源兼容 | 完成 | hash=noop、ID basename link、互斥 writer |
+| 成本/大小边界与 bundle 单一接口 | 完成 | 零额外 linking AI、三项上限、embed sync check |
+
 | Phase | 要求 | 状态 | 生产证据 | 自动化证据 |
 |---|---|---|---|---|
 | 0 | 依赖、lint、typecheck、test、build、benchmark、安全 | 完成 | `package.json`、`tsconfig.json`、安全设置入口 | 完整验证命令、可靠性/secret tests |

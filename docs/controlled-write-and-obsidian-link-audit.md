@@ -1,5 +1,16 @@
 # 两库受控写入与 Obsidian 关系审计
 
+> 2026-07-30 实现更新：下文 A/B 的“尚未接线”是实现前审计基线。当前生产入口已内嵌并调用
+> Phase 1/2/3 与 `src/structured-writer.js`；`scripts/embed-structured-writer.js --check`
+> 是防漂移门禁。默认仍为 legacy。仅在高级设置显式启用后运行：Pilot 保存 Phase 2、Phase 3
+> 和 dry-run plan artifact，零结构化写入；Cutover 与旧卡 writer 互斥。
+>
+> ID→path 索引和项目登记分别位于
+> `<artifactsPath>/structured-writer/id-path-index.v1.json` 与
+> `project-registry.v1.json`。提交采用串行锁、乐观 hash、transaction manifest 和隔离区恢复。
+> 生成文件名为全局唯一稳定 ID，关系使用 `[[target-id|标题]]` basename wikilink，归档移动后
+> 不依赖旧目录。未解析关系按“来源文档 + 原因”归组；任何硬风险、唯一关系未决或路径冲突均阻断。
+
 审计基线：`f429216` 及其后的本次设置页改动。结论以生产入口
 `main.js`、并行模块 `src/phase1-foundation.js`、`src/phase2-candidate-pipeline.js`
 和 `src/phase3-review-gate.js` 为准。

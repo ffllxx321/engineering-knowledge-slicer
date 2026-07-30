@@ -13728,6 +13728,15 @@ function composePrompt(parts, commonRules = COMMON_PROMPT_RULES) {
 }
 
 async function summarizeDocument(options) {
+  const installedEvidenceSchema = options.summarySchema?.properties?.evidence?.items;
+  const installedRequiresBlockId = Array.isArray(installedEvidenceSchema?.required)
+    && installedEvidenceSchema.required.includes('block_id');
+  diag('component.summaryContractDifference', {
+    installedSchemaRequiresBlockId: installedRequiresBlockId,
+    runtimeSchemaRequiresBlockId: true,
+    runtimePromptContractInjected: true,
+    replacementApplied: false
+  });
   // v2.7: 透传 WeKnora 式切片参数（重叠比例 + 小节合并开关）
   const packedChunks = Array.isArray(options.parsePackage.block_packs)
     ? options.parsePackage.block_packs.filter((pack) => String(pack.text || '').trim()).map((pack, index) => ({
@@ -13750,6 +13759,10 @@ async function summarizeDocument(options) {
   // block-native 输入不得仅因结构 packing 增加正常模式 provider 请求。
   // 若 pack 数高于既有 splitter，则保留旧切分；证据仍在 parsePackage.evidence_index 中做逐字回查。
   const chunks = packedChunks.length && packedChunks.length <= legacyChunks.length ? packedChunks : legacyChunks;
+  for (const chunk of chunks) {
+    chunk.sourceBlocks = summarySourceBlocks(options.parsePackage, chunk);
+    chunk.block_ids = chunk.sourceBlocks.map((block) => block.block_id);
+  }
   const partials = new Array(chunks.length);
   diag('summary.map.plan', {
     chunkTotal: chunks.length,
@@ -13762,8 +13775,16 @@ async function summarizeDocument(options) {
     const cached = typeof options.loadSummaryMapChunk === 'function'
       ? await options.loadSummaryMapChunk(chunk)
       : null;
-    if (cached && cached.coverage && exactCoverage(cached.coverage, 'chunk_ids', [chunk.chunk_id], '总结分块覆盖不完整').length === 0) {
-      partials[index] = cached;
+    const sanitizedCached = cached ? sanitizeSummaryEvidence(
+      normalizeSummaryMap(cached, options, chunk),
+      { stage: 'summary-map-cache', chunkId: chunk.chunk_id }
+    ) : null;
+    const cachedErrors = sanitizedCached ? [
+      ...validateSchema(summarySchemaWithRuntimeProvenance(options.summarySchema), sanitizedCached).errors,
+      ...exactCoverage(sanitizedCached.coverage, 'chunk_ids', [chunk.chunk_id], '总结分块覆盖不完整')
+    ] : ['missing'];
+    if (sanitizedCached && cachedErrors.length === 0) {
+      partials[index] = sanitizedCached;
       diag('summary.map.cacheHit', {
         chunkIndex: index + 1, chunkTotal: chunks.length,
         stableChunkId: chunk.stableChunkId || chunk.chunk_id
@@ -13784,6 +13805,14 @@ async function summarizeDocument(options) {
     const chunkContext = chunk.breadcrumb
       ? `当前分块 ${chunk.chunk_id}（${index + 1}/${chunks.length}），所属章节路径：\n${chunk.breadcrumb}`
       : `当前分块 ${chunk.chunk_id}（${index + 1}/${chunks.length}）：`;
+    const runtimeContract = [
+      '【运行时逐字证据契约（不可被组件提示词省略或覆盖）】',
+      '下面 SOURCE_BLOCKS 是本分块唯一允许引用的来源。每条 evidence 必须填写其中一个 block_id；quote 必须是从该块 text 复制的短小、连续逐字片段。',
+      '不得改写、概括、跨块拼接或根据标题/顺序猜测证据；locator 由程序按 block_id 回填，模型不得编造页码、行号、表格行或消息信息。',
+      '若没有可逐字支持的知识点，key_points 与 evidence 返回空数组。',
+      'SOURCE_BLOCKS:',
+      JSON.stringify(chunk.sourceBlocks, null, 2)
+    ].join('\n');
     const prompt = composePrompt([
       options.basePrompt,
       '当前文档类型专用规则：',
@@ -13791,21 +13820,27 @@ async function summarizeDocument(options) {
       '分类结果：',
       JSON.stringify(options.classification, null, 2),
       chunkContext,
-      chunk.markdown,
+      runtimeContract,
       `coverage.chunk_ids 必须且只能包含 ["${chunk.chunk_id}"]，complete 必须为 true。`,
       '所有面向使用者的内容统一使用简体中文。只返回符合 structured-summary.schema.json 的 JSON。'
     ]);
     partials[index] = await requestWithContract({
       prompt,
       stage: 'summary-map',
-      schema: options.summarySchema,
+      schema: summarySchemaWithRuntimeProvenance(options.summarySchema),
       requestJson: options.requestJson,
       requestStream: options.requestStream,
       streaming: !!options.requestStream,
       maxRepairAttempts: options.maxRepairAttempts,
       onProgress: options.onProgress,
       context: { chunk, chunkIndex: index + 1, chunkTotal: chunks.length },
-      normalizeValue: (value) => normalizeSummaryMap(value, options, chunk),
+      normalizeValue: (value) => sanitizeSummaryEvidence(
+        normalizeSummaryMap(value, options, chunk),
+        { stage: 'summary-map', chunkId: chunk.chunk_id }
+      ),
+      finalSanitize: (value) => sanitizeSummaryEvidence(value, {
+        stage: 'summary-map', chunkId: chunk.chunk_id
+      }),
       extraValidation: (value) => [
         ...exactCoverage(value.coverage, 'chunk_ids', [chunk.chunk_id], '总结分块覆盖不完整'),
         ...summaryEvidenceErrors(value, options.parsePackage)
@@ -13829,6 +13864,17 @@ async function summarizeDocument(options) {
   await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, () => summaryWorker()));
 
   provenanceFailureSummary(partials, 'summary-map');
+  const usableChunks = partials.filter((partial) => (partial?.key_points || []).length > 0).length;
+  const hasVerifiableBlocks = Object.keys(options.parsePackage?.evidence_index || {}).length > 0;
+  if (!usableChunks && hasVerifiableBlocks) {
+    const error = new Error(`全部 ${partials.length} 个总结分块都没有可由来源块逐字验证的知识点。请确认解析正文包含可引用内容，或更换能按 block_id 返回原文短引的模型后从总结检查点重试。`);
+    error.code = 'SUMMARY_ALL_CHUNKS_UNSUPPORTED';
+    error.stage = 'summary-map';
+    error.retryable = false;
+    error.details = { chunks: partials.length, empty_verified_chunks: partials.length };
+    diag('summary.map.allEmpty', error.details);
+    throw error;
+  }
   if (partials.length === 1) return partials[0];
   return reduceSummaryHierarchy(options, partials, Math.max(2, Number(options.reduceBatchSize) || 8));
 }
@@ -13909,7 +13955,7 @@ function normalizeSummaryMap(value, options, chunk) {
         quote: item.quote || ''
       });
       if (Object.keys(options.parsePackage?.evidence_index || {}).length) {
-        normalized = reconcileBlockEvidence(options.parsePackage, normalized);
+        normalized = reconcileBlockEvidence(options.parsePackage, normalized, new Set(chunk.block_ids || []));
       } else if (/^(mineru-api|paddleocr-api)$/.test(String(options.parsePackage?.parser || ''))) {
         var resolved = resolveEvidence(options.parsePackage, normalized.quote, {
           start: chunk.sourceStart,
@@ -13933,12 +13979,30 @@ function normalizeSummaryMap(value, options, chunk) {
   return result;
 }
 
-function reconcileBlockEvidence(parsePackage, item) {
+function reconcileBlockEvidence(parsePackage, item, allowedBlockIds) {
   if (!item || typeof item !== 'object') return item;
   const index = parsePackage?.evidence_index || {};
   const requestedId = String(item.block_id || item.provenance?.block_id || '');
   const quote = String(item.quote || '').trim();
+  if (!requestedId) {
+    return Object.assign({}, item, {
+      locator: '', block_id: '',
+      provenance_resolution: { ok: false, reason: 'block_id_missing' }
+    });
+  }
+  if (allowedBlockIds && !allowedBlockIds.has(requestedId)) {
+    return Object.assign({}, item, {
+      locator: '', block_id: requestedId,
+      provenance_resolution: { ok: false, reason: 'block_outside_chunk' }
+    });
+  }
   const repaired = reconcileEvidence(parsePackage, quote, requestedId ? { block_id: requestedId } : {});
+  if (repaired.ok && String(repaired.locator?.block_id || '') !== requestedId) {
+    return Object.assign({}, item, {
+      locator: '', block_id: requestedId,
+      provenance_resolution: { ok: false, reason: 'block_id_mismatch' }
+    });
+  }
   const entry = repaired.ok ? index[repaired.locator.block_id] : null;
   if (!entry || entry.card_eligible === false || !repaired.ok) {
     return Object.assign({}, item, {
@@ -13954,6 +14018,104 @@ function reconcileBlockEvidence(parsePackage, item) {
     locator_precision: 'block-exact',
     provenance_resolution: { ok: true, method: repaired.repaired ? 'reconciled' : 'exact' }
   });
+}
+
+function summarySourceBlocks(parsePackage, chunk) {
+  const evidenceIndex = parsePackage?.evidence_index || {};
+  const spans = Array.isArray(parsePackage?.provenance?.spans) ? parsePackage.provenance.spans : [];
+  const ids = new Set();
+  for (const id of chunk.provenanceSpanIds || []) {
+    if (evidenceIndex[id]) ids.add(String(id));
+    const span = spans.find((item) => String(item?.span_id || '') === String(id));
+    if (span?.block_id) ids.add(String(span.block_id));
+  }
+  if (!ids.size && Number.isInteger(chunk.sourceStart) && Number.isInteger(chunk.sourceEnd)) {
+    for (const span of spans) {
+      if (Number(span?.end) > chunk.sourceStart && Number(span?.start) < chunk.sourceEnd && span?.block_id) {
+        ids.add(String(span.block_id));
+      }
+    }
+  }
+  if (!ids.size) {
+    const chunkText = String(chunk.markdown || '');
+    for (const entry of Object.values(evidenceIndex)) {
+      const raw = String(entry?.raw_text || '');
+      if (raw && chunkText.includes(raw)) ids.add(String(entry.block_id));
+    }
+  }
+  return [...ids].map((blockId) => evidenceIndex[blockId]).filter((entry) =>
+    entry && entry.card_eligible !== false && String(entry.raw_text || '').trim()
+  ).map((entry) => ({
+    block_id: String(entry.block_id),
+    locator: entry.locator && typeof entry.locator === 'object' ? entry.locator : {},
+    text: String(entry.raw_text)
+  }));
+}
+
+function summarySchemaWithRuntimeProvenance(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  const result = JSON.parse(JSON.stringify(schema));
+  const evidenceItem = result?.properties?.evidence?.items;
+  if (result.properties && typeof result.properties === 'object') {
+    result.properties.map_status = { type: 'string', enum: ['verified', 'unsupported'] };
+    result.properties.evidence_sanitization = {
+      type: 'object',
+      properties: {
+        dropped_evidence: { type: 'integer', minimum: 0 },
+        dropped_points: { type: 'integer', minimum: 0 },
+        kept_evidence: { type: 'integer', minimum: 0 },
+        kept_points: { type: 'integer', minimum: 0 },
+        reasons: { type: 'object' }
+      },
+      required: ['dropped_evidence', 'dropped_points', 'kept_evidence', 'kept_points', 'reasons']
+    };
+  }
+  if (evidenceItem && typeof evidenceItem === 'object') {
+    evidenceItem.properties = Object.assign({}, evidenceItem.properties, { block_id: { type: 'string', minLength: 1 } });
+    evidenceItem.required = [...new Set([...(evidenceItem.required || []), 'block_id'])];
+  }
+  return result;
+}
+
+function sanitizeSummaryEvidence(value, context = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const rawEvidence = Array.isArray(value.evidence) ? value.evidence : [];
+  const keptEvidence = rawEvidence.filter((item) =>
+    item?.provenance_resolution?.ok === true && item?.provenance?.block_id && item?.quote
+  );
+  const keptIds = new Set(keptEvidence.map((item) => String(item.evidence_id || '')));
+  const reasons = {};
+  for (const item of rawEvidence) {
+    if (keptIds.has(String(item?.evidence_id || ''))) continue;
+    const reason = String(item?.provenance_resolution?.reason || 'unverified_evidence');
+    reasons[reason] = (reasons[reason] || 0) + 1;
+  }
+  let droppedPoints = 0;
+  const keyPoints = [];
+  for (const point of Array.isArray(value.key_points) ? value.key_points : []) {
+    const verifiedIds = [...new Set((point?.evidence_ids || []).map(String).filter((id) => keptIds.has(id)))];
+    if (!verifiedIds.length) {
+      droppedPoints += 1;
+      continue;
+    }
+    keyPoints.push(Object.assign({}, point, { evidence_ids: verifiedIds }));
+  }
+  const stats = {
+    dropped_evidence: rawEvidence.length - keptEvidence.length,
+    dropped_points: droppedPoints,
+    kept_evidence: keptEvidence.length,
+    kept_points: keyPoints.length,
+    reasons
+  };
+  const result = Object.assign({}, value, {
+    evidence: keptEvidence,
+    key_points: keyPoints,
+    evidence_sanitization: stats,
+    map_status: keyPoints.length ? 'verified' : 'unsupported'
+  });
+  diag(keyPoints.length ? 'summary.evidence.sanitized' : 'summary.map.emptyVerified',
+    Object.assign({}, context, stats));
+  return result;
 }
 
 function summaryEvidenceErrors(summary) {
@@ -14123,7 +14285,7 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
       if (cached) {
         const normalized = normalizeSummaryReduce(cached, chunkIds, options.parsePackage);
         const cachedErrors = [
-          ...validateSchema(options.summarySchema, normalized).errors,
+          ...validateSchema(summarySchemaWithRuntimeProvenance(options.summarySchema), normalized).errors,
           ...exactCoverage(normalized.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整')
         ];
         if (!cachedErrors.length) {
@@ -14148,14 +14310,20 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
         reduced = await requestWithContract({
           prompt,
           stage: 'summary-reduce',
-          schema: options.summarySchema,
+          schema: summarySchemaWithRuntimeProvenance(options.summarySchema),
           requestJson: options.requestJson,
           requestStream: options.requestStream,
           streaming: !!options.requestStream,
           maxRepairAttempts: options.maxRepairAttempts,
           onProgress: options.onProgress,
           context: { chunkIds, partialCount: group.length, reduceRound: round, reduceGroup: groupIndex + 1, reduceGroupTotal: groups.length },
-          normalizeValue: (value) => normalizeSummaryReduce(value, chunkIds, options.parsePackage),
+          normalizeValue: (value) => sanitizeSummaryEvidence(
+            normalizeSummaryReduce(value, chunkIds, options.parsePackage),
+            { stage: 'summary-reduce', chunkIds }
+          ),
+          finalSanitize: (value) => sanitizeSummaryEvidence(value, {
+            stage: 'summary-reduce', chunkIds
+          }),
           extraValidation: (value) => [
             ...exactCoverage(value.coverage, 'chunk_ids', chunkIds, '总结分块覆盖不完整'),
             ...summaryEvidenceErrors(value)
@@ -14600,6 +14768,23 @@ async function requestWithContract(options) {
     if (attempt < maxRepairs) {
       prompt = buildRepairPrompt(options.prompt, lastErrors, value);
     }
+  }
+  if (typeof options.finalSanitize === 'function' && typeof value !== 'undefined') {
+    const sanitized = options.finalSanitize(value, lastErrors);
+    const validation = validateSchema(options.schema, sanitized);
+    const remaining = [
+      ...validation.errors,
+      ...(options.extraValidation ? options.extraValidation(sanitized) : [])
+    ];
+    if (!remaining.length) {
+      diag('provider.contractRepair.sanitized', {
+        stage: options.stage,
+        providerAttempts: maxRepairs + 1,
+        validationErrorsBeforeSanitize: lastErrors.length
+      });
+      return sanitized;
+    }
+    lastErrors = remaining;
   }
   const error = new Error(lastErrors.join('；') || `${options.stage} 结果不符合契约`);
   error.code = 'AI_SCHEMA_OUTPUT_INVALID';
@@ -15085,7 +15270,11 @@ module.exports = {
   requestMiniMaxJson,
   requestMiniMaxStream,
   requestWithContract,
+  reconcileBlockEvidence,
   safeSlice,
+  sanitizeSummaryEvidence,
+  summarySchemaWithRuntimeProvenance,
+  summarySourceBlocks,
   splitByHeadings,
   splitMarkdownSections,
   validateAtomizationResult,
@@ -15610,7 +15799,11 @@ function counterSummary(events, counters = {}) {
       hits: count(/cacheHit/),
       misses: count(/cacheMiss/)
     },
-    summaryReduceRequests: Number(counters.summaryReduceRequests) || 0
+    summaryReduceRequests: Number(counters.summaryReduceRequests) || 0,
+    providerContractRepairs: count(/provider\.contractRepair/),
+    evidenceSanitizations: count(/^summary\.evidence\.sanitized$/),
+    emptyVerifiedChunks: count(/^summary\.map\.emptyVerified$/),
+    fatalAllEmptySummaries: count(/^summary\.map\.allEmpty$/)
   };
 }
 
@@ -15813,6 +16006,8 @@ function classifyFailure(input = {}) {
   if (code === 'COMPONENT_PATH_INVALID') return result(code, 'component_config', false, '组件路径配置无效', '修正组件相对路径后重试；路径必须是组件包内的 .md 或 .json 文件，不能是目录。');
   if (code === 'COMPONENT_NOT_FOUND') return result(code, 'component_config', false, '找不到组件文件', '该组件没有可用的内置兼容回退；恢复缺失的用户组件后重试，已有解析产物会复用，无需重新上传。');
   if (code === 'COMPONENT_CONFIG_INVALID') return result(code, 'component_config', false, '组件配置无效', '内置兼容回退不会替换已存在但无效的自定义内容；修正 folder-map、Schema 或 Prompt 后重试，已有解析产物会复用。');
+  if (code === 'SUMMARY_ALL_CHUNKS_UNSUPPORTED') return result(code, 'unsupported_knowledge', false,
+    '所有分块均无可核验知识', '确认解析正文包含可引用原文；如正文正常，请改用能按 block_id 返回短小逐字引文的模型，然后从总结检查点重试。');
   if (code === 'OCR_CANCELLED') return result(code, 'cancelled', false, '本地 OCR 已取消', '如需继续，请重新将文件加入队列；有效页级检查点会复用。');
   if (code === 'OCR_UNAVAILABLE') return result(code, 'local_ocr', true, '本地 OCR 不可用', '在设置中启用并检测本地 OCR，或配置绝对可执行文件路径。');
   if (code === 'OCR_RENDER_FAILURE') return result(code, 'local_ocr', true, 'PDF 页面渲染失败', '确认 pdftoppm 可用后重试；已完成页面会复用。');

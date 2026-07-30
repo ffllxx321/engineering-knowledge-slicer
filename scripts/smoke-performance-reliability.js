@@ -52,8 +52,16 @@ async function testSummaryConcurrency() {
       schema_version: '1.1'
     };
   };
-  await api.summarizeDocument({
-    parsePackage: { source_name: 'test', markdown: `${'甲'.repeat(120)}\n${'乙'.repeat(120)}\n${'丙'.repeat(120)}` },
+  let typedEmpty = false;
+  try {
+    await api.summarizeDocument({
+    parsePackage: {
+      source_name: 'test',
+      markdown: `${'甲'.repeat(120)}\n${'乙'.repeat(120)}\n${'丙'.repeat(120)}`,
+      evidence_index: {
+        source: { block_id: 'source', raw_text: '可验证来源块', locator: { scheme: 'line', value: '1' } }
+      }
+    },
     classification: { library: 'business', folder_type: 'test', document_type: 'test' },
     basePrompt: 'summary',
     typePrompt: '',
@@ -61,9 +69,13 @@ async function testSummaryConcurrency() {
     maxChunkChars: 100,
     coalesceTinyChunks: false,
     summaryConcurrency: 3,
-    requestJson
-  });
+      requestJson
+    });
+  } catch (error) {
+    typedEmpty = error.code === 'SUMMARY_ALL_CHUNKS_UNSUPPORTED';
+  }
   assert(peak === 3, '逐段总结使用独立 summaryConcurrency');
+  assert(typedEmpty, '并发空分块以 SUMMARY_ALL_CHUNKS_UNSUPPORTED 明确结束');
 }
 
 async function main() {

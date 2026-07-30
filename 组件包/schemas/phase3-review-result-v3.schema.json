@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "phase3-review-result-v3.schema.json",
+  "title": "Phase 3 shadow review result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "mode",
+    "classifications",
+    "handling_groups",
+    "summary",
+    "counters",
+    "writes_performed",
+    "deletes_performed",
+    "state_transitions_performed"
+  ],
+  "properties": {
+    "schema_version": { "const": "3.0" },
+    "mode": { "enum": ["shadow_review", "feature_off"] },
+    "classifications": { "type": "array" },
+    "handling_groups": { "type": "array" },
+    "summary": { "type": "string" },
+    "counters": {
+      "type": "object",
+      "required": ["generated", "auto_passed", "notices", "needs_handling", "handling_groups"],
+      "properties": {
+        "generated": { "type": "integer", "minimum": 0 },
+        "auto_passed": { "type": "integer", "minimum": 0 },
+        "notices": { "type": "integer", "minimum": 0 },
+        "needs_handling": { "type": "integer", "minimum": 0 },
+        "handling_groups": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "writes_performed": { "const": 0 },
+    "deletes_performed": { "const": 0 },
+    "state_transitions_performed": { "const": 0 }
+  },
+  "additionalProperties": true
+}

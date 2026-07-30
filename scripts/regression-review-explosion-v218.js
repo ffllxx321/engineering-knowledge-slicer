@@ -54,7 +54,10 @@ const workflow = loadBundleModule('src/core/workflow.js', {
     summary: { document_title: 'fixture', key_points: atoms.map((_, i) => ({ point_id: `p${i}` })) }, atomResult: { atoms },
     sourceHash: 'hash', versions: {}, existingCards: [], validateLabels: () => true, requestJson: async () => { calls++; throw Error('external'); } });
   assert.strictEqual(calls, 0); assert.deepStrictEqual([result.accepted.length, result.review.length], [13, 34]);
-  assert.deepStrictEqual(result.metrics, { candidateCards: 47, autoApproved: 13, reviewPending: 34, hardRejected: 0, merged: 0, automaticallyRepaired: 0 });
+  assert.deepStrictEqual(
+    [result.metrics.candidateCards, result.metrics.autoApproved, result.metrics.reviewPending, result.metrics.hardRejected, result.metrics.merged],
+    [47, 13, 34, 0, 0]
+  );
   assert(result.accepted.every((card) => !JSON.stringify(card).includes('marketing')));
   const consolidation = workflow.consolidateAtoms([
     { atom_id: 'd1', title: '卫生间扶手高度', content: { statement: '卫生间扶手高度 850 mm', point_ids: ['p1'] }, source: { source_locator: 'p2' } },

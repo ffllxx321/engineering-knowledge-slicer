@@ -657,6 +657,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.addCommand({ id: 'export-shadow-evaluation', name: '导出影子评估诊断报告', callback: () => this.exportShadowReport() });
     this.addCommand({ id: 'run-semantic-shadow', name: '运行语义影子处理', callback: () => this.runSemanticIndex() });
     this.addCommand({ id: 'rebuild-semantic-index', name: '重建语义向量索引', callback: () => this.rebuildSemanticIndex() });
+    this.addCommand({ id: 'revalidate-latest-task-local', name: '本地重新归并、校验并路由最近任务（零模型调用）', callback: () => this.revalidateLatestTaskLocal() });
 
     this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
       if (!(file instanceof TFile)) return;
@@ -1450,12 +1451,16 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         await this.writeAcceptedCard(current, card, workflow.route);
         current.written_card_ids.push(card.card_id);
       }
-      if (workflow.review.length) {
-        await this.persistArtifact(current, 'review', { version: '1.3', task_id: current.task_id, metrics: workflow.metrics, items: workflow.review });
+      if (workflow.review.length || workflow.hardRejected.length || workflow.documentWarnings.length || workflow.metrics?.hardRejected) {
+        await this.persistArtifact(current, 'review', {
+          version: '2.0', task_id: current.task_id, metrics: workflow.metrics,
+          documentWarnings: workflow.documentWarnings, items: workflow.review, rejected: workflow.hardRejected
+        });
         current.review_atom_ids = workflow.review.map((item) => item.atom_id);
       }
       if (workflow.accepted.length) await this.rebuildKnowledgeIndexes();
-      if (!workflow.accepted.length && !workflow.review.length) {
+      if (!workflow.accepted.length && !workflow.review.length && !workflow.hardRejected.length
+        && !(workflow.metrics?.hardRejected > 0)) {
         // v2.8.1: 错误信息带上下文计数，告诉用户去 diag.log 看哪几个事件
         const pointCount = (workflow.summary && Array.isArray(workflow.summary.key_points)) ? workflow.summary.key_points.length : 0;
         const atomCount = (workflow.atomResult && Array.isArray(workflow.atomResult.atoms)) ? workflow.atomResult.atoms.length : 0;
@@ -2226,6 +2231,66 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       diag('artifact.cacheHit', { taskId: task.task_id, stage: name });
       return name === 'review' ? migrateReviewArtifact(parsed.payload) : parsed.payload;
     } catch { return null; }
+  }
+
+  async loadArtifactPayloadUnchecked(task, name) {
+    const path = task.artifacts && task.artifacts[name];
+    const file = path && this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return null;
+    const parsed = JSON.parse(await this.app.vault.read(file));
+    const payload = parsed && Object.hasOwn(parsed, 'payload') ? parsed.payload : normalizeLegacyArtifact(name, parsed);
+    return name === 'review' ? migrateReviewArtifact(payload) : payload;
+  }
+
+  async revalidateLatestTaskLocal() {
+    const beforeRequests = Number(this.operationCounters.apiRequests) || 0;
+    const tasks = await this.loadTasks();
+    const task = [...tasks].reverse().find((item) => item.artifacts?.parsed && item.artifacts?.summary && item.artifacts?.atoms);
+    if (!task) throw new Error('没有同时保留解析、总结和知识原子产物的任务');
+    const [parsePackage, classification, summary, atomResult] = await Promise.all([
+      this.loadArtifactPayloadUnchecked(task, 'parsed'),
+      this.loadArtifactPayloadUnchecked(task, 'classification'),
+      this.loadArtifactPayloadUnchecked(task, 'summary'),
+      this.loadArtifactPayloadUnchecked(task, 'atoms')
+    ]);
+    if (!parsePackage || !classification || !summary || !atomResult) throw new Error('现有任务产物不完整，无法零调用重新校验');
+    const contracts = await this.loadRuntimeContracts();
+    const tagLibrary = parseTagLibrary(await this.loadTagLibraryText());
+    const existingCards = await this.loadExistingCards('');
+    const forbidProvider = async () => { throw new Error('LOCAL_REVALIDATION_PROVIDER_CALL_FORBIDDEN'); };
+    const result = await runKnowledgeWorkflow({
+      parsePackage, classification, summary, atomResult,
+      folderMap: contracts.folderMap, schemas: contracts.schemas, prompts: contracts.prompts,
+      sourceHash: task.source_hash, versions: runtimeVersions(this.settings),
+      businessTimeZone: resolveRuntimeTimeZone(this.settings.businessTimeZone),
+      shortDocumentMaxCards: this.settings.shortDocumentMaxCards,
+      autoApproveConfidenceThreshold: this.settings.autoApproveConfidenceThreshold,
+      existingCards, existingFingerprints: existingCards.map((card) => card.atom_fingerprint).filter(Boolean),
+      validateLabels: (atom) => validateAtomLabels(tagLibrary, atom),
+      requestJson: forbidProvider, requestStream: forbidProvider
+    });
+    if ((Number(this.operationCounters.apiRequests) || 0) !== beforeRequests) throw new Error('本地重新校验意外触发了模型调用');
+    const existingIds = new Set(existingCards.map((item) => item.card_id));
+    for (const card of result.accepted) {
+      if (!existingIds.has(card.card_id)) {
+        await this.writeAcceptedCard(task, card, result.route);
+        if (!task.written_card_ids.includes(card.card_id)) task.written_card_ids.push(card.card_id);
+        existingIds.add(card.card_id);
+      }
+    }
+    task.component_contract_hash = contracts.contractHash;
+    await this.persistArtifact(task, 'atoms', result.atomResult);
+    await this.persistArtifact(task, 'review', {
+      version: '2.0', task_id: task.task_id, metrics: result.metrics, documentWarnings: result.documentWarnings,
+      items: result.review, rejected: result.hardRejected, revalidated_locally_at: new Date().toISOString(), provider_requests: 0
+    });
+    task.review_atom_ids = result.review.map((item) => item.atom_id);
+    task.status = result.review.length ? 'needs_review' : 'written';
+    task.updated_at = new Date().toISOString();
+    await this.saveTasks(upsertTask(tasks, task));
+    new Notice(`本地重新校验完成：自动入库 ${result.accepted.length}，待确认 ${result.review.length}，拒绝 ${result.hardRejected.length}；模型调用 0`);
+    await this.refreshViews();
+    return result;
   }
 
   async persistArtifact(task, name, value) {
@@ -3165,6 +3230,11 @@ class ReviewExceptionModal extends Modal {
       source.createEl('h4', { text: '原文依据' });
       source.createDiv({ text: context.evidence_quote || '未找到可核验的逐字原文' });
       source.createDiv({ cls: 'eks-task-meta', text: `位置：${context.locator || '未定位'}${context.page ? ` · 第 ${context.page} 页` : ''}${context.block_id ? ` · 块 ${context.block_id}` : ''}` });
+      const differences = context.material_differences || {};
+      block.createDiv({
+        cls: 'eks-material-differences',
+        text: `关键差异：数字/单位 ${JSON.stringify(differences.statement_facts || []) === JSON.stringify(differences.evidence_facts || []) ? '一致' : '需核对'} · 语气 ${differences.statement_modality || '未知'} / ${differences.evidence_modality || '未知'} · 条件/例外 ${JSON.stringify(differences.statement_conditions || []) === JSON.stringify(differences.evidence_conditions || []) ? '一致' : '需核对'}`
+      });
       const gates = block.createDiv({ cls: 'eks-gate-checklist' });
       gates.createEl('h4', { text: '自动检查' });
       const gateLabels = { source_evidence: '原文证据', numbers: '数字/单位/日期', schema: '内容结构', route: '安全目录', tags: '标签', duplicate: '非重复内容' };
@@ -3173,6 +3243,7 @@ class ReviewExceptionModal extends Modal {
           text: `${context.gate_checklist?.[gate] ? '✓' : '✕'} ${label}` });
       }
       const repair = context.automatic_repair || {};
+      block.createDiv({ cls: 'eks-exception-action', text: `推荐操作：${context.recommended_action || explanation.action}` });
       block.createDiv({ cls: 'eks-task-meta', text: repair.attempted
         ? (repair.repaired ? `自动修复：已从原文重新定位证据（${repair.method || '本地匹配'}）` : `自动修复：已尝试本地证据对齐，但${repair.reason === 'ambiguous_alignment' ? '存在多个相近位置，不能安全决定' : '相似度或唯一性不足'}`)
         : '自动修复：未执行' });
@@ -3947,7 +4018,9 @@ class SlicerDashboardView extends ItemView {
       };
       const documentSummary = parent.createDiv('eks-review-document-summary');
       documentSummary.createEl('h4', { text: '文档处理结果' });
-      documentSummary.createDiv({ text: `生成候选 ${taskMetrics.candidateCards} · 自动批准 ${taskMetrics.autoApproved} · 自动修复 ${taskMetrics.automaticallyRepaired || 0} · 自动丢弃噪声/重复 ${(taskMetrics.hardRejected || 0) + (taskMetrics.merged || 0)} · 真正待处理 ${taskMetrics.reviewPending}` });
+      const originalCandidates = Number(taskMetrics.stageCardinalities?.atom_candidates)
+        || Number(taskMetrics.candidateCards || 0) + Number(taskMetrics.merged || 0) + Number(taskMetrics.hardRejected || 0);
+      documentSummary.createDiv({ text: `原始候选 ${originalCandidates} → 归并后 ${taskMetrics.stageCardinalities?.consolidated ?? taskMetrics.candidateCards} → 自动通过 ${taskMetrics.autoApproved} · 定向审核 ${taskMetrics.reviewPending} · 拒绝 ${taskMetrics.hardRejected || 0} · 合并 ${taskMetrics.merged || 0}` });
       for (const group of groupReviewItems(artifact.items)) {
         const block = parent.createDiv('eks-review-group');
         const header = block.createDiv('eks-review-group-header');
@@ -4528,7 +4601,7 @@ class SlicerSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('短文档卡片异常阈值')
-      .setDesc('3 页以内文档超过该数量时不自动入库，整批转入审核台；不会截断或丢弃卡片。默认 20。')
+      .setDesc('3 页以内文档超过该数量时仅显示文档级数量警告并抽样，不会阻断通过逐卡质量门禁的内容。默认 20。')
       .addText((text) => text.setPlaceholder('20')
         .setValue(String(this.plugin.settings.shortDocumentMaxCards || 20))
         .onChange(async (value) => {
@@ -4601,7 +4674,7 @@ function normalizeLegacyArtifact(stage, value) {
     return Array.isArray(value.atoms) && value.atoms.every((atom) => atom && typeof (atom.title || atom.Title) === 'string')
       && allowedOnly(['atoms', 'warnings', 'coverage', 'version']) ? value : null;
   }
-  if (name === 'review') return Array.isArray(value.items) && allowedOnly(['version', 'task_id', 'outcome', 'metrics', 'items', 'handled', 'rejected', 'manual_requests', 'regeneration_requests'])
+  if (name === 'review') return Array.isArray(value.items) && allowedOnly(['version', 'task_id', 'outcome', 'metrics', 'documentWarnings', 'items', 'handled', 'rejected', 'manual_requests', 'regeneration_requests', 'revalidated_locally_at', 'provider_requests'])
     ? migrateReviewArtifact(value) : null;
   if (name === 'error') {
     return typeof (value.message || value.code) === 'string'
@@ -10137,7 +10210,7 @@ function reconcileEvidence(parsePackage, quote, hint = {}) {
     });
   const queryFacts = factSet(query);
   const ranked = entries.map((entry) => {
-    const candidate = comparable(entry.raw_text);
+    const candidate = comparable(evidenceSearchText(entry, parsePackage));
     const token = dice(tokenSet(query), tokenSet(candidate));
     const chars = dice(grams(query), grams(candidate));
     const numeric = queryFacts.size ? subset(queryFacts, factSet(candidate)) : 1;
@@ -10163,12 +10236,45 @@ function reconcileEvidence(parsePackage, quote, hint = {}) {
   direct.locator.block_id = winner.entry.block_id || direct.locator.block_id;
   direct.locator.precision = 'block-exact';
   return Object.assign({}, direct, { quote: verbatim, repaired: true, attempted: true, method: 'local-alignment',
-    score: round3(winner.score), margin: round3(margin) });
+    score: round3(winner.score), margin: round3(margin), context: evidenceContext(winner.entry, parsePackage) });
+}
+function evidenceContext(entry, parsePackage) {
+  const block = (parsePackage?.blocks || []).find((item) => String(item.block_id) === String(entry.block_id)) || {};
+  const metadata = Object.assign({}, block.metadata || {}, entry.metadata || {});
+  const locator = Object.assign({}, block.locator || {}, entry.locator || {});
+  const context = {
+    section: metadata.section || metadata.heading || locator.section || '',
+    table: {
+      sheet: metadata.sheet || locator.sheet || '',
+      range: metadata.range || locator.range || '',
+      row: metadata.row ?? locator.row ?? '',
+      column: metadata.column ?? locator.column ?? '',
+      headers: metadata.headers || metadata.header_path || locator.headers || []
+    },
+    message: {
+      thread_id: metadata.thread_id || locator.thread_id || '',
+      message_id: metadata.message_id || locator.message_id || '',
+      from: metadata.from || '',
+      date: metadata.date || '',
+      subject: metadata.subject || ''
+    }
+  };
+  return context;
+}
+function evidenceSearchText(entry, parsePackage) {
+  const context = evidenceContext(entry, parsePackage);
+  return [
+    context.section,
+    context.table.sheet, context.table.range,
+    ...(Array.isArray(context.table.headers) ? context.table.headers : [context.table.headers]),
+    context.message.subject, context.message.from,
+    entry.raw_text
+  ].filter(Boolean).join(' ');
 }
 function comparable(value) { return normalizeText(value).toLowerCase().replace(/[「」『』“”‘’"'`]/g, '').trim(); }
 function tokenSet(value) { return new Set(String(value).match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]|[a-z]+|\d+(?:\.\d+)?(?:%|‰|mm|cm|m2|m²|m3|m³|mpa|kn)?/giu) || []); }
 function grams(value) { const out = new Set(); for (let i = 0; i < value.length - 1; i += 1) out.add(value.slice(i, i + 2)); return out; }
-function factSet(value) { return new Set((String(value).match(/\d+(?:\.\d+)?\s*(?:%|‰|毫米|厘米|米|平方米|立方米|mm|cm|m|m2|m²|m3|m³|MPa|kN|元|年|月|日)?/gi) || []).map((item) => item.replace(/\s+/g, '').toLowerCase())); }
+function factSet(value) { return new Set((String(value).normalize('NFKC').match(/\d+(?:[.,]\d+)?\s*(?:%|‰|[a-zµμ°℃℉²³/·]+|[\p{Script=Han}]{0,4})?/giu) || []).map((item) => item.replace(/[\s,]/g, '').toLowerCase())); }
 function dice(a, b) { if (!a.size && !b.size) return 1; let hit = 0; for (const item of a) if (b.has(item)) hit += 1; return 2 * hit / Math.max(1, a.size + b.size); }
 function subset(a, b) { let hit = 0; for (const item of a) if (b.has(item)) hit += 1; return hit / Math.max(1, a.size); }
 function round3(value) { return Number.isFinite(value) ? Math.round(value * 1000) / 1000 : 0; }
@@ -11911,7 +12017,7 @@ async function atomizeSummaryBatch(options, summary, pointIds, batchIndex, batch
     // v2.9.2: 归一化靠 content.point_ids 把原子归属到知识点。此前所有 prompt 只要求 coverage.point_ids（批次级），
     //   从不要求逐原子的 content.point_ids → 多知识点批次里每个原子都因"无归属"被丢弃（诊断日志
     //   droppedNoPointAttribution 全等于 rawAtoms），最终误报"AI 返回内容不是有效 JSON"。这里显式立约。
-    `每个原子的 content.point_ids 必须是非空字符串数组，取值只能来自本批知识点 ${JSON.stringify(pointIds)}，表示该原子归属的知识点；一个原子只归属一个知识点，禁止留空、禁止使用本批之外的 point_id。`,
+    `每个原子的 content.point_ids 必须是非空字符串数组，取值只能来自本批知识点 ${JSON.stringify(pointIds)}。归属是多对多：同一可复用知识单元可覆盖多个 point_id；一个 point_id 含多个独立要求时可生成多个原子。不得为了逐点交差而强制一要点一卡。`,
     `这是知识原子化第 ${batchIndex}/${batchTotal} 批；只处理本批知识点，不得重复其他批次。`,
     '标题和正文统一使用简体中文。只返回符合 knowledge-atoms.schema.json 的 JSON。',
     // v1.1.10: 显式列出必须的最外层结构。AI 返回不带 {atoms:[...], coverage:{...}, schema_version:”1.1”}
@@ -11964,11 +12070,11 @@ function normalizeAtomBatch(value, summary, pointIds) {
   const allowed = new Set(pointIds);
   const points = new Map((summary.key_points || []).map((point) => [point.point_id, point]));
   const evidence = new Map((summary.evidence || []).map((item) => [item.evidence_id, item]));
-  const byPoint = new Map();
+  const assigned = [];
+  const covered = new Set();
   // v2.8.1: 统计归一化丢弃原因——旧实现静默丢弃，"未生成任何可用知识原子"无从查起
   const rawCount = Array.isArray(value.atoms) ? value.atoms.length : 0;
   let droppedMismatch = 0;
-  let droppedDuplicate = 0;
   let droppedNoPoint = 0;
   const unassigned = [];
   for (const atom of value.atoms || []) {
@@ -11983,50 +12089,51 @@ function normalizeAtomBatch(value, summary, pointIds) {
     const rawPointIds = [...new Set(candidatePointIds)];
     const matched = rawPointIds.filter((pointId) => allowed.has(pointId));
     if (rawPointIds.length && !matched.length) { droppedMismatch += 1; continue; }
-    const pointId = matched[0] || '';
-    if (!pointId) {
+    if (!matched.length) {
       unassigned.push(atom);
       continue;
     }
-    if (byPoint.has(pointId)) { droppedDuplicate += 1; continue; }
-    byPoint.set(pointId, atom);
+    assigned.push({ atom, pointIds: matched });
+    matched.forEach((pointId) => covered.add(pointId));
   }
 
   // 批量输出最常见的失败形态是“原子数量正确、顺序正确，但漏写 point_ids”。
   // 只对尚未归属的原子按剩余 point 顺序补齐；显式写错的原子不会进入这里。
-  const remainingPointIds = pointIds.filter((pointId) => !byPoint.has(pointId));
+  const remainingPointIds = pointIds.filter((pointId) => !covered.has(pointId));
   if (unassigned.length === remainingPointIds.length) {
-    unassigned.forEach((atom, index) => byPoint.set(remainingPointIds[index], atom));
+    unassigned.forEach((atom, index) => assigned.push({ atom, pointIds: [remainingPointIds[index]] }));
   } else if (pointIds.length === 1 && unassigned.length) {
-    byPoint.set(pointIds[0], unassigned[0]);
+    unassigned.forEach((atom) => assigned.push({ atom, pointIds: [pointIds[0]] }));
   }
   droppedNoPoint = Math.max(0, unassigned.length - remainingPointIds.length);
 
-  for (const [pointId, atom] of [...byPoint.entries()]) {
-    const point = points.get(pointId);
-    const evidenceItem = evidence.get(point?.evidence_ids?.[0]) || {};
-    byPoint.set(pointId, Object.assign({}, atom, {
-      content: Object.assign({}, atom.content || {}, { point_ids: [pointId] }),
+  const keptAtoms = assigned.map(({ atom, pointIds: attributedIds }) => {
+    const attributedPoints = attributedIds.map((pointId) => points.get(pointId)).filter(Boolean);
+    const evidenceItems = attributedPoints.flatMap((point) => point.evidence_ids || [])
+      .map((id) => evidence.get(id)).filter(Boolean);
+    const evidenceItem = evidenceItems[0] || {};
+    return Object.assign({}, atom, {
+      content: Object.assign({}, atom.content || {}, { point_ids: [...new Set(attributedIds)] }),
       source: Object.assign({}, atom.source || {}, {
         source_link: '[[source]]',
-        source_locator: evidenceItem.locator || pointId,
+        source_locator: evidenceItem.locator || attributedIds.join(','),
         source_page: evidenceItem.source_page || evidenceItem.provenance?.page || '',
         source_provenance: evidenceItem.provenance || null,
         locator_precision: evidenceItem.locator_precision || evidenceItem.provenance?.precision || '',
-        evidence_quote: evidenceItem.quote || point?.content || '',
+        evidence_quote: evidenceItem.quote || attributedPoints.map((point) => point.content).join('；'),
+        evidence_ids: evidenceItems.map((item) => item.evidence_id).filter(Boolean),
         parent_summary: '[[summary]]'
       })
-    }));
-  }
-  const keptAtoms = pointIds.map((pointId) => byPoint.get(pointId)).filter(Boolean);
+    });
+  });
   // v2.8.1: AI 返回了原子但被归一化丢光时，必须留下可追查的诊断
-  if (rawCount > 0 && (droppedMismatch || droppedDuplicate || droppedNoPoint || !keptAtoms.length)) {
+  if (rawCount > 0 && (droppedMismatch || droppedNoPoint || !keptAtoms.length)) {
     diag('atomization.normalize', {
       requestedPoints: pointIds.length,
       rawAtoms: rawCount,
       keptAtoms: keptAtoms.length,
       droppedPointIdMismatch: droppedMismatch,
-      droppedDuplicatePoint: droppedDuplicate,
+      retainedOneToMany: Math.max(0, keptAtoms.length - covered.size),
       droppedNoPointAttribution: droppedNoPoint
     });
   }
@@ -13701,6 +13808,7 @@ async function runKnowledgeWorkflow(options) {
   ]);
   const accepted = [];
   const review = [];
+  const hardRejected = [];
   const pageCount = Array.isArray(options.parsePackage.pages) && options.parsePackage.pages.length
     ? options.parsePackage.pages.length
     : Number(options.parsePackage.total_pages || options.parsePackage.page_count || 0);
@@ -13727,6 +13835,7 @@ async function runKnowledgeWorkflow(options) {
       atom.source.block_id = alignment.locator.block_id || atom.source.block_id;
       atom.source.locator_precision = alignment.locator.precision;
       atom.source.provenance_verified = true;
+      atom.source.context = alignment.context || evidenceContextForBlock(options.parsePackage, alignment.locator.block_id);
     } else if (Object.keys(options.parsePackage?.evidence_index || {}).length) {
       const requestedId = String(atom.source?.source_provenance?.block_id || atom.source?.block_id || '');
       const quote = String(atom.source?.evidence_quote || '');
@@ -13812,14 +13921,22 @@ async function runKnowledgeWorkflow(options) {
       businessTimeZone: options.businessTimeZone
     });
     card.validation_report = validationReport;
-    if (confidence.decision === 'auto_ingest' && !quantityAnomaly && !excludedEvidenceBlock && !unverifiedVisualApproval && !noEligibleSourceBlocks) {
+    const rejectCodes = [];
+    if (duplicate) rejectCodes.push('DUPLICATE_CONFLICT');
+    if (excludedEvidenceBlock || noEligibleSourceBlocks) rejectCodes.push('UNSUPPORTED_SOURCE_BLOCK');
+    if (unverifiedVisualApproval) rejectCodes.push('UNSAFE_UNVERIFIED_VISUAL_CLAIM');
+    if (rejectCodes.length) {
+      hardRejected.push({
+        atom_id: atom.atom_id, atom, proposed_card: card, status: 'rejected',
+        reason_codes: rejectCodes, non_overridable: true
+      });
+    } else if (confidence.decision === 'auto_ingest') {
       accepted.push(card);
     } else {
       const reasons = [...confidence.hard_rules, ...(atom.validation_issues || [])];
       if (excludedEvidenceBlock) reasons.push(`来源块不可生成卡片：${excludedEvidenceBlock.exclusion_reason || 'not_card_content'} (${excludedEvidenceBlock.block_id})`);
       if (unverifiedVisualApproval) reasons.push('视觉印章/签名仅记录可见性，未验证审批状态；禁止自动形成批准结论');
       if (noEligibleSourceBlocks) reasons.push('整份来源没有可生成卡片的知识内容块');
-      if (quantityAnomaly) reasons.push(`短文档数量异常：${pageCount} 页生成 ${(atomResult.atoms || []).length} 张卡片，超过阈值 ${shortDocumentMaxCards}，需整批人工确认`);
       if (!labelsValid && !reasons.some((reason) => /标签/.test(reason))) reasons.push('标签字典校验未通过');
       if (!routeValid && !reasons.some((reason) => /目录/.test(reason))) reasons.push('知识原子目录与文档分类不一致');
       if (duplicate && !reasons.some((reason) => /重复/.test(reason))) reasons.push('与已有知识卡片重复');
@@ -13830,6 +13947,7 @@ async function runKnowledgeWorkflow(options) {
         folder_type: atom.folder_type,
         status: 'pending',
         reasons,
+        reason_codes: reviewReasonCodes(validationReport, confidence, atom.validation_issues),
         confidence,
         validationReport,
         atom,
@@ -13854,6 +13972,8 @@ async function runKnowledgeWorkflow(options) {
     generated: consolidation.metrics.generated,
     merged: consolidation.metrics.merged,
     droppedNoKnowledge: consolidation.metrics.dropped_no_knowledge,
+    hardRejected: hardRejected.length,
+    quantityWarning: quantityAnomaly,
     autoApproveThreshold: Number(options.autoApproveConfidenceThreshold),
     truncated: !!(atomResult && atomResult._truncated)
   });
@@ -13865,17 +13985,56 @@ async function runKnowledgeWorkflow(options) {
     atomResult,
     accepted,
     review,
+    hardRejected,
+    documentWarnings: quantityAnomaly ? [{
+      code: 'DOCUMENT_QUANTITY_ANOMALY',
+      message: `${pageCount} 页产生 ${(atomResult.atoms || []).length} 个候选；仅记录文档级警告，不阻塞逐卡自动入库。`,
+      sample_atom_ids: (atomResult.atoms || []).slice(0, 3).map((atom) => atom.atom_id)
+    }] : [],
     metrics: {
+      stageCardinalities: {
+        summary_points: (summary.key_points || []).length,
+        atom_candidates: consolidation.metrics.generated,
+        consolidated: consolidation.metrics.output,
+        auto_approved: accepted.length,
+        targeted_review: review.length,
+        hard_rejected: consolidation.metrics.dropped_no_knowledge + hardRejected.length
+      },
       candidateCards: accepted.length + review.length,
       autoApproved: accepted.length,
       reviewPending: review.length,
-      hardRejected: consolidation.metrics.dropped_no_knowledge,
+      hardRejected: consolidation.metrics.dropped_no_knowledge + hardRejected.length,
       merged: consolidation.metrics.merged,
-      automaticallyRepaired: (atomResult.atoms || []).filter((atom) => atom.source?.evidence_repair?.repaired).length
+      automaticallyRepaired: (atomResult.atoms || []).filter((atom) => atom.source?.evidence_repair?.repaired).length,
+      reasonHistograms: {
+        review: histogram(review.flatMap((item) => item.reason_codes || [])),
+        rejected: histogram(hardRejected.flatMap((item) => item.reason_codes || [])),
+        merge: { SEMANTIC_COMPATIBLE: consolidation.metrics.merged },
+        drop: { NON_REUSABLE_NOISE: consolidation.metrics.dropped_no_knowledge }
+      },
+      providerRequestsAdded: 0
     },
     truncated: !!(atomResult && atomResult._truncated),
     truncatedCompleted: Array.isArray(atomResult?.coverage?.point_ids) ? atomResult.coverage.point_ids.length : (atomResult?.atoms?.length || 0)
   };
+}
+
+function histogram(values) {
+  return (values || []).reduce((out, value) => {
+    out[value] = (out[value] || 0) + 1;
+    return out;
+  }, {});
+}
+
+function reviewReasonCodes(report, confidence, issues = []) {
+  const codes = [];
+  const failures = report.hardGateFailures || [];
+  if (failures.some((value) => ['EVIDENCE', 'NUMERIC_CONFLICT', 'DATE_CONFLICT', 'SUBJECT_CONFLICT'].includes(value))) codes.push('GROUNDING_DEFECT');
+  if (failures.some((value) => ['SCHEMA', 'ROUTING', 'TAG', 'SOURCE_LINK', 'UNSAFE_PATH'].includes(value))) codes.push('SCHEMA_ROUTE_DEFECT');
+  if (failures.includes('DUPLICATE')) codes.push('DUPLICATE_CONFLICT');
+  if ((issues || []).some((value) => /原子|拆分|完整|上下文|fragment|atomic/i.test(String(value)))) codes.push('SLICING_DEFECT');
+  if (!codes.length && confidence.decision !== 'auto_ingest') codes.push('SOFT_CONFIDENCE');
+  return [...new Set(codes)];
 }
 
 function normalizePresentationFields(atom) {
@@ -13889,6 +14048,24 @@ function normalizePresentationFields(atom) {
   return atom;
 }
 
+function evidenceContextForBlock(parsePackage, blockId) {
+  const block = (parsePackage?.blocks || []).find((item) => String(item.block_id) === String(blockId)) || {};
+  const metadata = block.metadata || {};
+  const locator = block.locator || {};
+  return {
+    section: metadata.section || metadata.heading || locator.section || '',
+    table: {
+      sheet: metadata.sheet || locator.sheet || '', range: metadata.range || locator.range || '',
+      row: metadata.row ?? locator.row ?? '', column: metadata.column ?? locator.column ?? '',
+      headers: metadata.headers || metadata.header_path || locator.headers || []
+    },
+    message: {
+      thread_id: metadata.thread_id || locator.thread_id || '', message_id: metadata.message_id || locator.message_id || '',
+      from: metadata.from || '', date: metadata.date || '', subject: metadata.subject || ''
+    }
+  };
+}
+
 function consolidateAtoms(atoms) {
   const output = [];
   let merged = 0;
@@ -13896,14 +14073,20 @@ function consolidateAtoms(atoms) {
   for (const original of atoms || []) {
     const atom = JSON.parse(JSON.stringify(original));
     const text = atomText(atom);
-    if (text.length < 8 || /^(目录|版权|联系方式|扫码|退订|unsubscribe)$/i.test(text)) { dropped += 1; continue; }
-    const duplicate = output.findIndex((item) => compatible(item, atom, 0.88, false));
-    const adjacent = output.length && compatible(output[output.length - 1], atom, 0.82, true) ? output.length - 1 : -1;
+    if (!isReusableKnowledge(text)) { dropped += 1; continue; }
+    const duplicate = output.findIndex((item) => compatible(item, atom, 0.86, false));
+    const adjacent = output.length && compatible(output[output.length - 1], atom, 0.76, true) ? output.length - 1 : -1;
     const index = duplicate >= 0 ? duplicate : adjacent;
     if (index < 0) output.push(atom);
     else { output[index] = mergeAtoms(output[index], atom); merged += 1; }
   }
   return { atoms: output, metrics: { generated: (atoms || []).length, merged, dropped_no_knowledge: dropped, output: output.length } };
+}
+function isReusableKnowledge(text) {
+  const value = String(text || '').trim();
+  if (value.length < 8) return false;
+  if (/^(?:目录|contents?|版权|copyright|联系方式|contact|扫码|qr\s*code|退订|unsubscribe)[\s:：\-—]*$/iu.test(value)) return false;
+  return /[\p{L}\p{N}]/u.test(value);
 }
 function atomText(atom) {
   const content = typeof atom?.content === 'string' ? atom.content : Object.entries(atom?.content || {})
@@ -13911,20 +14094,56 @@ function atomText(atom) {
     .map(([, value]) => typeof value === 'string' ? value : JSON.stringify(value)).join(' ');
   return `${atom?.title || ''} ${content}`.replace(/\s+/g, ' ').trim();
 }
-function atomFacts(atom) { return new Set(atomText(atom).match(/\d+(?:\.\d+)?\s*(?:%|‰|毫米|厘米|米|平方米|mm|cm|m²|MPa|kN|年|月|日)?/g) || []); }
-function atomSubjects(atom) { return new Set(atomText(atom).match(/(?:厨房|卫生间|卧室|客厅|阳台|楼梯|门|窗|扶手|地面|照明|浴室|玄关)/g) || []); }
+function atomFacts(atom) {
+  return new Set((atomText(atom).normalize('NFKC').match(
+    /(?:\d{1,4}[-/.年]\d{1,2}(?:[-/.月]\d{1,2}日?)?|\d+(?:[.,]\d+)?\s*(?:%|‰|[a-zµμ°℃℉²³/·]+|[\p{Script=Han}]{0,4}))/giu
+  ) || []).map((value) => value.toLowerCase().replace(/[\s,]/g, '')));
+}
+function contentTerms(atom) {
+  const text = atomText(atom).toLowerCase().normalize('NFKC');
+  const words = text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]|[a-z][a-z0-9_-]{1,}/giu) || [];
+  const stop = new Set(['the', 'and', 'for', 'with', 'this', 'that', 'from', '以及', '或者', '可以', '进行', '应当']);
+  return new Set(words.filter((word) => !stop.has(word)));
+}
+function propositionType(atom) {
+  const explicit = String(atom.card_kind || atom.Info_Type || atom.Event_Type || '').toLowerCase();
+  const text = atomText(atom);
+  if (/event|事件|会议|发送|received|sent|approved|完了|実施/u.test(`${explicit} ${text}`)) return 'event';
+  if (/步骤|procedure|手順|步骤|先.+再|第[一二三四五\d]+步/u.test(text)) return 'procedure';
+  if (/必须|不得|禁止|应(?:当|该)?|must|shall|may not|prohibited|禁止|べき|なければ/u.test(text)) return 'requirement';
+  if (/记录|record|台账|ログ|履歴/u.test(text)) return 'record';
+  return 'claim';
+}
+function modality(atom) {
+  const text = atomText(atom).toLowerCase();
+  if (/不得|禁止|严禁|must not|shall not|may not|prohibited|禁止/u.test(text)) return 'prohibited';
+  if (/必须|务必|须|must|shall|required|なければ|必須/u.test(text)) return 'must';
+  if (/可以|可(?:以)?|may|optional|任意|可能/u.test(text)) return 'may';
+  return 'asserted';
+}
+function conditionSignature(atom) {
+  const clauses = atomText(atom).match(/(?:如果|若|当|除非|仅当|在.+?时|if|when|unless|except|provided that|場合|とき|ただし)[^。！？!?;；]{0,100}/giu) || [];
+  return new Set(clauses.flatMap((clause) => [...contentTerms({ content: clause })]));
+}
+function sourceNeighborhood(atom) {
+  const provenance = atom.source?.source_provenance || {};
+  return String(provenance.section_id || provenance.sheet || provenance.message_id || provenance.thread_id
+    || provenance.block_id || atom.source?.block_id || atom.source?.source_locator || '');
+}
 function equalSet(a, b) { return a.size === b.size && [...a].every((item) => b.has(item)); }
 function atomSimilarity(a, b) {
-  const aa = new Set(atomText(a).match(/[\u3400-\u9fff]|[\u3040-\u30ff]|[a-z]+|\d+(?:\.\d+)?/gi) || []);
-  const bb = new Set(atomText(b).match(/[\u3400-\u9fff]|[\u3040-\u30ff]|[a-z]+|\d+(?:\.\d+)?/gi) || []);
+  const aa = contentTerms(a);
+  const bb = contentTerms(b);
   let hit = 0; for (const item of aa) if (bb.has(item)) hit += 1;
   return 2 * hit / Math.max(1, aa.size + bb.size);
 }
 function compatible(a, b, threshold, adjacentOnly) {
-  if (!equalSet(atomFacts(a), atomFacts(b)) || !equalSet(atomSubjects(a), atomSubjects(b)) || atomSimilarity(a, b) < threshold) return false;
-  const leftLocator = String(a.source?.source_provenance?.block_id || a.source?.source_locator || '');
-  const rightLocator = String(b.source?.source_provenance?.block_id || b.source?.source_locator || '');
-  const sameEvidence = leftLocator && leftLocator === rightLocator;
+  if (propositionType(a) !== propositionType(b) || modality(a) !== modality(b)) return false;
+  if (!equalSet(atomFacts(a), atomFacts(b)) || !equalSet(conditionSignature(a), conditionSignature(b))) return false;
+  if (atomSimilarity(a, b) < threshold) return false;
+  const leftLocator = sourceNeighborhood(a);
+  const rightLocator = sourceNeighborhood(b);
+  const sameEvidence = !!leftLocator && leftLocator === rightLocator;
   const equivalentQuote = String(a.source?.evidence_quote || '').trim()
     && String(a.source?.evidence_quote || '').trim() === String(b.source?.evidence_quote || '').trim();
   if (!sameEvidence && !equivalentQuote) return false;
@@ -13937,16 +14156,36 @@ function mergeAtoms(a, b) {
   });
   merged.merged_atom_ids = [...new Set([...(a.merged_atom_ids || [a.atom_id]), ...(b.merged_atom_ids || [b.atom_id])])];
   merged.merged_evidence = [...(a.merged_evidence || [a.source]), ...(b.merged_evidence || [b.source])];
+  merged.provenance = {
+    atom_ids: merged.merged_atom_ids,
+    point_ids: merged.content.point_ids,
+    evidence: merged.merged_evidence
+  };
   return merged;
 }
 function reviewContext(atom, report, reasons) {
+  const statement = atomText(atom);
+  const evidenceQuote = String(atom.source?.evidence_quote || '');
+  const sourceContext = atom.source?.context || {};
   return {
-    statement: atomText(atom), evidence_quote: String(atom.source?.evidence_quote || ''),
+    statement, evidence_quote: evidenceQuote,
     locator: String(atom.source?.source_locator || ''), page: atom.source?.source_page || atom.source?.source_provenance?.page || '',
     block_id: atom.source?.source_provenance?.block_id || atom.source?.block_id || '',
+    section: sourceContext.section || sourceContext.table?.sheet || sourceContext.message?.subject || '',
+    source_context: sourceContext,
+    material_differences: {
+      statement_facts: [...atomFacts(atom)],
+      evidence_facts: [...atomFacts({ content: evidenceQuote })],
+      statement_modality: modality(atom),
+      evidence_modality: modality({ content: evidenceQuote }),
+      statement_conditions: [...conditionSignature(atom)],
+      evidence_conditions: [...conditionSignature({ content: evidenceQuote })]
+    },
     automatic_repair: atom.source?.evidence_repair || { attempted: false },
     gate_checklist: { source_evidence: report.evidenceFound, numbers: report.numberConsistency,
       schema: report.schemaValid, route: report.routeValid, tags: report.tagsValid, duplicate: report.duplicateScore < 1 },
+    recommended_action: report.hardGateFailures?.length ? '重新切片或修正原文定位；必要检查未通过，不能人工强制批准。' : '抽查原文差异；确认只是可信度偏低后，可填写审核理由批量批准。',
+    developer_details_hidden: true,
     plain_reasons: reasons.map((reason) => /定位|证据|逐字/.test(reason) ? '尚未找到唯一、逐字一致的原文依据'
       : /数字|日期/.test(reason) ? '数字、单位或日期与原文依据不一致'
         : /可信度/.test(reason) ? '必要检查已通过，但综合可信度未达到自动入库门槛' : String(reason))
@@ -14226,20 +14465,32 @@ function groupReviewItems(items) {
   const groups = new Map();
   for (const item of items || []) {
     const issue = [...(item.reasons || [])].sort().join('；') || '其他异常';
-    const key = `${item.library || 'unknown'}|${item.folder_type || 'unknown'}|${issue}`;
+    const cause = (item.reason_codes || ['UNCLASSIFIED']).join('+');
+    const section = item.review_context?.section || item.review_context?.block_id || item.review_context?.locator || '未定位章节';
+    const key = `${cause}|${section}`;
     if (!groups.has(key)) {
       groups.set(key, {
         group_id: `review-${hashCode(key)}`,
         library: item.library,
         folder_type: item.folder_type,
         reasons: item.reasons || [],
-        label: `${item.folder_type || '未分类'} · ${issue}`,
+        reason_codes: item.reason_codes || [],
+        section,
+        label: `${section} · ${plainCauseLabel(cause)}`,
         items: []
       });
     }
     groups.get(key).items.push(item);
   }
   return [...groups.values()].sort((left, right) => right.items.length - left.items.length || left.label.localeCompare(right.label, 'zh-CN'));
+}
+function plainCauseLabel(code) {
+  const labels = {
+    SLICING_DEFECT: '切片边界需修正', GROUNDING_DEFECT: '原文依据需确认',
+    SCHEMA_ROUTE_DEFECT: '结构或归档需修正', DUPLICATE_CONFLICT: '重复或冲突',
+    SOFT_CONFIDENCE: '仅可信度偏低', UNCLASSIFIED: '其他异常'
+  };
+  return String(code).split('+').map((item) => labels[item] || item).join(' / ');
 }
 
 // v1.4 (M-05): 批量修正的字段白名单与校验器。

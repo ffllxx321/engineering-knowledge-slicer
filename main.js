@@ -652,7 +652,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.addCommand({ id: 'auto-process-source-files', name: '自动处理可信卡片', callback: () => this.autoProcessQueue(true) });
     this.addCommand({ id: 'retry-failed-source-files', name: '重试失败任务并自动处理', callback: () => this.retryFailedAndAutoProcess(true) });
     this.addCommand({ id: 'rollback-last-batch', name: '回滚最近一批卡片', callback: () => this.rollbackLastBatch() });
-    this.addCommand({ id: 'open-ai-settings', name: '打开工程知识切片 AI 设置', callback: () => this.activateView() });
+    this.addCommand({ id: 'open-ai-settings', name: '打开工程知识切片密钥设置', callback: () => this.openPluginSettings() });
     this.addCommand({ id: 'run-shadow-evaluation', name: '运行本地影子评估', callback: () => this.runShadowEvaluation() });
     this.addCommand({ id: 'export-shadow-evaluation', name: '导出影子评估诊断报告', callback: () => this.exportShadowReport() });
     this.addCommand({ id: 'run-semantic-shadow', name: '运行语义影子处理', callback: () => this.runSemanticIndex() });
@@ -852,6 +852,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const leaf = leaves[0] || this.app.workspace.getRightLeaf(false);
     await leaf.setViewState({ type: VIEW_TYPE_SLICER, active: true });
     this.app.workspace.revealLeaf(leaf);
+  }
+
+  openPluginSettings() {
+    this.app.setting?.open?.();
+    this.app.setting?.openTabById?.(this.manifest.id);
   }
 
   async saveSafeSettings() {
@@ -4145,6 +4150,61 @@ class SlicerSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl('h2', { text: '工程知识切片设置' });
+    containerEl.createEl('p', {
+      text: '这里只需填写当前功能需要的密钥。其他参数已采用安全默认值，无需设置。'
+    });
+
+    credentialSetting(containerEl, this.plugin, {
+      name: 'MiniMax 密钥',
+      desc: '用于整理文档并生成知识卡片。密钥只保存在本机。',
+      key: 'minimaxApiKey',
+      placeholder: '请输入密钥',
+      service: 'minimax'
+    });
+
+    if (this.plugin.settings.pdfAllowExternalUpload === true) {
+      containerEl.createEl('h3', { text: '云端文档识别' });
+      containerEl.createEl('p', { text: '你已启用云端文档识别。按实际使用的服务填写密钥即可。' });
+      credentialSetting(containerEl, this.plugin, {
+        name: 'MinerU 密钥',
+        desc: '用于识别扫描件和复杂版式文档。',
+        key: 'pdfMineruApiKey',
+        placeholder: '请输入密钥',
+        service: 'mineru'
+      });
+      credentialSetting(containerEl, this.plugin, {
+        name: 'PaddleOCR 密钥',
+        desc: '用于补充识别扫描件。',
+        key: 'pdfPaddleOcrApiKey',
+        placeholder: '请输入密钥',
+        service: 'paddleocr'
+      });
+    } else {
+      new Setting(containerEl)
+        .setName('文档识别')
+        .setDesc('当前使用本地识别，不需要填写云端识别密钥。');
+    }
+
+    if (this.plugin.settings.semanticConsent === true && this.plugin.settings.semanticEnabled === true) {
+      containerEl.createEl('h3', { text: '相似内容查找' });
+      credentialSetting(containerEl, this.plugin, {
+        name: '阿里云百炼密钥',
+        desc: '你已启用相似内容查找，此密钥用于该功能。',
+        key: 'embeddingApiKey',
+        placeholder: '请输入密钥',
+        service: 'semantic'
+      });
+    }
+
+    containerEl.createEl('p', {
+      text: '密钥不会写入知识库、诊断报告或日志。需要调整功能开关时，请使用产品中已有的对应功能入口。'
+    });
+  }
+
+  displayAdvancedLegacy() {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.createEl('h2', { text: '工程知识切片设置' });
     // v1.2: 一键打开诊断日志，方便没 DevTools 环境的用户直接查看文件路径
     // v1.3: 默认日志在 vault 之外（~/.eks/logs/diag.log），避开同步冲突；
     //       勾选"写到 vault 内"则回退到 .obsidian/plugins/engineering-knowledge-slicer/diag.log。
@@ -4824,6 +4884,49 @@ function passwordSetting(containerEl, plugin, name, desc, key, placeholder = '')
           await plugin.saveSettings();
         });
     });
+}
+
+function credentialSetting(containerEl, plugin, options) {
+  const last = plugin.settings.serviceTestResults?.[options.service];
+  const status = last
+    ? `${last.ok ? '上次测试成功' : '上次测试未通过'} · ${formatLocalTime(last.testedAt)}`
+    : (plugin.settings[options.key] ? '已填写，尚未测试' : '尚未填写');
+  let pendingValue = String(plugin.settings[options.key] || '');
+  let inputControl;
+  new Setting(containerEl)
+    .setName(options.name)
+    .setDesc(`${options.desc} ${status}。`)
+    .addText((text) => {
+      inputControl = text;
+      text.inputEl.type = 'password';
+      text.inputEl.autocomplete = 'new-password';
+      text.setPlaceholder(options.placeholder).setValue(pendingValue).onChange((value) => {
+        pendingValue = String(value || '').trim();
+      });
+    })
+    .addButton((button) => button.setButtonText('保存').setCta().onClick(async () => {
+      plugin.settings[options.key] = pendingValue;
+      saveSecretField(options.key, pendingValue);
+      await plugin.saveSafeSettings();
+      new Notice(pendingValue ? `${options.name}已保存。` : `${options.name}已清除。`);
+    }))
+    .addButton((button) => button.setButtonText('测试').onClick(async () => {
+      if (pendingValue !== String(plugin.settings[options.key] || '')) {
+        plugin.settings[options.key] = pendingValue;
+        saveSecretField(options.key, pendingValue);
+        await plugin.saveSafeSettings();
+      }
+      if (options.service === 'semantic') await plugin.testSemanticConnection();
+      else await plugin.testServiceConnection(options.service);
+    }))
+    .addButton((button) => button.setButtonText('清除').setWarning().onClick(async () => {
+      pendingValue = '';
+      plugin.settings[options.key] = '';
+      saveSecretField(options.key, '');
+      await plugin.saveSafeSettings();
+      inputControl?.setValue('');
+      new Notice(`${options.name}已清除。`);
+    }));
 }
 
 async function obsidianRequest(url, init = {}) {
@@ -5736,10 +5839,9 @@ const DEFAULT_SETTINGS = {
 
 function migrateSettings(stored = {}) {
   const source = stored && typeof stored === 'object' ? stored : {};
-  const migrated = {};
-  for (const key of Object.keys(DEFAULT_SETTINGS)) {
-    if (Object.hasOwn(source, key)) migrated[key] = source[key];
-  }
+  // Keep every stored field, including advanced/legacy fields no longer shown in
+  // the ordinary settings UI. Hidden settings must survive load/save unchanged.
+  const migrated = Object.assign({}, DEFAULT_SETTINGS, source);
   migrated.settingsVersion = 29;
   // Runtime contract boundary changed in 2.14.1. Parsed artifacts use their own
   // parser fingerprint and remain reusable; only classification and later stages
@@ -5774,8 +5876,8 @@ function migrateSettings(stored = {}) {
     || migrated.minimaxEndpoint === 'https://api.minimaxi.com/v1/chat/completions') {
     migrated.minimaxEndpoint = DEFAULT_SETTINGS.minimaxEndpoint;
   }
-  if (!migrated.aiMaxChunks || Number(migrated.aiMaxChunks) <= 8) migrated.aiMaxChunks = DEFAULT_SETTINGS.aiMaxChunks;
-  if (!migrated.aiChunkSize || Number(migrated.aiChunkSize) === 12000) migrated.aiChunkSize = DEFAULT_SETTINGS.aiChunkSize;
+  if (!Number(migrated.aiMaxChunks) || Number(migrated.aiMaxChunks) < 1) migrated.aiMaxChunks = DEFAULT_SETTINGS.aiMaxChunks;
+  if (!Number(migrated.aiChunkSize) || Number(migrated.aiChunkSize) < 1) migrated.aiChunkSize = DEFAULT_SETTINGS.aiChunkSize;
   if (!Number(migrated.maxPointsPerRequest)) migrated.maxPointsPerRequest = DEFAULT_SETTINGS.maxPointsPerRequest;
   migrated.maxPointsPerRequest = Math.max(1, Math.min(3, Math.round(Number(migrated.maxPointsPerRequest))));
   if (!Number(migrated.summaryConcurrency)) migrated.summaryConcurrency = DEFAULT_SETTINGS.summaryConcurrency;
@@ -5792,13 +5894,13 @@ function migrateSettings(stored = {}) {
   if (migrated.coalesceTinyChunks === undefined) migrated.coalesceTinyChunks = DEFAULT_SETTINGS.coalesceTinyChunks;
   // v2.8: 自动扫描默认关闭，只有明确存过 true 的才保持开启（布尔强转，杜绝字符串 "false" 之类脏值）
   migrated.autoScanOnStartup = source.autoScanOnStartup === true;
-  if (!Number(migrated.pdfExternalTimeoutMs) || Number(migrated.pdfExternalTimeoutMs) <= 300000) {
+  if (!Number(migrated.pdfExternalTimeoutMs) || Number(migrated.pdfExternalTimeoutMs) < 1) {
     migrated.pdfExternalTimeoutMs = DEFAULT_SETTINGS.pdfExternalTimeoutMs;
   }
-  if (!Number(migrated.aiRequestTimeoutMs) || Number(migrated.aiRequestTimeoutMs) <= 180000) {
+  if (!Number(migrated.aiRequestTimeoutMs) || Number(migrated.aiRequestTimeoutMs) < 1) {
     migrated.aiRequestTimeoutMs = DEFAULT_SETTINGS.aiRequestTimeoutMs;
   }
-  if (!Number(migrated.maxConcurrentDocuments) || Number(migrated.maxConcurrentDocuments) < 2) {
+  if (!Number(migrated.maxConcurrentDocuments) || Number(migrated.maxConcurrentDocuments) < 1) {
     migrated.maxConcurrentDocuments = DEFAULT_SETTINGS.maxConcurrentDocuments;
   }
   if (migrated.pdfAllowExternalUpload === undefined) migrated.pdfAllowExternalUpload = false;
@@ -5839,6 +5941,13 @@ function migrateSettings(stored = {}) {
   migrated.semanticConsent = source.semanticConsent === true;
   migrated.semanticEnabled = source.semanticEnabled === true && migrated.semanticConsent;
   migrated.semanticMode = 'shadow';
+  // Qwen uses a fixed supported contract. Archive any former hidden routing
+  // values before applying it so migration/save is lossless and reversible.
+  const legacyEmbedding = Object.assign({}, source.hiddenLegacyEmbedding || {});
+  for (const key of ['embeddingProvider', 'embeddingProtocol', 'embeddingEndpoint', 'embeddingModel', 'embeddingDimensions']) {
+    if (Object.hasOwn(source, key) && source[key] !== DEFAULT_SETTINGS[key]) legacyEmbedding[key] = source[key];
+  }
+  if (Object.keys(legacyEmbedding).length) migrated.hiddenLegacyEmbedding = legacyEmbedding;
   migrated.embeddingProvider = DEFAULT_SETTINGS.embeddingProvider;
   migrated.embeddingProtocol = DEFAULT_SETTINGS.embeddingProtocol;
   migrated.embeddingEndpoint = DEFAULT_SETTINGS.embeddingEndpoint;

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "engineering-knowledge-slicer://schema/phase2-business-item-candidate-batch-2.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "batch_id", "source_document_id", "items"],
+  "properties": {
+    "schema_version": { "const": "2.0" },
+    "batch_id": { "type": "string", "pattern": "^bib-[a-f0-9]{24}$" },
+    "source_document_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "items": {
+      "type": "array",
+      "maxItems": 320,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "candidate_id", "source_document_id", "item_type", "summary", "evidence", "applicable_conditions", "reusable_knowledge_candidate", "reuse_reasons", "review_reasons"],
+        "properties": {
+          "schema_version": { "const": "2.0" },
+          "candidate_id": { "type": "string", "pattern": "^bic-[a-f0-9]{24}$" },
+          "source_document_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "project_id": { "type": "string", "maxLength": 200 },
+          "directory_category": { "type": "string", "maxLength": 120 },
+          "item_type": { "enum": ["requirement", "decision", "commitment", "risk", "issue", "change", "action", "quotation", "material", "method", "acceptance_criterion", "clarification", "contract_obligation", "project_lesson"] },
+          "summary": { "type": "string", "minLength": 1, "maxLength": 1000 },
+          "evidence": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["block_id", "locator", "provenance", "verbatim"],
+            "properties": {
+              "block_id": { "type": "string", "minLength": 1, "maxLength": 100 },
+              "locator": { "type": ["object", "null"] },
+              "provenance": { "type": "array", "maxItems": 20, "items": { "type": "object" } },
+              "verbatim": { "type": "string", "minLength": 1, "maxLength": 2000 }
+            }
+          },
+          "applicable_conditions": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 500 } },
+          "facts": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "actors": { "$ref": "#/$defs/facts" },
+              "status": { "$ref": "#/$defs/facts" },
+              "dates": { "$ref": "#/$defs/facts" },
+              "units": { "$ref": "#/$defs/facts" },
+              "numbers": { "$ref": "#/$defs/facts" },
+              "modality": { "$ref": "#/$defs/facts" }
+            }
+          },
+          "reusable_knowledge_candidate": { "type": "boolean" },
+          "reuse_reasons": { "type": "array", "maxItems": 5, "items": { "type": "string", "maxLength": 300 } },
+          "review_reasons": { "type": "array", "uniqueItems": true, "maxItems": 6, "items": { "enum": ["ambiguous_project", "ambiguous_category", "conflicting_facts", "missing_evidence", "unsupported_invented_facts", "reuse_promotion"] } }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "facts": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 300 } }
+  }
+}

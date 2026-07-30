@@ -19,7 +19,8 @@ function task(overrides = {}) {
     queue_total: 1,
     status: 'writing',
     progress: { stage: 'writing', completedWork: 99 },
-    review_atom_ids: []
+    review_atom_ids: [],
+    artifacts: { review: 'review.json' }
   }, overrides);
 }
 
@@ -41,7 +42,8 @@ const noOutput = task({
   result_counts: { generated: 42, written: 0, hard_rejected: 42 }
 });
 snapshot = completionUiSnapshot([noOutput], noOutput.task_id);
-assert.strictEqual(snapshot.reviewCount, 1);
+assert.strictEqual(snapshot.reviewCount, 0);
+assert.strictEqual(snapshot.persistedReviewItemCount, 0);
 assert.strictEqual(snapshot.overallPercent, 100);
 
 // Terminal state always wins over a late heartbeat/progress callback.

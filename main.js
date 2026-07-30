@@ -1977,6 +1977,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       queuedCount: snapshot.queuedCount,
       activeCount: snapshot.activeCount,
       reviewCount: snapshot.reviewCount,
+      persistedReviewItemCount: snapshot.persistedReviewItemCount,
+      reviewInvariant: snapshot.reviewCount === snapshot.persistedReviewItemCount,
       overallPercent: snapshot.overallPercent,
       outcome
     });
@@ -3845,8 +3847,9 @@ class SlicerDashboardView extends ItemView {
   async renderContent(container, renderVersion) {
     const tasks = await this.plugin.loadTasks();
     if (renderVersion !== this._renderVersion) return;
-    const counts = statusCounts(tasks);
-    const reviewCount = pendingReviewCount(tasks);
+    const uiSnapshot = completionUiSnapshot(tasks);
+    const counts = uiSnapshot.counts;
+    const reviewCount = uiSnapshot.reviewCount;
     if (!this._hasRendered && reviewCount > 0) this.activeSection = 'review';
     if (!this._hasRendered && counts.failed > 0) {
       this.activeSection = 'errors';
@@ -3871,7 +3874,7 @@ class SlicerDashboardView extends ItemView {
     const taskProgress = pipelineProgress(activeTask, activeProgress);
     const overallPercent = activeTask && position.total > 0
       ? Math.min(99.9, ((position.ordinal - 1) + taskProgress.completedWork / 100) / position.total * 100)
-      : completionUiSnapshot(tasks).overallPercent;
+      : uiSnapshot.overallPercent;
     status.createDiv({ cls: 'eks-queue-position', text: activeTask ? position.label : (overallPercent === 100 ? '处理队列 已完成' : '处理队列 空闲') });
     status.createDiv({
       cls: 'eks-progress-text',
@@ -4011,6 +4014,13 @@ class SlicerDashboardView extends ItemView {
       ]) {
         meta.createDiv({ text: label, cls: 'eks-task-meta' });
         meta.createDiv({ text: value || '-', cls: 'eks-detail-value' });
+      }
+      if (task.status === 'completed_no_output') {
+        const counts = task.result_counts || {};
+        details.createDiv({
+          cls: 'eks-review-reason',
+          text: `未生成可入库结果：生成 ${Number(counts.generated) || 0}，写入 ${Number(counts.written) || 0}。${safeDisplayText(task.progress?.message, '未发现可由来源逐字核验的知识；请检查正文解析与证据定位后重试。')}`
+        });
       }
       const timeline = details.createDiv({ cls: 'eks-timeline', attr: { 'aria-label': '任务阶段时间线' } });
       const order = ['parsing', 'classification', 'summary-map', 'atomization', 'validating', 'writing', 'complete'];
@@ -4299,7 +4309,12 @@ class SlicerDashboardView extends ItemView {
         button(actions, '移除', () => this.plugin.dismissTask(task.task_id));
       }
     }
-    const reviewTasks = tasks.filter((task) => ['needs_review', 'completed_no_output'].includes(task.status) && task.artifacts?.review);
+    const reviewTasks = tasks.filter((task) =>
+      ['needs_review', 'completed_no_output'].includes(task.status)
+      && Array.isArray(task.review_atom_ids)
+      && task.review_atom_ids.length > 0
+      && task.artifacts?.review
+    );
     if (!reviewTasks.length) {
       if (!failedTasks.length) {
         parent.createDiv({ cls: 'eks-empty', text: '暂无异常项。可信结果会自动入库，不需要逐条审核。' });
@@ -8269,7 +8284,9 @@ function statusCounts(tasks) {
   for (const task of tasks) {
     if (task.status === 'queued' || task.status === 'discovered') counts.pending += 1;
     if (PROCESSING_STATUSES.has(task.status)) counts.processing += 1;
-    if (task.status === 'needs_review') counts.needsReview += 1;
+    if (task.status === 'needs_review' && task.artifacts?.review) {
+      counts.needsReview += Array.isArray(task.review_atom_ids) ? task.review_atom_ids.length : 0;
+    }
     if (task.status === 'failed') counts.failed += 1;
     if (task.status === 'rolled_back') counts.rolledBack += 1;
     else if (Array.isArray(task.written_card_ids) && task.written_card_ids.length) counts.written += task.written_card_ids.length;
@@ -12269,6 +12286,17 @@ function migrateTaskLedgerV3(tasks, versions = {}) {
       });
     }
     const runId = task.run_id || stableId(`${library}:${sourceHash}:${pipelineVersion}:${promptBundleVersion}`);
+    const reviewAtomIds = [...new Set((Array.isArray(task.review_atom_ids)
+      ? task.review_atom_ids
+      : Array.isArray(task.draftFiles) ? task.draftFiles : []).map(String).filter(Boolean))];
+    const hasPersistedReviewArtifact = Boolean(task.artifacts?.review);
+    const hasConcreteReview = hasPersistedReviewArtifact && reviewAtomIds.length > 0;
+    let migratedStatus = status;
+    if (!hasConcreteReview && status === 'needs_review') {
+      migratedStatus = (Array.isArray(task.written_card_ids) && task.written_card_ids.length) ? 'written' : 'completed_no_output';
+    } else if (hasConcreteReview && status === 'completed_no_output') {
+      migratedStatus = 'needs_review';
+    }
     const normalized = {
       task_id: taskId,
       run_id: runId,
@@ -12280,14 +12308,14 @@ function migrateTaskLedgerV3(tasks, versions = {}) {
       pipeline_version: pipelineVersion,
       prompt_bundle_version: promptBundleVersion,
       schema_version: versions.schemaVersion || '1.1',
-      status,
+      status: migratedStatus,
       remote_jobs: Array.isArray(task.remote_jobs) ? task.remote_jobs : [],
       retry_counts: task.retry_counts || {},
       artifacts: task.artifacts || {},
       written_card_ids: Array.isArray(task.written_card_ids) ? task.written_card_ids : [],
       writtenFiles: Array.isArray(task.writtenFiles) ? task.writtenFiles.map((value) => String(value).replace(/\\/g, '/')) : [],
       component_contract_hash: String(task.component_contract_hash || ''),
-      review_atom_ids: task.review_atom_ids || task.draftFiles || [],
+      review_atom_ids: reviewAtomIds,
       errors,
       progress: task.progress || {},
       lease: null,
@@ -12301,7 +12329,13 @@ function migrateTaskLedgerV3(tasks, versions = {}) {
     // apply the destructive shape conversion above to genuinely old records.
     // Known fields are still normalized by `normalized`, so aliases and unsafe
     // stale values cannot override the current contract.
-    return canonical ? Object.assign({}, task, normalized) : normalized;
+    const migrated = canonical ? Object.assign({}, task, normalized) : normalized;
+    if (!hasConcreteReview && migrated.status === 'completed_no_output') {
+      migrated.terminal_outcome = 'completed_no_output';
+      if (!migrated.result_counts) migrated.result_counts = { generated: 0, written: 0, review: 0 };
+      migrated.result_counts.review = 0;
+    }
+    return migrated;
   });
 }
 
@@ -13760,13 +13794,16 @@ async function summarizeDocument(options) {
   // 若 pack 数高于既有 splitter，则保留旧切分；证据仍在 parsePackage.evidence_index 中做逐字回查。
   const chunks = packedChunks.length && packedChunks.length <= legacyChunks.length ? packedChunks : legacyChunks;
   for (const chunk of chunks) {
+    chunk.legacyChunkId = chunk.chunk_id;
+    chunk.chunk_id = String(chunk.stableChunkId || chunk.chunk_id);
+    chunk.stableChunkId = chunk.chunk_id;
     chunk.sourceBlocks = summarySourceBlocks(options.parsePackage, chunk);
     chunk.block_ids = chunk.sourceBlocks.map((block) => block.block_id);
   }
   const partials = new Array(chunks.length);
   diag('summary.map.plan', {
     chunkTotal: chunks.length,
-    stableChunkIds: chunks.map((chunk) => chunk.stableChunkId || chunk.chunk_id).slice(0, 120)
+    stableChunkIds: chunks.map((chunk) => chunk.chunk_id).slice(0, 120)
   });
   const concurrency = Math.max(1, Math.min(3, Number(options.summaryConcurrency) || 2));
   let nextChunkIndex = 0;
@@ -13787,7 +13824,12 @@ async function summarizeDocument(options) {
       partials[index] = sanitizedCached;
       diag('summary.map.cacheHit', {
         chunkIndex: index + 1, chunkTotal: chunks.length,
-        stableChunkId: chunk.stableChunkId || chunk.chunk_id
+        stableChunkId: chunk.chunk_id,
+        canonicalChunkId: chunk.chunk_id,
+        sourceBlockCount: chunk.sourceBlocks.length,
+        sourceSpanCharacters: chunk.sourceBlocks.reduce((sum, block) => sum + block.text.length, 0),
+        mapOutputCount: sanitizedCached.key_points.length,
+        sanitizationCount: sanitizedCached.evidence_sanitization?.dropped_points || 0
       });
       await emitProgress(options.onProgress, {
         stage: 'summary-map', chunkIndex: index + 1, chunkTotal: chunks.length,
@@ -13798,7 +13840,7 @@ async function summarizeDocument(options) {
     if (cached) {
       diag('summary.map.cacheMiss', {
         chunkIndex: index + 1, chunkTotal: chunks.length,
-        stableChunkId: chunk.stableChunkId || chunk.chunk_id, reason: 'checkpoint_invalid'
+        stableChunkId: chunk.chunk_id, canonicalChunkId: chunk.chunk_id, reason: 'checkpoint_invalid'
       });
     }
     // v2.7: 把标题层级面包屑（WeKnora ContextHeader）注入 prompt，让 AI 拿到章节语境
@@ -13833,7 +13875,7 @@ async function summarizeDocument(options) {
       streaming: !!options.requestStream,
       maxRepairAttempts: options.maxRepairAttempts,
       onProgress: options.onProgress,
-      context: { chunk, chunkIndex: index + 1, chunkTotal: chunks.length },
+      context: { chunk, chunkId: chunk.chunk_id, chunkIndex: index + 1, chunkTotal: chunks.length },
       normalizeValue: (value) => sanitizeSummaryEvidence(
         normalizeSummaryMap(value, options, chunk),
         { stage: 'summary-map', chunkId: chunk.chunk_id }
@@ -13851,7 +13893,12 @@ async function summarizeDocument(options) {
     }
     diag('summary.map.completed', {
       chunkIndex: index + 1, chunkTotal: chunks.length,
-      stableChunkId: chunk.stableChunkId || chunk.chunk_id
+      stableChunkId: chunk.chunk_id,
+      canonicalChunkId: chunk.chunk_id,
+      sourceBlockCount: chunk.sourceBlocks.length,
+      sourceSpanCharacters: chunk.sourceBlocks.reduce((sum, block) => sum + block.text.length, 0),
+      mapOutputCount: partials[index]?.key_points?.length || 0,
+      sanitizationCount: partials[index]?.evidence_sanitization?.dropped_points || 0
     });
   }
   async function summaryWorker() {
@@ -13865,13 +13912,18 @@ async function summarizeDocument(options) {
 
   provenanceFailureSummary(partials, 'summary-map');
   const usableChunks = partials.filter((partial) => (partial?.key_points || []).length > 0).length;
-  const hasVerifiableBlocks = Object.keys(options.parsePackage?.evidence_index || {}).length > 0;
-  if (!usableChunks && hasVerifiableBlocks) {
+  if (!usableChunks) {
     const error = new Error(`全部 ${partials.length} 个总结分块都没有可由来源块逐字验证的知识点。请确认解析正文包含可引用内容，或更换能按 block_id 返回原文短引的模型后从总结检查点重试。`);
     error.code = 'SUMMARY_ALL_CHUNKS_UNSUPPORTED';
     error.stage = 'summary-map';
     error.retryable = false;
-    error.details = { chunks: partials.length, empty_verified_chunks: partials.length };
+    error.details = {
+      outcome: 'no_verified_knowledge',
+      chunks: partials.length,
+      empty_verified_chunks: partials.length,
+      reduce_calls: 0,
+      atomization_calls: 0
+    };
     diag('summary.map.allEmpty', error.details);
     throw error;
   }
@@ -13938,6 +13990,9 @@ function normalizeSummaryMap(value, options, chunk) {
     library: options.classification.library,
     folder_type: options.classification.folder_type,
     document_type: options.classification.document_type,
+    // Coverage is deterministic request bookkeeping.  Old checkpoints may
+    // contain the pre-stable logical id; loading them rewrites it once to the
+    // canonical id used by every new-run boundary.
     coverage: { chunk_ids: [chunk.chunk_id], complete: true }
   });
   if (Array.isArray(result.evidence)) {
@@ -13955,7 +14010,11 @@ function normalizeSummaryMap(value, options, chunk) {
         quote: item.quote || ''
       });
       if (Object.keys(options.parsePackage?.evidence_index || {}).length) {
-        normalized = reconcileBlockEvidence(options.parsePackage, normalized, new Set(chunk.block_ids || []));
+        normalized = reconcileBlockEvidence(
+          options.parsePackage,
+          normalized,
+          new Map((chunk.sourceBlocks || []).map((block) => [String(block.block_id), String(block.text || '')]))
+        );
       } else if (/^(mineru-api|paddleocr-api)$/.test(String(options.parsePackage?.parser || ''))) {
         var resolved = resolveEvidence(options.parsePackage, normalized.quote, {
           start: chunk.sourceStart,
@@ -13979,7 +14038,7 @@ function normalizeSummaryMap(value, options, chunk) {
   return result;
 }
 
-function reconcileBlockEvidence(parsePackage, item, allowedBlockIds) {
+function reconcileBlockEvidence(parsePackage, item, allowedBlocks) {
   if (!item || typeof item !== 'object') return item;
   const index = parsePackage?.evidence_index || {};
   const requestedId = String(item.block_id || item.provenance?.block_id || '');
@@ -13990,6 +14049,9 @@ function reconcileBlockEvidence(parsePackage, item, allowedBlockIds) {
       provenance_resolution: { ok: false, reason: 'block_id_missing' }
     });
   }
+  const allowedBlockIds = allowedBlocks instanceof Map
+    ? new Set(allowedBlocks.keys())
+    : allowedBlocks;
   if (allowedBlockIds && !allowedBlockIds.has(requestedId)) {
     return Object.assign({}, item, {
       locator: '', block_id: requestedId,
@@ -14008,6 +14070,12 @@ function reconcileBlockEvidence(parsePackage, item, allowedBlockIds) {
     return Object.assign({}, item, {
       locator: '', block_id: requestedId || '',
       provenance_resolution: { ok: false, reason: repaired.reason || 'BLOCK_EVIDENCE_UNVERIFIED' }
+    });
+  }
+  if (allowedBlocks instanceof Map && !allowedBlocks.get(requestedId)?.includes(String(repaired.quote || ''))) {
+    return Object.assign({}, item, {
+      locator: '', block_id: requestedId,
+      provenance_resolution: { ok: false, reason: 'quote_outside_chunk' }
     });
   }
   return Object.assign({}, item, {
@@ -14040,16 +14108,42 @@ function summarySourceBlocks(parsePackage, chunk) {
     const chunkText = String(chunk.markdown || '');
     for (const entry of Object.values(evidenceIndex)) {
       const raw = String(entry?.raw_text || '');
-      if (raw && chunkText.includes(raw)) ids.add(String(entry.block_id));
+      if (raw && (chunkText.includes(raw) || raw.includes(chunkText))) ids.add(String(entry.block_id));
     }
   }
   return [...ids].map((blockId) => evidenceIndex[blockId]).filter((entry) =>
     entry && entry.card_eligible !== false && String(entry.raw_text || '').trim()
-  ).map((entry) => ({
-    block_id: String(entry.block_id),
-    locator: entry.locator && typeof entry.locator === 'object' ? entry.locator : {},
-    text: String(entry.raw_text)
-  }));
+  ).map((entry) => {
+    const raw = String(entry.raw_text);
+    const chunkText = String(chunk.markdown || '');
+    let text = raw;
+    let blockStart = 0;
+    if (Number.isInteger(chunk.sourceStart) && Number.isInteger(chunk.sourceEnd)) {
+      const documentText = String(parsePackage?.markdown || '');
+      const blockDocumentStart = documentText.indexOf(raw);
+      if (blockDocumentStart >= 0) {
+        const overlapStart = Math.max(chunk.sourceStart, blockDocumentStart);
+        const overlapEnd = Math.min(chunk.sourceEnd, blockDocumentStart + raw.length);
+        if (overlapEnd > overlapStart) {
+          blockStart = overlapStart - blockDocumentStart;
+          text = raw.slice(blockStart, overlapEnd - blockDocumentStart);
+        }
+      }
+    } else if (raw.includes(chunkText)) {
+      blockStart = raw.indexOf(chunkText);
+      text = chunkText;
+    }
+    const locator = entry.locator && typeof entry.locator === 'object'
+      ? Object.assign({}, entry.locator)
+      : {};
+    locator.source_span = {
+      start: blockStart,
+      end: blockStart + text.length,
+      unit: 'character',
+      bounded: text.length < raw.length
+    };
+    return { block_id: String(entry.block_id), locator, text };
+  }).filter((block) => block.text.trim());
 }
 
 function summarySchemaWithRuntimeProvenance(schema) {
@@ -14366,13 +14460,21 @@ async function reduceSummaryHierarchy(options, initial, batchSize) {
 
 async function atomizeSummary(options) {
   const pointIds = (options.summary.key_points || []).map((point) => point.point_id);
+  if (!pointIds.length) {
+    const error = new Error('结构化总结中没有可由来源逐字验证的知识点，已停止知识原子化。请检查正文解析与 block_id 短引证据后从总结阶段重试。');
+    error.code = 'SUMMARY_ALL_CHUNKS_UNSUPPORTED';
+    error.stage = 'atomization';
+    error.retryable = false;
+    error.details = { outcome: 'no_verified_knowledge', requestedPoints: 0, providerCalls: 0 };
+    diag('atomization.skipped.noVerifiedPoints', error.details);
+    throw error;
+  }
   const configuredBatchSize = Number(options.maxPointsPerRequest) || 1;
   const batchSize = Math.max(1, Math.min(3, configuredBatchSize));
   const batches = [];
   for (let offset = 0; offset < pointIds.length; offset += batchSize) {
     batches.push(pointIds.slice(offset, offset + batchSize));
   }
-  if (!batches.length) batches.push([]);
 
   const results = new Array(batches.length);
   let completedBatches = 0;
@@ -16937,10 +17039,31 @@ const TERMINAL = new Set(['written', 'needs_review', 'completed_no_output', 'nee
 
 function pendingReviewCount(tasks) {
   return (tasks || []).reduce((sum, task) => {
-    if (!['needs_review', 'completed_no_output'].includes(task.status)) return sum;
-    const pending = Array.isArray(task.review_atom_ids) ? task.review_atom_ids.length : 0;
-    return sum + (pending || (task.status === 'completed_no_output' ? 1 : 0));
+    if (!['needs_review', 'completed_no_output'].includes(task.status) || !task.artifacts?.review) return sum;
+    return sum + (Array.isArray(task.review_atom_ids) ? new Set(task.review_atom_ids.map(String).filter(Boolean)).size : 0);
   }, 0);
+}
+
+function canonicalTaskUiState(tasks, completedTaskId) {
+  const rows = Array.isArray(tasks) ? tasks : [];
+  const reviewCount = pendingReviewCount(rows);
+  return {
+    rows,
+    reviewCount,
+    needsReview: reviewCount,
+    persistedReviewItemCount: rows.reduce((sum, task) =>
+      sum + (task.artifacts?.review && Array.isArray(task.review_atom_ids)
+        ? new Set(task.review_atom_ids.map(String).filter(Boolean)).size : 0), 0),
+    pending: rows.filter((task) => task.status === 'queued' || task.status === 'discovered').length,
+    processing: rows.filter((task) => PROCESSING.has(task.status)).length,
+    failed: rows.filter((task) => task.status === 'failed').length,
+    written: rows.reduce((sum, task) => sum + (
+      Array.isArray(task.written_card_ids) && task.written_card_ids.length
+        ? task.written_card_ids.length
+        : task.status === 'written' ? 1 : 0
+    ), 0),
+    completedTaskId
+  };
 }
 
 function shouldAcceptIncrementalProgress(task, terminalTaskIds) {
@@ -16948,7 +17071,8 @@ function shouldAcceptIncrementalProgress(task, terminalTaskIds) {
 }
 
 function completionUiSnapshot(tasks, completedTaskId) {
-  const rows = Array.isArray(tasks) ? tasks : [];
+  const canonical = canonicalTaskUiState(tasks, completedTaskId);
+  const rows = canonical.rows;
   const completed = rows.find((task) => task.task_id === completedTaskId);
   const active = rows.find((task) => PROCESSING.has(task.status));
   const runId = completed?.queue_run_id || active?.queue_run_id || '';
@@ -16966,13 +17090,15 @@ function completionUiSnapshot(tasks, completedTaskId) {
     queuedCount: rows.filter((task) => task.status === 'queued').length,
     activeCount: rows.filter((task) => PROCESSING.has(task.status)).length,
     activeTask: active || null,
-    reviewCount: pendingReviewCount(rows),
+    reviewCount: canonical.reviewCount,
+    persistedReviewItemCount: canonical.persistedReviewItemCount,
+    counts: canonical,
     runId,
     overallPercent
   };
 }
 
-module.exports = { completionUiSnapshot, pendingReviewCount, shouldAcceptIncrementalProgress };
+module.exports = { canonicalTaskUiState, completionUiSnapshot, pendingReviewCount, shouldAcceptIncrementalProgress };
 
 },
 /**

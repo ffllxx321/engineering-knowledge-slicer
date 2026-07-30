@@ -7,19 +7,33 @@ async function testMapChunkRestart() {
   const { api } = loadAiPipeline();
   const cache = new Map();
   let calls = 0;
-  const markdown = '# A\n' + '甲'.repeat(900) + '\n# B\n' + '乙'.repeat(900);
+  const markdown = '# A\n' + Array.from({ length: 180 }, (_, index) => `${String(index).padStart(4, '0')}甲`).join('\n')
+    + '\n# B\n' + Array.from({ length: 180 }, (_, index) => `${String(index).padStart(4, '0')}乙`).join('\n');
   const requestJson = async (_prompt, context) => {
     calls += 1;
     if (context.stage === 'summary-reduce') throw new Error('deterministic reduce failure');
     const chunk = context.chunk;
     return {
-      document_title: 'fixture', executive_summary: chunk.chunk_id, key_points: [],
-      evidence: [], entities: [], suggested_links: [],
+      document_title: 'fixture', executive_summary: chunk.chunk_id,
+      key_points: [{ point_id: 'P1', kind: 'requirement', content: chunk.markdown, evidence_ids: ['E1'] }],
+      evidence: [{ evidence_id: 'E1', block_id: 'document-block', locator: '', quote: chunk.markdown }],
+      entities: [], suggested_links: [],
       coverage: { chunk_ids: [chunk.chunk_id], complete: true }, model_confidence: 1
     };
   };
   const options = {
-    parsePackage: { markdown, source_name: 'fixture' },
+    parsePackage: {
+      markdown,
+      source_name: 'fixture',
+      blocks: [{ block_id: 'document-block', raw: { text: markdown }, locator: { scheme: 'line', value: '1-末行' }, card_eligible: true }],
+      evidence_index: {
+        'document-block': {
+          block_id: 'document-block', raw_text: markdown,
+          locator: { scheme: 'line', value: '1-末行' }, card_eligible: true
+        }
+      },
+      provenance: { spans: [] }
+    },
     classification: { library: 'bid', folder_type: 'project', document_type: 'note' },
     summarySchema: { type: 'object', additionalProperties: true },
     maxChunkChars: 500, summaryConcurrency: 2, requestJson,

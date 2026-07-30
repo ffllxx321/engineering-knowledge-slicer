@@ -17,8 +17,8 @@ function summary(chunkIds, overrides = {}) {
     document_type: 'report',
     executive_summary: '合并结果',
     entities: [],
-    key_points: [],
-    evidence: [],
+    key_points: [{ point_id: 'P1', kind: 'requirement', content: '唯一证据', evidence_ids: ['E1'] }],
+    evidence: [{ evidence_id: 'E1', block_id: 'document-block', locator: '', quote: '唯一证据' }],
     suggested_links: [],
     coverage: { chunk_ids: chunkIds, complete: true },
     model_confidence: 1,
@@ -26,10 +26,30 @@ function summary(chunkIds, overrides = {}) {
   }, overrides);
 }
 
+function mapSummary(context, overrides = {}) {
+  const quote = context.chunk.markdown;
+  return summary([context.chunk.chunk_id], Object.assign({
+    executive_summary: context.chunk.chunk_id,
+    key_points: [{ point_id: 'P1', kind: 'requirement', content: quote, evidence_ids: ['E1'] }],
+    evidence: [{ evidence_id: 'E1', block_id: 'document-block', locator: '', quote }]
+  }, overrides));
+}
+
 function options(requestJson, cache = new Map()) {
-  const markdown = '# A\n' + '甲'.repeat(700) + '\n# B\n' + '乙'.repeat(700);
+  const markdown = '# A 唯一证据\n' + '甲'.repeat(700) + '\n# B\n' + '乙'.repeat(700);
   return {
-    parsePackage: { source_name: '大型 PDF', markdown },
+    parsePackage: {
+      source_name: '大型 PDF',
+      markdown,
+      blocks: [{ block_id: 'document-block', raw: { text: markdown }, locator: { scheme: 'line', value: '1-末行' }, card_eligible: true }],
+      evidence_index: {
+        'document-block': {
+          block_id: 'document-block', raw_text: markdown,
+          locator: { scheme: 'line', value: '1-末行' }, card_eligible: true
+        }
+      },
+      provenance: { spans: [] }
+    },
     classification: { library: 'business', folder_type: 'project', document_type: 'report' },
     basePrompt: 'summary',
     typePrompt: '',
@@ -50,7 +70,7 @@ async function testExactProductionWrapperSignature() {
   let requested = [];
   const result = await api.summarizeDocument(options(async (_prompt, context) => {
     if (context.stage === 'summary-map') {
-      return summary([context.chunk.chunk_id], { executive_summary: context.chunk.chunk_id });
+      return mapSummary(context);
     }
     reduceCalls += 1;
     requested = context.chunkIds;
@@ -67,7 +87,7 @@ async function testIncompleteCoverageReconstructedFromRequestedMaps() {
   const { api } = loadAiPipeline();
   let requested = [];
   const result = await api.summarizeDocument(options(async (_prompt, context) => {
-    if (context.stage === 'summary-map') return summary([context.chunk.chunk_id]);
+    if (context.stage === 'summary-map') return mapSummary(context);
     requested = context.chunkIds;
     return summary([context.chunkIds[0]], {
       coverage: { chunk_ids: [context.chunkIds[0]], complete: false }
@@ -86,7 +106,7 @@ async function testUnsafeCoverageGetsOneBoundedRepairAndResumeSkipsMaps() {
   const requestJson = async (_prompt, context) => {
     if (context.stage === 'summary-map') {
       mapCalls += 1;
-      return summary([context.chunk.chunk_id]);
+      return mapSummary(context);
     }
     reduceCalls += 1;
     requested = context.chunkIds;
@@ -112,7 +132,7 @@ async function testProduction8192HierarchyAndReduceCheckpointResume() {
   const cache = new Map();
   const reduceCache = new Map();
   const markdown = Array.from({ length: 26 }, (_, index) =>
-    `# 第 ${index + 1} 节\n${String.fromCharCode(0x4e00 + index).repeat(520)}`
+    `# 第 ${index + 1} 节${index === 0 ? ' 唯一证据' : ''}\n${String.fromCharCode(0x4e00 + index).repeat(520)}`
   ).join('\n');
   let mapCalls = 0;
   const mappedChunkIds = new Set();
@@ -122,16 +142,25 @@ async function testProduction8192HierarchyAndReduceCheckpointResume() {
     if (context.stage === 'summary-map') {
       mapCalls += 1;
       mappedChunkIds.add(context.chunk.chunk_id);
-      return summary([context.chunk.chunk_id], {
-        executive_summary: `分块 ${context.chunk.chunk_id}`
-      });
+      return mapSummary(context, { executive_summary: `分块 ${context.chunk.chunk_id}` });
     }
     reduceCalls += 1;
     if (reduceCalls === failAfter) throw new Error('deterministic interrupted reduce');
     return summary(context.chunkIds);
   }, cache);
   Object.assign(base, {
-    parsePackage: { source_name: '生产 8192 故障', markdown },
+    parsePackage: {
+      source_name: '生产 8192 故障',
+      markdown,
+      blocks: [{ block_id: 'document-block', raw: { text: markdown }, locator: { scheme: 'line', value: '1-末行' }, card_eligible: true }],
+      evidence_index: {
+        'document-block': {
+          block_id: 'document-block', raw_text: markdown,
+          locator: { scheme: 'line', value: '1-末行' }, card_eligible: true
+        }
+      },
+      provenance: { spans: [] }
+    },
     maxChunkChars: 600,
     reduceInputBudgetChars: 7000,
     reduceBatchSize: 8,

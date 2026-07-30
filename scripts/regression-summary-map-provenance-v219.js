@@ -80,7 +80,7 @@ async function mixedAndEmpty() {
     if (context.stage === 'summary-reduce') {
       return {
         ...summary('unused', []),
-        key_points: context.chunkIds.includes('block-pack-002') ? [{
+        key_points: context.chunkIds.includes('pack-b') ? [{
           point_id: 'P-valid', kind: 'requirement', content: '验收合格后方可投入使用。',
           evidence_ids: ['EV-valid']
         }] : [],
@@ -92,7 +92,7 @@ async function mixedAndEmpty() {
       };
     }
     mapRequests += 1;
-    if (context.chunk.chunk_id === 'block-pack-001') {
+    if (context.chunk.chunk_id === 'pack-a') {
       return summary(context.chunk.chunk_id, Array.from({ length: 12 }, (_, index) => ({
         block_id: 'block-a', quote: `模型改写且来源不存在 ${index}`, content: `无依据点 ${index}`
       })));
@@ -141,7 +141,7 @@ async function cacheAndAtomization() {
       coverage: { chunk_ids: context.chunkIds, complete: true }
     };
   }, {
-    loadSummaryMapChunk: async (chunk) => chunk.chunk_id === 'block-pack-002'
+    loadSummaryMapChunk: async (chunk) => chunk.chunk_id === 'pack-b'
       ? sanitized
       : {
         ...summary('block-pack-001', []),

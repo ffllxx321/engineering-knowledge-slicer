@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "engineering-knowledge-slicer://schema/business-item-1.0",
+  "title": "业务条目",
+  "type": "object",
+  "required": ["schema_version", "record_kind", "record_id", "title", "library", "category", "created_at", "updated_at"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "record_kind": { "const": "business_item" },
+    "record_id": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "library": { "enum": ["active_tender", "business"] },
+    "category": { "enum": ["historical_projects", "standards", "correspondence", "materials", "suppliers", "costs", "methods", "risks", "company_knowledge"] },
+    "summary": { "type": "string" },
+    "project_ids": { "$ref": "#/$defs/ids" },
+    "source_document_ids": { "$ref": "#/$defs/ids" },
+    "company_knowledge_ids": { "$ref": "#/$defs/ids" },
+    "related_item_ids": { "$ref": "#/$defs/ids" },
+    "supersedes_id": { "type": "string", "minLength": 1 },
+    "replaces_id": { "type": "string", "minLength": 1 },
+    "derived_from_ids": { "$ref": "#/$defs/ids" },
+    "created_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 },
+    "extensions": { "type": "object", "additionalProperties": true }
+  },
+  "additionalProperties": false,
+  "$defs": { "ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true } }
+}

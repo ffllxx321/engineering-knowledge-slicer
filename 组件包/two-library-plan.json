@@ -1,0 +1,33 @@
+{
+  "version": "1.0",
+  "mode": "definitions_only",
+  "auto_create_or_move": false,
+  "libraries": [
+    {
+      "key": "active_tender",
+      "label": "在办投标库",
+      "suggested_path": "在办投标库",
+      "categories": [
+        { "key": "projects", "label": "在办项目", "storage": "owned" },
+        { "key": "common_knowledge", "label": "通用知识", "storage": "reference", "target_library": "business", "target_category": "company_knowledge" },
+        { "key": "templates", "label": "模板", "storage": "reference", "target_library": "business", "target_category": "company_knowledge" }
+      ]
+    },
+    {
+      "key": "business",
+      "label": "长期业务库",
+      "suggested_path": "长期业务库",
+      "categories": [
+        { "key": "historical_projects", "label": "历史项目" },
+        { "key": "standards", "label": "标准规范" },
+        { "key": "correspondence", "label": "往来函件" },
+        { "key": "materials", "label": "材料" },
+        { "key": "suppliers", "label": "供应商" },
+        { "key": "costs", "label": "成本" },
+        { "key": "methods", "label": "方法做法" },
+        { "key": "risks", "label": "风险" },
+        { "key": "company_knowledge", "label": "公司知识" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "engineering-knowledge-slicer://schema/company-knowledge-1.0",
+  "title": "公司知识",
+  "type": "object",
+  "required": ["schema_version", "record_kind", "record_id", "title", "library", "created_at", "updated_at"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "record_kind": { "const": "company_knowledge" },
+    "record_id": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "library": { "const": "business" },
+    "category": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string" },
+    "reuse_status": { "enum": ["candidate", "approved", "retired"] },
+    "project_ids": { "$ref": "#/$defs/ids" },
+    "source_document_ids": { "$ref": "#/$defs/ids" },
+    "business_item_ids": { "$ref": "#/$defs/ids" },
+    "related_item_ids": { "$ref": "#/$defs/ids" },
+    "supersedes_id": { "type": "string", "minLength": 1 },
+    "replaces_id": { "type": "string", "minLength": 1 },
+    "derived_from_ids": { "$ref": "#/$defs/ids" },
+    "created_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 },
+    "extensions": { "type": "object", "additionalProperties": true }
+  },
+  "additionalProperties": false,
+  "$defs": { "ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true } }
+}

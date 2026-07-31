@@ -1,5 +1,11 @@
 # 工程知识切片 变更记录
 
+## v2.20.4 — 2026-07-31 生产方法可执行门禁
+
+- 生产 bundle 现在显式导入 vault 相对路径边界函数，修复 `runStructuredWriterPhase` 与空 `source_path` 续传实际执行时的跨模块 `ReferenceError`。
+- 结构化事务在读取计划目标前正确等待异步 `adapter.exists`，不存在的 vault 文件不再因 Promise 被当作真值而触发错误读取和回滚。
+- 生产根路径回归改为加载实际发布 bundle 插件类并执行真实 `runStructuredWriterPhase` 提交及 `processTask` 续传；mock Obsidian adapter 逐次拒绝主机绝对/截断路径，并验证污染索引清理、parsed/universal checkpoint 复用、零解析/上传/provider、正确阶段和组件错误分类。
+
 ## v2.20.3 — 2026-07-31 生产 vault 路径根边界修正
 
 - 结构化 writer 在读取持久化索引后先丢弃不合法记录，并在所有 `exists/read/write/rename` 前强制执行唯一的 vault 相对路径边界；Windows 盘符、UNC/主机绝对路径和目录穿越不再进入 Obsidian adapter 或被截断后重组，合法空格、Unicode 与 apostrophe 保持原样。

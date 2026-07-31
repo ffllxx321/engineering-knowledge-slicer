@@ -23,13 +23,15 @@ const {
   migrateSettings,
   normalizeConfiguredPath,
   normalizeVaultPath,
+  optionalVaultRelativePath,
   rollbackPath,
   sourceHash,
   statusCounts,
   TASK_STATUSES,
   PROCESSING_STATUSES,
   tasksPath,
-  validateConfiguredPathSet
+  validateConfiguredPathSet,
+  vaultRelativePath
 } = require("src/core/task.js");
 const { extractTextFromBuffer, sanitizeAttachmentFileName } = require("src/core/extractors.js");
 const { upgradeParsePackage } = require("src/core/document-parser.js");
@@ -2847,7 +2849,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const vault = {
       readIfExists: async (path) => {
         const relative = vaultRelativePath(path, 'structured writer read');
-        return adapter.exists(relative) ? adapter.read(relative) : null;
+        return await adapter.exists(relative) ? adapter.read(relative) : null;
       },
       write: async (path, content) => writeFile(this.app, vaultRelativePath(path, 'structured writer write'), content),
       rename: async (from, to) => adapter.rename(
@@ -9291,12 +9293,14 @@ module.exports = {
   migrateSettings,
   normalizeConfiguredPath,
   normalizeVaultPath,
+  optionalVaultRelativePath,
   rollbackPath,
   sourceHash,
   statusCounts,
   TASK_STATUSES,
   PROCESSING_STATUSES,
   validateConfiguredPathSet,
+  vaultRelativePath,
   tasksPath
 };
 

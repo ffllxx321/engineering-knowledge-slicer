@@ -1,94 +1,335 @@
 'use strict';
 
 const assert = require('assert');
-const fs = require('fs');
+const Module = require('module');
 const path = require('path');
-const { runUniversalPipeline } = require('../src/universal-knowledge-pipeline.js');
-const { buildPlan, emptyIndex, pathSafe, validateIndex } = require('../src/structured-writer.js');
-const { loadBundleModule } = require('./load-bundle-module.js');
 
-const root = path.join(__dirname, '..');
-const production = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
-const hostRoot = "C:\\工作\\OneDrive - SHIMIZU CORPORATION\\团队 O'Brien\\知识库";
-const poisonedPath = `${hostRoot}\\在办投标库\\src-poisoned.md`;
+class HostBase {}
+class Plugin extends HostBase {}
+class TFile extends HostBase {
+  constructor(filePath, text = '') {
+    super();
+    this.path = filePath;
+    this.name = filePath.split('/').pop();
+    this.extension = this.name.includes('.') ? this.name.split('.').pop() : '';
+    this.text = text;
+    this.stat = { mtime: 1, size: Buffer.byteLength(text) };
+  }
+}
+class TFolder extends HostBase {}
 
-assert.strictEqual(pathSafe(poisonedPath), false, 'Windows host paths must never be vault paths');
-const poisonedIndex = emptyIndex();
-poisonedIndex.records['src-poisoned'] = {
-  record_id: 'src-poisoned', record_kind: 'source_document', path: poisonedPath
-};
-const checked = validateIndex(poisonedIndex);
-assert.deepStrictEqual(checked.index.records, {}, 'invalid host paths must be removed at the persisted-index boundary');
-assert.strictEqual(checked.discarded[0].cause, 'malformed_index');
-
-const document = {
-  source_identity: 'resume-with-empty-source-path',
-  source_document_id: 'resume-with-empty-source-path',
-  source_path: '',
-  source_hash: 'a'.repeat(64),
-  source_type: 'pdf',
-  media_type: 'pdf',
-  title: "Unicode 空格与 apostrophe 的恢复",
-  ingested_at: '2026-07-31T00:00:00.000Z',
-  metadata: { document_role: 'source_record' },
-  blocks: [{
-    schema_version: 'block_v0', block_id: 'block-root-boundary-01',
-    source_hash: 'a'.repeat(64), order: 0, parent_id: null, kind: 'paragraph',
-    locator: { scheme: 'page', value: '1', page: 1 },
-    provenance: [{ scheme: 'page', value: '1', page: 1 }],
-    raw: { text: '施工前必须完成安全检查。', fields: {} }, inferred: {},
-    parse: { method: 'pdf', quality: 1, status: 'present' },
-    card_eligible: true, exclusion_reason: null, metadata: {}
-  }]
-};
-const universalResult = runUniversalPipeline({ document });
-const settings = {
-  controlledWriterEnabled: true, structuredWriterMode: 'structured-pilot',
-  structuredActiveRoot: "在办投标库/日本 O'Brien", structuredBusinessRoot: '长期业务库/工程 知识',
-  artifactsPath: '系统/产物', structuredMaxRecords: 100, structuredMaxActions: 300,
-  structuredMaxLinkFanout: 20
-};
-for (const index of [emptyIndex(), poisonedIndex]) {
-  const plan = buildPlan({
-    settings, document, universalResult, projectRegistry: [],
-    index: validateIndex(index).index, existingFiles: {}, logicalTime: document.ingested_at
+function loadProductionPlugin() {
+  const originalLoad = Module._load;
+  const obsidian = new Proxy({
+    Plugin,
+    TFile,
+    TFolder,
+    Notice: class Notice {},
+    normalizePath: (value) => String(value || '').replace(/\\/g, '/').replace(/\/+/g, '/'),
+    requestUrl: async () => {
+      throw new Error('PROVIDER_CALL_FORBIDDEN');
+    }
+  }, {
+    get(target, property) {
+      if (Object.hasOwn(target, property)) return target[property];
+      return HostBase;
+    }
   });
-  assert(plan.actions.length > 0, 'clean and resumed plans must remain productive');
-  assert(!JSON.stringify(plan).includes(hostRoot), 'a host root must not contaminate a plan or source path');
+  try {
+    Module._load = function load(request, parent, isMain) {
+      if (request === 'obsidian' || request === 'electron') return obsidian;
+      return originalLoad.call(this, request, parent, isMain);
+    };
+    delete require.cache[require.resolve('../main.js')];
+    return require('../main.js');
+  } finally {
+    Module._load = originalLoad;
+  }
 }
 
-const reliability = loadBundleModule('src/core/reliability.js');
-assert.notStrictEqual(reliability.classifyFailure({ code: 'VAULT_PATH_INVALID', message: `ENOENT ${poisonedPath}` }).code,
-  'FILE_NOT_FOUND', 'path-contract failures must not claim that the source file disappeared');
-assert.strictEqual(reliability.classifyFailure({ code: 'COMPONENT_NOT_FOUND' }).category, 'component_config',
-  'missing components must retain component-specific classification');
+const hostRoot = "C:\\工作\\OneDrive - SHIMIZU CORPORATION\\团队 O'Brien\\知识库";
+const poisonedPath = `${hostRoot}\\在办投标库\\src-poisoned.md`;
+const forbiddenFragments = [
+  'C:', '工作', 'OneDrive - SHIMIZU CORPORATION', "团队 O'Brien", '知识库\\'
+];
 
-const processStart = production.indexOf('  async processTask(task) {');
-const processEnd = production.indexOf('\n  async loadComponentText(', processStart);
-const processTask = production.slice(processStart, processEnd);
-assert(processTask.includes("stage: universalProduction ? 'universal-writer' : 'component-contracts'"),
-  'universal production must not retain a stale component-contract checkpoint');
-assert(processTask.includes("let parsePackage = await this.loadArtifact(current, 'parsed');"),
-  'resume must load parsed before deciding whether a source file is required');
-assert(processTask.includes('if (!current.source_path && !parsePackage)'),
-  'empty sourcePath is allowed only when a parsed checkpoint is reusable');
+function assertVaultPath(rawPath, operation) {
+  const value = String(rawPath || '');
+  assert(value, `${operation} received an empty path`);
+  assert(!path.win32.isAbsolute(value), `${operation} leaked a Windows host path: ${value}`);
+  assert(!path.posix.isAbsolute(value), `${operation} leaked a POSIX host path: ${value}`);
+  assert(!value.includes('\\'), `${operation} received a non-canonical vault path: ${value}`);
+  for (const fragment of forbiddenFragments) {
+    assert(!value.includes(fragment), `${operation} leaked a host-path fragment: ${value}`);
+  }
+  assert(!value.split('/').includes('..'), `${operation} escaped the vault: ${value}`);
+  return value;
+}
 
-const writerStart = production.indexOf('  async runStructuredWriterPhase(task, parsePackage) {');
-const writerEnd = production.indexOf('\n  async writeAcceptedCard(', writerStart);
-const writer = production.slice(writerStart, writerEnd);
-assert(writer.includes('validateStructuredIndex(rawIndex)'), 'runtime must sanitize persisted index paths');
-assert(writer.includes("vaultRelativePath(entry.path, 'structured index record')"),
-  'index reads must cross the canonical vault-relative boundary');
-assert(writer.includes('priorUniversal?.document?.source_hash === document.source_hash'),
-  'resume must reuse the universal checkpoint without provider calls');
-assert(!writer.includes('adapter.getBasePath'), 'writer must never reconstruct host paths from the vault base path');
+function createVault(initialFiles) {
+  const files = new Map(Object.entries(initialFiles));
+  const folders = new Set();
+  const calls = [];
+  const record = (operation, ...rawPaths) => {
+    const paths = rawPaths.map((value) => assertVaultPath(value, operation));
+    calls.push({ operation, paths });
+    return paths;
+  };
+  const adapter = {
+    exists: async (rawPath) => {
+      const [filePath] = record('exists', rawPath);
+      return files.has(filePath) || folders.has(filePath);
+    },
+    read: async (rawPath) => {
+      const [filePath] = record('read', rawPath);
+      if (!files.has(filePath)) {
+        const error = new Error(`ENOENT ${filePath}`);
+        error.code = 'ENOENT';
+        throw error;
+      }
+      return files.get(filePath);
+    },
+    write: async (rawPath, content) => {
+      const [filePath] = record('write', rawPath);
+      files.set(filePath, String(content));
+    },
+    rename: async (rawFrom, rawTo) => {
+      const [from, to] = record('rename', rawFrom, rawTo);
+      assert(files.has(from), `rename source does not exist: ${from}`);
+      files.set(to, files.get(from));
+      files.delete(from);
+    },
+    remove: async (rawPath) => {
+      const [filePath] = record('remove', rawPath);
+      files.delete(filePath);
+    },
+    mkdir: async (rawPath) => {
+      const [folderPath] = record('mkdir', rawPath);
+      folders.add(folderPath);
+    }
+  };
+  const vault = {
+    adapter,
+    getAbstractFileByPath(rawPath) {
+      const filePath = assertVaultPath(rawPath, 'getAbstractFileByPath');
+      return files.has(filePath) ? new TFile(filePath, files.get(filePath)) : null;
+    },
+    getMarkdownFiles() {
+      return [...files.entries()]
+        .filter(([filePath]) => filePath.endsWith('.md'))
+        .map(([filePath, text]) => new TFile(filePath, text));
+    },
+    read: async (file) => adapter.read(file.path),
+    createFolder: async (rawPath) => adapter.mkdir(rawPath),
+    create: async (rawPath, content) => adapter.write(rawPath, content),
+    modify: async (file, content) => adapter.write(file.path, content)
+  };
+  return { vault, files, calls };
+}
 
-const componentStart = production.indexOf('  async loadComponentText(relativePath) {');
-const componentEnd = production.indexOf('\n  async loadComponentJson(', componentStart);
-const componentLoader = production.slice(componentStart, componentEnd);
-assert(componentLoader.includes('this.app.vault.read(file)'));
-assert(!componentLoader.includes("require('fs')"), 'component files must be read only through vault APIs');
-assert(componentLoader.includes('builtInInfrastructureSchema(normalizedRelative)'),
-  'cache misses must retain the intended built-in schema fallback');
+const sourceHash = 'a'.repeat(64);
+const parsed = {
+  schema_version: 'parse-package/1.1',
+  source_path: '',
+  source_hash: sourceHash,
+  source_type: 'pdf',
+  title: "Unicode 空格与 apostrophe 的恢复",
+  metadata: { document_role: 'source_record' },
+  blocks: [{
+    schema_version: 'block_v0',
+    block_id: 'block-root-boundary-01',
+    source_hash: sourceHash,
+    order: 0,
+    parent_id: null,
+    kind: 'paragraph',
+    locator: { scheme: 'page', value: '1', page: 1 },
+    provenance: [{ scheme: 'page', value: '1', page: 1 }],
+    raw: { text: '施工前必须完成安全检查。', fields: {} },
+    inferred: {},
+    parse: { method: 'pdf', quality: 1, status: 'present' },
+    card_eligible: true,
+    exclusion_reason: null,
+    metadata: {}
+  }]
+};
 
-console.log('production vault-root boundary regression: clean/resume, Windows Unicode paths, empty sourcePath, fallback and classification passed');
+function createPlugin(PluginClass, vaultHarness, task, artifacts, counters) {
+  const plugin = Object.create(PluginClass.prototype);
+  plugin.app = { vault: vaultHarness.vault };
+  plugin.settings = {
+    controlledWriterEnabled: true,
+    structuredWriterMode: 'structured-write',
+    structuredActiveRoot: "在办投标库/日本 O'Brien",
+    structuredBusinessRoot: '长期业务库/工程 知识',
+    artifactsPath: '系统/产物',
+    componentPackPath: '组件包',
+    structuredMaxRecords: 100,
+    structuredMaxActions: 300,
+    structuredMaxLinkFanout: 20,
+    minimaxModel: 'provider-must-not-run',
+    businessTimeZone: 'Asia/Shanghai'
+  };
+  plugin.operationCounters = {
+    apiRequests: 0, aiRetries: 0, summaryReduceRequests: 0,
+    promptCharacters: 0, outputCharacters: 0, bytesRead: 0,
+    bytesWritten: 0, ledgerWrites: 0, artifactWrites: 0
+  };
+  plugin.sessionStats = {
+    scanned: 0, processed: 0, written: 0, review: 0,
+    failed: 0, skipped: 0, current: '', lastMessage: ''
+  };
+  plugin.taskControllers = new Map();
+  plugin._terminalTaskIds = new Set();
+  plugin.pauseRequested = false;
+  plugin.cancelRequestedTaskId = '';
+  plugin.structuredWriterLock = {
+    tail: Promise.resolve(),
+    acquire: async () => () => {}
+  };
+  plugin.componentCache = new Map();
+  plugin.loadTasks = async () => [task];
+  plugin.saveTasks = async () => {};
+  plugin.flushSaveTasksImmediate = async () => {};
+  plugin.refreshViews = async () => {};
+  plugin.refreshProgressOnly = () => {};
+  plugin.transitionCompletionUi = async () => {};
+  plugin.writeTaskLog = async () => {};
+  plugin.setTaskProgress = async (current, message, details) => {
+    counters.progress.push({ message, ...details });
+    current.progress = { message, ...details };
+  };
+  plugin.loadArtifact = async (_current, name) => {
+    counters.artifactLoads[name] = (counters.artifactLoads[name] || 0) + 1;
+    return artifacts[name] || null;
+  };
+  plugin.persistArtifact = async (current, name, value) => {
+    artifacts[name] = value;
+    current.artifacts = Object.assign({}, current.artifacts, {
+      [name]: `系统/产物/${current.run_id}/${name}.json`
+    });
+  };
+  return plugin;
+}
+
+async function main() {
+  globalThis.__eksDiag = { state: { buffer: [], events: [] } };
+  const PluginClass = loadProductionPlugin();
+  assert.strictEqual(typeof PluginClass.prototype.runStructuredWriterPhase, 'function');
+  assert.strictEqual(typeof PluginClass.prototype.processTask, 'function');
+
+  const poisonedIndex = {
+    schema_version: 'id-path-index/1.0',
+    revision: 0,
+    records: {
+      'src-poisoned': {
+        record_id: 'src-poisoned',
+        record_kind: 'source_document',
+        path: poisonedPath
+      }
+    }
+  };
+  const indexPath = '系统/产物/structured-writer/id-path-index.v1.json';
+  const registryPath = '系统/产物/structured-writer/project-registry.v1.json';
+  const vaultHarness = createVault({
+    [indexPath]: JSON.stringify(poisonedIndex),
+    [registryPath]: '[]'
+  });
+  const task = {
+    task_id: 'resume-with-empty-source-path',
+    run_id: 'run-production-executable-gate',
+    source_identity: 'resume-with-empty-source-path',
+    source_path: '',
+    source_hash: sourceHash,
+    source_type: 'pdf',
+    created_at: '2026-07-31T00:00:00.000Z',
+    discovered_at: '2026-07-31T00:00:00.000Z',
+    status: 'queued',
+    errors: [],
+    artifacts: {
+      parsed: '系统/产物/run-production-executable-gate/parsed.json',
+      'universal-canonical': '系统/产物/run-production-executable-gate/universal-canonical.json'
+    },
+    written_card_ids: [],
+    review_atom_ids: []
+  };
+  const canonical = require('../src/universal-knowledge-pipeline.js')
+    .runUniversalPipeline({ document: {
+      source_identity: task.source_identity,
+      source_document_id: task.task_id,
+      source_path: '',
+      source_hash: sourceHash,
+      source_type: 'pdf',
+      media_type: 'pdf',
+      title: parsed.title,
+      ingested_at: task.created_at,
+      metadata: parsed.metadata,
+      blocks: parsed.blocks
+    } });
+  const artifacts = { parsed, 'universal-canonical': canonical };
+  const counters = { artifactLoads: {}, progress: [], parser: 0, upload: 0, provider: 0 };
+  const plugin = createPlugin(PluginClass, vaultHarness, task, artifacts, counters);
+
+  const direct = await PluginClass.prototype.runStructuredWriterPhase.call(plugin, task, parsed);
+  assert.strictEqual(direct.mode, 'structured-write');
+  assert(direct.plan && direct.plan.actions.length > 0, 'actual bundled writer must produce a plan');
+  assert(direct.transaction, 'actual bundled writer must commit its plan');
+  assert.strictEqual(direct.universalResult, canonical, 'the valid universal checkpoint must be reused');
+  assert.strictEqual(counters.artifactLoads['universal-canonical'], 1);
+  assert.strictEqual(plugin.operationCounters.apiRequests, 0);
+  assert(!JSON.stringify(direct.plan).includes(hostRoot), 'poisoned host paths must not enter the plan');
+  const persistedIndex = JSON.parse(vaultHarness.files.get(indexPath));
+  assert(!JSON.stringify(persistedIndex).includes(hostRoot), 'the committed index must discard poisoned host paths');
+
+  // Exercise the actual processTask resume boundary as well. The parsed and
+  // universal checkpoints are supplied by loadArtifact, so any parser/upload or
+  // provider access is a hard test failure.
+  await PluginClass.prototype.processTask.call(plugin, task);
+  assert.strictEqual(counters.parser, 0);
+  assert.strictEqual(counters.upload, 0);
+  assert.strictEqual(counters.provider, 0);
+  assert.strictEqual(plugin.operationCounters.apiRequests, 0);
+  assert(counters.artifactLoads.parsed >= 1, 'processTask must load the parsed checkpoint');
+  assert(counters.artifactLoads['universal-canonical'] >= 2,
+    'processTask must pass through the bundled writer and reuse the universal checkpoint');
+  assert(counters.progress.some((entry) => entry.stage === 'universal-writer'));
+  assert(counters.progress.some((entry) => entry.stage === 'writing'));
+  assert(!counters.progress.some((entry) => entry.stage === 'component-contracts'),
+    'universal resume must never enter component-contracts');
+  assert(['written', 'needs_review', 'completed_no_output'].includes(task.status),
+    `unexpected final status: ${task.status}`);
+
+  await assert.rejects(
+    () => PluginClass.prototype.loadComponentText.call(plugin, '提示词/业务库/刻意缺失.md'),
+    (error) => error.code === 'COMPONENT_NOT_FOUND'
+      && error.code !== 'FILE_NOT_FOUND'
+  );
+  for (const operation of ['exists', 'read', 'write', 'rename']) {
+    assert(vaultHarness.calls.some((call) => call.operation === operation),
+      `mock adapter did not observe production ${operation}`);
+  }
+
+  console.log(JSON.stringify({
+    gate: 'production vault-root boundary executable',
+    bundledMethods: ['runStructuredWriterPhase', 'processTask'],
+    sourcePath: task.source_path,
+    checkpointReuse: { parsed: true, universalCanonical: true },
+    calls: {
+      parser: counters.parser,
+      upload: counters.upload,
+      provider: counters.provider,
+      adapter: vaultHarness.calls.reduce((counts, call) => {
+        counts[call.operation] = (counts[call.operation] || 0) + 1;
+        return counts;
+      }, {})
+    },
+    finalStage: counters.progress.findLast((entry) => entry.stage)?.stage,
+    finalStatus: task.status,
+    committedActions: direct.plan.actions.length,
+    componentMissingCode: 'COMPONENT_NOT_FOUND'
+  }, null, 2));
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

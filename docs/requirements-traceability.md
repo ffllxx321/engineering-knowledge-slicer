@@ -1,5 +1,21 @@
 # Phase 0–5 严格追踪矩阵
 
+## v2.20 通用企业知识管线
+
+| 要求 | 生产证据 | 自动化证据 |
+|---|---|---|
+| 物理解析与语义理解分离、未知格式降级 | `canonicalizeDocument` | `testCanonicalAndProfile`、跨格式等价 |
+| 多标签画像与区域级语义分割 | `inferProfile`、`segmentDocument` | mixed/long/dense tests |
+| 通用知识单元、旧 artifact 规范化 | `normalizeKnowledgeUnit`、`planKnowledgeUnits` | legacy migration/boundary tests |
+| 区域覆盖、局部修复、压缩遥测 | `repairCoverage`、telemetry | coverage/cost tests |
+| 单元级两库、标签规范化 | `routeUnit`、`normalizeTags` | mixed routing/tag tests |
+| 证据关系、稳定双向链接、归档 | `relationEvidence`、structured writer | relation/archive/idempotence tests |
+| 四记录、完整计划、事务/回滚 | `buildCanonicalRecords`、`buildPlan`、`commitPlan` | universal E2E + existing writer rollback suites |
+| 少量分组审核、无正常 UI JSON | `groupedReview`、`humanLocator` | grouped review/Markdown assertions |
+| 生产接线与内置回退 | `runStructuredWriterPhase`、embedded module | embed/build/builtin fallback suites |
+
+架构与用户配置边界见 `docs/universal-enterprise-knowledge-pipeline-v220.md`。
+
 审计基点 `a42cd418`，2026-07-27。完成只表示生产路径和确定性自动化证据同时存在；外部供应商效果不以本地测试冒充。
 
 ## 未发布 Phase 2/3 生产阶段

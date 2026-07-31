@@ -136,6 +136,18 @@ function relationLink(relation) {
   return `[[${relation.target_id}|${relation.target_title || relation.target_id}]]`;
 }
 
+function humanLocator(locator = {}) {
+  return [
+    locator.page !== undefined ? `第 ${locator.page} 页` : '',
+    locator.sheet ? `工作表“${clean(String(locator.sheet), 120)}”` : '',
+    locator.range ? `区域 ${clean(String(locator.range), 80)}` : '',
+    locator.row !== undefined ? `第 ${locator.row} 行` : '',
+    locator.message_id ? `邮件 ${clean(String(locator.message_id), 120)}` : '',
+    locator.heading_path ? `章节 ${Array.isArray(locator.heading_path) ? locator.heading_path.join(' / ') : locator.heading_path}` : '',
+    !locator.page && !locator.sheet && !locator.range && locator.value ? clean(String(locator.value), 160) : ''
+  ].filter(Boolean).join('，') || '来源原文';
+}
+
 function serializeRecord(record) {
   const check = validateRecord(record);
   if (!check.valid) throw new Error(`记录 ${record.record_id} 不符合 schema：${check.errors.join('；')}`);
@@ -155,6 +167,8 @@ function serializeRecord(record) {
   for (const key of ['state', 'archive_outcome', 'source_path', 'source_hash', 'source_version', 'media_type', 'category', 'item_type', 'reuse_status']) {
     if (record[key]) frontmatter.push(`${key}: ${yamlScalar(record[key])}`);
   }
+  if (record.semantic_kind) frontmatter.push(`semantic_kind: ${yamlScalar(record.semantic_kind)}`);
+  if (record.tags?.length) frontmatter.push(`tags: ${yamlArray(record.tags)}`);
   for (const key of ['project_ids', 'source_document_ids', 'business_item_ids', 'company_knowledge_ids']) {
     if (record[key]?.length) frontmatter.push(`${key}: ${yamlArray(record[key])}`);
   }
@@ -163,7 +177,7 @@ function serializeRecord(record) {
   if (record.summary) body.push('## 内容', '', record.summary, '');
   if (record.evidence?.verbatim) {
     body.push('## 来源证据', '', `> ${clean(record.evidence.verbatim, 4000).replace(/\n/g, '\n> ')}`, '',
-      `定位：${yamlScalar(stableJson(record.evidence.locator || {}))}`, '');
+      `定位：${humanLocator(record.evidence.locator || {})}`, '');
   }
   if (relations.length) body.push('## 关系', '', ...relations.map((relation) =>
     `- ${relation.type}：${relationLink(relation)}`), '');
@@ -177,7 +191,7 @@ function serializeRecord(record) {
 }
 
 function routeRecord(record, route, registryEntry, settings) {
-  const categoryValue = route.directory_category || record.category;
+  const categoryValue = record.category || route.directory_category;
   if (!categoryValue) throw new Error('结构化路由分类未确定，禁止使用默认目录');
   const category = safeSegment(categoryValue);
   if (record.library === 'active_tender') {
@@ -242,6 +256,7 @@ function resolveRelations(records, index, limits) {
 }
 
 function buildRecords(input, settings) {
+  if (input.universalResult?.knowledge_units) return buildCanonicalRecords(input, settings);
   const phase2 = input.phase2Result || {};
   const phase3 = input.phase3Result || {};
   const document = input.document || {};
@@ -327,6 +342,79 @@ function buildRecords(input, settings) {
   return { records, registry, route, sourceId };
 }
 
+function buildCanonicalRecords(input, settings) {
+  const result = input.universalResult;
+  const document = result.document || input.document || {};
+  const units = (result.knowledge_units || []).filter((unit) =>
+    !(result.review_decisions || []).some((review) => review.unit_ids?.includes(unit.unit_id)));
+  const now = clean(input.logicalTime || document.ingested_at || '1970-01-01T00:00:00.000Z', 80);
+  const sourceId = stableId('source_document', sourceIdentity(document));
+  const registryMatches = (input.projectRegistry || []).filter((entry) =>
+    units.some((unit) => unit.project_ids?.includes(entry.project_id)));
+  if (units.some((unit) => unit.route?.library === 'active_tender') && registryMatches.length !== 1) {
+    throw Object.assign(new Error('在办知识单元必须唯一匹配项目登记表'), { code: 'STRUCTURED_ROUTE_UNRESOLVED' });
+  }
+  const registry = registryMatches[0] || null;
+  const sourceLibrary = units.some((unit) => unit.route?.library === 'active_tender') ? 'active_tender' : 'business';
+  const source = {
+    schema_version: '1.0', record_kind: 'source_document', record_id: sourceId,
+    title: clean(document.title || '来源文档', 300), library: sourceLibrary,
+    created_at: now, updated_at: now, source_path: clean(document.source_path, 800),
+    source_hash: clean(document.source_hash, 128), media_type: clean(document.media_type, 100),
+    owner_source_id: sourceId, summary: `统一语义管线来源记录；共形成 ${units.length} 个知识单元。`,
+    category: sourceLibrary === 'active_tender' ? 'project_material_index' : 'terminology_general_knowledge'
+  };
+  const records = [source];
+  let project = null;
+  if (registry) {
+    const projectId = stableId('project', projectIdentity(registry));
+    project = {
+      schema_version: '1.0', record_kind: 'project', record_id: projectId,
+      title: clean(registry.name || registry.project_id, 300), library: 'active_tender',
+      created_at: now, updated_at: now, state: clean(registry.state || 'lead', 40),
+      owner_source_id: sourceId, source_document_ids: [sourceId], category: 'project_overview'
+    };
+    source.project_ids = [projectId];
+    source.requested_relations = [{ type: 'belongs_to', target_id: projectId }];
+    records.unshift(project);
+  }
+  const unitToRecord = new Map();
+  for (const unit of units) {
+    const recordKind = unit.route.library === 'business' && unit.reusable === true
+      ? 'company_knowledge' : 'business_item';
+    const recordId = stableId(recordKind, `${sourceId}:unit:${unit.fingerprint || unit.unit_id}`);
+    unitToRecord.set(unit.unit_id, recordId);
+    records.push({
+      schema_version: '1.0', record_kind: recordKind, record_id: recordId,
+      title: clean(unit.title, 160) || '知识单元', library: unit.route.library,
+      created_at: now, updated_at: now, category: unit.route.category,
+      item_type: recordKind === 'business_item' ? unit.semantic_kind : undefined,
+      reuse_status: recordKind === 'company_knowledge' ? 'auto_supported' : undefined,
+      summary: clean(unit.statement, 8000), evidence: unit.evidence?.[0],
+      evidence_list: unit.evidence, tags: unit.tags, semantic_kind: unit.semantic_kind,
+      conditions: unit.applicable_conditions, exceptions: unit.exceptions,
+      structured_facts: unit.structured_facts, confidence: unit.confidence,
+      uncertainty: unit.uncertainty, owner_source_id: sourceId,
+      source_document_ids: [sourceId], project_ids: project ? [project.record_id] : [],
+      requested_relations: [{ type: 'derived_from', target_id: sourceId }]
+    });
+  }
+  for (const relation of result.relations || []) {
+    const from = records.find((record) => record.record_id === unitToRecord.get(relation.from_unit_id));
+    const toId = unitToRecord.get(relation.to_unit_id);
+    if (!from || !toId) continue;
+    from.requested_relations.push({ type: relation.type, target_id: toId, evidence_locator: relation.evidence });
+    const to = records.find((record) => record.record_id === toId);
+    if (to) to.requested_relations.push({ type: relation.type, target_id: from.record_id, evidence_locator: relation.evidence });
+  }
+  if (records.length > settings.limits.max_records) throw new Error('结构化记录数量超过安全上限');
+  return {
+    records, registry, sourceId,
+    route: { library: sourceLibrary, directory_category: source.category },
+    reviewDecisions: result.review_decisions || []
+  };
+}
+
 function buildPlan(input) {
   const settings = normalizeSettings(input.settings);
   if (!settings.enabled || settings.mode === 'legacy') return {
@@ -351,7 +439,7 @@ function buildPlan(input) {
     }
   }
   const { index, conflicts: indexConflicts } = validateIndex(input.index);
-  const { records, registry, route, sourceId } = buildRecords(input, settings);
+  const { records, registry, route, sourceId, reviewDecisions = [] } = buildRecords(input, settings);
   const conflicts = [...indexConflicts];
   const physicalIds = new Map();
   for (const [path, content] of Object.entries(input.existingFiles || {})) {
@@ -380,7 +468,7 @@ function buildPlan(input) {
     };
   }
   for (const record of records) {
-    record.path = routeRecord(record, route, registry, settings);
+    record.path = routeRecord(record, { ...route, directory_category: record.category || route.directory_category }, registry, settings);
     const existingIndex = index.records?.[record.record_id];
     if (existingIndex && existingIndex.path !== record.path && input.archiveTransition !== true) {
       record.path = existingIndex.path; // rename/title changes never move identity
@@ -440,12 +528,12 @@ function buildPlan(input) {
   if (actions.length > settings.limits.max_actions) throw new Error('写入计划超过安全上限');
   const counts = {};
   for (const action of actions) counts[action.action] = (counts[action.action] || 0) + 1;
-  const blocked = conflicts.length > 0 || reviewGroups.length > 0
+  const blocked = conflicts.length > 0 || reviewGroups.length > 0 || reviewDecisions.length > 0
     || (input.phase3Result?.handling_groups || []).length > 0;
   const planCore = {
     version: WRITER_VERSION, mode: settings.mode, source_document_id: sourceId,
     generator: 'structured-writer', actions, conflicts, review_groups: reviewGroups,
-    phase3_handling_groups: input.phase3Result?.handling_groups || [], counts,
+    phase3_handling_groups: [...(input.phase3Result?.handling_groups || []), ...reviewDecisions], counts,
     source_hash: clean(input.document?.source_hash, 128),
     source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
     index_revision: Number(index.revision || 0), blocked,

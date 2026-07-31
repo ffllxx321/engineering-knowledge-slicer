@@ -12,6 +12,7 @@ const modules = [
   ['src/phase1-foundation.js', 'src/phase1-foundation.js'],
   ['src/phase2-candidate-pipeline.js', 'src/phase2-candidate-pipeline.js'],
   ['src/phase3-review-gate.js', 'src/phase3-review-gate.js'],
+  ['src/universal-knowledge-pipeline.js', 'src/universal-knowledge-pipeline.js'],
   ['src/structured-writer.js', 'src/structured-writer.js']
 ];
 function factory(id, sourcePath) {

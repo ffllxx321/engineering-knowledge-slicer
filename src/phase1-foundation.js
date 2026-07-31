@@ -118,6 +118,11 @@ const BUSINESS_ITEM_TYPES = Object.freeze([
   ['contract_obligation', '合同义务'],
   ['project_lesson', '项目教训']
 ].map(([key, label]) => Object.freeze({ key, label })));
+const CANONICAL_ITEM_TYPES = new Set([
+  'fact', 'requirement', 'decision', 'action', 'process', 'method', 'parameter',
+  'risk', 'issue', 'experience', 'commercial_term', 'schedule', 'entity_profile',
+  'correspondence'
+]);
 
 const DIRECTORY_PLAN = Object.freeze({
   version: SCHEMA_VERSION,
@@ -259,7 +264,8 @@ function validateRecord(input) {
     }
   }
   if (record.record_kind === 'business_item' && record.item_type
-    && !BUSINESS_ITEM_TYPES.some((item) => item.key === record.item_type)) {
+    && !BUSINESS_ITEM_TYPES.some((item) => item.key === record.item_type)
+    && !CANONICAL_ITEM_TYPES.has(record.item_type)) {
     errors.push('item_type 不是有效业务条目类型');
   }
   if (record.record_kind === 'company_knowledge' && record.library !== 'business') {

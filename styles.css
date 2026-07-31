@@ -814,3 +814,16 @@
 .eks-gate-checklist span{padding:3px 8px;border-radius:999px;background:var(--background-secondary)}
 .eks-gate-checklist .is-pass{color:var(--text-success)}.eks-gate-checklist .is-fail,.eks-approval-blocked{color:var(--text-error)}
 @media(max-width:700px){.eks-evidence-comparison{grid-template-columns:1fr}}
+.eks-review-difference-mark {
+  background: var(--text-highlight-bg);
+  color: var(--text-normal);
+  border-bottom: 2px solid var(--color-red);
+  padding: 0 2px;
+}
+.eks-review-difference-detail {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--color-red);
+  background: var(--background-secondary);
+  line-height: 1.5;
+}

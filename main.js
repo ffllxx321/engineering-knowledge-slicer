@@ -3530,29 +3530,27 @@ class ReviewExceptionModal extends Modal {
     approveSafe.addEventListener('click', () => this.runAction(plan.eligibleIds, 'approve_selected', true));
     const body = contentEl.createDiv('eks-review-modal-body');
     body.createEl('h3', { text: plainCardTitle(item) });
+    const difference = context.material_differences || {};
     const comparison = body.createDiv('eks-evidence-comparison');
     const generated = comparison.createDiv('eks-review-pane');
     generated.createEl('h4', { text: '生成内容' });
-    generated.createDiv({ cls: 'eks-review-pane-scroll', text: context.statement || plainClaim(item) });
+    renderDifferenceText(generated.createDiv({ cls: 'eks-review-pane-scroll' }),
+      context.statement || plainClaim(item), differenceSpans(context.material_differences, 'generated'));
     const source = comparison.createDiv('eks-review-pane');
     source.createEl('h4', { text: '原文依据' });
-    source.createDiv({ cls: 'eks-review-pane-scroll', text: context.evidence_quote || '未找到可核验的原文依据' });
+    renderDifferenceText(source.createDiv({ cls: 'eks-review-pane-scroll' }),
+      context.evidence_quote || '未找到可核验的原文依据', differenceSpans(context.material_differences, 'source'));
     source.createDiv({ cls: 'eks-task-meta', text: `位置：${formatReviewLocator(context)}` });
-    const difference = context.material_differences || {};
     body.createDiv({
       cls: difference.status === 'matched' || difference.status === 'not_applicable' ? 'eks-automatic-pass' : 'eks-approval-blocked',
       text: plainDifferenceSummary(difference)
     });
+    for (const detail of plainDifferenceDetails(difference)) {
+      body.createDiv({ cls: 'eks-review-difference-detail', text: detail });
+    }
     if (!isApprovalEligible(item)) {
       body.createDiv({ cls: 'eks-approval-blocked', text: '此项存在未解决的实质差异，不能批准。请重新生成、拒绝或转交专家。' });
     }
-    const technical = body.createEl('details', { cls: 'eks-technical-details' });
-    technical.createEl('summary', { text: '技术信息' });
-    technical.createEl('pre', { text: JSON.stringify({
-      reason_codes: item.reason_codes,
-      validation: item.validationReport || item.validation_report,
-      status: item.status
-    }, null, 2) });
     const pager = contentEl.createDiv({ cls: 'eks-exception-pager' });
     const previous = pager.createEl('button', { text: '上一项', attr: { 'aria-label': '上一项' } }); previous.disabled = this.index === 0;
     previous.addEventListener('click', () => this.navigate(-1));
@@ -3560,7 +3558,7 @@ class ReviewExceptionModal extends Modal {
     const next = pager.createEl('button', { text: '下一项', attr: { 'aria-label': '下一项' } }); next.disabled = this.index >= this.items.length - 1;
     next.addEventListener('click', () => this.navigate(1));
     const actions = contentEl.createDiv({ cls: 'eks-review-exception-actions' });
-    const approve = actions.createEl('button', { text: '批准此项', cls: 'mod-cta', attr: { 'aria-label': '批准此项（快捷键 A）' } });
+    const approve = actions.createEl('button', { text: '批准', cls: 'mod-cta', attr: { 'aria-label': '批准此项（快捷键 A）' } });
     approve.disabled = !isApprovalEligible(item);
     approve.addEventListener('click', () => this.runAction([item.atom_id], 'approve_selected'));
     actions.createEl('button', { text: '重新生成', attr: { 'aria-label': '重新生成此项（快捷键 R）' } })
@@ -3647,6 +3645,48 @@ function plainDifferenceSummary(difference) {
     ambiguous_conversion: '单位换算关系不明确。'
   };
   return labels[difference.status] || '检测到需要处理的实质差异。';
+}
+function differenceSpans(difference, side) {
+  const rows = difference?.factComparison?.differences || difference?.differences || [];
+  return [...new Set(rows.flatMap((row) => side === 'generated'
+    ? [row.claim || row.generated || '']
+    : (Array.isArray(row.evidence) ? row.evidence : [row.source || row.evidence || ''])).filter(Boolean))];
+}
+function renderDifferenceText(container, value, spans) {
+  const source = String(value || '');
+  const matches = (spans || []).flatMap((span) => {
+    const start = source.indexOf(String(span));
+    return start < 0 ? [] : [{ start, end: start + String(span).length }];
+  }).sort((a, b) => a.start - b.start);
+  let cursor = 0;
+  for (const match of matches) {
+    if (match.start < cursor) continue;
+    if (match.start > cursor) container.appendText(source.slice(cursor, match.start));
+    container.createEl('mark', { cls: 'eks-review-difference-mark', text: source.slice(match.start, match.end) });
+    cursor = match.end;
+  }
+  if (cursor < source.length) container.appendText(source.slice(cursor));
+}
+function plainDifferenceDetails(difference) {
+  const labels = {
+    conflict: '数值、日期或单位冲突', unsupported_addition: '原文不支持这项新增事实',
+    missing_in_evidence: '原文缺少对应单位', ambiguous_conversion: '单位换算无法确认',
+    material_conflict: '材料、产品或型号冲突', unsupported_material: '原文不支持这项材料、产品或型号',
+    strengthened_obligation: '义务被加强', weakened_obligation: '义务被弱化',
+    changed_obligation: '义务强度改变', invented_condition: '新增了适用条件',
+    removed_condition_or_exception: '删除了条件或例外'
+  };
+  const rows = difference?.factComparison?.differences || difference?.differences || [];
+  const details = rows.map((row) => {
+    const source = (Array.isArray(row.evidence) ? row.evidence.join('、') : row.source || row.evidence) || '原文无对应值';
+    return `差异：${labels[row.status] || '事实不一致'}；生成值：${row.claim || row.generated || '未标明'}；原文值：${source}；影响：可能改变检索、选材或验收判断。`;
+  });
+  for (const item of [difference?.modality, difference?.conditions]) {
+    if (item?.status && item.status !== 'matched') {
+      details.push(`差异：${labels[item.status] || item.status}；生成值：${item.statement || '无'}；原文值：${item.evidence || '无'}；影响：可能改变责任或适用范围。`);
+    }
+  }
+  return details;
 }
 
 // v1.3: 上传源文件到外部解析器（MinerU / PaddleOCR）前的二次确认弹窗。
@@ -15734,6 +15774,21 @@ function evidenceConsistency(statement, evidence) {
   const statementFacts = extractedFacts(statement);
   const evidenceFacts = extractedFacts(evidence);
   const facts = compareFacts(statementFacts, evidenceFacts);
+  const materialClaims = explicitMaterialClaims(statement);
+  const evidenceMaterials = explicitMaterialClaims(evidence);
+  for (const claim of materialClaims) {
+    if (normalizeText(evidence).toLowerCase().includes(claim.value.toLowerCase())) continue;
+    facts.differences.push({
+      status: evidenceMaterials.length ? 'material_conflict' : 'unsupported_material',
+      claim: claim.raw,
+      evidence: evidenceMaterials.map((item) => item.raw)
+    });
+  }
+  if (facts.differences.some((item) => ['material_conflict', 'unsupported_material'].includes(item.status))) {
+    facts.status = facts.differences.some((item) => item.status === 'material_conflict')
+      ? 'material_conflict' : 'unsupported_material';
+    facts.blocking = true;
+  }
   const statementModality = explicitModality(statement);
   const evidenceModality = explicitModality(evidence);
   let modalityStatus = 'matched';
@@ -15753,6 +15808,8 @@ function evidenceConsistency(statement, evidence) {
     unsupported_addition: '生成内容增加了原文没有的数字或日期',
     missing_in_evidence: '原文依据缺少核验该数值所需的单位',
     ambiguous_conversion: '生成内容与原文的单位换算关系不明确'
+    ,material_conflict: '生成内容中的材料、产品或型号与原文冲突'
+    ,unsupported_material: '生成内容增加了原文没有的材料、产品或型号'
   };
   if (facts.blocking) plainReasons.push(factLabels[facts.status]);
   if (modalityStatus === 'strengthened_obligation') plainReasons.push('生成内容把原文加强为强制要求');
@@ -15771,6 +15828,19 @@ function evidenceConsistency(statement, evidence) {
     modality: { status: modalityStatus, statement: statementModality || 'none', evidence: evidenceModality || 'none' },
     conditions: { status: conditionStatus, statement: conditions, evidence: evidenceConditions }
   };
+}
+
+function explicitMaterialClaims(value) {
+  const original = String(value || '');
+  const source = original.normalize('NFKC');
+  const output = [];
+  const pattern = /(?:材料|材质|产品|型号|饰面|面层)\s*[:：=为]\s*([^；;，,\n]{1,80})/giu;
+  for (const match of source.matchAll(pattern)) {
+    const material = normalizeText(match[1]).replace(/[。.]$/, '');
+    if (material) output.push({ value: material, raw: original.slice(match.index, match.index + match[0].length) });
+  }
+  return output.filter((item, index, all) =>
+    all.findIndex((candidate) => candidate.value.toLowerCase() === item.value.toLowerCase()) === index);
 }
 
 function explicitModality(text) {
@@ -16745,6 +16815,208 @@ module.exports = {
  * 串联 ai-pipeline / routing / link-service / markdown-renderer / confidence
  * @exports runKnowledgeWorkflow
  */
+"src/core/table-knowledge.js": function(require, module, exports) {
+'use strict';
+
+const crypto = require('crypto');
+
+const text = (value) => String(value == null ? '' : value).normalize('NFKC').replace(/\s+/g, ' ').trim();
+const id = (prefix, value) => `${prefix}-${crypto.createHash('sha256').update(value).digest('hex').slice(0, 20)}`;
+const columnNumber = (value) => [...String(value || '').toUpperCase()]
+  .reduce((number, character) => number * 26 + character.charCodeAt(0) - 64, 0);
+const meaningful = (value) => text(value) && !/^(?:[-—/\\]|n\/?a|无|合计|小计|序号)$/iu.test(text(value));
+const headerLike = (value) => /材料|产品|部位|位置|区域|系统|规格|型号|单位|性能|要求|做法|施工|验收|责任|适用|备注|名称/iu.test(text(value));
+
+function tableKey(block) {
+  const metadata = block.metadata || {};
+  if (block.kind === 'spreadsheet_cell') return `xlsx:${metadata.sheet || ''}`;
+  if (block.kind === 'table_cell') return `docx:${metadata.part || ''}:${metadata.table || 0}`;
+  if (block.kind === 'table') return `text:${block.locator?.value || block.block_id}`;
+  if (/table/i.test(block.kind || '') || metadata.table || metadata.table_id) {
+    return `ocr:${metadata.table_id || metadata.table || block.locator?.page || block.locator?.value || block.block_id}`;
+  }
+  return '';
+}
+
+function cellPosition(block, fallbackRow, fallbackColumn) {
+  const metadata = block.metadata || {};
+  return {
+    row: Number(metadata.row || metadata.table_row || fallbackRow),
+    column: Number(metadata.cell || metadata.column_index || columnNumber(metadata.column) || fallbackColumn)
+  };
+}
+
+function markdownCells(block) {
+  const lines = String(block.raw?.text || '').split(/\r?\n/).filter((line) => /^\s*\|.*\|\s*$/.test(line));
+  return lines.flatMap((line, rowIndex) => {
+    const cells = line.trim().replace(/^\||\|$/g, '').split('|').map(text);
+    if (cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return [];
+    return cells.map((value, columnIndex) => ({
+      block, value, row: rowIndex + 1, column: columnIndex + 1
+    }));
+  });
+}
+
+function collectTables(parsePackage) {
+  const groups = new Map();
+  for (const block of parsePackage?.blocks || []) {
+    const key = tableKey(block);
+    if (!key || block.card_eligible === false || block.parse?.status === 'missing') continue;
+    if (!groups.has(key)) groups.set(key, []);
+    if (block.kind === 'table') groups.get(key).push(...markdownCells(block));
+    else {
+      const position = cellPosition(block, groups.get(key).length + 1, 1);
+      groups.get(key).push({ block, value: text(block.raw?.text), ...position });
+    }
+  }
+  return [...groups.entries()].map(([key, cells]) => ({ key, cells })).filter((table) => table.cells.some((cell) => meaningful(cell.value)));
+}
+
+function expandedValue(cell, table) {
+  if (meaningful(cell.value)) return cell.value;
+  const merge = cell.block.metadata?.merge;
+  if (!merge) return '';
+  const preceding = table.cells.filter((candidate) =>
+    candidate.row <= cell.row && candidate.column <= cell.column && meaningful(candidate.value));
+  return preceding.length ? preceding[preceding.length - 1].value : '';
+}
+
+function analyzeTable(table) {
+  const rows = new Map();
+  for (const cell of table.cells) {
+    if (!rows.has(cell.row)) rows.set(cell.row, []);
+    rows.get(cell.row).push(cell);
+  }
+  const orderedRows = [...rows.entries()].sort((a, b) => a[0] - b[0]);
+  const headerRows = [];
+  let previousHeaderSignature = '';
+  for (const [row, cells] of orderedRows.slice(0, 5)) {
+    const values = cells.map((cell) => expandedValue(cell, table)).filter(meaningful);
+    if (!values.length) continue;
+    const signature = values.map((value) => text(value).toLowerCase()).join('|');
+    if (headerRows.length && signature === previousHeaderSignature) break;
+    const headerScore = values.filter(headerLike).length / values.length;
+    if (!headerRows.length || headerScore >= 0.5 || values.length === 1) {
+      headerRows.push(row);
+      previousHeaderSignature = signature;
+    }
+    else break;
+  }
+  if (!headerRows.length && orderedRows.length) headerRows.push(orderedRows[0][0]);
+  const maxColumn = Math.max(0, ...table.cells.map((cell) => cell.column));
+  const headers = new Map();
+  for (let column = 1; column <= maxColumn; column += 1) {
+    const path = headerRows.map((row) => {
+      const cell = table.cells.find((candidate) => candidate.row === row && candidate.column === column);
+      return cell ? expandedValue(cell, table) : '';
+    }).filter(meaningful);
+    headers.set(column, [...new Set(path)].join(' / ') || `第${column}列`);
+  }
+  const signatures = new Set();
+  const subjects = [];
+  let repeatedHeaders = 0;
+  let emptyRows = 0;
+  for (const [row, cells] of orderedRows) {
+    if (headerRows.includes(row)) continue;
+    const values = new Map(cells.map((cell) => [cell.column, expandedValue(cell, table)]));
+    const nonempty = [...values.values()].filter(meaningful);
+    if (!nonempty.length) { emptyRows += 1; continue; }
+    const headerMatches = [...values].filter(([column, value]) =>
+      text(value).toLowerCase() === text(headers.get(column)).split(' / ').pop().toLowerCase()).length;
+    if (headerMatches >= Math.max(2, Math.ceil(nonempty.length * 0.6))) { repeatedHeaders += 1; continue; }
+    const fields = [...values].filter(([, value]) => meaningful(value))
+      .map(([column, value]) => ({ header: headers.get(column), value, column }));
+    const signature = fields.map((field) => `${field.header}:${field.value}`).join('|').toLowerCase();
+    if (signatures.has(signature)) continue;
+    signatures.add(signature);
+    const subjectFields = fields.filter((field) => /材料|产品|名称|部位|位置|区域|系统|做法/iu.test(field.header));
+    const requirementFields = fields.filter((field) => !subjectFields.includes(field));
+    const subject = subjectFields.map((field) => field.value).join(' / ') || fields[0].value;
+    const content = `${subject}：${requirementFields.map((field) => `${field.header}=${field.value}`).join('；') || fields.map((field) => `${field.header}=${field.value}`).join('；')}`;
+    const evidenceCells = cells.filter((cell) => meaningful(cell.value));
+    subjects.push({ row, subject, content, fields, evidenceCells });
+  }
+  return { ...table, headers: Object.fromEntries(headers), headerRows, subjects, repeatedHeaders, emptyRows };
+}
+
+function structureAwareTableKnowledge(parsePackage, summary = {}) {
+  const tables = collectTables(parsePackage).map(analyzeTable);
+  const existing = new Set((summary.key_points || []).map((point) => text(point.content).toLowerCase()));
+  const keyPoints = [];
+  const evidence = [];
+  let duplicates = 0;
+  for (const table of tables) {
+    for (const subject of table.subjects) {
+      const normalized = text(subject.content).toLowerCase();
+      if (existing.has(normalized)) { duplicates += 1; continue; }
+      existing.add(normalized);
+      const evidenceIds = subject.evidenceCells.map((cell) => {
+        const evidenceId = id('table-evidence', `${cell.block.block_id}|${cell.row}|${cell.column}|${cell.value}`);
+        evidence.push({
+          evidence_id: evidenceId,
+          block_id: cell.block.block_id,
+          locator: `${cell.block.locator?.scheme || ''}:${cell.block.locator?.value || ''}`,
+          quote: cell.value,
+          source_page: cell.block.locator?.page || cell.block.metadata?.page || cell.block.metadata?.sheet || '',
+          locator_precision: 'table-cell',
+          provenance: { ...(cell.block.locator || {}), block_id: cell.block.block_id, row: cell.row, column: cell.column },
+          table_context: { table: table.key, headers: table.headers, row: subject.row, section: cell.block.metadata?.section || '' }
+        });
+        return evidenceId;
+      });
+      keyPoints.push({
+        point_id: id('table-point', `${table.key}|${subject.content}`),
+        kind: 'table_requirement',
+        content: subject.content,
+        evidence_ids: [...new Set(evidenceIds)],
+        table_subject: subject.subject,
+        table_context: { table: table.key, headers: table.headers, row: subject.row }
+      });
+    }
+  }
+  const subjectsFound = tables.reduce((sum, table) => sum + table.subjects.length, 0);
+  const dense = tables.filter((table) => table.subjects.length >= 6);
+  const ratio = subjectsFound ? keyPoints.length / subjectsFound : 1;
+  const warning = dense.length && ratio < 0.6 ? {
+    code: 'TABLE_DENSE_COVERAGE_WARNING',
+    message: `发现 ${subjectsFound} 个表格知识主题，仅生成 ${keyPoints.length} 个候选，压缩比例异常。`,
+    blocking: false
+  } : null;
+  return {
+    keyPoints, evidence,
+    diagnostics: {
+      tables_found: tables.length,
+      subjects_found: subjectsFound,
+      candidates_generated: keyPoints.length,
+      consolidated: duplicates,
+      dropped: {
+        empty_rows: tables.reduce((sum, table) => sum + table.emptyRows, 0),
+        repeated_headers: tables.reduce((sum, table) => sum + table.repeatedHeaders, 0),
+        duplicates
+      },
+      coverage_ratio: ratio,
+      warning
+    }
+  };
+}
+
+function enrichSummaryWithTableKnowledge(parsePackage, summary) {
+  const result = structureAwareTableKnowledge(parsePackage, summary);
+  return {
+    summary: {
+      ...summary,
+      key_points: [...(summary.key_points || []), ...result.keyPoints],
+      evidence: [...(summary.evidence || []), ...result.evidence],
+      table_coverage: result.diagnostics
+    },
+    diagnostics: result.diagnostics
+  };
+}
+
+module.exports = { collectTables, analyzeTable, structureAwareTableKnowledge, enrichSummaryWithTableKnowledge };
+
+
+},
 "src/core/workflow.js": function(require, module, exports) {
 const { atomizeSummary, classifyDocument, summarizeDocument, validateAtomizationResult } = require("src/core/ai-pipeline.js");
 const { upgradeParsePackage } = require("src/core/document-parser.js");
@@ -16755,6 +17027,12 @@ const { resolveFixedRoute } = require("src/core/routing.js");
 const { findLinkCandidates, validateRelations } = require("src/core/link-service.js");
 const { buildValidationReport } = require("src/core/reliability.js");
 const { verifyLocator, reconcileEvidence } = require("src/core/provenance.js");
+let enrichSummaryWithTableKnowledge = (_parsePackage, summary) => ({
+  summary, diagnostics: { tables_found: 0, subjects_found: 0, candidates_generated: 0, dropped: {} }
+});
+try {
+  ({ enrichSummaryWithTableKnowledge } = require("src/core/table-knowledge.js"));
+} catch (_) { /* isolated legacy harnesses may omit optional bundle dependencies */ }
 const workflowDiag = (event, details) => {
   try { globalThis.__eksDiag?.diag?.(event, details); } catch (_) {}
 };
@@ -16774,7 +17052,7 @@ async function runKnowledgeWorkflow(options) {
   await emitArtifact(options.onArtifact, 'classification', classification);
   const route = resolveFixedRoute(options.folderMap, classification);
   const typePrompt = options.prompts.type || (typeof options.loadTypePrompt === 'function' ? await options.loadTypePrompt(route, classification) : '');
-  const summary = options.summary || await summarizeDocument({
+  const baseSummary = options.summary || await summarizeDocument({
     parsePackage: options.parsePackage,
     classification,
     basePrompt: options.prompts.summaryBase,
@@ -16793,6 +17071,9 @@ async function runKnowledgeWorkflow(options) {
     requestStream: options.requestStream,
     onProgress: options.onProgress
   });
+  const tableEnrichment = enrichSummaryWithTableKnowledge(options.parsePackage, baseSummary);
+  const summary = tableEnrichment.summary;
+  workflowDiag('table.coverage', tableEnrichment.diagnostics);
   await emitArtifact(options.onArtifact, 'summary', summary);
   const linkCandidates = findLinkCandidates({ title: summary.document_title, content: summary }, options.existingCards || [], { limit: 20 });
   let atomResult = options.atomResult;
@@ -16844,6 +17125,7 @@ async function runKnowledgeWorkflow(options) {
     : Number(options.parsePackage.total_pages || options.parsePackage.page_count || 0);
   const shortDocumentMaxCards = Math.max(5, Number(options.shortDocumentMaxCards) || 20);
   const quantityAnomaly = pageCount > 0 && pageCount <= 3 && (atomResult.atoms || []).length > shortDocumentMaxCards;
+  const tableCoverageWarning = summary.table_coverage?.warning || null;
   const noEligibleSourceBlocks = Array.isArray(options.parsePackage.blocks) && options.parsePackage.blocks.length > 0
     && !options.parsePackage.blocks.some((block) => block?.card_eligible === true && String(block?.raw?.text || '').trim());
   const provenanceDiagnostics = {};
@@ -17043,13 +17325,16 @@ async function runKnowledgeWorkflow(options) {
     alreadyPersisted,
     review,
     hardRejected,
-    documentWarnings: quantityAnomaly ? [{
+    documentWarnings: [...(quantityAnomaly ? [{
       code: 'DOCUMENT_QUANTITY_ANOMALY',
       message: `${pageCount} 页产生 ${(atomResult.atoms || []).length} 个候选；仅记录文档级警告，不阻塞逐卡自动入库。`,
       sample_atom_ids: (atomResult.atoms || []).slice(0, 3).map((atom) => atom.atom_id)
-    }] : [],
+    }] : []), ...(tableCoverageWarning ? [tableCoverageWarning] : [])],
     metrics: {
       stageCardinalities: {
+        tables_found: summary.table_coverage?.tables_found || 0,
+        table_subjects: summary.table_coverage?.subjects_found || 0,
+        table_candidates: summary.table_coverage?.candidates_generated || 0,
         summary_points: (summary.key_points || []).length,
         atom_candidates: consolidation.metrics.generated,
         consolidated: consolidation.metrics.output,

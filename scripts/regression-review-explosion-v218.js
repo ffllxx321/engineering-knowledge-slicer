@@ -75,6 +75,8 @@ const workflow = loadBundleModule('src/core/workflow.js', {
   }));
   assert(!review.isApprovalEligible({ status: 'pending', reasons: ['证据缺失'], validationReport: { hardGateFailures: ['EVIDENCE'], nonOverridableFailures: ['EVIDENCE'] } }));
   const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8'), css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
-  for (const expected of ['reviewer_reason', 'original_failed_soft_gates', '技术信息', '生成内容', '原文依据', '批准此项', 'migrateReviewArtifact']) assert(main.includes(expected));
+  for (const expected of ['reviewer_reason', 'original_failed_soft_gates', '生成内容', '原文依据', "text: '批准'", 'migrateReviewArtifact']) assert(main.includes(expected));
+  const modal = main.slice(main.indexOf('class ReviewExceptionModal'), main.indexOf('class UploadConfirmModal'));
+  assert(!modal.includes("text: '技术信息'"));
   assert(css.includes('.eks-evidence-comparison')); console.log('review explosion regressions passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

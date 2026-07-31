@@ -638,6 +638,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.pauseRequested = false;
     this.cancelRequestedTaskId = '';
     this.taskControllers = new Map();
+    this.activeTaskRuns = new Map();
+    this.taskLeaseOwner = `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    this._tasksFlushTail = Promise.resolve();
     this.structuredWriterLock = {
       tail: Promise.resolve(),
       acquire: async () => {
@@ -1241,8 +1244,40 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async processTask(task) {
+    const taskId = String(task?.task_id || '');
+    if (!taskId) throw Object.assign(new Error('任务缺少 task_id，无法执行。'), { code: 'TASK_ID_MISSING' });
+    if (!this.activeTaskRuns) this.activeTaskRuns = new Map();
+    if (!this.taskLeaseOwner) this.taskLeaseOwner = `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    const existingRun = this.activeTaskRuns.get(taskId);
+    if (existingRun) {
+      this.sessionStats.lastMessage = `任务已在处理中：${task.source_path || taskId}`;
+      new Notice('该任务已在处理中，本次重复执行已忽略。');
+      return { processed: false, alreadyProcessing: true, taskId, runId: existingRun.runId };
+    }
+    const run = {
+      runId: `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+      startedAt: new Date().toISOString()
+    };
+    this.activeTaskRuns.set(taskId, run);
+    try {
+      return await this._processTaskOwned(task, run);
+    } finally {
+      if (this.activeTaskRuns.get(taskId) === run) this.activeTaskRuns.delete(taskId);
+    }
+  }
+
+  async _processTaskOwned(task, executionRun) {
     const tasks = await this.loadTasks();
     const current = tasks.find((item) => item.task_id === task.task_id) || task;
+    current.lease = {
+      owner: this.taskLeaseOwner,
+      run_id: executionRun.runId,
+      acquired_at: executionRun.startedAt,
+      heartbeat_at: executionRun.startedAt
+    };
+    current.run_id = current.run_id || executionRun.runId;
+    await this.saveTasks(upsertTask(tasks, current));
+    await this.flushSaveTasksImmediate();
     this._terminalTaskIds.delete(current.task_id);
     const startedAt = Date.now();
     const counterBaseline = Object.assign({}, this.operationCounters);
@@ -1442,17 +1477,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         existingFingerprints: existingCards.map((card) => card.atom_fingerprint).filter(Boolean),
         validateLabels: (atom) => validateAtomLabels(tagLibrary, atom),
         signal: taskController.signal,
-        requestJson: (prompt, context) => this.rateLimiter.run(
-          async () => {
-            this.operationCounters.apiRequests += 1;
-            if (Number(context?.attempt) > 1) this.operationCounters.aiRetries += 1;
-            if (context?.stage === 'summary-reduce') this.operationCounters.summaryReduceRequests += 1;
-            this.operationCounters.promptCharacters += String(prompt || '').length;
-            const result = await requestMiniMaxJson({ settings: this.settings, prompt, context, fetchImpl: obsidianRequest, signal: context?.signal || taskController.signal });
-            this.operationCounters.outputCharacters += typeof result === 'string' ? result.length : JSON.stringify(result || {}).length;
-            return result;
-          },
-          { signal: context?.signal || taskController.signal }
+        requestJson: (prompt, context) => this.requestMiniMaxProduction(
+          prompt, context, { signal: context?.signal || taskController.signal }
         ),
         requestStream: this.settings.useStreamingAi
           ? (prompt, context, hooks) => this.rateLimiter.run(
@@ -1744,9 +1770,41 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       // v1.1.6: 更明确的 Notice（带阶段名），避免错误被截图渲染误导
       new Notice(`${appError.message} · ${appError.suggestedAction}`);
     } finally {
-      this.taskControllers.delete(current.task_id);
+      current.lease = null;
+      try {
+        await this.saveTasks(upsertTask(await this.loadTasks(), current));
+        await this.flushSaveTasksImmediate();
+      } catch (leaseError) {
+        try { diag('task.lease.release.failed', { taskId: current.task_id, message: String(leaseError?.message || leaseError) }); } catch (_) {}
+      }
+      if (this.taskControllers.get(current.task_id) === taskController) this.taskControllers.delete(current.task_id);
       await this.refreshViews();
     }
+  }
+
+  async requestMiniMaxProduction(prompt, context = {}, options = {}) {
+    const signal = options.signal || context.signal;
+    return this.providerLimiters.minimax.run(async () => {
+      this.operationCounters.apiRequests += 1;
+      if (Number(context.attempt) > 1) this.operationCounters.aiRetries += 1;
+      if (context.stage === 'summary-reduce') this.operationCounters.summaryReduceRequests += 1;
+      this.operationCounters.promptCharacters += String(prompt || '').length;
+      try {
+        const result = await requestMiniMaxJson({
+          settings: this.settings, prompt, context, fetchImpl: obsidianRequest, signal
+        });
+        this.operationCounters.outputCharacters += typeof result === 'string'
+          ? result.length : JSON.stringify(result || {}).length;
+        return result;
+      } catch (error) {
+        error.provider = error.provider || 'minimax';
+        error.stage = error.stage || context.stage || 'ai-provider';
+        error.details = Object.assign({}, error.details || {}, {
+          provider: 'minimax', operation: context.operation || context.stage || 'request'
+        });
+        throw error;
+      }
+    }, { signal });
   }
 
   shadowStorePath() {
@@ -2704,14 +2762,20 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const stateFolder = normalizeVaultPath(`${this.settings.artifactsPath}/structured-writer`);
     const indexPath = normalizeVaultPath(`${stateFolder}/id-path-index.v1.json`);
     const registryPath = normalizeVaultPath(`${stateFolder}/project-registry.v1.json`);
-    const readJson = async (rawPath, fallback) => {
+    const readJson = async (rawPath, fallback, kind) => {
       const path = vaultRelativePath(rawPath, 'structured state read');
       if (!(await this.app.vault.adapter.exists(path))) return fallback;
       try { return JSON.parse(await this.app.vault.adapter.read(path)); } catch (error) {
-        throw new Error(`结构化状态文件损坏：${path}（${error.message}）`);
+        const stateError = new Error(`结构化${kind === 'index' ? '索引' : '项目登记表'}损坏：${path}。原文件未被修改。`);
+        stateError.code = kind === 'index' ? 'STRUCTURED_INDEX_CORRUPT' : 'PROJECT_REGISTRY_CORRUPT';
+        stateError.category = 'structured_state';
+        stateError.stage = kind === 'index' ? 'structured-state-index-read' : 'structured-state-registry-read';
+        stateError.artifactPath = path;
+        stateError.details = { phase: 'read', stateKind: kind, parseError: String(error?.message || error) };
+        throw stateError;
       }
     };
-    const rawIndex = await readJson(indexPath, emptyStructuredIndex());
+    const rawIndex = await readJson(indexPath, emptyStructuredIndex(), 'index');
     const { index, discarded: discardedIndexEntries = [] } = validateStructuredIndex(rawIndex);
     if (discardedIndexEntries.length) {
       diag('structuredWriter.indexEntriesDiscarded', {
@@ -2719,8 +2783,15 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         reasons: [...new Set(discardedIndexEntries.map((item) => item.cause))]
       });
     }
-    const projectRegistry = await readJson(registryPath, []);
-    if (!Array.isArray(projectRegistry)) throw new Error('项目登记表必须是数组');
+    const projectRegistry = await readJson(registryPath, [], 'registry');
+    if (!Array.isArray(projectRegistry)) {
+      const registryError = new Error('项目登记表格式无效：顶层必须是数组。原文件未被修改。');
+      registryError.code = 'PROJECT_REGISTRY_INVALID';
+      registryError.category = 'structured_state';
+      registryError.stage = 'structured-state-registry-validate';
+      registryError.artifactPath = registryPath;
+      throw registryError;
+    }
     const blocks = Array.isArray(parsePackage?.blocks) ? parsePackage.blocks
       : Array.isArray(parsePackage?.normalized_blocks) ? parsePackage.normalized_blocks : [];
     const metadata = Object.assign({}, parsePackage?.metadata || {});
@@ -2751,11 +2822,17 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         translation_cache: translationCheckpoint?.cache || priorUniversal?.translation_cache || {},
         translation_prompt_version: 'universal-zh-v1',
         model_version: this.settings.minimaxModel || 'configured-provider',
-        translate_batch: async (regions, contract) => requestMiniMaxJson({
-          settings: this.settings,
-          fetchImpl: obsidianRequest,
-          context: {
+        translate_batch: async (regions, contract) => {
+          const prompt = [
+            '把以下知识区域准确翻译为简体中文。不得翻译或改变 preserve_exactly 中的身份标识。',
+            '精确保留 must/shall/应/必须、should/宜、may/可以、must not/不得 的强度，以及条件和例外。',
+            '只返回 schema 指定的 JSON，不得遗漏或添加 region_id。',
+            JSON.stringify(contract),
+            JSON.stringify({ regions })
+          ].join('\n');
+          return this.requestMiniMaxProduction(prompt, {
             stage: 'translation',
+            operation: 'universal-translation',
             schema: {
               type: 'object', additionalProperties: false, required: ['translations'],
               properties: {
@@ -2769,16 +2846,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
                 }
               }
             }
-          },
-          signal: this.taskControllers?.get(task.task_id)?.signal,
-          prompt: [
-            '把以下知识区域准确翻译为简体中文。不得翻译或改变 preserve_exactly 中的身份标识。',
-            '精确保留 must/shall/应/必须、should/宜、may/可以、must not/不得 的强度，以及条件和例外。',
-            '只返回 schema 指定的 JSON，不得遗漏或添加 region_id。',
-            JSON.stringify(contract),
-            JSON.stringify({ regions })
-          ].join('\n')
-        })
+          }, { signal: this.taskControllers?.get(task.task_id)?.signal });
+        }
       });
       }
     } catch (error) {
@@ -3292,14 +3361,24 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async loadTasks() {
+    if (this._pendingSaveDirty && Array.isArray(this._pendingSaveTasks)) {
+      return migrateTaskLedgerV3(structuredClone(this._pendingSaveTasks), runtimeVersions(this.settings));
+    }
     const path = tasksPath(this.settings);
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return [];
     try {
       const parsed = JSON.parse(await this.app.vault.read(file));
-      return migrateTaskLedgerV3(Array.isArray(parsed) ? parsed : [], runtimeVersions(this.settings));
-    } catch {
-      return [];
+      if (!Array.isArray(parsed)) throw new Error('账本顶层必须是数组');
+      return migrateTaskLedgerV3(parsed, runtimeVersions(this.settings));
+    } catch (cause) {
+      const error = new Error(`任务账本无法读取：${path}。原文件未被修改，请修复 JSON 或从备份恢复。`);
+      error.code = 'TASK_LEDGER_CORRUPT';
+      error.category = 'task_ledger';
+      error.stage = 'task-ledger-read';
+      error.artifactPath = path;
+      error.details = { phase: 'read', parseError: String(cause?.message || cause) };
+      throw error;
     }
   }
 
@@ -3307,7 +3386,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   //              一次 12 批次原子化可能触发 30+ 次磁盘 IO。改为 500ms 防抖，
   //              关键节点（status 转换 / 错误落库 / onunload）走 flushSaveTasksImmediate 立即落。
   async saveTasks(tasks) {
-    this._pendingSaveTasks = tasks;
+    this._pendingSaveTasks = structuredClone(tasks);
     this._pendingSaveDirty = true;
     if (this._saveTasksTimer) clearTimeout(this._saveTasksTimer);
     this._saveTasksTimer = setTimeout(() => {
@@ -3316,6 +3395,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         try { diag('tasks.save.flush.error', { message: String(e && e.message || e) }); } catch (_) {}
       });
     }, 500);
+    return { scheduled: true, durable: false };
   }
 
   // v1.6 (M-04): 立即落盘（绕过防抖）。用在 status 转换 / 错误落库 / onunload 等关键节点。
@@ -3325,31 +3405,38 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async _flushSaveTasks() {
-    if (!this._pendingSaveDirty) return;
-    const tasks = this._pendingSaveTasks;
-    this._pendingSaveTasks = null;
-    this._pendingSaveDirty = false;
-    await this.ensureFolders();
-    const target = tasksPath(this.settings);
+    if (!this._tasksFlushTail) this._tasksFlushTail = Promise.resolve();
+    const flush = async () => {
+      while (this._pendingSaveDirty) {
+        const tasks = this._pendingSaveTasks;
+        this._pendingSaveTasks = null;
+        this._pendingSaveDirty = false;
+        await this.ensureFolders();
+        const target = tasksPath(this.settings);
     // v1.4 (M-11): 写盘前备份上一版 tasks.json，便于迁移出错时回退。
     // v2.9.3: 改为单一滚动备份。高频进度落盘若每次创建时间戳文件，
     //         会在 vault / 同步盘持续制造目录项与同步 IO，而恢复只需要上一版。
-    if (this.settings.backupTasksOnSave !== false) {
-      try {
-        const existing = this.app.vault.getAbstractFileByPath(target);
-        if (existing instanceof TFile) {
-          const backupPath = target.replace(/\.json$/i, '.bak.json');
-          const content = await this.app.vault.read(existing);
-          await writeFile(this.app, backupPath, content);
+        if (this.settings.backupTasksOnSave !== false) {
+          try {
+            const existing = this.app.vault.getAbstractFileByPath(target);
+            if (existing instanceof TFile) {
+              const backupPath = target.replace(/\.json$/i, '.bak.json');
+              const content = await this.app.vault.read(existing);
+              await writeFile(this.app, backupPath, content);
+            }
+          } catch (e) {
+            try { diag('tasks.backup.error', { message: String(e && e.message || e) }); } catch (_) {}
+          }
         }
-      } catch (e) {
-        try { diag('tasks.backup.error', { message: String(e && e.message || e) }); } catch (_) {}
+        const serialized = JSON.stringify(tasks, null, 2);
+        await writeFile(this.app, target, serialized);
+        this.operationCounters.ledgerWrites += 1;
+        this.operationCounters.bytesWritten += Buffer.byteLength(serialized);
       }
-    }
-    const serialized = JSON.stringify(tasks, null, 2);
-    await writeFile(this.app, target, serialized);
-    this.operationCounters.ledgerWrites += 1;
-    this.operationCounters.bytesWritten += Buffer.byteLength(serialized);
+    };
+    const result = this._tasksFlushTail.then(flush, flush);
+    this._tasksFlushTail = result.catch(() => {});
+    return result;
   }
 
   // v1.4 (M-11): 手动把所有 paused 任务重新入队（dashboard 按钮触发）
@@ -8994,7 +9081,9 @@ function migrateSettings(stored = {}) {
   const pathErrors = validateConfiguredPathSet(migrated);
   for (const error of pathErrors) {
     if (error.reason === 'overlap') continue;
-    migrated[error.key] = DEFAULT_SETTINGS[error.key];
+    migrated.pathMigrationDiagnostics = Object.assign({}, migrated.pathMigrationDiagnostics, {
+      [error.key]: { code: 'SETTINGS_PATH_INVALID', action: 'user_must_repair' }
+    });
   }
   const extractionOrder = String(source.pdfExtractionOrder || '').split(',').map((value) => value.trim()).filter(Boolean);
   migrated.pdfExtractionOrder = extractionOrder.length
@@ -9144,7 +9233,10 @@ function normalizeVaultPath(filePath) {
 function vaultRelativePath(value, context = 'vault path') {
   const raw = String(value == null ? '' : value).trim();
   const slashed = raw.replace(/\\/g, '/');
-  if (!raw || slashed.startsWith('/') || /^[A-Za-z]:\//.test(slashed)) {
+  const hostAbsolute = slashed.startsWith('/')
+    || /^[A-Za-z]:(?:\/|$)/.test(slashed)
+    || /^(?:\/\/|[\\/]{2})(?:[?.](?:\/|$)|[^/])/.test(raw);
+  if (!raw || hostAbsolute) {
     const error = new Error(`${context} 必须是 Obsidian vault 相对路径。`);
     error.code = 'VAULT_PATH_INVALID';
     error.details = { reason: !raw ? 'empty' : 'host_absolute_path', pathContext: context };
@@ -9163,16 +9255,14 @@ function vaultRelativePath(value, context = 'vault path') {
 
 function optionalVaultRelativePath(value) {
   if (value == null || String(value).trim() === '') return '';
-  try { return vaultRelativePath(value, 'source path'); } catch { return ''; }
+  return vaultRelativePath(value, 'source path');
 }
 
 function normalizeConfiguredPath(value, fallback = '') {
-  const raw = String(value == null ? '' : value).trim().replace(/\\/g, '/');
-  if (!raw || raw === '/' || /^[A-Za-z]:\//.test(raw)) return normalizeVaultPath(fallback);
-  const normalized = normalizeVaultPath(raw);
-  const parts = normalized.split('/');
-  if (!normalized || parts.some((part) => part === '..' || part === '.')) return normalizeVaultPath(fallback);
-  return normalized;
+  if (value == null) return vaultRelativePath(fallback, 'default configured path');
+  const raw = String(value).trim();
+  if (!raw) return '';
+  return raw.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '').normalize('NFC');
 }
 
 function validateConfiguredPathSet(settings) {
@@ -9180,8 +9270,9 @@ function validateConfiguredPathSet(settings) {
   const errors = [];
   for (const key of keys) {
     const raw = String(settings[key] == null ? '' : settings[key]).trim();
-    const normalized = normalizeVaultPath(raw);
-    if (!raw || !normalized || raw === '/' || /^[A-Za-z]:[\\/]/.test(raw) || normalized.split('/').some((p) => p === '..' || p === '.')) {
+    let normalized = '';
+    try { normalized = vaultRelativePath(raw, `setting ${key}`); } catch (_) {}
+    if (!normalized) {
       errors.push({ key, reason: 'invalid' });
     }
   }
@@ -13232,9 +13323,24 @@ function normalizeUnicodeForm(value) {
   if (typeof str.normalize === 'function') {
     try { str = str.normalize('NFC'); } catch { /* 不可用则忽略 */ }
   }
-  str = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]﻿/g, '');
-  str = str.replace(/[  ]/g, ' ');
+  str = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\uFEFF]/g, '');
+  str = str.replace(/ {2,}/g, ' ');
   return str;
+}
+
+function migrateVaultPath(value) {
+  const original = String(value || '');
+  const cleaned = normalizeUnicodeForm(original).replace(/\\/g, '/');
+  const unsafe = !cleaned || cleaned.startsWith('/') || /^[A-Za-z]:(?:\/|$)/.test(cleaned)
+    || /[\x00-\x1F\x7F]/.test(original)
+    || cleaned.split('/').some((part) => !part || part === '.' || part === '..');
+  return {
+    path: unsafe ? '' : cleaned,
+    rejected: unsafe && original ? {
+      reason: 'unsafe_legacy_path',
+      redacted_hint: `<rejected-path:${Buffer.byteLength(original, 'utf8')}b>`
+    } : null
+  };
 }
 
 function migrateTaskLedgerV3(tasks, versions = {}) {
@@ -13244,7 +13350,8 @@ function migrateTaskLedgerV3(tasks, versions = {}) {
     const canonical = ['1.1', '1.2'].includes(task.schema_version) && Boolean(task.task_id) && Boolean(task.run_id);
     // v1.1.2: 旧任务 source_path 可能在 macOS 上是 NFD 编码、Windows 上是 GBK，统一规范成 NFC，
     // 避免按路径查文件时因编码不一致出现"找不到源文件"。
-    const sourcePath = normalizeUnicodeForm(String(task.source_path || task.sourcePath || '').replace(/\\/g, '/'));
+    const migratedPath = migrateVaultPath(task.source_path || task.sourcePath || '');
+    const sourcePath = migratedPath.path;
     const sourceHash = String(task.source_hash || task.sourceHash || '');
     const taskId = task.task_id || task.taskId || `slicer-${sourceHash.slice(0, 12)}`;
     const library = task.library || (sourcePath.includes('/业务库/') ? 'business' : 'bid');
@@ -13311,6 +13418,7 @@ function migrateTaskLedgerV3(tasks, versions = {}) {
     // Known fields are still normalized by `normalized`, so aliases and unsafe
     // stale values cannot override the current contract.
     const migrated = canonical ? Object.assign({}, task, normalized) : normalized;
+    if (migratedPath.rejected) migrated.migration_path_rejection = migratedPath.rejected;
     if (!hasConcreteReview && migrated.status === 'completed_no_output') {
       migrated.terminal_outcome = 'completed_no_output';
       if (!migrated.result_counts) migrated.result_counts = { generated: 0, written: 0, review: 0 };
@@ -17332,6 +17440,8 @@ function toAppError(error, context = {}) {
     : classifyFailure({ status, code, message });
   return new AppError(Object.assign({}, context, classified, {
     stage: error?.stage || context.stage,
+    artifactPath: error?.artifactPath || context.artifactPath,
+    provider: error?.provider || context.provider,
     message: userMessage(classified.category),
     technicalMessage: message,
     stack: error?.stack,
@@ -17347,6 +17457,9 @@ function classifyFailure(input = {}) {
   if (code === 'COMPONENT_NOT_FOUND') return result(code, 'component_config', false, '找不到组件文件', '该组件没有可用的内置兼容回退；恢复缺失的用户组件后重试，已有解析产物会复用，无需重新上传。');
   if (code === 'COMPONENT_CONFIG_INVALID') return result(code, 'component_config', false, '组件配置无效', '内置兼容回退不会替换已存在但无效的自定义内容；修正 folder-map、Schema 或 Prompt 后重试，已有解析产物会复用。');
   if (code === 'VAULT_PATH_INVALID') return result(code, 'path_contract', false, '插件路径契约无效', '修复或移除包含主机绝对路径的旧索引/状态记录后重试；已有解析与统一知识产物会复用。');
+  if (code === 'STRUCTURED_INDEX_CORRUPT') return result(code, 'structured_state', false, '结构化索引已损坏', '修复索引 JSON 后重试；插件不会覆盖原文件，解析与统一知识检查点会复用。');
+  if (code === 'PROJECT_REGISTRY_CORRUPT' || code === 'PROJECT_REGISTRY_INVALID') return result(code, 'structured_state', false, '项目登记表损坏或格式无效', '修复项目登记表 JSON/数组格式后重试；插件不会覆盖原文件，已有检查点会复用。');
+  if (code === 'TASK_LEDGER_CORRUPT') return result(code, 'task_ledger', false, '任务账本损坏或无法读取', '修复 tasks.json 或从滚动备份恢复；插件不会清空或覆盖损坏账本。');
   if (code === 'SOURCE_PATH_MISSING') return result(code, 'file', false, '缺少源文件定位信息', '若已有解析产物请直接重试；否则重新扫描源文件以恢复 vault 相对路径。');
   if (code === 'SUMMARY_ALL_CHUNKS_UNSUPPORTED') return result(code, 'unsupported_knowledge', false,
     '所有分块均无可核验知识', '确认解析正文包含可引用原文；如正文正常，请改用能按 block_id 返回短小逐字引文的模型，然后从总结检查点重试。');
@@ -17376,7 +17489,8 @@ function result(code, category, retryable, message, suggestedAction) {
 function userMessage(category) {
   return ({ auth: '外部服务鉴权失败', rate_limit: '外部服务限流', timeout: '处理阶段超时',
     network: '外部服务暂时不可用', json_parse: '服务返回格式无法解析', schema: '模型输出未通过结构校验',
-    file: '找不到源文件', path_contract: '插件路径契约无效', component_config: '组件配置加载失败', cancelled: '任务已取消', checkpoint: '已保存批次读取或写入失败',
+    file: '找不到源文件', path_contract: '插件路径契约无效', structured_state: '结构化状态无法读取',
+    task_ledger: '任务账本无法读取', component_config: '组件配置加载失败', cancelled: '任务已取消', checkpoint: '已保存批次读取或写入失败',
     ai_provider: '知识原子化批次未完整完成', local_ocr: '本地 OCR 处理失败',
     internal_parse_contract: '解析产物内部契约不完整' })[category] || '工程知识切片处理失败';
 }

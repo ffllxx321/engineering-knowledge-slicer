@@ -19,8 +19,12 @@ assert.strictEqual(custom.settingsVersion, 30);
 assert.strictEqual(custom.bidIntakePath, '客户库/投标输入');
 assert.strictEqual(custom.businessOutputPath, '成果/业务');
 assert.strictEqual(custom.componentPackPath, '系统/组件');
-assert.strictEqual(task.migrateSettings({ bidIntakePath: '' }).bidIntakePath, task.DEFAULT_SETTINGS.bidIntakePath);
-assert.strictEqual(task.migrateSettings({ bidIntakePath: 'C:\\outside\\data' }).bidIntakePath, task.DEFAULT_SETTINGS.bidIntakePath);
+const emptyPath = task.migrateSettings({ bidIntakePath: '' });
+assert.strictEqual(emptyPath.bidIntakePath, '');
+assert.strictEqual(emptyPath.pathMigrationDiagnostics.bidIntakePath.code, 'SETTINGS_PATH_INVALID');
+const hostPath = task.migrateSettings({ bidIntakePath: 'C:\\outside\\data' });
+assert.strictEqual(hostPath.bidIntakePath, 'C:/outside/data');
+assert.strictEqual(hostPath.pathMigrationDiagnostics.bidIntakePath.code, 'SETTINGS_PATH_INVALID');
 assert(task.validateConfiguredPathSet(Object.assign({}, custom, { bidOutputPath: '成果', businessOutputPath: '成果/业务' }))
   .some((item) => item.reason === 'overlap'));
 

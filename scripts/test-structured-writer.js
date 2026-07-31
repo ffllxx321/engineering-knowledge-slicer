@@ -97,6 +97,44 @@ class MemoryVault {
   async mkdirp() { this.hit(); }
 }
 
+class NoopRecordVault extends MemoryVault {
+  async write(path, content) {
+    this.hit();
+    if (!path.endsWith('.md')) this.files.set(path, content);
+  }
+}
+
+function universalResult(count) {
+  const doc = document();
+  return {
+    document: doc,
+    knowledge_units: Array.from({ length: count }, (_, index) => ({
+      unit_id: `ku-${String(index).padStart(24, '0')}`,
+      fingerprint: `fingerprint-${index}`,
+      title: `通用知识 ${index + 1}`,
+      statement: `第 ${index + 1} 项要求必须执行并留存记录。`,
+      semantic_kind: 'requirement',
+      reusable: false,
+      route: { library: 'business', category: 'risks_issues' },
+      evidence: [{
+        block_id: doc.blocks[0].block_id,
+        locator: doc.blocks[0].locator,
+        verbatim: doc.blocks[0].raw.text
+      }],
+      source_language: 'zh',
+      output_language: 'zh-CN',
+      applicable_conditions: [],
+      exceptions: [],
+      structured_facts: {},
+      confidence: 1,
+      uncertainty: [],
+      tags: []
+    })),
+    relations: [],
+    review_decisions: []
+  };
+}
+
 function lock() {
   let busy = false;
   return {
@@ -305,6 +343,9 @@ async function main() {
     saveIndex: async (value) => { savedIndex = value; }
   });
   assert.strictEqual(committed.manifest.status, 'committed');
+  assert.strictEqual(committed.verified.counts.knowledge_records, 1);
+  assert.strictEqual(committed.verified.counts.source_records, 1);
+  assert.strictEqual(committed.verified.knowledge_paths.length, 1);
   assert.strictEqual(savedIndex.revision, 1);
   const rolled = await rollbackTransaction(committed.manifest, {
     vault, lock: lock(), stateRoot: '状态'
@@ -328,6 +369,43 @@ async function main() {
       }
     }
   }
+
+  const universal22 = universalResult(22);
+  const plan22 = buildPlan({
+    ...input(), document: universal22.document, universalResult: universal22,
+    phase2Result: undefined, phase3Result: undefined
+  });
+  assert.strictEqual(plan22.actions.filter((item) =>
+    ['business_item', 'company_knowledge'].includes(item.record_kind)).length, 22);
+  const vault22 = new MemoryVault();
+  const first22 = await commitPlan({ ...plan22, mode: 'structured-write' }, {
+    vault: vault22, lock: lock(), stateRoot: '状态', index: emptyIndex(),
+    logicalTime: TIME, saveIndex: async () => {}
+  });
+  assert.strictEqual(first22.verified.counts.knowledge_records, 22);
+  assert.strictEqual(first22.verified.counts.knowledge_created, 22);
+  assert.strictEqual(first22.verified.counts.source_records, 1);
+  assert.strictEqual(first22.verified.counts.project_records, 0);
+  const existingFiles22 = Object.fromEntries([...vault22.files].filter(([filePath]) => filePath.endsWith('.md')));
+  const rerun22 = buildPlan({
+    ...input(), document: universal22.document, universalResult: universal22,
+    phase2Result: undefined, phase3Result: undefined,
+    index: first22.index, existingFiles: existingFiles22
+  });
+  const second22 = await commitPlan({ ...rerun22, mode: 'structured-write' }, {
+    vault: vault22, lock: lock(), stateRoot: '状态', index: first22.index,
+    logicalTime: TIME, saveIndex: async () => {}
+  });
+  assert.strictEqual(second22.verified.counts.knowledge_records, 22);
+  assert.strictEqual(second22.verified.counts.knowledge_unchanged, 22);
+  assert.strictEqual(new Set(second22.verified.knowledge_paths).size, 22);
+
+  const noopVault = new NoopRecordVault();
+  await assert.rejects(() => commitPlan({ ...plan22, mode: 'structured-write' }, {
+    vault: noopVault, lock: lock(), stateRoot: '状态', index: emptyIndex(),
+    logicalTime: TIME, saveIndex: async () => {}
+  }), (error) => error.code === 'STRUCTURED_RECORD_VERIFICATION_FAILED'
+    && error.details.reason === 'missing_file');
 
   await realPhasePath();
   const production = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');

@@ -1,6 +1,6 @@
 {
   "name": "engineering-knowledge-slicer",
-  "version": "2.20.5",
+  "version": "2.20.6",
   "description": "通过 MinerU/PaddleOCR 与 MiniMax M3，把工程资料转为中文、可追溯、固定目录归档的 Obsidian 知识卡片。",
   "main": "main.js",
   "scripts": {
@@ -13,7 +13,7 @@
     "test:phase1": "node scripts/test-phase1-foundation.js",
     "test:phase2": "node scripts/test-phase2-candidate-pipeline.js",
     "test:phase3": "node scripts/test-phase3-review-gate.js",
-    "test:structured": "node scripts/test-structured-writer.js",
+    "test:structured": "node scripts/test-structured-writer.js && node scripts/regression-production-vault-root-boundary.js",
     "test": "node scripts/test-universal-pipeline.js && npm run test:phase1 && npm run test:phase2 && npm run test:phase3 && node scripts/regression-task-ledger-lossless.js && node scripts/regression-generic-card-architecture.js && node scripts/regression-review-explosion-v218.js && node scripts/test-semantic-embedding.js && node scripts/regression-minimal-settings-ui.js && node scripts/regression-reliability-consistency.js && node scripts/regression-component-runtime.js && node scripts/regression-builtin-component-fallback.js && node scripts/regression-shadow-evaluation.js && node scripts/regression-block-native-quality.js && node scripts/smoke-timestamp-policy.js && node scripts/smoke-split.js && node scripts/smoke-splitter-v26.js && node scripts/smoke-ratelimit.js && node scripts/smoke-json-repair.js && node scripts/smoke-v292.js && node scripts/smoke-performance-reliability.js && node scripts/smoke-reliability-v210.js && node scripts/regression-diagnostic-report.js && node scripts/smoke-summary-reduce-recovery.js && node scripts/integration-workflow-recovery.js && node scripts/gap-closure-tests.js && node scripts/regression-production-repair.js && node scripts/regression-production-ux.js && node scripts/regression-ocr-provenance.js && node scripts/regression-local-ocr.js && node scripts/regression-ooxml.js && node scripts/regression-selected-regeneration.js && node scripts/regression-completion-transition.js",
     "test:production-slice": "node scripts/regression-block-v0-adapters.js && node scripts/regression-local-ocr.js && node scripts/regression-ooxml.js",
     "benchmark": "node scripts/benchmark-optimization.js && node scripts/benchmark-semantic.js",

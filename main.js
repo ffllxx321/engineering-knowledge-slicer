@@ -1592,10 +1592,13 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           : legacyReview.map((item) => item.atom_id);
       }
       if (legacyAccepted.length && !structuredWriteMode) await this.rebuildKnowledgeIndexes();
-      const structuredWrites = structured.transaction
-        ? (structured.plan?.actions || []).filter((action) => action.action !== 'noop').length
-        : 0;
-      const persistedCount = current.written_card_ids.length + structuredWrites;
+      const verifiedStructured = structured.transaction?.verified || null;
+      const structuredWrites = Number(verifiedStructured?.counts?.knowledge_created || 0)
+        + Number(verifiedStructured?.counts?.knowledge_updated || 0);
+      const structuredExisting = Number(verifiedStructured?.counts?.knowledge_unchanged || 0);
+      const structuredVisible = Number(verifiedStructured?.counts?.knowledge_records || 0);
+      const persistedCount = current.written_card_ids.length
+        + (universalProduction ? structuredVisible : structuredWrites);
       const generatedCount = universalProduction
         ? Number(structured.universalResult?.knowledge_units?.length || 0)
         : Number(workflow.metrics?.generated ?? workflow.atomResult?.atoms?.length ?? 0);
@@ -1610,10 +1613,22 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       current.result_counts = {
         generated: generatedCount,
         written: persistedCount,
+        created: Number(verifiedStructured?.counts?.knowledge_created || 0),
+        updated: Number(verifiedStructured?.counts?.knowledge_updated || 0),
+        unchanged: structuredExisting,
+        source_records: Number(verifiedStructured?.counts?.source_records || 0),
+        project_records: Number(verifiedStructured?.counts?.project_records || 0),
+        knowledge_records: structuredVisible,
         review: universalProduction ? structuredHandlingGroups.length : legacyReview.length,
         hard_rejected: hardRejectedCount,
         structured_commits: structuredWrites
       };
+      if (universalProduction) {
+        current.output_paths = [...(verifiedStructured?.knowledge_paths || [])];
+        current.artifacts = Object.assign({}, current.artifacts || {}, {
+          knowledge_records: current.output_paths
+        });
+      }
       delete current.regeneration_mode;
       current.updated_at = new Date().toISOString();
       current.progress = {
@@ -1621,7 +1636,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         message: persistedCount === 0
           ? `处理完成但未写入：生成 ${generatedCount}，写入 0，硬拒绝 ${hardRejectedCount}。请查看按根因分组的诊断并修复来源解析/证据定位后重试。`
           : (structured.plan?.summary
-            ? `结构化处理完成：${structured.plan.summary}`
+            ? `结构化处理完成：知识记录 ${structuredVisible}（新建 ${current.result_counts.created}，更新 ${current.result_counts.updated}，已存在 ${structuredExisting}）。`
             : `处理完成：写入 ${persistedCount} 张，异常 ${legacyReview.length} 项`),
         elapsedMs: Date.now() - startedAt,
         at: current.updated_at
@@ -1656,7 +1671,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         candidateCards: universalProduction ? generatedCount : workflow.metrics?.candidateCards,
         autoApproved: universalProduction ? generatedCount - structuredHandlingGroups.length : workflow.metrics?.autoApproved,
         reviewPending: universalProduction ? structuredHandlingGroups.length : workflow.metrics?.reviewPending,
-        cardsMerged: universalProduction ? 0 : workflow.metrics?.merged
+        cardsMerged: universalProduction ? 0 : workflow.metrics?.merged,
+        cardsWritten: universalProduction ? structuredWrites : current.written_card_ids.length,
+        bytesWritten: universalProduction ? Number(verifiedStructured?.bytes_written || 0) : 0
       }));
       if (!universalProduction) diag('review.routing', {
         before: { generated: (workflow.metrics?.candidateCards || 0) + (workflow.metrics?.merged || 0) },
@@ -2914,6 +2931,18 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     }));
     if (mode === 'structured-pilot') return { mode, plan, universalResult: universal };
     if (plan.blocked) return { mode, plan, blocked: true, universalResult: universal };
+    const knowledgeActions = (plan.actions || []).filter((action) =>
+      ['business_item', 'company_knowledge'].includes(action.record_kind));
+    if ((universal.knowledge_units || []).length > 0 && knowledgeActions.length === 0) {
+      const error = new Error('已生成知识单元，但结构化计划没有可写入的知识记录；请检查计划冲突、审核组和路由设置。');
+      error.code = 'STRUCTURED_NO_KNOWLEDGE_ACTIONS';
+      error.stage = 'structured-plan';
+      error.details = {
+        conflicts: plan.conflicts || [], review_groups: plan.review_groups || [],
+        phase3_handling_groups: plan.phase3_handling_groups || [], plan_summary: plan.summary || ''
+      };
+      throw error;
+    }
     const adapter = this.app.vault.adapter;
     const vault = {
       readIfExists: async (path) => {
@@ -2941,7 +2970,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     });
     await this.persistArtifact(task, 'structured-transaction', {
       transaction_id: committed.transactionId, manifest_path: committed.manifestPath,
-      index_revision: committed.index.revision
+      index_revision: committed.index.revision,
+      verified_counts: committed.verified.counts,
+      knowledge_paths: committed.verified.knowledge_paths
     });
     task.structured_transaction_id = committed.transactionId;
     return { mode, plan, transaction: committed, universalResult: universal };
@@ -4203,7 +4234,8 @@ class SlicerDashboardView extends ItemView {
         ['当前阶段', stageLabel(task.progress?.stage || task.status)],
         ['已用时间', formatDuration(task.progress?.elapsedMs || 0)],
         ['重试次数', String(task.retry_count || task.attempt || 0)],
-        ['结果数量', String(task.written_card_ids?.length || 0)],
+        ['结果数量', String(Number(task.result_counts?.knowledge_records)
+          || Number(task.result_counts?.written) || task.written_card_ids?.length || 0)],
         ['最后更新', formatLocalTime(task.updated_at || task.progress?.at || '')],
         ['错误代码', error?.code || '-']
       ]) {
@@ -4216,6 +4248,16 @@ class SlicerDashboardView extends ItemView {
           cls: 'eks-review-reason',
           text: `未生成可入库结果：生成 ${Number(counts.generated) || 0}，写入 ${Number(counts.written) || 0}。${safeDisplayText(task.progress?.message, '未发现可由来源逐字核验的知识；请检查正文解析与证据定位后重试。')}`
         });
+      }
+      const outputPaths = Array.isArray(task.output_paths) ? task.output_paths : [];
+      if (outputPaths.length) {
+        const outputs = details.createEl('details', { cls: 'eks-technical-details' });
+        outputs.createEl('summary', { text: `知识记录路径（${outputPaths.length}）` });
+        for (const outputPath of outputPaths) {
+          const row = outputs.createDiv('eks-row-actions');
+          row.createSpan({ text: safeDisplayText(outputPath, '知识记录') });
+          button(row, '打开', () => this.plugin.app.workspace.openLinkText(outputPath, '', false));
+        }
       }
       const timeline = details.createDiv({ cls: 'eks-timeline', attr: { 'aria-label': '任务阶段时间线' } });
       const order = ['parsing', 'classification', 'summary-map', 'atomization', 'validating', 'writing', 'complete'];
@@ -8769,6 +8811,66 @@ async function ensureParent(vault, path) {
   if (parent) await vault.mkdirp(parent);
 }
 
+const KNOWLEDGE_RECORD_KINDS = new Set(['business_item', 'company_knowledge']);
+
+function frontmatterValue(content, key) {
+  const match = String(content || '').match(new RegExp(`^${key}:\\s*["']?([^"'\\n]+)`, 'm'));
+  return clean(match?.[1], 300);
+}
+
+function hasSourceAssociation(content, sourceId) {
+  const value = String(content || '');
+  return value.includes(`- 归属来源：${sourceId}`)
+    || new RegExp(`^source_document_ids:\\s*\\[[^\\n]*["']?${sourceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?`, 'm').test(value);
+}
+
+async function verifyCommittedRecords(plan, vault) {
+  const records = [];
+  for (const action of plan.actions) {
+    const content = await vault.readIfExists(action.path);
+    const actualId = frontmatterValue(content, 'record_id');
+    const actualKind = frontmatterValue(content, 'record_kind');
+    if (content === null || !action.path.endsWith('.md') || actualId !== action.record_id
+      || actualKind !== action.record_kind
+      || (KNOWLEDGE_RECORD_KINDS.has(action.record_kind)
+        && !hasSourceAssociation(content, action.owner_source_id))) {
+      const error = new Error(`提交后验证失败：${action.record_id}（${action.path}）`);
+      error.code = 'STRUCTURED_RECORD_VERIFICATION_FAILED';
+      error.details = {
+        record_id: action.record_id, record_kind: action.record_kind, path: action.path,
+        reason: content === null ? 'missing_file' : 'identity_or_source_mismatch'
+      };
+      throw error;
+    }
+    records.push({
+      record_id: action.record_id, record_kind: action.record_kind, path: action.path,
+      disposition: action.action === 'noop' ? 'unchanged' : action.action,
+      bytes: Buffer.byteLength(content), knowledge_record: KNOWLEDGE_RECORD_KINDS.has(action.record_kind)
+    });
+  }
+  const knowledgeRecords = records.filter((record) => record.knowledge_record);
+  return {
+    records,
+    knowledge_records: knowledgeRecords,
+    knowledge_paths: knowledgeRecords.map((record) => record.path),
+    counts: {
+      created: records.filter((record) => record.disposition === 'create').length,
+      updated: records.filter((record) => record.disposition.includes('update')).length,
+      unchanged: records.filter((record) => record.disposition === 'unchanged').length,
+      moved: records.filter((record) => record.disposition.includes('move')).length,
+      source_records: records.filter((record) => record.record_kind === 'source_document').length,
+      project_records: records.filter((record) => record.record_kind === 'project').length,
+      knowledge_records: knowledgeRecords.length,
+      knowledge_created: knowledgeRecords.filter((record) => record.disposition === 'create').length,
+      knowledge_updated: knowledgeRecords.filter((record) => record.disposition.includes('update')).length,
+      knowledge_unchanged: knowledgeRecords.filter((record) => record.disposition === 'unchanged').length
+    },
+    bytes_written: records
+      .filter((record) => record.disposition !== 'unchanged')
+      .reduce((sum, record) => sum + record.bytes, 0)
+  };
+}
+
 async function commitPlan(plan, options) {
   if (!plan || plan.mode !== 'structured-write') throw new Error('只有 structured-write 计划可提交');
   if (plan.blocked) throw new Error('计划包含冲突或待处理项，禁止提交');
@@ -8802,6 +8904,7 @@ async function commitPlan(plan, options) {
       step.status = 'committed';
       await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
     }
+    const verified = await verifyCommittedRecords(plan, vault);
     const index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
     index.version = INDEX_VERSION;
     index.revision = Number(index.revision || 0) + 1;
@@ -8817,7 +8920,7 @@ async function commitPlan(plan, options) {
     manifest.status = 'committed';
     manifest.index_revision = index.revision;
     await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
-    return { transactionId, manifestPath, manifest, index };
+    return { transactionId, manifestPath, manifest, index, verified };
   } catch (error) {
     manifest.status = 'recovering';
     manifest.error = String(error?.message || error);
@@ -8892,7 +8995,7 @@ module.exports = {
   WRITER_VERSION, INDEX_VERSION, PLAN_LIMITS, MODES, RELATION_TYPES,
   stableJson, hash, stableId, pathSafe, normalizeSettings, sourceIdentity,
   candidateIdentity, emptyIndex, validateIndex, serializeRecord, resolveRelations,
-  buildPlan, commitPlan, rollbackTransaction
+  buildPlan, commitPlan, rollbackTransaction, verifyCommittedRecords
 };
 },
 /* STRUCTURED_PHASE_MODULES_END */
@@ -17613,7 +17716,8 @@ function createStageMetric(input = {}) {
     outputCharacters: Number(input.outputCharacters) || 0, estimatedOutputTokens: Math.ceil((Number(input.outputCharacters) || 0) / 3),
     bytesRead: Number(input.bytesRead) || 0, bytesWritten: Number(input.bytesWritten) || 0,
     cacheHit: input.cacheHit === true, cacheMiss: input.cacheMiss === true,
-    cardsGenerated: Number(input.cardsGenerated) || 0, cardsRejected: Number(input.cardsRejected) || 0,
+    cardsGenerated: Number(input.cardsGenerated) || 0, cardsWritten: Number(input.cardsWritten) || 0,
+    cardsRejected: Number(input.cardsRejected) || 0,
     candidateCards: Number(input.candidateCards) || 0, autoApproved: Number(input.autoApproved) || 0,
     reviewPending: Number(input.reviewPending) || 0, cardsMerged: Number(input.cardsMerged) || 0,
     duplicateCardsMerged: Number(input.duplicateCardsMerged) || 0, errorCode: input.errorCode || ''

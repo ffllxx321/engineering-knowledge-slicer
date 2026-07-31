@@ -570,6 +570,66 @@ async function ensureParent(vault, path) {
   if (parent) await vault.mkdirp(parent);
 }
 
+const KNOWLEDGE_RECORD_KINDS = new Set(['business_item', 'company_knowledge']);
+
+function frontmatterValue(content, key) {
+  const match = String(content || '').match(new RegExp(`^${key}:\\s*["']?([^"'\\n]+)`, 'm'));
+  return clean(match?.[1], 300);
+}
+
+function hasSourceAssociation(content, sourceId) {
+  const value = String(content || '');
+  return value.includes(`- 归属来源：${sourceId}`)
+    || new RegExp(`^source_document_ids:\\s*\\[[^\\n]*["']?${sourceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?`, 'm').test(value);
+}
+
+async function verifyCommittedRecords(plan, vault) {
+  const records = [];
+  for (const action of plan.actions) {
+    const content = await vault.readIfExists(action.path);
+    const actualId = frontmatterValue(content, 'record_id');
+    const actualKind = frontmatterValue(content, 'record_kind');
+    if (content === null || !action.path.endsWith('.md') || actualId !== action.record_id
+      || actualKind !== action.record_kind
+      || (KNOWLEDGE_RECORD_KINDS.has(action.record_kind)
+        && !hasSourceAssociation(content, action.owner_source_id))) {
+      const error = new Error(`提交后验证失败：${action.record_id}（${action.path}）`);
+      error.code = 'STRUCTURED_RECORD_VERIFICATION_FAILED';
+      error.details = {
+        record_id: action.record_id, record_kind: action.record_kind, path: action.path,
+        reason: content === null ? 'missing_file' : 'identity_or_source_mismatch'
+      };
+      throw error;
+    }
+    records.push({
+      record_id: action.record_id, record_kind: action.record_kind, path: action.path,
+      disposition: action.action === 'noop' ? 'unchanged' : action.action,
+      bytes: Buffer.byteLength(content), knowledge_record: KNOWLEDGE_RECORD_KINDS.has(action.record_kind)
+    });
+  }
+  const knowledgeRecords = records.filter((record) => record.knowledge_record);
+  return {
+    records,
+    knowledge_records: knowledgeRecords,
+    knowledge_paths: knowledgeRecords.map((record) => record.path),
+    counts: {
+      created: records.filter((record) => record.disposition === 'create').length,
+      updated: records.filter((record) => record.disposition.includes('update')).length,
+      unchanged: records.filter((record) => record.disposition === 'unchanged').length,
+      moved: records.filter((record) => record.disposition.includes('move')).length,
+      source_records: records.filter((record) => record.record_kind === 'source_document').length,
+      project_records: records.filter((record) => record.record_kind === 'project').length,
+      knowledge_records: knowledgeRecords.length,
+      knowledge_created: knowledgeRecords.filter((record) => record.disposition === 'create').length,
+      knowledge_updated: knowledgeRecords.filter((record) => record.disposition.includes('update')).length,
+      knowledge_unchanged: knowledgeRecords.filter((record) => record.disposition === 'unchanged').length
+    },
+    bytes_written: records
+      .filter((record) => record.disposition !== 'unchanged')
+      .reduce((sum, record) => sum + record.bytes, 0)
+  };
+}
+
 async function commitPlan(plan, options) {
   if (!plan || plan.mode !== 'structured-write') throw new Error('只有 structured-write 计划可提交');
   if (plan.blocked) throw new Error('计划包含冲突或待处理项，禁止提交');
@@ -603,6 +663,7 @@ async function commitPlan(plan, options) {
       step.status = 'committed';
       await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
     }
+    const verified = await verifyCommittedRecords(plan, vault);
     const index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
     index.version = INDEX_VERSION;
     index.revision = Number(index.revision || 0) + 1;
@@ -618,7 +679,7 @@ async function commitPlan(plan, options) {
     manifest.status = 'committed';
     manifest.index_revision = index.revision;
     await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
-    return { transactionId, manifestPath, manifest, index };
+    return { transactionId, manifestPath, manifest, index, verified };
   } catch (error) {
     manifest.status = 'recovering';
     manifest.error = String(error?.message || error);
@@ -693,5 +754,5 @@ module.exports = {
   WRITER_VERSION, INDEX_VERSION, PLAN_LIMITS, MODES, RELATION_TYPES,
   stableJson, hash, stableId, pathSafe, normalizeSettings, sourceIdentity,
   candidateIdentity, emptyIndex, validateIndex, serializeRecord, resolveRelations,
-  buildPlan, commitPlan, rollbackTransaction
+  buildPlan, commitPlan, rollbackTransaction, verifyCommittedRecords
 };

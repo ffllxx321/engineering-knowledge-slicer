@@ -1,5 +1,14 @@
 # 工程知识切片 变更记录
 
+## v2.20.6 — 2026-07-31 可见知识记录提交验证
+
+- 修复结构化事务把来源、项目等任意非 noop 动作当作知识卡片写入成功的问题。任务终态、结果数量和完成提示现在只依据回读验证通过的 `business_item` / `company_knowledge` Markdown，不再依据候选数或通用事务动作数。
+- 提交在保存索引和宣布成功前逐一回读预期 Markdown，核对 vault 相对路径、`record_id`、`record_kind` 与来源关联；适配器吞写、文件缺失或身份不符会抛出稳定错误并走原事务回滚，保留检查点和诊断。
+- 事务结果明确区分新建、更新、移动、已存在不变、来源记录、项目记录和知识记录，并返回用户可见的 vault 相对知识路径。幂等重跑会报告“已存在/不变”及原路径，不会制造重复，也不会误报零输出。
+- 统一知识已生成但计划没有知识动作时返回 `STRUCTURED_NO_KNOWLEDGE_ACTIONS`，附带冲突、审核组、处理组和计划摘要；阻塞或零知识计划不能进入 written/completed 成功 UI。
+- 指标语义统一：`performance.task.cardsGenerated` 是生成知识单元数，`cardsWritten` 是本次实际新建/更新的已验证知识 Markdown 数，`bytesWritten` 是这些知识 Markdown 的 UTF-8 字节数；`performance.counters.bytesWritten` 仍表示任务全部持久化写入（含产物、账本、事务和索引）的字节总量。
+- 新增真实 writer 与打包 `main.js` 可执行门禁：覆盖 22→22、1→1、非知识动作不膨胀、幂等路径、阻塞/冲突、适配器 no-op、两库与 Obsidian 稳定链接，并实际执行 `runStructuredWriterPhase` 和 `processTask`。
+
 ## v2.20.5 — 2026-07-31 一致性与恢复安全修复
 
 - 翻译与其他 MiniMax 请求共用同一限流、取消、计数和诊断边界；真实翻译调用会准确计入请求与输入输出统计，完整缓存仍保持零调用。

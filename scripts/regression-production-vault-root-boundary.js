@@ -273,6 +273,8 @@ async function main() {
   assert.strictEqual(direct.mode, 'structured-write');
   assert(direct.plan && direct.plan.actions.length > 0, 'actual bundled writer must produce a plan');
   assert(direct.transaction, 'actual bundled writer must commit its plan');
+  assert.strictEqual(direct.transaction.verified.counts.knowledge_records, 1);
+  assert.strictEqual(direct.transaction.verified.knowledge_paths.length, 1);
   assert.strictEqual(direct.universalResult, canonical, 'the valid universal checkpoint must be reused');
   assert.strictEqual(counters.artifactLoads['universal-canonical'], 1);
   assert.strictEqual(plugin.operationCounters.apiRequests, 0);
@@ -297,6 +299,11 @@ async function main() {
     'universal resume must never enter component-contracts');
   assert(['written', 'needs_review', 'completed_no_output'].includes(task.status),
     `unexpected final status: ${task.status}`);
+  assert.strictEqual(task.status, 'written');
+  assert.strictEqual(task.result_counts.knowledge_records, 1);
+  assert.strictEqual(task.result_counts.unchanged, 1);
+  assert.strictEqual(task.output_paths.length, 1);
+  assert.deepStrictEqual(task.artifacts.knowledge_records, task.output_paths);
 
   await assert.rejects(
     () => PluginClass.prototype.loadComponentText.call(plugin, '提示词/业务库/刻意缺失.md'),
@@ -325,6 +332,9 @@ async function main() {
     finalStage: counters.progress.findLast((entry) => entry.stage)?.stage,
     finalStatus: task.status,
     committedActions: direct.plan.actions.length,
+    verifiedKnowledgeRecords: direct.transaction.verified.counts.knowledge_records,
+    rerunUnchanged: task.result_counts.unchanged,
+    outputPaths: task.output_paths,
     componentMissingCode: 'COMPONENT_NOT_FOUND'
   }, null, 2));
 }

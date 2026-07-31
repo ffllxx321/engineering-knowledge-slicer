@@ -459,7 +459,7 @@ function buildPlan(input) {
     return {
       version: WRITER_VERSION, mode: settings.mode, source_document_id: sourceId,
       generator: 'structured-writer', actions: [], conflicts, review_groups: [],
-      phase3_handling_groups: input.phase3Result?.handling_groups || [],
+      phase3_handling_groups: reviewDecisions,
       counts: {}, source_hash: clean(input.document?.source_hash, 128),
       source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
       index_revision: Number(index.revision || 0), blocked: true, writes_performed: 0,
@@ -528,12 +528,14 @@ function buildPlan(input) {
   if (actions.length > settings.limits.max_actions) throw new Error('写入计划超过安全上限');
   const counts = {};
   for (const action of actions) counts[action.action] = (counts[action.action] || 0) + 1;
-  const blocked = conflicts.length > 0 || reviewGroups.length > 0 || reviewDecisions.length > 0
-    || (input.phase3Result?.handling_groups || []).length > 0;
+  const universalMode = Boolean(input.universalResult?.knowledge_units);
+  const phase3HandlingGroups = universalMode ? reviewDecisions
+    : [...(input.phase3Result?.handling_groups || []), ...reviewDecisions];
+  const blocked = conflicts.length > 0 || reviewGroups.length > 0 || phase3HandlingGroups.length > 0;
   const planCore = {
     version: WRITER_VERSION, mode: settings.mode, source_document_id: sourceId,
     generator: 'structured-writer', actions, conflicts, review_groups: reviewGroups,
-    phase3_handling_groups: [...(input.phase3Result?.handling_groups || []), ...reviewDecisions], counts,
+    phase3_handling_groups: phase3HandlingGroups, counts,
     source_hash: clean(input.document?.source_hash, 128),
     source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
     index_revision: Number(index.revision || 0), blocked,

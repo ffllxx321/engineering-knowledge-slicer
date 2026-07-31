@@ -102,15 +102,12 @@ const {
   SemanticPostProcessor,
   semanticSettingsSnapshot
 } = require("src/core/semantic-embedding.js");
-const { runPhase2CandidatePipeline } = require("src/phase2-candidate-pipeline.js");
-const { evaluatePhase3 } = require("src/phase3-review-gate.js");
 const { runUniversalPipeline } = require("src/universal-knowledge-pipeline.js");
 const {
   buildPlan: buildStructuredPlan,
   commitPlan: commitStructuredPlan,
   rollbackTransaction: rollbackStructuredTransaction,
-  emptyIndex: emptyStructuredIndex,
-  hash: structuredHash
+  emptyIndex: emptyStructuredIndex
 } = require("src/structured-writer.js");
 
 // v1.1.9 / v1.1.10: 把诊断共享状态挂到 globalThis，让 src/core/ai-pipeline.js 等独立闭包模块也能调用 diag()
@@ -1387,19 +1384,22 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       await this.setTaskProgress(current, '正在加载运行时组件与路由配置', {
         stage: 'component-contracts', elapsedMs: Date.now() - startedAt
       });
-      const contracts = await this.loadRuntimeContracts();
-      current.component_contract_hash = contracts.contractHash;
-      const tagLibraryText = await this.loadTagLibraryText();
-      const tagLibrary = parseTagLibrary(tagLibraryText);
-      // Atom regeneration must see cards already written for this source. Otherwise a
-      // recovery run can write the same approved card again.
-      const existingCards = await this.loadExistingCards(current.regeneration_mode ? '' : current.source_hash);
+      const universalProduction = this.settings.controlledWriterEnabled === true
+        && ['structured-pilot', 'structured-write'].includes(this.settings.structuredWriterMode);
+      const contracts = universalProduction ? null : await this.loadRuntimeContracts();
+      if (contracts) current.component_contract_hash = contracts.contractHash;
+      const tagLibrary = universalProduction ? null : parseTagLibrary(await this.loadTagLibraryText());
+      // Legacy mode alone loads card state and executes the card workflow. Universal
+      // production starts from the canonical document and has no legacy semantic input.
+      const existingCards = universalProduction ? [] : await this.loadExistingCards(
+        current.regeneration_mode ? '' : current.source_hash
+      );
       // v1.1.8: 启动心跳，1 秒一次更新已用时 / 进度条，避免 18 分钟黑屏
       const heartbeat = startProgressHeartbeat(this, current, startedAt);
       diag('heartbeat.start', { sourcePath: current.source_path, intervalMs: 1000 });
-      let workflow;
+      let workflow = null;
       try {
-        workflow = await runKnowledgeWorkflow({
+        if (!universalProduction) workflow = await runKnowledgeWorkflow({
         parsePackage,
         folderMap: contracts.folderMap,
         schemas: contracts.schemas,
@@ -1478,11 +1478,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         diag('heartbeat.stop', { sourcePath: current.source_path, totalElapsedMs: Date.now() - startedAt });
       }
 
-      const summaryLink = current.artifacts.summary_markdown
+      const summaryLink = !universalProduction && current.artifacts.summary_markdown
         ? `[[${current.artifacts.summary_markdown.replace(/\.md$/i, '')}]]`
-        : `[[${workflow.summary.document_title}]]`;
-      for (const card of workflow.accepted) card.parent_summary = summaryLink;
-      for (const item of workflow.review) {
+        : !universalProduction ? `[[${workflow.summary.document_title}]]` : '';
+      for (const card of workflow?.accepted || []) card.parent_summary = summaryLink;
+      for (const item of workflow?.review || []) {
         item.atom.source.parent_summary = summaryLink;
         item.proposed_card.parent_summary = summaryLink;
       }
@@ -1498,26 +1498,35 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         ? `[[${normalizeVaultPath(current.parent_source_path).split('/').pop().replace(/\.[^.]+$/, '')}]]`
         : '';
       if (attachmentLinks.length || parentSourceLink) {
-        for (const card of workflow.accepted) {
+        for (const card of workflow?.accepted || []) {
           if (attachmentLinks.length) card.attachment_links = attachmentLinks;
           if (parentSourceLink) card.parent_source_link = parentSourceLink;
         }
-        for (const item of workflow.review) {
+        for (const item of workflow?.review || []) {
           if (attachmentLinks.length) item.proposed_card.attachment_links = attachmentLinks;
           if (parentSourceLink) item.proposed_card.parent_source_link = parentSourceLink;
         }
       }
 
-      const structured = await this.runStructuredWriterPhase(current, parsePackage, workflow);
+      const structured = universalProduction
+        ? await this.runStructuredWriterPhase(current, parsePackage)
+        : { mode: 'legacy', plan: null };
       const structuredWriteMode = structured.mode === 'structured-write';
+      const legacyAccepted = workflow?.accepted || [];
+      const legacyReview = workflow?.review || [];
+      const legacyRejected = workflow?.hardRejected || [];
       current.status = 'writing';
       await this.setTaskProgress(current, structuredWriteMode
         ? `正在提交结构化计划（${structured.plan?.actions?.length || 0} 项）`
-        : `正在写入 ${workflow.accepted.length} 张可信知识卡片`, {
-        stage: 'writing', cardCount: workflow.accepted.length, reviewCount: workflow.review.length, elapsedMs: Date.now() - startedAt
+        : universalProduction
+          ? `正在生成统一结构化计划（${structured.plan?.actions?.length || 0} 项）`
+          : `正在写入 ${legacyAccepted.length} 张可信知识卡片`, {
+        stage: 'writing', cardCount: universalProduction ? structured.plan?.actions?.length || 0 : legacyAccepted.length,
+        reviewCount: universalProduction ? structured.plan?.phase3_handling_groups?.length || 0 : legacyReview.length,
+        elapsedMs: Date.now() - startedAt
       });
       if (!structuredWriteMode) {
-        for (const card of workflow.accepted) {
+        for (const card of legacyAccepted) {
           await this.writeAcceptedCard(current, card, workflow.route);
           current.written_card_ids.push(card.card_id);
         }
@@ -1527,32 +1536,42 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         ...(structured.plan?.review_groups || []),
         ...(structured.plan?.conflicts || [])
       ];
-      if (workflow.review.length || workflow.hardRejected.length || workflow.documentWarnings.length
-        || workflow.metrics?.hardRejected || structuredHandlingGroups.length) {
+      if (universalProduction || (!universalProduction && (legacyReview.length || legacyRejected.length
+        || workflow.documentWarnings.length || workflow.metrics?.hardRejected))
+        || structuredHandlingGroups.length) {
         await this.persistArtifact(current, 'review', {
-          version: '2.0', task_id: current.task_id, metrics: workflow.metrics,
-          documentWarnings: workflow.documentWarnings, items: workflow.review, rejected: workflow.hardRejected,
+          version: '2.1', semantic_path: universalProduction ? 'universal' : 'legacy',
+          task_id: current.task_id, metrics: universalProduction ? structured.universalResult?.telemetry : workflow.metrics,
+          documentWarnings: universalProduction ? [] : workflow.documentWarnings,
+          items: universalProduction ? [] : legacyReview,
+          rejected: universalProduction ? [] : legacyRejected,
           structured_summary: structured.plan?.summary || '',
           structured_handling_groups: structuredHandlingGroups
         });
-        current.review_atom_ids = workflow.review.map((item) => item.atom_id);
+        current.review_atom_ids = universalProduction
+          ? structuredHandlingGroups.map((item, index) => item.decision_id || item.conflict_id || `universal-${index}`)
+          : legacyReview.map((item) => item.atom_id);
       }
-      if (workflow.accepted.length && !structuredWriteMode) await this.rebuildKnowledgeIndexes();
-      const structuredWrites = Number(structured.commit?.writes_performed
-        ?? structured.plan?.writes_performed ?? 0);
+      if (legacyAccepted.length && !structuredWriteMode) await this.rebuildKnowledgeIndexes();
+      const structuredWrites = structured.transaction
+        ? (structured.plan?.actions || []).filter((action) => action.action !== 'noop').length
+        : 0;
       const persistedCount = current.written_card_ids.length + structuredWrites;
-      const generatedCount = Number(workflow.metrics?.generated ?? workflow.atomResult?.atoms?.length ?? 0);
-      const hardRejectedCount = Number(workflow.metrics?.hardRejected ?? workflow.hardRejected?.length ?? 0);
+      const generatedCount = universalProduction
+        ? Number(structured.universalResult?.knowledge_units?.length || 0)
+        : Number(workflow.metrics?.generated ?? workflow.atomResult?.atoms?.length ?? 0);
+      const hardRejectedCount = universalProduction ? 0
+        : Number(workflow.metrics?.hardRejected ?? legacyRejected.length ?? 0);
       current.terminal_outcome = persistedCount > 0
         ? 'completed_with_output'
-        : (workflow.review.length || structuredHandlingGroups.length ? 'needs_attention' : 'completed_no_output');
+        : (legacyReview.length || structuredHandlingGroups.length ? 'needs_attention' : 'completed_no_output');
       current.status = persistedCount > 0
-        ? (workflow.review.length || structuredHandlingGroups.length ? 'needs_review' : 'written')
-        : 'completed_no_output';
+        ? (legacyReview.length || structuredHandlingGroups.length ? 'needs_review' : 'written')
+        : (legacyReview.length || structuredHandlingGroups.length ? 'needs_review' : 'completed_no_output');
       current.result_counts = {
         generated: generatedCount,
         written: persistedCount,
-        review: workflow.review.length,
+        review: universalProduction ? structuredHandlingGroups.length : legacyReview.length,
         hard_rejected: hardRejectedCount,
         structured_commits: structuredWrites
       };
@@ -1564,12 +1583,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           ? `处理完成但未写入：生成 ${generatedCount}，写入 0，硬拒绝 ${hardRejectedCount}。请查看按根因分组的诊断并修复来源解析/证据定位后重试。`
           : (structured.plan?.summary
             ? `结构化处理完成：${structured.plan.summary}`
-            : `处理完成：写入 ${persistedCount} 张，异常 ${workflow.review.length} 项`),
+            : `处理完成：写入 ${persistedCount} 张，异常 ${legacyReview.length} 项`),
         elapsedMs: Date.now() - startedAt,
         at: current.updated_at
       };
       // v1.4 (M-07): 记录 AI 截断标志，dashboard 顶部 banner 与 Notice 会消费
-      if (workflow.truncated) {
+      if (workflow?.truncated) {
         current.truncated = true;
         current.truncated_completed = workflow.truncatedCompleted || 0;
         new Notice(`⚠️ AI 输出超过 8192 token 上限被截断。已成功 ${current.truncated_completed} 个原子。dashboard 顶部有警告。`);
@@ -1591,15 +1610,16 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         stageCompletedAt: Date.now(),
         provider: 'minimax',
         inputCharacters: parsePackage?.markdown?.length || 0,
-        outputCharacters: JSON.stringify(workflow.summary || {}).length,
-        cardsGenerated: workflow.metrics?.candidateCards || workflow.accepted.length + workflow.review.length,
-        cardsRejected: workflow.metrics?.hardRejected || 0,
-        candidateCards: workflow.metrics?.candidateCards,
-        autoApproved: workflow.metrics?.autoApproved,
-        reviewPending: workflow.metrics?.reviewPending,
-        cardsMerged: workflow.metrics?.merged
+        outputCharacters: universalProduction ? JSON.stringify(structured.universalResult || {}).length
+          : JSON.stringify(workflow.summary || {}).length,
+        cardsGenerated: universalProduction ? generatedCount : workflow.metrics?.candidateCards || legacyAccepted.length + legacyReview.length,
+        cardsRejected: universalProduction ? 0 : workflow.metrics?.hardRejected || 0,
+        candidateCards: universalProduction ? generatedCount : workflow.metrics?.candidateCards,
+        autoApproved: universalProduction ? generatedCount - structuredHandlingGroups.length : workflow.metrics?.autoApproved,
+        reviewPending: universalProduction ? structuredHandlingGroups.length : workflow.metrics?.reviewPending,
+        cardsMerged: universalProduction ? 0 : workflow.metrics?.merged
       }));
-      diag('review.routing', {
+      if (!universalProduction) diag('review.routing', {
         before: { generated: (workflow.metrics?.candidateCards || 0) + (workflow.metrics?.merged || 0) },
         after: workflow.metrics,
         reasonHistogram: (workflow.review || []).reduce((histogram, item) => {
@@ -1616,8 +1636,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       });
       diag('performance.counters', Object.assign({ taskId: current.task_id, runId: current.run_id }, this.operationCounters));
       this.sessionStats.processed += 1;
-      this.sessionStats.review += workflow.review.length;
-      this.sessionStats.written += workflow.accepted.length;
+      this.sessionStats.review += universalProduction ? structuredHandlingGroups.length : legacyReview.length;
+      this.sessionStats.written += universalProduction ? structuredWrites : legacyAccepted.length;
       this.sessionStats.lastMessage = current.progress.message;
       new Notice(current.progress.message);
     } catch (error) {
@@ -2663,9 +2683,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     return cards;
   }
 
-  async runStructuredWriterPhase(task, parsePackage, workflow) {
-    // v2.20: this is the single production writer. Pilot remains a reversible
-    // dry-run, while disabled/legacy settings migrate to controlled cutover.
+  async runStructuredWriterPhase(task, parsePackage) {
+    // Universal production accepts only canonical source state. Legacy Phase 2/3
+    // remains available through its explicit legacy workflow, never as writer input.
     const mode = this.settings.structuredWriterMode === 'structured-pilot'
       ? 'structured-pilot' : 'structured-write';
     const stateFolder = normalizeVaultPath(`${this.settings.artifactsPath}/structured-writer`);
@@ -2683,29 +2703,6 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const blocks = Array.isArray(parsePackage?.blocks) ? parsePackage.blocks
       : Array.isArray(parsePackage?.normalized_blocks) ? parsePackage.normalized_blocks : [];
     const metadata = Object.assign({}, parsePackage?.metadata || {});
-    const routeLibrary = workflow.route?.library === 'bid' ? 'active_tender'
-      : workflow.route?.library === 'business' ? 'business' : metadata.library;
-    if (!metadata.library && routeLibrary) metadata.library = routeLibrary;
-    const legacyCategoryMap = {
-      '00-项目总览': 'project_overview', '02-招标文件解读': 'tender_documents_interpretation',
-      '06-技术标': 'technical_bid', '07-商务报价': 'commercial_quotation_cost',
-      '08-采购与分包': 'procurement_subcontracting', '09-风险评估与合规': 'risk_deviation_compliance',
-      '10-内部会议与评审': 'internal_review_decision', '11-答疑澄清与投标过程': 'qa_addenda',
-      '12-开标评标与中标跟踪': 'opening_evaluation_award_tracking',
-      '13-合同谈判与签约': 'contract_negotiation_signing', '15-复盘与知识沉淀': 'review_knowledge_candidates',
-      '01-客户库': 'customers', '02-案例库': 'proposals_cases', '03-提案库': 'proposals_cases',
-      '04-报价库': 'quotation_cost', '05-施工计划库': 'construction_organization_schedules',
-      '06-风险库': 'risks_issues', '07-失败中成长': 'failures_terminated_lessons',
-      '08-人才能力库': 'talent_experts', '09-政府申请（报批报建）': 'company_systems_processes'
-    };
-    if (!metadata.directory_category) {
-      const mapped = legacyCategoryMap[workflow.route?.folder_type];
-      const activeCategories = new Set(ACTIVE_TENDER_CATEGORIES.map((entry) => entry.key));
-      const businessCategories = new Set(BUSINESS_CATEGORIES.map((entry) => entry.key));
-      const compatible = routeLibrary === 'active_tender' ? activeCategories.has(mapped)
-        : routeLibrary === 'business' ? businessCategories.has(mapped) : false;
-      if (mapped && compatible) metadata.directory_category = mapped;
-    }
     if (!metadata.document_role) metadata.document_role = 'source_record';
     const document = {
       source_identity: task.source_identity || task.task_id,
@@ -2739,52 +2736,6 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       telemetry: universal.telemetry,
       cache_key: universal.cache_key
     });
-    let phase2 = await runPhase2CandidatePipeline({
-      document, projectRegistry, requestJson: null,
-      limits: {
-        max_extraction_requests: 0,
-        max_blocks_per_batch: Math.max(1, Math.min(50, Number(this.settings.structuredPhase2BatchSize) || 12))
-      }
-    });
-    // The production workflow has already paid for and checkpointed atomization.
-    // Reuse those normalized results instead of issuing a duplicate provider call.
-    const cards = [
-      ...(workflow.accepted || []),
-      ...(workflow.review || []).map((item) => item.proposed_card).filter(Boolean)
-    ];
-    const candidates = cards.slice(0, Number(this.settings.structuredMaxRecords || 100)).map((card, index) => {
-      const quote = String(card.source_excerpt || card.evidence_quote || card.summary || card.content || '').trim().slice(0, 2000);
-      const locator = card.source_locator && typeof card.source_locator === 'object'
-        ? card.source_locator : { scheme: 'artifact', value: card.card_id || `card-${index}` };
-      return {
-        schema_version: '2.0',
-        candidate_id: `bic-${structuredHash([task.task_id, card.card_id || index]).slice(0, 24)}`,
-        source_document_id: task.task_id,
-        item_type: card.item_type || 'requirement',
-        summary: String(card.summary || card.title || card.content || '业务事项').slice(0, 1000),
-        evidence: {
-          block_id: String(card.block_id || card.atom_id || `workflow-${index}`).slice(0, 100),
-          locator, provenance: Array.isArray(card.provenance) ? card.provenance.slice(0, 20) : [locator],
-          verbatim: quote
-        },
-        applicable_conditions: [],
-        reusable_knowledge_candidate: card.reusable_knowledge_candidate === true,
-        reuse_reasons: [],
-        review_reasons: quote ? [] : ['missing_evidence']
-      };
-    });
-    phase2 = Object.assign({}, phase2, {
-      mode: 'production_reused_artifacts',
-      business_item_batch: Object.assign({}, phase2.business_item_batch, { items: candidates }),
-      diagnostics: [...(phase2.diagnostics || []), {
-        code: 'REUSED_NORMALIZED_WORKFLOW_ARTIFACTS',
-        provider_requests_added: 0,
-        candidate_count: candidates.length
-      }]
-    });
-    const phase3 = evaluatePhase3(phase2);
-    await this.persistArtifact(task, 'phase2-structured', phase2);
-    await this.persistArtifact(task, 'phase3-structured', phase3);
     const settings = Object.assign({}, this.settings, {
       controlledWriterEnabled: true,
       structuredWriterMode: mode
@@ -2799,8 +2750,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       .slice(0, Number(this.settings.structuredMaxActions || 300) * 2);
     for (const file of generatedFiles) existingFiles[file.path] = await this.app.vault.read(file);
     let plan = buildStructuredPlan({
-      settings, document, projectRegistry, phase2Result: phase2, phase3Result: phase3,
-      universalResult: universal,
+      settings, document, projectRegistry, universalResult: universal,
       index, existingFiles, logicalTime: task.created_at || '1970-01-01T00:00:00.000Z'
     });
     for (const action of plan.actions || []) {
@@ -2817,15 +2767,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
     }
     plan = buildStructuredPlan({
-      settings, document, projectRegistry, phase2Result: phase2, phase3Result: phase3,
-      universalResult: universal,
+      settings, document, projectRegistry, universalResult: universal,
       index, existingFiles, logicalTime: task.created_at || '1970-01-01T00:00:00.000Z'
     });
     await this.persistArtifact(task, 'structured-write-plan', Object.assign({}, plan, {
       actions: plan.actions.map(({ prior_content, content, ...action }) => action)
     }));
-    if (mode === 'structured-pilot') return { mode, plan };
-    if (plan.blocked) return { mode, plan, blocked: true };
+    if (mode === 'structured-pilot') return { mode, plan, universalResult: universal };
+    if (plan.blocked) return { mode, plan, blocked: true, universalResult: universal };
     const adapter = this.app.vault.adapter;
     const vault = {
       readIfExists: async (path) => adapter.exists(path) ? adapter.read(path) : null,
@@ -2850,7 +2799,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       index_revision: committed.index.revision
     });
     task.structured_transaction_id = committed.transactionId;
-    return { mode, plan, transaction: committed };
+    return { mode, plan, transaction: committed, universalResult: universal };
   }
 
   async writeAcceptedCard(task, card, route) {
@@ -8307,7 +8256,7 @@ function buildPlan(input) {
     return {
       version: WRITER_VERSION, mode: settings.mode, source_document_id: sourceId,
       generator: 'structured-writer', actions: [], conflicts, review_groups: [],
-      phase3_handling_groups: input.phase3Result?.handling_groups || [],
+      phase3_handling_groups: reviewDecisions,
       counts: {}, source_hash: clean(input.document?.source_hash, 128),
       source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
       index_revision: Number(index.revision || 0), blocked: true, writes_performed: 0,
@@ -8376,12 +8325,14 @@ function buildPlan(input) {
   if (actions.length > settings.limits.max_actions) throw new Error('写入计划超过安全上限');
   const counts = {};
   for (const action of actions) counts[action.action] = (counts[action.action] || 0) + 1;
-  const blocked = conflicts.length > 0 || reviewGroups.length > 0 || reviewDecisions.length > 0
-    || (input.phase3Result?.handling_groups || []).length > 0;
+  const universalMode = Boolean(input.universalResult?.knowledge_units);
+  const phase3HandlingGroups = universalMode ? reviewDecisions
+    : [...(input.phase3Result?.handling_groups || []), ...reviewDecisions];
+  const blocked = conflicts.length > 0 || reviewGroups.length > 0 || phase3HandlingGroups.length > 0;
   const planCore = {
     version: WRITER_VERSION, mode: settings.mode, source_document_id: sourceId,
     generator: 'structured-writer', actions, conflicts, review_groups: reviewGroups,
-    phase3_handling_groups: [...(input.phase3Result?.handling_groups || []), ...reviewDecisions], counts,
+    phase3_handling_groups: phase3HandlingGroups, counts,
     source_hash: clean(input.document?.source_hash, 128),
     source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
     index_revision: Number(index.revision || 0), blocked,

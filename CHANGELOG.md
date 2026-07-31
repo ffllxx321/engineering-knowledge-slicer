@@ -1,5 +1,12 @@
 # 工程知识切片 变更记录
 
+## v2.20.1 — 2026-07-31 唯一通用生产路径修正
+
+- `structured-pilot` 与 `structured-write` 在解析后直接进入 canonical document → universal result → writer；不再执行旧卡片 workflow、`runPhase2CandidatePipeline` 或 `evaluatePhase3`，也不再从 accepted/review 卡片重建候选。
+- 通用 writer 只接收 canonical document、universal result、项目登记表、索引、现有文件和设置；Phase 2/3 模块仅保留给显式 legacy、旧 artifact 迁移、回滚读取与兼容测试。
+- 通用审核 artifact 明确标记 `semantic_path: universal`，并始终覆盖旧视图；任务计数、状态与 UI 只聚合通用分组决定、关系问题和 writer 冲突，不再泄漏旧 review/hardRejected。
+- 新增可执行生产边界回归，覆盖 Pilot/Write 零 Phase 2/3 调用、零 provider 增量、旧审核毒化隔离及旧 workflow 旁路。
+
 ## v2.20.0 — 2026-07-31 通用企业知识管线
 
 - 生产结构化路径改为格式无关的 canonical blocks → 多标签画像 → 语义区域 → 知识单元；表格、邮件、OOXML、PDF 和未知格式只提供结构与证据，不再直接规定卡片。

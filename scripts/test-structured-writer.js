@@ -331,13 +331,21 @@ async function main() {
 
   await realPhasePath();
   const production = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-  assert(production.includes('const structured = await this.runStructuredWriterPhase(current, parsePackage, workflow);'));
+  assert(production.includes('await this.runStructuredWriterPhase(current, parsePackage)'));
+  assert(production.includes('if (!universalProduction) workflow = await runKnowledgeWorkflow({'),
+    'universal production must bypass the legacy card workflow');
   assert(production.includes("if (!structuredWriteMode) {"), 'cutover must suppress legacy writes');
-  assert(production.includes('requestJson: null'), 'production adapter must add zero Phase 2 provider calls');
-  assert(production.includes("if (mode === 'structured-pilot') return { mode, plan };"),
+  const writerStart = production.indexOf('  async runStructuredWriterPhase(task, parsePackage) {');
+  const writerEnd = production.indexOf('\n  async writeAcceptedCard(', writerStart);
+  const writerProduction = production.slice(writerStart, writerEnd);
+  assert(!writerProduction.includes('runPhase2CandidatePipeline('),
+    'production adapter must add zero Phase 2 calls');
+  assert(!writerProduction.includes('evaluatePhase3('),
+    'production adapter must add zero Phase 3 evaluations');
+  assert(production.includes("if (mode === 'structured-pilot') return { mode, plan, universalResult: universal };"),
     'pilot must return before commit');
-  assert(production.includes("this.settings.controlledWriterEnabled !== true"),
-    'feature off must return before structured work');
+  assert(production.includes('this.settings.controlledWriterEnabled === true'),
+    'universal production must have an explicit feature boundary');
   console.log('structured writer production tests: ok');
 }
 

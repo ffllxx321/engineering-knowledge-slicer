@@ -10,6 +10,12 @@ v2.20 建立唯一的结构化生产路径：
 
 旧 artifact 仍可读取，但在进入新路径、恢复、缓存命中和迁移边界都会规范为统一知识单元；旧 schema 不再决定新知识的切分和路由。
 
+### v2.20.1 生产边界修正
+
+`structured-pilot` 和 `structured-write` 不加载或执行旧卡片 workflow，也不调用 Phase 2 候选管线或 Phase 3 审核门。writer 的完整生产输入固定为 canonical document、universal result、项目登记表、ID→路径索引、现有文件与设置。旧 Phase 2/3 实现仅用于显式 legacy、旧 artifact 迁移/读取、回滚和兼容测试。
+
+通用模式每次都写入带 `semantic_path: universal` 的审核视图；其中只包含统一管线的分组决定、关系问题和 writer 冲突。旧 `workflow.review`、`hardRejected`、计数、路由与 artifact 不参与计划、任务终态、遥测或界面聚合。
+
 ## 决策边界
 
 - 格式适配器只恢复顺序、标题、段落、列表、表格、页/工作表、邮件、附件和原文定位。未知格式退化为 text block。

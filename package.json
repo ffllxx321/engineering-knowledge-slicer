@@ -1,12 +1,12 @@
 {
   "name": "engineering-knowledge-slicer",
-  "version": "2.20.0",
+  "version": "2.20.1",
   "description": "通过 MinerU/PaddleOCR 与 MiniMax M3，把工程资料转为中文、可追溯、固定目录归档的 Obsidian 知识卡片。",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs watch",
     "build": "node scripts/embed-local-ocr.js --check && node scripts/embed-ooxml.js --check && node scripts/embed-structured-writer.js --check && node scripts/embed-table-knowledge.js --check && node scripts/validate-bundle-build.js",
-    "pretest": "node scripts/regression-local-text-blocks.js && node scripts/regression-parse-artifact-upgrade.js && node scripts/regression-evidence-scope-v219.js && node scripts/regression-review-migration-v219.js && node scripts/regression-review-policy-v220.js && node scripts/regression-provenance-production-fix.js && node scripts/regression-summary-map-provenance-v219.js && node scripts/regression-production-canonical-boundaries.js && node scripts/regression-table-review-v2191.js",
+    "pretest": "node scripts/regression-local-text-blocks.js && node scripts/regression-parse-artifact-upgrade.js && node scripts/regression-evidence-scope-v219.js && node scripts/regression-review-migration-v219.js && node scripts/regression-review-policy-v220.js && node scripts/regression-universal-production-path-v2201.js && node scripts/regression-provenance-production-fix.js && node scripts/regression-summary-map-provenance-v219.js && node scripts/regression-production-canonical-boundaries.js && node scripts/regression-table-review-v2191.js",
     "lint": "node --check main.js && node --check scripts/*.js && node --check src/*.js",
     "typecheck": "tsc -p tsconfig.json",
     "test:phase1": "node scripts/test-phase1-foundation.js",

@@ -107,7 +107,11 @@ assert.strictEqual(merged.metrics.dropped_no_knowledge, 1, 'isolated footer nois
   assert.strictEqual(result.accepted.length, 25);
   assert.strictEqual(result.documentWarnings[0].code, 'DOCUMENT_QUANTITY_ANOMALY');
   assert.strictEqual(result.documentWarnings[0].sample_atom_ids.length, 3);
-  assert(review.isApprovalEligible({ status: 'pending', reasons: ['可信度偏低'], reason_codes: ['SOFT_CONFIDENCE'], validationReport: { hardGateFailures: [] } }));
+  assert(review.isApprovalEligible({
+    status: 'pending', reasons: ['可信度偏低'], reason_codes: ['SOFT_CONFIDENCE'],
+    atom: { source: { provenance_verified: true } },
+    validationReport: { evidenceFound: true, materialDifferenceStatus: 'matched', hardGateFailures: [] }
+  }));
   assert(!review.isApprovalEligible({ status: 'pending', reasons: ['证据缺失'], reason_codes: ['GROUNDING_DEFECT'], validationReport: { hardGateFailures: ['EVIDENCE'] } }));
   const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
   assert(source.includes('LOCAL_REVALIDATION_PROVIDER_CALL_FORBIDDEN'));

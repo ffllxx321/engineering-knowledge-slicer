@@ -69,9 +69,12 @@ const workflow = loadBundleModule('src/core/workflow.js', {
   const formatted = { Category: '　施工　计划  ', TagL1: ' 适老化 ' };
   workflow.normalizePresentationFields(formatted);
   assert.deepStrictEqual([formatted.Category, formatted.TagL1, formatted.presentation_repairs.length], ['施工 计划', '适老化', 2]);
-  assert(review.isApprovalEligible({ status: 'pending', reasons: ['可信度偏低'], validationReport: { hardGateFailures: [] } }));
+  assert(review.isApprovalEligible({
+    status: 'pending', reasons: ['可信度偏低'], atom: { source: { provenance_verified: true } },
+    validationReport: { evidenceFound: true, materialDifferenceStatus: 'matched', hardGateFailures: [] }
+  }));
   assert(!review.isApprovalEligible({ status: 'pending', reasons: ['证据缺失'], validationReport: { hardGateFailures: ['EVIDENCE'], nonOverridableFailures: ['EVIDENCE'] } }));
   const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8'), css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
-  for (const expected of ['reviewer_reason', 'original_failed_soft_gates', '开发诊断', '生成内容', '原文依据', '自动检查', 'migrateReviewArtifact']) assert(main.includes(expected));
+  for (const expected of ['reviewer_reason', 'original_failed_soft_gates', '技术信息', '生成内容', '原文依据', '批准此项', 'migrateReviewArtifact']) assert(main.includes(expected));
   assert(css.includes('.eks-evidence-comparison')); console.log('review explosion regressions passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

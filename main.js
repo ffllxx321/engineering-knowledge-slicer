@@ -53,7 +53,7 @@ const { createTaskRecord } = require("src/core/pipeline.js");
 const { requestMiniMaxJson, requestMiniMaxStream } = require("src/core/ai-pipeline.js");
 const { runKnowledgeWorkflow } = require("src/core/workflow.js");
 const { buildCardRecord, cardFileName, renderKnowledgeCard, renderStructuredSummary } = require("src/core/markdown-renderer.js");
-const { groupReviewItems, applyBatchAction, isApprovalEligible, reviewSelection } = require("src/core/review-service.js");
+const { groupReviewItems, applyBatchAction, isApprovalEligible, safeApprovalPlan, nextReviewIndex } = require("src/core/review-service.js");
 const {
   consumeSelectedRegeneration,
   createSelectedRegenerationPlan,
@@ -2970,7 +2970,6 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       return this.regenerateSelectedReview(task, artifact, chosen);
     }
     if (action === 'approve_selected') {
-      if (!String(reviewerReason || '').trim()) throw new Error('人工批准必须填写审核理由');
       const blocked = chosen.filter((item) => !isApprovalEligible(item));
       if (blocked.length) throw new Error(`所选内容中有 ${blocked.length} 项未通过必要检查，不能批准`);
       const folderMap = (await this.loadRuntimeContracts()).folderMap;
@@ -3003,7 +3002,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       artifact.handled = [...(artifact.handled || []), ...chosen.map((item) => Object.assign({}, item, {
         review_action: action,
         review_action_at: now,
-        reviewer_reason: action === 'approve_selected' ? String(reviewerReason).slice(0, 500) : '',
+        reviewer_reason: action === 'approve_selected'
+          ? String(reviewerReason || '自动检查无未解决阻断差异，用户一键批准').slice(0, 500) : '',
         original_failed_soft_gates: action === 'approve_selected'
           ? (item.validationReport?.hardGateFailures || []).filter((failure) =>
             !(item.validationReport?.nonOverridableFailures || []).includes(failure))
@@ -3025,7 +3025,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     return {
       handled: action === 'manual_selected' ? 0 : chosen.length,
       pending: action === 'manual_selected' ? chosen.length : 0,
-      remaining: artifact.items.length
+      remaining: artifact.items.length,
+      remainingItems: artifact.items
     };
   }
 
@@ -3124,7 +3125,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     if (consumed.written.length) await this.rebuildKnowledgeIndexes();
     new Notice(`所选内容已重新生成：新入库 ${consumed.written.length} 项，仍待处理 ${merged.items.length} 项`);
     await this.refreshViews();
-    return { handled: chosen.length, remaining: merged.items.length, requestId: plan.request_id };
+    return { handled: chosen.length, remaining: merged.items.length, remainingItems: merged.items, requestId: plan.request_id };
   }
 
   async approveDraft(taskId, draftPath) {
@@ -3493,160 +3494,159 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 };
 
-// 审核弹窗：业务语言摘要 + 可访问的分页选择；原始诊断在技术详情中完整保留。
+// 审核弹窗：每页只处理一个问题；业务信息与技术诊断严格分层。
 class ReviewExceptionModal extends Modal {
   constructor(app, group, sourcePath, handlers = {}) {
     super(app);
     this.group = group;
     this.sourcePath = sourcePath;
     this.handlers = handlers;
-    this.selectedIds = new Set();
-    this.filter = 'all';
-    this.page = 0;
-    this.pageSize = 20;
+    this.index = 0;
+    this.items = [...(group.items || [])];
+    this.keyHandler = (event) => this.onKeyDown(event);
   }
   onOpen() {
     const { contentEl } = this;
+    if (!this.items.length) { this.close(); return; }
+    this.index = nextReviewIndex(this.index, this.items.length);
     contentEl.empty();
     contentEl.addClass('eks-review-exception-modal');
-    contentEl.createEl('h2', { text: '需要确认的内容' });
-    const selection = reviewSelection(this.group.items, this.selectedIds);
-    contentEl.createDiv({
-      cls: 'eks-exception-summary',
-      text: `共 ${selection.total} 项 · 可批准 ${selection.eligible} 项 · 需处理 ${selection.total - selection.eligible} 项`
+    contentEl.setAttr('tabindex', '-1');
+    contentEl.removeEventListener('keydown', this.keyHandler);
+    contentEl.addEventListener('keydown', this.keyHandler);
+    const item = this.items[this.index];
+    const context = item.review_context || {};
+    const explanation = explainIssue(item);
+    const header = contentEl.createDiv('eks-review-modal-header');
+    header.createEl('h2', { text: `第 ${this.index + 1} / ${this.items.length} 项` });
+    header.createDiv({ cls: 'eks-review-plain-reason', text: (context.plain_reasons || [explanation.happened])[0] });
+    header.createDiv({ cls: 'eks-task-meta', text: `源文档：${this.sourcePath || '未知文档'}` });
+    const plan = safeApprovalPlan(this.items);
+    const approveSafe = header.createEl('button', {
+      text: `批准全部可安全批准项（${plan.eligible}）`,
+      attr: { 'aria-label': `批准全部 ${plan.eligible} 个可安全批准项` }
     });
-    contentEl.createDiv({
-      cls: 'eks-task-meta',
-      text: `源文档：${this.sourcePath || '(未知)'}`
+    approveSafe.disabled = plan.eligible === 0;
+    approveSafe.addEventListener('click', () => this.runAction(plan.eligibleIds, 'approve_selected', true));
+    const body = contentEl.createDiv('eks-review-modal-body');
+    body.createEl('h3', { text: plainCardTitle(item) });
+    const comparison = body.createDiv('eks-evidence-comparison');
+    const generated = comparison.createDiv('eks-review-pane');
+    generated.createEl('h4', { text: '生成内容' });
+    generated.createDiv({ cls: 'eks-review-pane-scroll', text: context.statement || plainClaim(item) });
+    const source = comparison.createDiv('eks-review-pane');
+    source.createEl('h4', { text: '原文依据' });
+    source.createDiv({ cls: 'eks-review-pane-scroll', text: context.evidence_quote || '未找到可核验的原文依据' });
+    source.createDiv({ cls: 'eks-task-meta', text: `位置：${formatReviewLocator(context)}` });
+    const difference = context.material_differences || {};
+    body.createDiv({
+      cls: difference.status === 'matched' || difference.status === 'not_applicable' ? 'eks-automatic-pass' : 'eks-approval-blocked',
+      text: plainDifferenceSummary(difference)
     });
-    const controls = contentEl.createDiv({ cls: 'eks-exception-controls' });
-    const filter = controls.createEl('select', { attr: { 'aria-label': '筛选待确认内容' } });
-    for (const [value, label] of [['all', '全部'], ['eligible', '可批准'], ['blocked', '需处理']]) {
-      const option = filter.createEl('option', { text: label, attr: { value } });
-      option.selected = this.filter === value;
+    if (!isApprovalEligible(item)) {
+      body.createDiv({ cls: 'eks-approval-blocked', text: '此项存在未解决的实质差异，不能批准。请重新生成、拒绝或转交专家。' });
     }
-    filter.addEventListener('change', () => { this.filter = filter.value; this.page = 0; this.onOpen(); });
-    const selectEligible = controls.createEl('button', { text: `全选可批准项（${selection.eligible}）` });
-    selectEligible.addEventListener('click', () => {
-      for (const id of selection.eligibleIds) this.selectedIds.add(id);
-      this.onOpen();
-    });
-    controls.createSpan({ cls: 'eks-selection-count', text: `已选择 ${selection.selected} 项` });
-    const visible = this.group.items.filter((item) =>
-      this.filter === 'all' || (this.filter === 'eligible' ? isApprovalEligible(item) : !isApprovalEligible(item)));
-    const pageCount = Math.max(1, Math.ceil(visible.length / this.pageSize));
-    this.page = Math.min(this.page, pageCount - 1);
-    const pageItems = visible.slice(this.page * this.pageSize, (this.page + 1) * this.pageSize);
-    const list = contentEl.createDiv({ cls: 'eks-review-exception-list', attr: { role: 'list', 'aria-label': '待确认内容列表' } });
-    for (let index = 0; index < pageItems.length; index += 1) {
-      const item = pageItems[index];
-      const explanation = explainIssue(item);
-      const block = list.createDiv({ cls: 'eks-review-exception-item', attr: { role: 'listitem' } });
-      const head = block.createDiv({ cls: 'eks-review-exception-head' });
-      const checkbox = head.createEl('input', { attr: { type: 'checkbox', 'aria-label': `选择 ${item.atom?.title || item.atom_id}` } });
-      checkbox.checked = this.selectedIds.has(item.atom_id);
-      checkbox.addEventListener('change', () => {
-        checkbox.checked ? this.selectedIds.add(item.atom_id) : this.selectedIds.delete(item.atom_id);
-        this.onOpen();
-      });
-      const title = head.createDiv('eks-exception-title');
-      title.createEl('strong', { text: item.atom?.title || '未命名内容' });
-      title.createSpan({ cls: `eks-eligibility ${isApprovalEligible(item) ? 'is-eligible' : 'is-blocked'}`, text: isApprovalEligible(item) ? '可批准' : '需处理' });
-      block.createEl('h3', { text: explanation.kind });
-      block.createDiv({ cls: 'eks-exception-fact', text: `发生了什么：${explanation.happened}` });
-      block.createDiv({ cls: 'eks-exception-fact', text: `影响：${explanation.effect}` });
-      block.createDiv({ cls: 'eks-exception-action', text: `建议：${explanation.action}` });
-      const context = item.review_context || {};
-      const comparison = block.createDiv({ cls: 'eks-evidence-comparison' });
-      const generated = comparison.createDiv({ cls: 'eks-generated-content' });
-      generated.createEl('h4', { text: '生成内容' });
-      generated.createDiv({ text: context.statement || `${item.atom?.title || ''}\n${JSON.stringify(item.atom?.content || {})}` });
-      const source = comparison.createDiv({ cls: 'eks-source-evidence' });
-      source.createEl('h4', { text: '原文依据' });
-      source.createDiv({ text: context.evidence_quote || '未找到可核验的逐字原文' });
-      source.createDiv({ cls: 'eks-task-meta', text: `位置：${context.locator || '未定位'}${context.page ? ` · 第 ${context.page} 页` : ''}${context.block_id ? ` · 块 ${context.block_id}` : ''}` });
-      const differences = context.material_differences || {};
-      block.createDiv({
-        cls: 'eks-material-differences',
-        text: `关键差异：数字/单位 ${JSON.stringify(differences.statement_facts || []) === JSON.stringify(differences.evidence_facts || []) ? '一致' : '需核对'} · 语气 ${differences.statement_modality || '未知'} / ${differences.evidence_modality || '未知'} · 条件/例外 ${JSON.stringify(differences.statement_conditions || []) === JSON.stringify(differences.evidence_conditions || []) ? '一致' : '需核对'}`
-      });
-      const gates = block.createDiv({ cls: 'eks-gate-checklist' });
-      gates.createEl('h4', { text: '自动检查' });
-      const gateLabels = { source_evidence: '原文证据', numbers: '数字/单位/日期', schema: '内容结构', route: '安全目录', tags: '标签', duplicate: '非重复内容' };
-      for (const [gate, label] of Object.entries(gateLabels)) {
-        gates.createSpan({ cls: context.gate_checklist?.[gate] ? 'is-pass' : 'is-fail',
-          text: `${context.gate_checklist?.[gate] ? '✓' : '✕'} ${label}` });
-      }
-      const repair = context.automatic_repair || {};
-      block.createDiv({ cls: 'eks-exception-action', text: `推荐操作：${context.recommended_action || explanation.action}` });
-      block.createDiv({ cls: 'eks-task-meta', text: repair.attempted
-        ? (repair.repaired ? `自动修复：已从原文重新定位证据（${repair.method || '本地匹配'}）` : `自动修复：已尝试本地证据对齐，但${repair.reason === 'ambiguous_alignment' ? '存在多个相近位置，不能安全决定' : '相似度或唯一性不足'}`)
-        : '自动修复：未执行' });
-      if (!isApprovalEligible(item)) {
-        const blocked = (item.validationReport?.nonOverridableFailures || item.validationReport?.hardGateFailures || []).join('、');
-        block.createDiv({ cls: 'eks-approval-blocked', text: `无法批准：仍有不可绕过的必要检查未通过${blocked ? `（${blocked}）` : ''}。请重新生成、拒绝或转交专家。` });
-      }
-      const technical = block.createEl('details', { cls: 'eks-technical-details' });
-      technical.createEl('summary', { text: '开发诊断' });
-      technical.createEl('pre', { text: JSON.stringify({
-        atom_id: item.atom_id,
-        reasons: item.reasons,
-        confidence: item.confidence,
-        validationReport: item.validationReport || item.validation_report,
-        status: item.status,
-        atom: item.atom,
-        proposed_card: item.proposed_card
-      }, null, 2) });
-    }
-
+    const technical = body.createEl('details', { cls: 'eks-technical-details' });
+    technical.createEl('summary', { text: '技术信息' });
+    technical.createEl('pre', { text: JSON.stringify({
+      reason_codes: item.reason_codes,
+      validation: item.validationReport || item.validation_report,
+      status: item.status
+    }, null, 2) });
     const pager = contentEl.createDiv({ cls: 'eks-exception-pager' });
-    const previous = pager.createEl('button', { text: '上一页' }); previous.disabled = this.page === 0;
-    previous.addEventListener('click', () => { this.page -= 1; this.onOpen(); });
-    pager.createSpan({ text: `第 ${this.page + 1}/${pageCount} 页 · 每页最多 ${this.pageSize} 项` });
-    const next = pager.createEl('button', { text: '下一页' }); next.disabled = this.page >= pageCount - 1;
-    next.addEventListener('click', () => { this.page += 1; this.onOpen(); });
+    const previous = pager.createEl('button', { text: '上一项', attr: { 'aria-label': '上一项' } }); previous.disabled = this.index === 0;
+    previous.addEventListener('click', () => this.navigate(-1));
+    pager.createSpan({ text: `${this.index + 1} / ${this.items.length}` });
+    const next = pager.createEl('button', { text: '下一项', attr: { 'aria-label': '下一项' } }); next.disabled = this.index >= this.items.length - 1;
+    next.addEventListener('click', () => this.navigate(1));
     const actions = contentEl.createDiv({ cls: 'eks-review-exception-actions' });
-    const runAction = async (action) => {
-      const current = reviewSelection(this.group.items, this.selectedIds);
-      if (!current.selected) { new Notice('请先选择至少一项'); return; }
-      if (action === 'approve_selected' && current.selectedIneligible) {
-        new Notice(`有 ${current.selectedIneligible} 项未通过必要检查，不能批准`);
-        return;
-      }
-      const message = action === 'approve_selected'
-        ? `将批准 ${current.selectedEligible} 项，其余 ${current.total - current.selectedEligible} 项继续留待处理。确认继续？`
-        : `确认处理所选 ${current.selected} 项？`;
-      if (!window.confirm(message)) return;
-      const auditReason = action === 'approve_selected'
-        ? String(window.prompt('请填写人工批准理由（将写入审核审计记录）：', '已逐项核对生成内容与原文依据一致') || '').trim()
-        : '';
-      if (action === 'approve_selected' && !auditReason) { new Notice('人工批准必须填写审核理由'); return; }
-      try { await this.handlers.onAction?.([...this.selectedIds], action, auditReason); this.close(); }
-      catch (error) { new Notice(`操作失败：${error.message}`); }
-    };
-    actions.createEl('button', { text: '原文依据正确 → 人工批准', cls: 'mod-cta' }).addEventListener('click', () => runAction('approve_selected'));
-    actions.createEl('button', { text: '重新生成' }).addEventListener('click', () => runAction('regenerate_selected'));
-    actions.createEl('button', { text: '拒绝所选' }).addEventListener('click', () => runAction('reject_selected'));
-    actions.createEl('button', { text: '转交专家' }).addEventListener('click', () => runAction('manual_selected'));
-    actions.createEl('button', { text: '无法精确重生成？重做整个文件知识原子' }).addEventListener('click', async () => {
+    const approve = actions.createEl('button', { text: '批准此项', cls: 'mod-cta', attr: { 'aria-label': '批准此项（快捷键 A）' } });
+    approve.disabled = !isApprovalEligible(item);
+    approve.addEventListener('click', () => this.runAction([item.atom_id], 'approve_selected'));
+    actions.createEl('button', { text: '重新生成', attr: { 'aria-label': '重新生成此项（快捷键 R）' } })
+      .addEventListener('click', () => this.runAction([item.atom_id], 'regenerate_selected'));
+    const more = actions.createEl('details', { cls: 'eks-more-actions' });
+    more.createEl('summary', { text: '更多操作' });
+    const menu = more.createDiv('eks-more-actions-menu');
+    menu.createEl('button', { text: '拒绝此项' }).addEventListener('click', () => this.runAction([item.atom_id], 'reject_selected'));
+    menu.createEl('button', { text: '转交专家' }).addEventListener('click', () => this.runAction([item.atom_id], 'manual_selected'));
+    menu.createEl('button', { text: '打开原文' }).addEventListener('click', () => this.openSource());
+    menu.createEl('button', { text: '重做整份文档知识卡' }).addEventListener('click', async () => {
       if (!window.confirm('这会重新生成整个文件的知识原子；已有已批准卡片不会重复写入。确认继续？')) return;
       try { await this.handlers.onWholeRegenerate?.(); this.close(); }
       catch (error) { new Notice(`整文件知识原子重生成失败：${error.message}`); }
     });
-    actions.createEl('button', { text: '打开源文档', cls: 'mod-cta' }).addEventListener('click', async () => {
-      if (!this.sourcePath) { new Notice('源文档路径未知'); return; }
-      const file = this.app.vault.getAbstractFileByPath(this.sourcePath);
-      if (file instanceof TFile) {
-        await this.app.workspace.openLinkText(this.sourcePath, '', false);
-      } else {
-        new Notice(`源文档不在 vault 中：${this.sourcePath}`);
-      }
-    });
     actions.createEl('button', { text: '关闭' }).addEventListener('click', () => this.close());
+    contentEl.focus();
+  }
+  navigate(delta) {
+    this.index = nextReviewIndex(this.index + delta, this.items.length);
+    this.onOpen();
+  }
+  async runAction(ids, action, safeAll = false) {
+    if (!ids.length) return;
+    if (safeAll && ids.length > 1 && !window.confirm(`将批准 ${ids.length} 项；有实质差异的项目会保留。确认继续？`)) return;
+    try {
+      diag('review.uiAction', { action, count: ids.length, safeAll, sourceIncluded: false });
+      const result = await this.handlers.onAction?.(ids, action, '');
+      const removed = new Set(action === 'manual_selected' ? ids : ids);
+      const remainingIds = new Set((result?.remainingItems || []).map((entry) => entry.atom_id));
+      this.items = this.items.filter((entry) => !removed.has(entry.atom_id) && (!result?.remainingItems || remainingIds.has(entry.atom_id)));
+      this.index = nextReviewIndex(this.index, this.items.length);
+      if (!this.items.length) this.close(); else this.onOpen();
+    } catch (error) { new Notice(`操作失败：${error.message}`); }
+  }
+  async openSource() {
+    if (!this.sourcePath) { new Notice('源文档路径未知'); return; }
+    const file = this.app.vault.getAbstractFileByPath(this.sourcePath);
+    if (file instanceof TFile) await this.app.workspace.openLinkText(this.sourcePath, '', false);
+    else new Notice(`源文档不在 vault 中：${this.sourcePath}`);
+  }
+  onKeyDown(event) {
+    if (event.target?.matches?.('button, summary, input, textarea, select')) return;
+    if (event.key === 'ArrowLeft') { event.preventDefault(); this.navigate(-1); }
+    else if (event.key === 'ArrowRight') { event.preventDefault(); this.navigate(1); }
+    else if (event.key.toLowerCase() === 'a' && isApprovalEligible(this.items[this.index])) {
+      event.preventDefault(); this.runAction([this.items[this.index].atom_id], 'approve_selected');
+    } else if (event.key.toLowerCase() === 'r') {
+      event.preventDefault(); this.runAction([this.items[this.index].atom_id], 'regenerate_selected');
+    } else if (event.key === 'Escape') { event.preventDefault(); this.close(); }
   }
   onClose() {
+    this.contentEl.removeEventListener('keydown', this.keyHandler);
     this.contentEl.empty();
   }
+}
+
+function plainCardTitle(item) {
+  return String(item?.atom?.title || item?.proposed_card?.title || '待确认的知识卡').replace(/\s+/g, ' ').slice(0, 100);
+}
+function plainClaim(item) {
+  const value = item?.atom?.content;
+  if (typeof value === 'string') return value;
+  return Object.values(value || {}).flatMap((entry) => Array.isArray(entry) ? entry : [entry])
+    .filter((entry) => ['string', 'number'].includes(typeof entry)).join('；').slice(0, 2000) || plainCardTitle(item);
+}
+function formatReviewLocator(context) {
+  const source = context.source_context || {};
+  const parts = [];
+  if (context.page) parts.push(`第 ${context.page} 页`);
+  if (source.table?.sheet) parts.push(`工作表 ${source.table.sheet}`);
+  if (source.table?.row !== '' && source.table?.row != null) parts.push(`第 ${source.table.row} 行`);
+  if (source.message?.subject) parts.push(`邮件“${source.message.subject}”`);
+  if (context.section) parts.push(`章节“${context.section}”`);
+  return parts.join(' · ') || context.locator || '原文中的已核验位置';
+}
+function plainDifferenceSummary(difference) {
+  const labels = {
+    matched: '自动检查通过：数字、日期、单位、义务强度和适用条件与原文一致。',
+    not_applicable: '自动检查通过：此项没有需要核对的数字、日期或单位，义务与条件无实质差异。',
+    conflict: '数字或日期与原文冲突。',
+    unsupported_addition: '生成内容增加了原文没有的数字或日期。',
+    missing_in_evidence: '原文依据缺少核验该数值所需的单位。',
+    ambiguous_conversion: '单位换算关系不明确。'
+  };
+  return labels[difference.status] || '检测到需要处理的实质差异。';
 }
 
 // v1.3: 上传源文件到外部解析器（MinerU / PaddleOCR）前的二次确认弹窗。
@@ -5145,13 +5145,30 @@ function isCurrentArtifactEnvelope(value) {
 
 function migrateReviewArtifact(value) {
   const artifact = JSON.parse(JSON.stringify(value || {}));
+  const plainStatement = (item) => {
+    const atom = item?.atom || {};
+    if (typeof atom.content === 'string') return `${atom.title || ''} ${atom.content}`.trim();
+    const values = Object.values(atom.content || {}).flatMap((entry) => Array.isArray(entry) ? entry : [entry])
+      .filter((entry) => ['string', 'number'].includes(typeof entry));
+    return `${atom.title || ''} ${values.join('；')}`.trim();
+  };
   artifact.version = '2.0';
   artifact.items = (artifact.items || []).map((item) => {
     const atom = item.atom || {};
     const source = atom.source || {};
     const report = item.validationReport || item.validation_report || {};
+    const legacyDifference = item.review_context?.material_differences || {};
+    const arraysMatch = Array.isArray(legacyDifference.statement_facts)
+      && JSON.stringify(legacyDifference.statement_facts) === JSON.stringify(legacyDifference.evidence_facts || []);
+    if (arraysMatch) {
+      report.materialDifferenceStatus = 'matched';
+      report.materialDifferences = { status: 'matched', modality: { status: 'matched' }, conditions: { status: 'matched' } };
+      report.numberConsistency = true;
+      report.hardGateFailures = (report.hardGateFailures || []).filter((code) => code !== 'NUMERIC_CONFLICT');
+      report.nonOverridableFailures = (report.nonOverridableFailures || []).filter((code) => code !== 'NUMERIC_CONFLICT');
+    }
     const context = item.review_context || {
-      statement: `${atom.title || ''} ${typeof atom.content === 'string' ? atom.content : JSON.stringify(atom.content || {})}`.trim(),
+      statement: plainStatement(item),
       evidence_quote: String(source.evidence_quote || item.proposed_card?.evidence_quote || ''),
       locator: String(source.source_locator || item.proposed_card?.source_locator || ''),
       page: source.source_page || source.source_provenance?.page || '',
@@ -5167,7 +5184,17 @@ function migrateReviewArtifact(value) {
       },
       plain_reasons: (item.reasons || []).map(String)
     };
-    return Object.assign({}, item, { status: item.status || 'pending', review_context: context });
+    context.statement = String(context.statement || plainStatement(item)).replace(/\s+/g, ' ').slice(0, 2000);
+    context.material_differences = report.materialDifferences || context.material_differences || {
+      status: report.numberConsistency === false ? 'conflict' : 'not_applicable',
+      modality: { status: 'matched' },
+      conditions: { status: 'matched' }
+    };
+    return Object.assign({}, item, {
+      status: item.status || 'pending',
+      validationReport: report,
+      review_context: context
+    });
   });
   return artifact;
 }
@@ -7111,8 +7138,12 @@ function classifyCandidate(candidate, route = {}) {
   if (candidate.reusable_knowledge_candidate === true || reasons.has('reuse_promotion')) {
     hardRisks.push('company_reuse_promotion');
   }
-  if (reasons.has('critical_fact_conflict')
-      || (reasons.has('conflicting_facts') && conflictSignature(candidate))) {
+  const differenceStatus = text(candidate.material_difference_status
+    || candidate.material_differences?.status, 80);
+  const blockingDifference = ['missing_in_evidence', 'unsupported_addition', 'conflict',
+    'ambiguous_conversion', 'strengthened_obligation', 'weakened_obligation',
+    'changed_obligation', 'invented_condition', 'removed_condition_or_exception'].includes(differenceStatus);
+  if (reasons.has('critical_fact_conflict') || blockingDifference) {
     hardRisks.push('critical_fact_conflict');
   } else if (reasons.has('conflicting_facts')) {
     notices.push('noncritical_difference');
@@ -15611,7 +15642,7 @@ function calculateConfidence(input) {
     hardRules.push('逐字证据无法在解析文本中定位');
     score = Math.min(score, 0.59);
   }
-  if (!numbersGrounded) hardRules.push(`知识卡片引入了当前证据范围不支持的${factConsistency.failures.join('、')}`);
+  if (!numbersGrounded) hardRules.push(...factConsistency.plainReasons);
   if (!input.schemaValid || !input.routeValid || !input.labelsValid) {
     hardRules.push('Schema、固定目录或标签字典校验未通过');
     score = Math.min(score, 0.69);
@@ -15640,7 +15671,8 @@ function calculateConfidence(input) {
     components: Object.fromEntries(Object.entries(components).map(([key, value]) => [key, round(value)])),
     weights: WEIGHTS,
     auto_approve_threshold: threshold,
-    hard_rules: hardRules
+    hard_rules: hardRules,
+    material_differences: factConsistency
   };
 }
 
@@ -15650,24 +15682,95 @@ function normalizeAutoApproveThreshold(value) {
   return Math.round(Math.max(0.7, Math.min(1, number)) * 1000) / 1000;
 }
 
+const FACT_UNITS = '(?:%|‰|mm|cm|km|m|m2|m3|m²|m³|pa|kpa|mpa|gpa|n|kn|kg|t|l|ml|℃|°c|元|万元|亿元|年|月|日|小时|分钟|秒)';
 function extractedFacts(text) {
-  return [...new Set((String(text || '').normalize('NFKC').match(
-    /(?:\b(?:19|20)\d{2}(?:[-/.年]\d{1,2}(?:[-/.月]\d{1,2}日?)?)?|\d+(?:[.,]\d+)?\s*(?:%|‰|mm|cm|km|m2|m3|m²|m³|pa|kpa|mpa|gpa|n|kn|kg|t|l|ml|℃|°c|元|万元|亿元|年|月|日|小时|分钟|秒)?)/giu
-  ) || []).map((value) => value.toLowerCase().replace(/[\s,]/g, '')))];
+  const value = String(text || '').normalize('NFKC');
+  const facts = [];
+  const occupied = [];
+  const datePattern = /\b((?:19|20)\d{2})\s*(?:[-/.年]\s*(\d{1,2})\s*(?:[-/.月]\s*(\d{1,2})\s*日?)?)?/giu;
+  for (const match of value.matchAll(datePattern)) {
+    const month = match[2] ? Number(match[2]) : 0;
+    const day = match[3] ? Number(match[3]) : 0;
+    facts.push({ kind: 'date', value: `${Number(match[1])}${month ? `-${String(month).padStart(2, '0')}` : ''}${day ? `-${String(day).padStart(2, '0')}` : ''}`, unit: '', raw: match[0] });
+    occupied.push([match.index, match.index + match[0].length]);
+  }
+  const numericPattern = new RegExp(`[-+]?\\d+(?:[.,]\\d+)?\\s*${FACT_UNITS}?`, 'giu');
+  for (const match of value.matchAll(numericPattern)) {
+    if (occupied.some(([start, end]) => match.index >= start && match.index < end)) continue;
+    const parts = match[0].trim().match(/^([-+]?\d+(?:[.,]\d+)?)\s*(.*)$/u);
+    if (!parts) continue;
+    facts.push({ kind: 'number', value: String(Number(parts[1].replace(/,/g, ''))), unit: normalizeUnit(parts[2]), raw: match[0] });
+  }
+  return facts.filter((fact, index, all) =>
+    all.findIndex((candidate) => candidate.kind === fact.kind && candidate.value === fact.value && candidate.unit === fact.unit) === index);
+}
+
+function normalizeUnit(unit) {
+  const value = String(unit || '').normalize('NFKC').toLowerCase().replace(/\s+/g, '');
+  return ({ '°c': '℃', m2: 'm²', m3: 'm³', '毫升': 'ml', '升': 'l' })[value] || value;
+}
+
+function compareFacts(statementFacts, evidenceFacts) {
+  if (!statementFacts.length && !evidenceFacts.length) return { status: 'not_applicable', blocking: false, differences: [] };
+  const differences = [];
+  for (const fact of statementFacts) {
+    if (evidenceFacts.some((candidate) => candidate.kind === fact.kind && candidate.value === fact.value && candidate.unit === fact.unit)) continue;
+    const sameValue = evidenceFacts.filter((candidate) => candidate.kind === fact.kind && candidate.value === fact.value);
+    if (sameValue.length) {
+      const evidenceUnits = [...new Set(sameValue.map((candidate) => candidate.unit))];
+      const status = !fact.unit || evidenceUnits.includes('') ? 'missing_in_evidence' : 'ambiguous_conversion';
+      differences.push({ status, claim: fact.raw, evidence: sameValue.map((candidate) => candidate.raw) });
+      continue;
+    }
+    const sameKind = evidenceFacts.filter((candidate) => candidate.kind === fact.kind);
+    differences.push({ status: sameKind.length ? 'conflict' : 'unsupported_addition', claim: fact.raw, evidence: sameKind.map((candidate) => candidate.raw) });
+  }
+  if (!differences.length) return { status: 'matched', blocking: false, differences: [] };
+  const priority = ['conflict', 'unsupported_addition', 'ambiguous_conversion', 'missing_in_evidence'];
+  return { status: priority.find((status) => differences.some((item) => item.status === status)), blocking: true, differences };
 }
 
 function evidenceConsistency(statement, evidence) {
   const statementFacts = extractedFacts(statement);
-  const evidenceFacts = new Set(extractedFacts(evidence));
-  const failures = [];
-  if (!statementFacts.every((fact) => evidenceFacts.has(fact))) failures.push('数字、日期或单位');
+  const evidenceFacts = extractedFacts(evidence);
+  const facts = compareFacts(statementFacts, evidenceFacts);
   const statementModality = explicitModality(statement);
   const evidenceModality = explicitModality(evidence);
-  if (statementModality && statementModality !== evidenceModality) failures.push('语气/模态');
+  let modalityStatus = 'matched';
+  if (statementModality !== evidenceModality) {
+    modalityStatus = statementModality && !evidenceModality ? 'strengthened_obligation'
+      : !statementModality && evidenceModality ? 'weakened_obligation' : 'changed_obligation';
+  }
   const conditions = conditionTokens(statement);
   const evidenceConditions = conditionTokens(evidence);
-  if (conditions.length && !conditions.every((token) => evidenceConditions.includes(token))) failures.push('适用条件/例外');
-  return { ok: failures.length === 0, failures, statementFacts, evidenceFacts: [...evidenceFacts] };
+  const addedConditions = conditions.filter((token) => !evidenceConditions.includes(token));
+  const removedConditions = evidenceConditions.filter((token) => !conditions.includes(token));
+  const conditionStatus = addedConditions.length ? 'invented_condition'
+    : removedConditions.length ? 'removed_condition_or_exception' : 'matched';
+  const plainReasons = [];
+  const factLabels = {
+    conflict: '生成内容中的数字或日期与原文冲突',
+    unsupported_addition: '生成内容增加了原文没有的数字或日期',
+    missing_in_evidence: '原文依据缺少核验该数值所需的单位',
+    ambiguous_conversion: '生成内容与原文的单位换算关系不明确'
+  };
+  if (facts.blocking) plainReasons.push(factLabels[facts.status]);
+  if (modalityStatus === 'strengthened_obligation') plainReasons.push('生成内容把原文加强为强制要求');
+  if (modalityStatus === 'weakened_obligation') plainReasons.push('生成内容弱化了原文的强制要求');
+  if (modalityStatus === 'changed_obligation') plainReasons.push('生成内容改变了原文的义务强度');
+  if (conditionStatus === 'invented_condition') plainReasons.push('生成内容增加了原文没有的适用条件');
+  if (conditionStatus === 'removed_condition_or_exception') plainReasons.push('生成内容删除了原文的条件或例外');
+  return {
+    ok: plainReasons.length === 0,
+    status: facts.status,
+    failures: plainReasons,
+    plainReasons,
+    factComparison: facts,
+    statementFacts,
+    evidenceFacts,
+    modality: { status: modalityStatus, statement: statementModality || 'none', evidence: evidenceModality || 'none' },
+    conditions: { status: conditionStatus, statement: conditions, evidence: evidenceConditions }
+  };
 }
 
 function explicitModality(text) {
@@ -16382,7 +16485,16 @@ function buildValidationReport(input = {}) {
   if (input.tagsValid === false) failures.push('TAG');
   if (input.sourceLinkValid === false) failures.push('SOURCE_LINK');
   if (input.evidenceFound === false) failures.push('EVIDENCE');
-  if (input.numberConsistency === false) failures.push('NUMERIC_CONFLICT');
+  const difference = input.materialDifferences || {};
+  const factFailureCodes = {
+    missing_in_evidence: 'FACT_MISSING_IN_EVIDENCE',
+    unsupported_addition: 'UNSUPPORTED_ADDITION',
+    conflict: 'FACT_CONFLICT',
+    ambiguous_conversion: 'AMBIGUOUS_CONVERSION'
+  };
+  if (factFailureCodes[difference.status]) failures.push(factFailureCodes[difference.status]);
+  if (difference.modality?.status && difference.modality.status !== 'matched') failures.push('MODALITY_CONFLICT');
+  if (difference.conditions?.status && difference.conditions.status !== 'matched') failures.push('CONDITION_CONFLICT');
   if (input.dateConsistency === false) failures.push('DATE_CONFLICT');
   if (input.entityConsistency === false) failures.push('SUBJECT_CONFLICT');
   if (input.unsafePath === true) failures.push('UNSAFE_PATH');
@@ -16396,15 +16508,19 @@ function buildValidationReport(input = {}) {
     parentSummaryValid: input.parentSummaryValid !== false,
     evidenceFound: input.evidenceFound !== false,
     evidenceMatchScore: number(input.evidenceMatchScore),
-    numberConsistency: input.numberConsistency !== false,
+    numberConsistency: !factFailureCodes[difference.status] && input.numberConsistency !== false,
+    materialDifferenceStatus: difference.status || 'not_applicable',
+    materialDifferences: difference,
     dateConsistency: input.dateConsistency !== false,
     entityConsistency: input.entityConsistency !== false,
     atomicityScore: number(input.atomicityScore),
     duplicateScore: number(input.duplicateScore),
     hardGateFailures: failures,
     nonOverridableFailures: failures.filter((failure) =>
-      ['SCHEMA', 'ROUTING', 'SOURCE_LINK', 'EVIDENCE', 'NUMERIC_CONFLICT', 'DATE_CONFLICT',
-        'SUBJECT_CONFLICT', 'UNSAFE_PATH', 'UNSUPPORTED_CONTENT', 'DUPLICATE'].includes(failure)),
+      ['SCHEMA', 'ROUTING', 'SOURCE_LINK', 'EVIDENCE', 'FACT_MISSING_IN_EVIDENCE',
+        'UNSUPPORTED_ADDITION', 'FACT_CONFLICT', 'AMBIGUOUS_CONVERSION', 'MODALITY_CONFLICT',
+        'CONDITION_CONFLICT', 'DATE_CONFLICT', 'SUBJECT_CONFLICT', 'UNSAFE_PATH',
+        'UNSUPPORTED_CONTENT', 'DUPLICATE'].includes(failure)),
     warnings: Array.isArray(input.warnings) ? input.warnings : [],
     confidenceComponents: input.confidenceComponents || {},
     finalDecision: failures.length ? 'review' : (input.finalDecision || 'auto_ingest')
@@ -16632,7 +16748,7 @@ module.exports = {
 "src/core/workflow.js": function(require, module, exports) {
 const { atomizeSummary, classifyDocument, summarizeDocument, validateAtomizationResult } = require("src/core/ai-pipeline.js");
 const { upgradeParsePackage } = require("src/core/document-parser.js");
-const { calculateConfidence } = require("src/core/confidence.js");
+const { calculateConfidence, evidenceConsistency, extractedFacts } = require("src/core/confidence.js");
 const { atomFingerprint } = require("src/core/identity.js");
 const { buildCardRecord } = require("src/core/markdown-renderer.js");
 const { resolveFixedRoute } = require("src/core/routing.js");
@@ -16794,6 +16910,7 @@ async function runKnowledgeWorkflow(options) {
     }
     reconcileAtomLinks(atom, linkCandidates);
     normalizePresentationFields(atom);
+    expandEvidenceWithinVerifiedBlock(options.parsePackage, atom);
     const fingerprint = atomFingerprint(atom);
     const labelsValid = typeof options.validateLabels === 'function' ? options.validateLabels(atom) : true;
     const routeValid = atom.library === classification.library && atom.folder_type === classification.folder_type;
@@ -16833,7 +16950,8 @@ async function runKnowledgeWorkflow(options) {
       parentSummaryValid: true,
       evidenceFound: atom.source?.provenance_verified === true,
       evidenceMatchScore: confidence.components?.evidence || 0,
-      numberConsistency: !confidence.hard_rules.some((reason) => /数字|日期/.test(reason)),
+      numberConsistency: !confidence.material_differences?.factComparison?.blocking,
+      materialDifferences: confidence.material_differences,
       atomicityScore: confidence.components?.atom_quality || 0,
       duplicateScore: duplicate ? 1 : 0,
       confidenceComponents: confidence.components || {},
@@ -16973,7 +17091,9 @@ function histogram(values) {
 function reviewReasonCodes(report, confidence, issues = []) {
   const codes = [];
   const failures = report.hardGateFailures || [];
-  if (failures.some((value) => ['EVIDENCE', 'NUMERIC_CONFLICT', 'DATE_CONFLICT', 'SUBJECT_CONFLICT'].includes(value))) codes.push('GROUNDING_DEFECT');
+  if (failures.some((value) => ['EVIDENCE', 'FACT_MISSING_IN_EVIDENCE', 'UNSUPPORTED_ADDITION',
+    'FACT_CONFLICT', 'AMBIGUOUS_CONVERSION', 'MODALITY_CONFLICT', 'CONDITION_CONFLICT',
+    'DATE_CONFLICT', 'SUBJECT_CONFLICT'].includes(value))) codes.push('GROUNDING_DEFECT');
   if (failures.some((value) => ['SCHEMA', 'ROUTING', 'TAG', 'SOURCE_LINK', 'UNSAFE_PATH'].includes(value))) codes.push('SCHEMA_ROUTE_DEFECT');
   if (failures.includes('DUPLICATE')) codes.push('DUPLICATE_CONFLICT');
   if ((issues || []).some((value) => /原子|拆分|完整|上下文|fragment|atomic/i.test(String(value)))) codes.push('SLICING_DEFECT');
@@ -17008,6 +17128,49 @@ function evidenceContextForBlock(parsePackage, blockId) {
       from: metadata.from || '', date: metadata.date || '', subject: metadata.subject || ''
     }
   };
+}
+
+function expandEvidenceWithinVerifiedBlock(parsePackage, atom) {
+  if (typeof evidenceConsistency !== 'function' || typeof extractedFacts !== 'function') {
+    return { expanded: false, reason: 'difference_policy_unavailable' };
+  }
+  if (atom?.source?.provenance_verified !== true) return { expanded: false, reason: 'evidence_unverified' };
+  const blockId = String(atom.source?.source_provenance?.block_id || atom.source?.block_id || '');
+  const entry = blockId && parsePackage?.evidence_index?.[blockId];
+  if (!entry || String(entry.block_id) !== blockId || entry.card_eligible === false) {
+    return { expanded: false, reason: 'verified_block_unavailable' };
+  }
+  const quote = String(atom.source.evidence_quote || '');
+  const blockText = String(entry.raw_text || '');
+  if (!quote || !blockText.includes(quote)) return { expanded: false, reason: 'quote_outside_verified_block' };
+  const claim = atomText(atom);
+  const quoteResult = evidenceConsistency(claim, quote);
+  if (quoteResult.ok) {
+    atom.source.bound_evidence_text = quote;
+    return { expanded: false, reason: 'quote_sufficient' };
+  }
+  const blockResult = evidenceConsistency(claim, blockText);
+  atom.source.bound_evidence_text = blockText;
+  atom.source.evidence_scope = {
+    expanded: true,
+    block_id: blockId,
+    crossed_blocks: false,
+    method: 'verified_block_exact'
+  };
+  if (blockResult.ok || blockResult.status !== quoteResult.status) {
+    atom.source.review_evidence_excerpt = boundedBlockExcerpt(blockText, quote, claim);
+  }
+  return { expanded: true, reason: blockResult.ok ? 'verified_in_same_block' : 'same_block_still_differs' };
+}
+
+function boundedBlockExcerpt(blockText, quote, claim) {
+  const facts = extractedFacts(claim);
+  const anchors = [quote, ...facts.map((fact) => fact.raw)].filter(Boolean);
+  const offsets = anchors.map((anchor) => blockText.normalize('NFKC').indexOf(String(anchor).normalize('NFKC'))).filter((offset) => offset >= 0);
+  const center = offsets.length ? Math.min(...offsets) : Math.max(0, blockText.indexOf(quote));
+  const start = Math.max(0, center - 240);
+  const end = Math.min(blockText.length, Math.max(start + 480, center + 720));
+  return `${start ? '…' : ''}${blockText.slice(start, end).trim()}${end < blockText.length ? '…' : ''}`;
 }
 
 function consolidateAtoms(atoms) {
@@ -17109,7 +17272,7 @@ function mergeAtoms(a, b) {
 }
 function reviewContext(atom, report, reasons) {
   const statement = atomText(atom);
-  const evidenceQuote = String(atom.source?.evidence_quote || '');
+  const evidenceQuote = String(atom.source?.review_evidence_excerpt || atom.source?.bound_evidence_text || atom.source?.evidence_quote || '');
   const sourceContext = atom.source?.context || {};
   return {
     statement, evidence_quote: evidenceQuote,
@@ -17117,13 +17280,10 @@ function reviewContext(atom, report, reasons) {
     block_id: atom.source?.source_provenance?.block_id || atom.source?.block_id || '',
     section: sourceContext.section || sourceContext.table?.sheet || sourceContext.message?.subject || '',
     source_context: sourceContext,
-    material_differences: {
-      statement_facts: [...atomFacts(atom)],
-      evidence_facts: [...atomFacts({ content: evidenceQuote })],
-      statement_modality: modality(atom),
-      evidence_modality: modality({ content: evidenceQuote }),
-      statement_conditions: [...conditionSignature(atom)],
-      evidence_conditions: [...conditionSignature({ content: evidenceQuote })]
+    material_differences: report.materialDifferences || {
+      status: 'not_applicable',
+      modality: { status: 'matched' },
+      conditions: { status: 'matched' }
     },
     automatic_repair: atom.source?.evidence_repair || { attempted: false },
     gate_checklist: { source_evidence: report.evidenceFound, numbers: report.numberConsistency,
@@ -17131,8 +17291,7 @@ function reviewContext(atom, report, reasons) {
     recommended_action: report.hardGateFailures?.length ? '重新切片或修正原文定位；必要检查未通过，不能人工强制批准。' : '抽查原文差异；确认只是可信度偏低后，可填写审核理由批量批准。',
     developer_details_hidden: true,
     plain_reasons: reasons.map((reason) => /定位|证据|逐字/.test(reason) ? '尚未找到唯一、逐字一致的原文依据'
-      : /数字|日期/.test(reason) ? '数字、单位或日期与原文依据不一致'
-        : /可信度/.test(reason) ? '必要检查已通过，但综合可信度未达到自动入库门槛' : String(reason))
+      : /可信度/.test(reason) ? '必要检查已通过，但综合可信度未达到自动入库门槛' : String(reason))
   };
 }
 
@@ -17150,7 +17309,7 @@ async function emitArtifact(handler, name, value) {
   if (typeof handler === 'function') await handler(name, value);
 }
 
-module.exports = { runKnowledgeWorkflow, consolidateAtoms, normalizePresentationFields, reviewContext };
+module.exports = { runKnowledgeWorkflow, consolidateAtoms, normalizePresentationFields, reviewContext, expandEvidenceWithinVerifiedBlock };
 
 },
 /**
@@ -17515,25 +17674,32 @@ function isApprovalEligible(item) {
   if (item.eligible === false || item.ineligible === true) return false;
   const report = item.validationReport || item.validation_report || {};
   const hardFailures = report.nonOverridableFailures || (report.hardGateFailures || []).filter((failure) =>
-    ['SCHEMA', 'ROUTING', 'SOURCE_LINK', 'EVIDENCE', 'NUMERIC_CONFLICT', 'DATE_CONFLICT',
-      'SUBJECT_CONFLICT', 'UNSAFE_PATH', 'UNSUPPORTED_CONTENT', 'DUPLICATE'].includes(failure));
+    ['SCHEMA', 'ROUTING', 'SOURCE_LINK', 'EVIDENCE', 'FACT_MISSING_IN_EVIDENCE',
+      'UNSUPPORTED_ADDITION', 'FACT_CONFLICT', 'AMBIGUOUS_CONVERSION', 'MODALITY_CONFLICT',
+      'CONDITION_CONFLICT', 'DATE_CONFLICT', 'SUBJECT_CONFLICT', 'UNSAFE_PATH',
+      'UNSUPPORTED_CONTENT', 'DUPLICATE'].includes(failure));
   if (hardFailures.length) return false;
+  if (report.evidenceFound !== true || item.atom?.source?.provenance_verified !== true) return false;
+  if (report.materialDifferenceStatus && !['matched', 'not_applicable'].includes(report.materialDifferenceStatus)) return false;
   const reasons = (item.reasons || []).join('；');
   return !/schema|结构校验|必填字段|证据.*(?:缺失|找不到)|逐字证据|locator missing|数字.*不存在|目录与.*不一致|重复/i.test(reasons);
 }
 
-function reviewSelection(items, selectedIds) {
-  const selected = new Set(selectedIds || []);
+function safeApprovalPlan(items) {
   const eligible = (items || []).filter(isApprovalEligible);
-  const chosen = (items || []).filter((item) => selected.has(item.atom_id));
   return {
     total: (items || []).length,
-    selected: chosen.length,
     eligible: eligible.length,
-    selectedEligible: chosen.filter(isApprovalEligible).length,
-    selectedIneligible: chosen.filter((item) => !isApprovalEligible(item)).length,
-    eligibleIds: eligible.map((item) => item.atom_id)
+    blocked: (items || []).length - eligible.length,
+    eligibleIds: eligible.map((item) => item.atom_id),
+    blockedIds: (items || []).filter((item) => !isApprovalEligible(item)).map((item) => item.atom_id),
+    items: eligible
   };
+}
+
+function nextReviewIndex(currentIndex, remainingCount) {
+  if (remainingCount <= 0) return -1;
+  return Math.max(0, Math.min(Number(currentIndex) || 0, remainingCount - 1));
 }
 
 function pendingReviewItems(reviewArtifacts) {
@@ -17550,7 +17716,7 @@ function hashCode(value) {
   return Math.abs(hash).toString(36);
 }
 
-module.exports = { applyBatchAction, groupReviewItems, pendingReviewItems, isApprovalEligible, reviewSelection };
+module.exports = { applyBatchAction, groupReviewItems, pendingReviewItems, isApprovalEligible, safeApprovalPlan, nextReviewIndex };
 
 
 },

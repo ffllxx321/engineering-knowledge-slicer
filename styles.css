@@ -483,22 +483,18 @@
 }
 
 .eks-review-exception-modal {
-  width: min(680px, calc(100vw - 24px));
+  width: min(980px, calc(100vw - 24px));
   max-width: 100%;
-  overflow-x: hidden;
+  height: min(84vh, 760px);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  overflow: hidden;
 }
 
 .eks-review-exception-modal h2 {
   margin-bottom: 6px;
 }
 
-.eks-exception-summary {
-  margin: 4px 0 10px;
-  font-weight: var(--font-semibold, 600);
-  overflow-wrap: anywhere;
-}
-
-.eks-exception-controls,
 .eks-exception-pager,
 .eks-review-exception-actions {
   display: flex;
@@ -508,51 +504,66 @@
   margin: 12px 0;
 }
 
-.eks-selection-count {
-  color: var(--text-accent);
+.eks-review-modal-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--eks-border);
+  background: var(--background-primary);
+}
+
+.eks-review-modal-header button {
+  margin-top: 8px;
+}
+
+.eks-review-plain-reason {
+  color: var(--text-warning);
   font-weight: var(--font-semibold, 600);
 }
 
-.eks-review-exception-list {
-  display: grid;
-  gap: 12px;
-  max-height: min(58vh, 620px);
+.eks-review-modal-body {
+  min-height: 0;
   overflow-y: auto;
-  padding: 2px 4px 2px 2px;
+  padding: 12px 4px;
 }
 
-.eks-review-exception-item {
+.eks-evidence-comparison {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.eks-review-pane {
+  min-width: 0;
   border: 1px solid var(--eks-border, var(--background-modifier-border));
   border-radius: var(--radius-m, 6px);
-  background: var(--background-primary);
-  padding: 12px;
-  overflow: hidden;
-  overflow-wrap: anywhere;
+  padding: 10px;
 }
 
-.eks-review-exception-item:focus-within {
+.eks-review-pane:focus-within,
+.eks-review-exception-modal button:focus-visible,
+.eks-review-exception-modal summary:focus-visible {
   border-color: var(--interactive-accent);
-  box-shadow: 0 0 0 2px var(--background-modifier-border-focus);
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
 }
 
-.eks-review-exception-head {
-  display: grid;
-  grid-template-columns: 20px minmax(0, 1fr);
-  align-items: start;
-  gap: 8px;
+.eks-review-pane h4 {
+  margin: 0 0 8px;
 }
 
-.eks-exception-title {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 6px;
+.eks-review-pane-scroll {
+  height: clamp(180px, 34vh, 360px);
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding-right: 4px;
 }
 
-.eks-review-exception-item h3 {
-  margin: 10px 0 6px;
-  font-size: 1em;
+.eks-automatic-pass {
+  margin-top: 10px;
+  color: var(--text-success);
 }
 
 .eks-exception-fact,
@@ -584,6 +595,42 @@
 
 .eks-technical-details {
   margin-top: 8px;
+}
+
+.eks-review-exception-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  padding-top: 10px;
+  border-top: 1px solid var(--eks-border);
+  background: var(--background-primary);
+}
+
+.eks-more-actions {
+  position: relative;
+}
+
+.eks-more-actions > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 5px 10px;
+  border: 1px solid var(--interactive-normal);
+  border-radius: var(--button-radius, 5px);
+}
+
+.eks-more-actions-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 4;
+  min-width: 220px;
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--eks-border);
+  border-radius: var(--radius-m, 6px);
+  background: var(--background-primary);
+  box-shadow: var(--shadow-s);
 }
 
 .eks-technical-details > summary {
@@ -682,12 +729,11 @@
     flex: 1 1 auto;
   }
 
-  .eks-review-exception-item {
-    padding: 10px;
+  .eks-evidence-comparison {
+    grid-template-columns: minmax(0, 1fr);
   }
 
-  .eks-review-exception-actions button,
-  .eks-exception-controls button {
+  .eks-review-exception-actions button {
     flex: 1 1 100%;
   }
 }

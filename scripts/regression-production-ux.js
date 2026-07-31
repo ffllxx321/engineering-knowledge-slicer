@@ -12,8 +12,13 @@ function item(index, failure = false) {
   return {
     atom_id: `A${index}`, status: 'pending',
     reasons: failure ? ['evidence locator missing'] : ['可信度略低，需确认'],
-    validationReport: { hardGateFailures: failure ? ['EVIDENCE_NOT_FOUND'] : [] },
-    atom: { title: `条目 ${index}` }, proposed_card: { card_id: `C${index}` }
+    validationReport: {
+      evidenceFound: true,
+      materialDifferenceStatus: failure ? 'conflict' : 'matched',
+      hardGateFailures: failure ? ['FACT_CONFLICT'] : [],
+      nonOverridableFailures: failure ? ['FACT_CONFLICT'] : []
+    },
+    atom: { title: `条目 ${index}`, source: { provenance_verified: true } }, proposed_card: { card_id: `C${index}` }
   };
 }
 
@@ -27,10 +32,10 @@ const diagnostic = { reasons: ['schema invalid'], code: 'SCHEMA_42', atom: { id:
 assert.strictEqual(ux.explainIssue(diagnostic).technical, diagnostic);
 
 const items = Array.from({ length: 40 }, (_, index) => item(index + 1, index >= 38));
-const selection = review.reviewSelection(items, items.map((entry) => entry.atom_id));
+const selection = review.safeApprovalPlan(items);
 assert.deepStrictEqual(
-  { total: selection.total, eligible: selection.eligible, selectedEligible: selection.selectedEligible, selectedIneligible: selection.selectedIneligible },
-  { total: 40, eligible: 38, selectedEligible: 38, selectedIneligible: 2 }
+  { total: selection.total, eligible: selection.eligible, blocked: selection.blocked },
+  { total: 40, eligible: 38, blocked: 2 }
 );
 assert(selection.eligibleIds.every((id) => !['A39', 'A40'].includes(id)));
 assert.strictEqual(review.isApprovalEligible(items[38]), false);
@@ -42,8 +47,10 @@ assert.strictEqual((lowerSummary.match(/待处理队列/g) || []).length, 0, 'au
 const compactQueue = source.slice(source.indexOf('renderQueue(parent, tasks)'), source.indexOf('renderQueueLegacy(parent, tasks)'));
 assert(!compactQueue.includes("'待自动处理'"), 'compact summary must not duplicate queue state');
 assert(source.includes("text: '技术详情'") && source.includes('JSON.stringify({'));
-assert(source.includes('pageSize = 20') && source.includes("role: 'listitem'"));
-assert(css.includes('.eks-review-exception-item') && css.includes('gap: 12px') && css.includes(':focus-within'));
+assert(source.includes('safeApprovalPlan(this.items)') && !source.slice(
+  source.indexOf('class ReviewExceptionModal'), source.indexOf('class UploadConfirmModal')
+).includes("type: 'checkbox'"));
+assert(css.includes('.eks-review-pane-scroll') && css.includes('gap: 12px') && css.includes(':focus-visible'));
 
 assert.strictEqual(ux.pipelineProgress({ status: 'summarizing', progress: { completedWork: 40 } }, { stage: 'parsing' }).completedWork, 40);
 assert(ux.pipelineProgress({ status: 'writing' }, { stage: 'writing', batchIndex: 99, batchTotal: 99 }).completedWork < 100);

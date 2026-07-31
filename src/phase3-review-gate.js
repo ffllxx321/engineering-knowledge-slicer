@@ -79,8 +79,12 @@ function classifyCandidate(candidate, route = {}) {
   if (candidate.reusable_knowledge_candidate === true || reasons.has('reuse_promotion')) {
     hardRisks.push('company_reuse_promotion');
   }
-  if (reasons.has('critical_fact_conflict')
-      || (reasons.has('conflicting_facts') && conflictSignature(candidate))) {
+  const differenceStatus = text(candidate.material_difference_status
+    || candidate.material_differences?.status, 80);
+  const blockingDifference = ['missing_in_evidence', 'unsupported_addition', 'conflict',
+    'ambiguous_conversion', 'strengthened_obligation', 'weakened_obligation',
+    'changed_obligation', 'invented_condition', 'removed_condition_or_exception'].includes(differenceStatus);
+  if (reasons.has('critical_fact_conflict') || blockingDifference) {
     hardRisks.push('critical_fact_conflict');
   } else if (reasons.has('conflicting_facts')) {
     notices.push('noncritical_difference');

@@ -42,10 +42,10 @@ function main() {
     candidate('normal', { confidence: 0.01 }),
     candidate('notice', { review_reasons: ['ambiguous_category'] }),
     candidate('owner', { review_reasons: ['ambiguous_project'] }),
-    candidate('amount', { review_reasons: ['conflicting_facts'], facts: { amounts: ['10', '11'] } }),
+    candidate('amount', { review_reasons: ['conflicting_facts'], material_difference_status: 'conflict', facts: { amounts: ['10', '11'] } }),
     candidate('date', { review_reasons: ['critical_fact_conflict'], facts: { dates: ['A', 'B'] } }),
-    candidate('unit', { review_reasons: ['conflicting_facts'], facts: { units: ['x', 'y'] } }),
-    candidate('status', { review_reasons: ['conflicting_facts'], facts: { statuses: ['m', 'n'] } }),
+    candidate('unit', { review_reasons: ['conflicting_facts'], material_difference_status: 'ambiguous_conversion', facts: { units: ['x', 'y'] } }),
+    candidate('status', { review_reasons: ['critical_fact_conflict'], facts: { statuses: ['m', 'n'] } }),
     candidate('missing', { evidence: null }),
     candidate('unsupported', { review_reasons: ['unsupported_invented_facts'] }),
     candidate('reuse', { reusable_knowledge_candidate: true })

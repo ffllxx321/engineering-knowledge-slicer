@@ -7,7 +7,9 @@
  */
 const crypto = require('crypto');
 
-const PIPELINE_VERSION = '3.0';
+const PIPELINE_VERSION = '3.1';
+const OUTPUT_LANGUAGE = 'zh-CN';
+const TRANSLATION_VERSION = 'universal-zh-v1';
 const SEMANTIC_KINDS = Object.freeze([
   'fact', 'requirement', 'decision', 'action', 'process', 'method', 'parameter',
   'risk', 'issue', 'experience', 'commercial_term', 'schedule', 'entity_profile',
@@ -25,7 +27,12 @@ const TAG_SYNONYMS = Object.freeze({
   '质量管理': '质量', '品质': '质量', '安全管理': '安全', '工期': '时间',
   '进度': '时间', '造价': '成本', '报价': '成本', '供应商': '供应链',
   '分包商': '供应链', '施工工艺': '工艺', '技术方法': '工艺',
-  '合同条款': '合同', '规范': '标准', '标准规范': '标准'
+  '合同条款': '合同', '规范': '标准', '标准规范': '标准',
+  quality: '质量', 品質管理: '质量', safety: '安全', 安全管理: '安全',
+  schedule: '时间', 工期: '时间', cost: '成本', price: '成本', 見積: '成本',
+  supplier: '供应链', サプライヤー: '供应链', subcontractor: '供应链',
+  contract: '合同', 契約: '合同', standard: '标准', 規格: '标准',
+  requirement: '要求', 要求事項: '要求', risk: '风险', リスク: '风险'
 });
 const KIND_TAG = Object.freeze({
   fact: '事实', requirement: '要求', decision: '决策', action: '行动',
@@ -65,6 +72,58 @@ const uniq = (items) => [...new Set((items || []).filter((item) => item !== unde
   .map((item) => clean(String(item), 160)).filter(Boolean))];
 const score = (text, patterns) => patterns.reduce((total, pattern) => total + (pattern.test(text) ? 1 : 0), 0);
 
+function detectLanguage(text) {
+  const value = clean(text, 30000);
+  const counts = {
+    han: (value.match(/\p{Script=Han}/gu) || []).length,
+    hiragana: (value.match(/\p{Script=Hiragana}/gu) || []).length,
+    katakana: (value.match(/\p{Script=Katakana}/gu) || []).length,
+    latin: (value.match(/[A-Za-z]/g) || []).length
+  };
+  const meaningful = counts.han + counts.hiragana + counts.katakana + counts.latin;
+  const japanese = counts.hiragana + counts.katakana;
+  let language = 'unknown';
+  if (meaningful) {
+    const hasJa = japanese >= 2;
+    const hasHan = counts.han >= 2;
+    const hasEn = counts.latin >= 4;
+    if ((hasJa && hasEn) || (hasEn && hasHan && !hasJa)) language = 'mixed';
+    else if (hasJa) language = 'ja';
+    else if (hasHan) language = 'zh';
+    else if (hasEn) language = 'en';
+  }
+  const dominant = Math.max(counts.han, japanese, counts.latin);
+  return {
+    language, confidence: meaningful ? Math.min(0.99, 0.55 + dominant / Math.max(1, meaningful) * 0.44) : 0,
+    script_evidence: counts
+  };
+}
+
+const SIMPLE_RENDERINGS = Object.freeze([
+  [/\bshall\b|\bmust\b|\brequired to\b/gi, '必须'],
+  [/\bshall not\b|\bmust not\b|\bprohibited\b/gi, '不得'],
+  [/\bshould\b/gi, '宜'], [/\bmay\b/gi, '可以'],
+  [/しなければならない|すること|必須/g, '必须'], [/してはならない|禁止/g, '不得'],
+  [/望ましい|べき/g, '宜'], [/してもよい|可能/g, '可以'],
+  [/\brequirement(s)?\b/gi, '要求'], [/\brisk(s)?\b/gi, '风险'],
+  [/\bdecision(s)?\b/gi, '决策'], [/\baction item(s)?\b/gi, '行动项'],
+  [/\bschedule\b/gi, '计划'], [/\bmethod\b/gi, '方法'], [/\bprocess\b/gi, '流程'],
+  [/要求事項/g, '要求'], [/リスク/g, '风险'], [/決定事項/g, '决策'],
+  [/対応事項/g, '行动项'], [/工程/g, '流程'], [/方法/g, '方法']
+]);
+
+function deterministicChinese(text) {
+  let output = clean(text, 30000);
+  let changed = false;
+  for (const [pattern, replacement] of SIMPLE_RENDERINGS) {
+    const next = output.replace(pattern, replacement);
+    if (next !== output) changed = true;
+    output = next;
+  }
+  const remaining = detectLanguage(output).language;
+  return { text: output, safe: changed && !['ja', 'en', 'mixed'].includes(remaining) };
+}
+
 function normalizeLocator(raw, fallback) {
   const locator = raw && typeof raw === 'object' ? raw : {};
   const result = {};
@@ -93,6 +152,7 @@ function canonicalizeDocument(input = {}) {
     const blockId = clean(raw?.block_id, 160) || `blk-${digest([source.source_document_id || source.source_hash || 'source', order, rawText]).slice(0, 20)}`;
     return {
       block_id: blockId, order, kind, text: rawText,
+      source_language: detectLanguage(rawText),
       hierarchy, locator: normalizeLocator(raw?.locator, blockId),
       parse_status: clean(raw?.parse?.status, 40) || (rawText ? 'present' : 'missing'),
       metadata, provenance: Array.isArray(raw?.provenance) ? raw.provenance : []
@@ -106,6 +166,8 @@ function canonicalizeDocument(input = {}) {
     source_hash: clean(source.source_hash, 128), source_path: clean(source.source_path, 1000),
     title: clean(source.title || source.filename, 400) || '未命名资料',
     media_type: clean(source.media_type || source.source_type, 120) || 'unknown',
+    source_language: detectLanguage(blocks.map((block) => block.text).join('\n')),
+    output_language: OUTPUT_LANGUAGE,
     metadata: source.metadata && typeof source.metadata === 'object' ? { ...source.metadata } : {},
     blocks, fingerprint: digest(blocks.map(({ kind, text, hierarchy }) => ({ kind, text, hierarchy })))
   };
@@ -113,19 +175,19 @@ function canonicalizeDocument(input = {}) {
 
 function semanticSignals(text) {
   const patterns = {
-    requirement: [/必须|应当|不得|须|shall|must|required/i],
-    decision: [/决定|决议|批准|同意|确定|adopted|approved/i],
-    action: [/责任人|负责人|待办|完成日期|行动项|follow[- ]?up|action/i],
-    process: [/流程|程序|步骤|审批|process|procedure/i],
-    method: [/方法|工艺|做法|施工方案|method|technique/i],
+    requirement: [/必须|应当|不得|须|shall|must|required|しなければならない|すること|必須|禁止|べき/i],
+    decision: [/决定|决议|批准|同意|确定|adopted|approved|決定|決議|承認|合意/i],
+    action: [/责任人|负责人|待办|完成日期|行动项|follow[- ]?up|action|担当者|対応事項|期限/i],
+    process: [/流程|程序|步骤|审批|process|procedure|工程|手順|承認フロー/i],
+    method: [/方法|工艺|做法|施工方案|method|technique|工法|施工方法/i],
     parameter: [/\d+(?:\.\d+)?\s*(?:mm|cm|m|kg|t|mpa|%|元|万元|天|日|小时)\b/i, /型号|规格|参数|阈值|允许偏差/i],
-    risk: [/风险|隐患|可能导致|应急|risk|hazard/i],
-    issue: [/问题|缺陷|争议|未解决|issue|defect/i],
-    experience: [/经验|教训|复盘|建议|lesson|retrospective/i],
-    commercial_term: [/报价|付款|合同价|税率|保函|索赔|违约|payment|price|contract/i],
-    schedule: [/进度|工期|里程碑|开工|完工|计划日期|schedule|milestone/i],
-    entity_profile: [/客户|业主|供应商|分包商|公司|联系人|client|supplier/i],
-    correspondence: [/发件人|收件人|主题|抄送|函|回复|from:|to:|subject:/i]
+    risk: [/风险|隐患|可能导致|应急|risk|hazard|リスク|危険/i],
+    issue: [/问题|缺陷|争议|未解决|issue|defect|問題|不具合|未解決/i],
+    experience: [/经验|教训|复盘|建议|lesson|retrospective|経験|教訓|振り返り/i],
+    commercial_term: [/报价|付款|合同价|税率|保函|索赔|违约|payment|price|contract|見積|支払|契約|違約/i],
+    schedule: [/进度|工期|里程碑|开工|完工|计划日期|schedule|milestone|日程|工期|着工|完了/i],
+    entity_profile: [/客户|业主|供应商|分包商|公司|联系人|client|supplier|顧客|発注者|会社|担当者/i],
+    correspondence: [/发件人|收件人|主题|抄送|函|回复|from:|to:|subject:|差出人|宛先|件名|返信/i]
   };
   return Object.fromEntries(Object.entries(patterns).map(([key, values]) => [key, score(text, values)]));
 }
@@ -188,6 +250,7 @@ function segmentDocument(document) {
   const flush = () => {
     if (!current) return;
     current.text = current.blocks.map((block) => block.text).filter(Boolean).join('\n');
+    current.source_language = detectLanguage(current.text);
     current.region_id = `reg-${digest([document.source_document_id, current.blocks.map((block) => block.block_id), current.semantic_kind]).slice(0, 24)}`;
     current.fingerprint = digest([current.semantic_kind, current.subject, current.text]);
     regions.push(current); current = null;
@@ -238,6 +301,130 @@ function extractFacts(text) {
   return { numbers: uniq(numbers), dates: uniq(dates), models: uniq(models) };
 }
 
+function protectedTokens(text) {
+  return uniq([
+    ...extractFacts(text).numbers, ...extractFacts(text).dates, ...extractFacts(text).models,
+    ...[...text.matchAll(/\b(?:ISO|IEC|JIS|GB|EN|ASTM|DIN)[ -]?[A-Z0-9./:-]+\b/gi)].map((match) => match[0]),
+    ...[...text.matchAll(/\b[A-Z][A-Za-z0-9]*(?:[-_/][A-Za-z0-9]+)+\b/g)].map((match) => match[0])
+  ]);
+}
+
+function validateTranslationResult(requested, response) {
+  const rows = Array.isArray(response) ? response : response?.translations;
+  if (!Array.isArray(rows)) throw Object.assign(new Error('翻译提供商未返回 translations 数组'), { code: 'TRANSLATION_SCHEMA_INVALID' });
+  const expected = requested.map((item) => item.region_id);
+  const actual = rows.map((item) => clean(item?.region_id, 160));
+  if (new Set(actual).size !== actual.length || expected.length !== actual.length
+    || expected.some((id) => !actual.includes(id)) || actual.some((id) => !expected.includes(id))) {
+    throw Object.assign(new Error('翻译区域 ID 不完整或包含额外 ID'), {
+      code: 'TRANSLATION_REGION_IDS_INVALID', expected_region_ids: expected, actual_region_ids: actual
+    });
+  }
+  return rows.map((row) => {
+    const translated = clean(row.translated_text, 30000);
+    const language = detectLanguage(translated);
+    if (!translated || language.language === 'ja' || language.language === 'en'
+      || language.script_evidence.han < 2) {
+      throw Object.assign(new Error(`区域 ${row.region_id} 未生成简体中文`), { code: 'TRANSLATION_NOT_CHINESE' });
+    }
+    const source = requested.find((item) => item.region_id === row.region_id);
+    const missing = protectedTokens(source.text).filter((token) => !translated.includes(token));
+    if (missing.length) throw Object.assign(new Error(`区域 ${row.region_id} 丢失受保护标识：${missing.join('、')}`), {
+      code: 'TRANSLATION_FIDELITY_INVALID', region_id: row.region_id, missing
+    });
+    return { region_id: row.region_id, translated_text: translated };
+  });
+}
+
+function translationCacheKey(region, options = {}) {
+  return digest([
+    clean(region.text, 30000).normalize('NFKC').replace(/\s+/g, ' '),
+    region.source_language?.language || 'unknown', OUTPUT_LANGUAGE,
+    options.translation_prompt_version || TRANSLATION_VERSION,
+    options.model_version || 'configured-provider'
+  ]);
+}
+
+async function translateRegions(regions, options = {}) {
+  const cache = options.translation_cache && typeof options.translation_cache === 'object'
+    ? { ...options.translation_cache } : {};
+  const telemetry = {
+    regions: [], cache_hits: 0, cache_misses: 0, provider_calls: 0,
+    provider_tokens: 0, failures: 0, fallback_count: 0
+  };
+  const pending = [];
+  for (const region of regions) {
+    const language = region.source_language || detectLanguage(region.text);
+    region.source_language = language;
+    if (region.semantic_kind === 'noise') continue;
+    if (language.language === 'zh') {
+      region.translated_text = region.text;
+      region.translation = { status: 'not_required', version: TRANSLATION_VERSION, provenance: 'source-zh' };
+      telemetry.regions.push({ region_id: region.region_id, source_language: 'zh', status: 'not_required' });
+      continue;
+    }
+    const key = translationCacheKey(region, options);
+    if (cache[key]?.translated_text) {
+      region.translated_text = cache[key].translated_text;
+      region.translation = { status: 'translated', version: TRANSLATION_VERSION, provenance: 'cache', cache_key: key };
+      telemetry.cache_hits += 1;
+      telemetry.regions.push({ region_id: region.region_id, source_language: language.language, status: 'cache_hit' });
+      continue;
+    }
+    const local = deterministicChinese(region.text);
+    if (local.safe) {
+      region.translated_text = local.text;
+      region.translation = { status: 'translated', version: TRANSLATION_VERSION, provenance: 'deterministic', cache_key: key };
+      cache[key] = { translated_text: local.text, source_language: language.language, version: TRANSLATION_VERSION };
+      telemetry.fallback_count += 1;
+      telemetry.regions.push({ region_id: region.region_id, source_language: language.language, status: 'deterministic' });
+      continue;
+    }
+    telemetry.cache_misses += 1;
+    pending.push({ region, key });
+  }
+  if (pending.length && typeof options.translate_batch !== 'function') {
+    throw Object.assign(new Error('存在非中文知识区域，但未配置可恢复的翻译提供商'), {
+      code: 'TRANSLATION_REQUIRED', retryable: true,
+      checkpoint: { cache, missing_region_ids: pending.map((item) => item.region.region_id), telemetry }
+    });
+  }
+  const batchSize = Math.max(1, Math.min(20, Number(options.translation_batch_size) || 8));
+  for (let offset = 0; offset < pending.length; offset += batchSize) {
+    const batch = pending.slice(offset, offset + batchSize);
+    const request = batch.map(({ region }) => ({
+      region_id: region.region_id, source_language: region.source_language.language,
+      text: region.text, preserve_exactly: protectedTokens(region.text)
+    }));
+    try {
+      telemetry.provider_calls += 1;
+      const response = await options.translate_batch(request, {
+        target_language: OUTPUT_LANGUAGE, prompt_version: options.translation_prompt_version || TRANSLATION_VERSION,
+        contract: '只返回 translations；区域 ID 必须完整且无额外项；保留名称、代码、标准、数字、日期、单位、模态、条件和例外。'
+      });
+      const validated = validateTranslationResult(request, response);
+      telemetry.provider_tokens += Number(response?.usage?.total_tokens) || 0;
+      for (const row of validated) {
+        const item = batch.find(({ region }) => region.region_id === row.region_id);
+        item.region.translated_text = row.translated_text;
+        item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
+          provenance: 'configured-provider', cache_key: item.key };
+        cache[item.key] = { translated_text: row.translated_text,
+          source_language: item.region.source_language.language, version: TRANSLATION_VERSION };
+        telemetry.regions.push({ region_id: row.region_id,
+          source_language: item.region.source_language.language, status: 'provider' });
+      }
+    } catch (error) {
+      telemetry.failures += batch.length;
+      throw Object.assign(new Error(`翻译批次失败：${error.message}`), {
+        code: error.code || 'TRANSLATION_PROVIDER_FAILED', retryable: true, cause: error,
+        checkpoint: { cache, missing_region_ids: pending.slice(offset).map((item) => item.region.region_id), telemetry }
+      });
+    }
+  }
+  return { regions, cache, telemetry };
+}
+
 function routeUnit(unit, profile, options = {}) {
   const state = clean(profile.lifecycle || unit.status, 80).toLowerCase();
   const projectSpecific = unit.project_ids.length > 0 || unit.scope === 'project';
@@ -279,15 +466,24 @@ function normalizeKnowledgeUnit(raw, context = {}) {
     : ({ commitment: 'requirement', quotation: 'commercial_term', material: 'parameter',
       acceptance_criterion: 'requirement', clarification: 'correspondence',
       contract_obligation: 'commercial_term', project_lesson: 'experience' }[raw.item_type] || 'fact');
-  const statement = clean(raw.statement || raw.summary || raw.content || raw.title, 8000);
+  const statement = clean(raw.translated_statement || raw.statement || raw.summary || raw.content || raw.title, 8000);
+  const originalStatement = clean(raw.original_statement || raw.statement || raw.summary || raw.content || raw.title, 8000);
   const sourceId = clean(raw.source_document_id || context.source_document_id, 300);
   const projectIds = uniq(raw.project_ids || (raw.project_id ? [raw.project_id] : context.project_ids || []));
-  const fingerprint = digest({ kind, statement: statement.toLocaleLowerCase().replace(/\s+/g, ''), projectIds,
+  const fingerprint = digest({ kind, source_meaning: clean(raw.source_meaning_fingerprint, 128)
+      || originalStatement.toLocaleLowerCase().replace(/\s+/g, ''), projectIds,
     evidence: evidence.map((item) => [item.block_id, item.locator]) });
   return {
     schema_version: 'knowledge-unit/1.0', unit_id: clean(raw.unit_id || raw.candidate_id || raw.card_id, 300) || `ku-${fingerprint.slice(0, 24)}`,
-    fingerprint, title: clean(raw.title, 180) || clean(statement.split(/[。；;\n]/)[0], 120) || '知识单元',
-    statement, semantic_kind: kind, subject: clean(raw.subject, 300) || clean(raw.title, 300),
+    fingerprint, title: clean(raw.translated_title || raw.title, 180) || clean(statement.split(/[。；;\n]/)[0], 120) || '知识单元',
+    original_title: clean(raw.original_title || raw.title, 180),
+    translated_title: clean(raw.translated_title || raw.title, 180) || clean(statement.split(/[。；;\n]/)[0], 120),
+    statement, original_statement: originalStatement, translated_statement: statement,
+    source_language: clean(raw.source_language?.language || raw.source_language, 20) || detectLanguage(originalStatement).language,
+    output_language: OUTPUT_LANGUAGE,
+    translation: raw.translation || { status: detectLanguage(originalStatement).language === 'zh' ? 'not_required' : 'legacy_default',
+      version: TRANSLATION_VERSION, provenance: 'deterministic-migration' },
+    semantic_kind: kind, subject: clean(raw.subject, 300) || clean(raw.title, 300),
     scope: clean(raw.scope, 120) || (projectIds.length ? 'project' : 'general'),
     applicable_conditions: uniq(raw.applicable_conditions || raw.conditions),
     exceptions: uniq(raw.exceptions), project_ids: projectIds, entity_ids: uniq(raw.entity_ids),
@@ -324,8 +520,14 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
       ...region.blocks.flatMap((block) => [block.metadata.project_id, block.metadata.project_name])
     ]);
     const raw = {
-      semantic_kind: region.semantic_kind, title: region.subject, subject: region.subject,
-      statement: region.text, evidence, project_ids: projectIds,
+      semantic_kind: region.semantic_kind,
+      title: region.translated_text ? clean(region.translated_text.split(/[。；;\n]/)[0], 120) : region.subject,
+      original_title: region.subject,
+      translated_title: region.translated_text ? clean(region.translated_text.split(/[。；;\n]/)[0], 120) : region.subject,
+      subject: region.subject, statement: region.translated_text || region.text,
+      original_statement: region.text, translated_statement: region.translated_text || region.text,
+      source_language: region.source_language, translation: region.translation,
+      source_meaning_fingerprint: region.fingerprint, evidence, project_ids: projectIds,
       source_document_id: document.source_document_id, source_region_ids: [region.region_id],
       scope: projectIds.length ? 'project' : 'general', status: profile.lifecycle,
       authority: profile.authority,
@@ -453,9 +655,46 @@ function runUniversalPipeline(input = {}) {
   };
 }
 
+async function runUniversalPipelineMultilingual(input = {}) {
+  const document = canonicalizeDocument(input.document || input);
+  const profile = inferProfile(document);
+  const regions = segmentDocument(document);
+  const translated = await translateRegions(regions, input);
+  let planned = planKnowledgeUnits(document, profile, translated.regions, input);
+  planned = repairCoverage(document, profile, translated.regions, planned, input);
+  const relations = relationEvidence(planned.units);
+  for (const relation of relations) {
+    const source = planned.units.find((unit) => unit.unit_id === relation.from_unit_id);
+    if (source) source.relations.push(relation);
+  }
+  const meaningful = regions.filter((region) => region.semantic_kind !== 'noise').length;
+  const covered = Object.values(planned.coverage).filter((entry) => ['covered', 'merged'].includes(entry.status)).length;
+  const review = groupedReview(planned.units);
+  return {
+    schema_version: 'universal-pipeline/1.1', pipeline_version: PIPELINE_VERSION,
+    output_language: OUTPUT_LANGUAGE, document, profile, regions: translated.regions,
+    knowledge_units: planned.units, coverage: planned.coverage,
+    repaired_region_ids: planned.repaired_region_ids, relations, review_decisions: review,
+    translation_cache: translated.cache, translation_checkpoint: { status: 'complete', missing_region_ids: [] },
+    telemetry: {
+      parse_blocks: document.blocks.length, semantic_regions: regions.length,
+      planned_units: planned.units.length, semantic_coverage: meaningful ? covered / meaningful : 1,
+      compression_ratio: meaningful ? planned.units.length / meaningful : 0,
+      llm_calls: translated.telemetry.provider_calls, llm_tokens: translated.telemetry.provider_tokens,
+      cache_hits: translated.telemetry.cache_hits, translation: translated.telemetry,
+      accepted: planned.units.length - review.flatMap((group) => group.unit_ids).length,
+      review: review.length, rejected: regions.filter((region) => region.semantic_kind === 'noise').length,
+      relations: relations.length, writes: 0
+    },
+    cache_key: digest([document.fingerprint, PIPELINE_VERSION,
+      input.translation_prompt_version || TRANSLATION_VERSION, input.model_version || 'configured-provider'])
+  };
+}
+
 module.exports = {
-  PIPELINE_VERSION, SEMANTIC_KINDS, REGION_KINDS, TAG_SYNONYMS,
+  PIPELINE_VERSION, OUTPUT_LANGUAGE, TRANSLATION_VERSION, SEMANTIC_KINDS, REGION_KINDS, TAG_SYNONYMS,
+  detectLanguage, deterministicChinese, validateTranslationResult, translationCacheKey, translateRegions,
   canonicalizeDocument, inferProfile, segmentDocument, normalizeKnowledgeUnit,
   normalizeTags, routeUnit, planKnowledgeUnits, repairCoverage, relationEvidence,
-  groupedReview, runUniversalPipeline, digest, stableJson
+  groupedReview, runUniversalPipeline, runUniversalPipelineMultilingual, digest, stableJson
 };

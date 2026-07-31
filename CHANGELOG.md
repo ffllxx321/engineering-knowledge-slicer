@@ -1,5 +1,12 @@
 # 工程知识切片 变更记录
 
+## v2.20.2 — 2026-07-31 中日英输入与简体中文输出
+
+- 通用管线按 canonical block/语义区域检测 `zh/ja/en/mixed/unknown`，记录置信度和字符证据；中日英义务、决策、行动、流程、方法、参数、风险、问题、经验、商务、计划、实体和往来信号归一到同一语义类型、路由和受控标签。
+- 中文知识区域零翻译调用；非中文知识区域先走安全确定性词汇，再按区域指纹、源语言、`zh-CN`、prompt/model 版本缓存并限量批处理。严格校验完整 region ID、中文结果和代码/标准/数字/日期/单位保真，失败保存可重试 checkpoint，禁止把日英原文冒充中文正文。
+- 知识单元补齐源语言、`output_language: zh-CN`、原文/译文标题与陈述及翻译状态/来源/版本；稳定身份绑定源语义与证据，翻译措辞或版本变化不制造重复卡片，旧中文 artifact 使用确定性默认值。
+- Markdown 与审核内容保持中文，原文证据和定位不翻译，另列“证据中文译文”；不显示翻译 JSON。新增语言检测、跨语言等价、混合区域、模态/条件/例外、标识保留、零调用、批量缓存/续传/部分失败、严格 ID、幂等和 writer 展示回归。
+
 ## v2.20.1 — 2026-07-31 唯一通用生产路径修正
 
 - `structured-pilot` 与 `structured-write` 在解析后直接进入 canonical document → universal result → writer；不再执行旧卡片 workflow、`runPhase2CandidatePipeline` 或 `evaluatePhase3`，也不再从 accepted/review 卡片重建候选。

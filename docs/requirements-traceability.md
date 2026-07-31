@@ -13,6 +13,9 @@
 | 四记录、完整计划、事务/回滚 | `buildCanonicalRecords`、`buildPlan`、`commitPlan` | universal E2E + existing writer rollback suites |
 | 少量分组审核、无正常 UI JSON | `groupedReview`、`humanLocator` | grouped review/Markdown assertions |
 | 生产接线与内置回退 | `runStructuredWriterPhase`、embedded module | embed/build/builtin fallback suites |
+| 区域语言检测与中日英语义归一 | `detectLanguage`、`semanticSignals` | `test-multilingual-zh-output` |
+| zh-CN 输出、证据原文与稳定身份 | `normalizeKnowledgeUnit`、`serializeRecord` | cross-language/writer/idempotence assertions |
+| 批量翻译、缓存续传与严格完整性 | `translateRegions`、`validateTranslationResult` | zero-call/cache/partial failure/missing-ID assertions |
 
 架构与用户配置边界见 `docs/universal-enterprise-knowledge-pipeline-v220.md`。
 

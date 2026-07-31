@@ -168,6 +168,8 @@ function serializeRecord(record) {
     if (record[key]) frontmatter.push(`${key}: ${yamlScalar(record[key])}`);
   }
   if (record.semantic_kind) frontmatter.push(`semantic_kind: ${yamlScalar(record.semantic_kind)}`);
+  if (record.source_language) frontmatter.push(`source_language: ${yamlScalar(record.source_language)}`);
+  frontmatter.push(`output_language: ${yamlScalar(record.output_language || 'zh-CN')}`);
   if (record.tags?.length) frontmatter.push(`tags: ${yamlArray(record.tags)}`);
   for (const key of ['project_ids', 'source_document_ids', 'business_item_ids', 'company_knowledge_ids']) {
     if (record[key]?.length) frontmatter.push(`${key}: ${yamlArray(record[key])}`);
@@ -176,8 +178,11 @@ function serializeRecord(record) {
   const body = [];
   if (record.summary) body.push('## 内容', '', record.summary, '');
   if (record.evidence?.verbatim) {
-    body.push('## 来源证据', '', `> ${clean(record.evidence.verbatim, 4000).replace(/\n/g, '\n> ')}`, '',
+    body.push('## 来源证据（原文）', '', `> ${clean(record.evidence.verbatim, 4000).replace(/\n/g, '\n> ')}`, '',
       `定位：${humanLocator(record.evidence.locator || {})}`, '');
+    if (record.evidence_translation && record.evidence_translation !== record.evidence.verbatim) {
+      body.push('### 证据中文译文', '', `> ${clean(record.evidence_translation, 4000).replace(/\n/g, '\n> ')}`, '');
+    }
   }
   if (relations.length) body.push('## 关系', '', ...relations.map((relation) =>
     `- ${relation.type}：${relationLink(relation)}`), '');
@@ -391,7 +396,11 @@ function buildCanonicalRecords(input, settings) {
       item_type: recordKind === 'business_item' ? unit.semantic_kind : undefined,
       reuse_status: recordKind === 'company_knowledge' ? 'auto_supported' : undefined,
       summary: clean(unit.statement, 8000), evidence: unit.evidence?.[0],
+      evidence_translation: unit.source_language === 'zh' ? '' : clean(unit.translated_statement, 8000),
       evidence_list: unit.evidence, tags: unit.tags, semantic_kind: unit.semantic_kind,
+      source_language: unit.source_language, output_language: unit.output_language || 'zh-CN',
+      original_statement: unit.original_statement, translated_statement: unit.translated_statement,
+      translation: unit.translation,
       conditions: unit.applicable_conditions, exceptions: unit.exceptions,
       structured_facts: unit.structured_facts, confidence: unit.confidence,
       uncertainty: unit.uncertainty, owner_source_id: sourceId,

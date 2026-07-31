@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 function loadBundleModule(id, dependencies = {}) {
   const code = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
@@ -18,6 +19,15 @@ function loadBundleModule(id, dependencies = {}) {
   new Function('require', 'module', 'exports', code.slice(bodyStart, end))(
     (name) => {
       if (Object.hasOwn(dependencies, name)) return dependencies[name];
+      if (name === 'src/core/document-parser.js') {
+        const block = loadBundleModule('src/core/block-v0.js', { crypto });
+        const provenance = loadBundleModule('src/core/provenance.js', { crypto });
+        return loadBundleModule(name, {
+          crypto,
+          'src/core/block-v0.js': block,
+          'src/core/provenance.js': provenance
+        });
+      }
       throw new Error(`未提供依赖：${name}`);
     },
     module,

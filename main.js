@@ -32,6 +32,7 @@ const {
   validateConfiguredPathSet
 } = require("src/core/task.js");
 const { extractTextFromBuffer, sanitizeAttachmentFileName } = require("src/core/extractors.js");
+const { upgradeParsePackage } = require("src/core/document-parser.js");
 const { probeLocalOcr } = require("src/core/local-ocr.js");
 const { createFolderIndexMarkdown, folderIndexPath } = require("src/core/moc.js");
 const { parseTagLibrary, suggestMapIndex, validateCard } = require("src/core/tags.js");
@@ -1323,7 +1324,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           return;
         }
         if (extracted.status === 'review_required' && extracted.parsePackage) {
-          parsePackage = extracted.parsePackage;
+          parsePackage = upgradeParsePackage(extracted.parsePackage, { sourceHash: current.source_hash });
           current.status = 'needs_review';
           current.review_outcome = {
             kind: 'review_required',
@@ -1348,7 +1349,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           return;
         }
         if (extracted.status !== 'ok' || !extracted.parsePackage) throw new Error(extracted.message || '文档解析 API 未返回可用 Markdown');
-        parsePackage = extracted.parsePackage;
+        parsePackage = upgradeParsePackage(extracted.parsePackage, { sourceHash: current.source_hash });
         const localOcrMetrics = parsePackage.metadata?.local_ocr?.metrics;
         if (localOcrMetrics) {
           this.operationCounters.ocrPages += Number(localOcrMetrics.pages_completed) || 0;
@@ -1845,7 +1846,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
             saveOcrCheckpoint: (key, value) => saveCheckpoint(key, value)
           });
           if (extracted.status === 'ok' && extracted.parsePackage) {
-            parsePackage = extracted.parsePackage;
+            parsePackage = upgradeParsePackage(extracted.parsePackage, { sourceHash: task.source_hash });
             await saveCheckpoint('parsed', parsePackage);
           } else {
             reasons.push(extracted.status === 'ocr_required' ? 'OCR_REQUIRED' : 'PARSER_REVIEW_REQUIRED');
@@ -2332,9 +2333,13 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           // Parsed text may be reused after conservative normalization because it
           // prevents repeated OCR.  Persist a current, fingerprinted envelope now;
           // all AI-derived legacy stages are invalidated and rebuilt downstream.
-          await this.persistArtifact(task, 'parsed', legacy);
-          diag('artifact.migrated', { taskId: task.task_id, stage: name, from: 'legacy-raw' });
-          return legacy;
+          const upgraded = upgradeParsePackage(legacy, { sourceHash: task.source_hash });
+          await this.persistArtifact(task, 'parsed', upgraded);
+          diag('artifact.migrated', {
+            taskId: task.task_id, stage: name, from: 'legacy-raw',
+            blockCount: upgraded.blocks.length, contractFingerprint: upgraded.parse_contract?.fingerprint
+          });
+          return upgraded;
         }
         if (name === 'review' && legacy) return migrateReviewArtifact(legacy);
         if (!legacy) {
@@ -2349,6 +2354,19 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         diag('artifact.cacheMiss', { taskId: task.task_id, stage: name, reason: 'fingerprint_changed' });
         return null;
       }
+      if (name === 'parsed') {
+        const upgraded = upgradeParsePackage(parsed.payload, { sourceHash: task.source_hash });
+        if (JSON.stringify(upgraded) !== JSON.stringify(parsed.payload)) {
+          await this.persistArtifact(task, 'parsed', upgraded);
+          diag('artifact.migrated', {
+            taskId: task.task_id, stage: name, from: 'current-envelope',
+            blockCount: upgraded.blocks.length, contractFingerprint: upgraded.parse_contract?.fingerprint
+          });
+        } else {
+          diag('artifact.cacheHit', { taskId: task.task_id, stage: name });
+        }
+        return upgraded;
+      }
       diag('artifact.cacheHit', { taskId: task.task_id, stage: name });
       return name === 'review' ? migrateReviewArtifact(parsed.payload) : parsed.payload;
     } catch { return null; }
@@ -2359,7 +2377,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const file = path && this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return null;
     const parsed = JSON.parse(await this.app.vault.read(file));
-    const payload = parsed && Object.hasOwn(parsed, 'payload') ? parsed.payload : normalizeLegacyArtifact(name, parsed);
+    let payload = parsed && Object.hasOwn(parsed, 'payload') ? parsed.payload : normalizeLegacyArtifact(name, parsed);
+    if (name === 'parsed' && payload) {
+      const upgraded = upgradeParsePackage(payload, { sourceHash: task.source_hash });
+      if (JSON.stringify(upgraded) !== JSON.stringify(payload)) await this.persistArtifact(task, 'parsed', upgraded);
+      payload = upgraded;
+    }
     return name === 'review' ? migrateReviewArtifact(payload) : payload;
   }
 
@@ -12821,6 +12844,125 @@ function createParsePackage(options) {
   };
 }
 
+const PARSE_CONTRACT_VERSION = 'block-runtime-v1';
+
+function upgradeParsePackage(input, options = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+  const markdown = String(input.markdown ?? input.text ?? '');
+  const sourceHash = String(input.source_hash || options.sourceHash || crypto.createHash('sha256').update(markdown).digest('hex'));
+  const parser = normalizeParser(input.parser || options.parser);
+  const originalBlocks = Array.isArray(input.blocks) ? input.blocks.filter(Boolean) : [];
+  const normalizedBlocks = [];
+  for (let order = 0; order < originalBlocks.length; order += 1) {
+    const original = originalBlocks[order];
+    const rawText = String(original?.raw?.text ?? original?.text ?? '');
+    const locator = original?.locator && typeof original.locator === 'object'
+      && String(original.locator.scheme || '').trim() && typeof original.locator.value === 'string'
+      ? original.locator : null;
+    if (!rawText.trim() || !locator) continue;
+    const block = createBlock({
+      source_hash: String(original.source_hash || sourceHash),
+      order: Number.isInteger(original.order) ? original.order : order,
+      block_id: String(original.block_id || original.id || '') || undefined,
+      parent_id: original.parent_id,
+      kind: original.kind || 'text',
+      locator,
+      provenance: Array.isArray(original.provenance) && original.provenance.length ? original.provenance : [locator],
+      raw_text: rawText,
+      raw_fields: original.raw?.fields || original.raw_fields,
+      inferred: original.inferred,
+      parse_method: original.parse?.method || parser,
+      parse_quality: original.parse?.quality,
+      status: original.parse?.status,
+      card_eligible: original.card_eligible !== false,
+      exclusion_reason: original.exclusion_reason,
+      metadata: original.metadata
+    });
+    normalizedBlocks.push(block);
+  }
+  if (!normalizedBlocks.length && markdown.trim()) {
+    const suppliedPages = Array.isArray(input.pages) ? input.pages.filter((page) =>
+      positivePage(page?.page) && typeof page?.text === 'string' && page.text.trim()) : [];
+    if (suppliedPages.length) {
+      for (const [order, page] of suppliedPages.entries()) {
+        normalizedBlocks.push(createBlock({
+          source_hash: sourceHash, order, kind: 'page-text', raw_text: page.text,
+          locator: { scheme: 'page', value: String(page.page), page: positivePage(page.page) },
+          parse_method: parser, metadata: { generated_fallback: true, migrated_legacy: true }
+        }));
+      }
+    } else {
+      normalizedBlocks.push(createBlock({
+        source_hash: sourceHash, order: 0, kind: 'parsed-markdown', raw_text: markdown,
+        locator: { scheme: 'parsed-text-span', value: `chars:0-${markdown.length}`, text_start: 0, text_end: markdown.length },
+        parse_method: parser,
+        metadata: { generated_fallback: true, migrated_legacy: true, page_claimed: false }
+      }));
+    }
+  }
+  const evidenceIndex = {};
+  const spans = [];
+  let searchFrom = 0;
+  for (const block of normalizedBlocks) {
+    const rawText = String(block.raw?.text || '');
+    evidenceIndex[block.block_id] = {
+      block_id: block.block_id, locator: block.locator, raw_text: rawText,
+      card_eligible: block.card_eligible !== false,
+      ...(block.metadata && Object.keys(block.metadata).length ? { metadata: block.metadata } : {})
+    };
+    let start = markdown.indexOf(rawText, searchFrom);
+    if (start < 0) start = markdown.indexOf(rawText);
+    if (start < 0 && block.locator?.scheme === 'parsed-text-span'
+      && Number.isInteger(block.locator.text_start) && Number.isInteger(block.locator.text_end)
+      && markdown.slice(block.locator.text_start, block.locator.text_end) === rawText) {
+      start = block.locator.text_start;
+    }
+    if (start < 0) continue;
+    const end = start + rawText.length;
+    const locator = block.locator || {};
+    spans.push({
+      span_id: `runtime:${block.block_id}`, block_id: block.block_id,
+      start, end, text: rawText, text_hash: crypto.createHash('sha256').update(normalizeContractText(rawText)).digest('hex').slice(0, 16),
+      ...(positivePage(locator.page) ? { page: positivePage(locator.page) } : {}),
+      ...(locator.line_id ? { line_id: locator.line_id } : {}),
+      ...(Array.isArray(locator.bbox) ? { bbox: locator.bbox } : {})
+    });
+    searchFrom = end;
+  }
+  const blockPacks = [];
+  for (const block of normalizedBlocks.filter((item) => item.card_eligible !== false)) {
+    const text = String(block.raw?.text || '');
+    for (let start = 0; start < text.length; start += 4000) {
+      const part = text.slice(start, start + 4000);
+      if (!part.trim()) continue;
+      blockPacks.push({
+        pack_id: `pack-${crypto.createHash('sha256').update(`${block.block_id}\0${start}\0${part}`).digest('hex').slice(0, 20)}`,
+        text: part, token_count: Math.max(1, Math.ceil(part.length / 3)),
+        block_ids: [block.block_id], locators: [block.locator]
+      });
+    }
+  }
+  const contractShape = {
+    version: PARSE_CONTRACT_VERSION, markdown_hash: crypto.createHash('sha256').update(markdown).digest('hex'),
+    blocks: normalizedBlocks.map((block) => ({
+      block_id: block.block_id, locator: block.locator,
+      text_hash: crypto.createHash('sha256').update(String(block.raw?.text || '')).digest('hex')
+    }))
+  };
+  const fingerprint = crypto.createHash('sha256').update(JSON.stringify(contractShape)).digest('hex');
+  return Object.assign({}, input, {
+    markdown, source_hash: input.source_hash || sourceHash, parser,
+    blocks: normalizedBlocks, block_packs: blockPacks,
+    evidence_index: evidenceIndex, evidence_index_version: 'block-evidence-v1',
+    provenance: { version: input.provenance?.version || '1.0', spans },
+    parse_contract: { version: PARSE_CONTRACT_VERSION, fingerprint }
+  });
+}
+
+function normalizeContractText(value) {
+  return String(value || '').normalize('NFKC').replace(/\s+/gu, ' ').trim();
+}
+
 function positivePage(value) {
   const number = Number(value);
   return Number.isInteger(number) && number > 0 ? number : 0;
@@ -12868,6 +13010,8 @@ function clamp(value) {
 module.exports = {
   MAX_MINERU_FILE_BYTES,
   createParsePackage,
+  upgradeParsePackage,
+  PARSE_CONTRACT_VERSION,
   markdownQuality,
   documentPlan
 };
@@ -13800,6 +13944,31 @@ async function summarizeDocument(options) {
     chunk.sourceBlocks = summarySourceBlocks(options.parsePackage, chunk);
     chunk.block_ids = chunk.sourceBlocks.map((block) => block.block_id);
   }
+  const parseContractFingerprint = String(options.parsePackage?.parse_contract?.fingerprint || '');
+  const emptySourceChunks = chunks.filter((chunk) =>
+    String(chunk.markdown || '').trim() && (!chunk.sourceBlocks.length
+      || chunk.sourceBlocks.reduce((sum, block) => sum + String(block.text || '').length, 0) <= 0));
+  if (emptySourceChunks.length) {
+    const error = new Error(`解析产物内部契约不完整：${emptySourceChunks.length}/${chunks.length} 个非空总结分块没有可引用来源块。请保留原文件并从“解析”检查点重试；若仍失败，请导出脱敏诊断报告。`);
+    error.name = 'ParseContractError';
+    error.code = 'PARSE_CONTRACT_SOURCE_BLOCKS_MISSING';
+    error.category = 'internal_parse_contract';
+    error.stage = 'summary-map-preflight';
+    error.retryable = false;
+    error.details = {
+      planned_chunks: chunks.length,
+      non_empty_chunks: chunks.filter((chunk) => String(chunk.markdown || '').trim()).length,
+      zero_source_block_chunks: emptySourceChunks.length,
+      zero_source_span_characters: emptySourceChunks.filter((chunk) =>
+        chunk.sourceBlocks.reduce((sum, block) => sum + String(block.text || '').length, 0) <= 0).length,
+      block_count: Array.isArray(options.parsePackage?.blocks) ? options.parsePackage.blocks.length : 0,
+      evidence_index_count: Object.keys(options.parsePackage?.evidence_index || {}).length,
+      parse_contract_fingerprint: parseContractFingerprint,
+      provider_calls: 0
+    };
+    diag('summary.map.parseContractRejected', error.details);
+    throw error;
+  }
   const partials = new Array(chunks.length);
   diag('summary.map.plan', {
     chunkTotal: chunks.length,
@@ -13809,9 +13978,13 @@ async function summarizeDocument(options) {
   let nextChunkIndex = 0;
   async function summarizeChunk(index) {
     const chunk = chunks[index];
-    const cached = typeof options.loadSummaryMapChunk === 'function'
+    const cachedEnvelope = typeof options.loadSummaryMapChunk === 'function'
       ? await options.loadSummaryMapChunk(chunk)
       : null;
+    const cached = cachedEnvelope?.parseContractFingerprint === parseContractFingerprint
+      ? cachedEnvelope.payload
+      : (!parseContractFingerprint && cachedEnvelope && !Object.hasOwn(cachedEnvelope, 'parseContractFingerprint')
+        ? cachedEnvelope : null);
     const sanitizedCached = cached ? sanitizeSummaryEvidence(
       normalizeSummaryMap(cached, options, chunk),
       { stage: 'summary-map-cache', chunkId: chunk.chunk_id }
@@ -13837,10 +14010,11 @@ async function summarizeDocument(options) {
       });
       return;
     }
-    if (cached) {
+    if (cachedEnvelope) {
       diag('summary.map.cacheMiss', {
         chunkIndex: index + 1, chunkTotal: chunks.length,
-        stableChunkId: chunk.chunk_id, canonicalChunkId: chunk.chunk_id, reason: 'checkpoint_invalid'
+        stableChunkId: chunk.chunk_id, canonicalChunkId: chunk.chunk_id,
+        reason: cached ? 'checkpoint_invalid' : 'parse_contract_changed'
       });
     }
     // v2.7: 把标题层级面包屑（WeKnora ContextHeader）注入 prompt，让 AI 拿到章节语境
@@ -13889,7 +14063,10 @@ async function summarizeDocument(options) {
       ]
     });
     if (typeof options.saveSummaryMapChunk === 'function') {
-      await options.saveSummaryMapChunk(chunk, partials[index]);
+      await options.saveSummaryMapChunk(chunk, {
+        parseContractFingerprint,
+        payload: partials[index]
+      });
     }
     diag('summary.map.completed', {
       chunkIndex: index + 1, chunkTotal: chunks.length,
@@ -15905,7 +16082,8 @@ function counterSummary(events, counters = {}) {
     providerContractRepairs: count(/provider\.contractRepair/),
     evidenceSanitizations: count(/^summary\.evidence\.sanitized$/),
     emptyVerifiedChunks: count(/^summary\.map\.emptyVerified$/),
-    fatalAllEmptySummaries: count(/^summary\.map\.allEmpty$/)
+    fatalAllEmptySummaries: count(/^summary\.map\.allEmpty$/),
+    parseContractRejections: count(/^summary\.map\.parseContractRejected$/)
   };
 }
 
@@ -16110,6 +16288,8 @@ function classifyFailure(input = {}) {
   if (code === 'COMPONENT_CONFIG_INVALID') return result(code, 'component_config', false, '组件配置无效', '内置兼容回退不会替换已存在但无效的自定义内容；修正 folder-map、Schema 或 Prompt 后重试，已有解析产物会复用。');
   if (code === 'SUMMARY_ALL_CHUNKS_UNSUPPORTED') return result(code, 'unsupported_knowledge', false,
     '所有分块均无可核验知识', '确认解析正文包含可引用原文；如正文正常，请改用能按 block_id 返回短小逐字引文的模型，然后从总结检查点重试。');
+  if (code === 'PARSE_CONTRACT_SOURCE_BLOCKS_MISSING') return result(code, 'internal_parse_contract', false,
+    '解析产物内部契约不完整', '模型尚未被调用。请保留原文件并从“解析”检查点重试；若仍失败，请导出脱敏诊断报告。');
   if (code === 'OCR_CANCELLED') return result(code, 'cancelled', false, '本地 OCR 已取消', '如需继续，请重新将文件加入队列；有效页级检查点会复用。');
   if (code === 'OCR_UNAVAILABLE') return result(code, 'local_ocr', true, '本地 OCR 不可用', '在设置中启用并检测本地 OCR，或配置绝对可执行文件路径。');
   if (code === 'OCR_RENDER_FAILURE') return result(code, 'local_ocr', true, 'PDF 页面渲染失败', '确认 pdftoppm 可用后重试；已完成页面会复用。');
@@ -16135,7 +16315,8 @@ function userMessage(category) {
   return ({ auth: '外部服务鉴权失败', rate_limit: '外部服务限流', timeout: '处理阶段超时',
     network: '外部服务暂时不可用', json_parse: '服务返回格式无法解析', schema: '模型输出未通过结构校验',
     file: '找不到源文件', component_config: '组件配置加载失败', cancelled: '任务已取消', checkpoint: '已保存批次读取或写入失败',
-    ai_provider: '知识原子化批次未完整完成', local_ocr: '本地 OCR 处理失败' })[category] || '工程知识切片处理失败';
+    ai_provider: '知识原子化批次未完整完成', local_ocr: '本地 OCR 处理失败',
+    internal_parse_contract: '解析产物内部契约不完整' })[category] || '工程知识切片处理失败';
 }
 
 function redactText(value) {
@@ -16450,6 +16631,7 @@ module.exports = {
  */
 "src/core/workflow.js": function(require, module, exports) {
 const { atomizeSummary, classifyDocument, summarizeDocument, validateAtomizationResult } = require("src/core/ai-pipeline.js");
+const { upgradeParsePackage } = require("src/core/document-parser.js");
 const { calculateConfidence } = require("src/core/confidence.js");
 const { atomFingerprint } = require("src/core/identity.js");
 const { buildCardRecord } = require("src/core/markdown-renderer.js");
@@ -16462,6 +16644,9 @@ const workflowDiag = (event, details) => {
 };
 
 async function runKnowledgeWorkflow(options) {
+  options = Object.assign({}, options, {
+    parsePackage: upgradeParsePackage(options.parsePackage, { sourceHash: options.sourceHash })
+  });
   const classification = options.classification || await classifyDocument({
     parsePackage: options.parsePackage,
     folderMap: options.folderMap,

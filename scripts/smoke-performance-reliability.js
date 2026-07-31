@@ -13,6 +13,7 @@ function assert(condition, message) {
 
 async function testSummaryConcurrency() {
   const { api } = loadAiPipeline();
+  const markdown = `${'甲'.repeat(120)}\n${'乙'.repeat(120)}\n${'丙'.repeat(120)}`;
   let active = 0;
   let peak = 0;
   const requestJson = async (_prompt, context) => {
@@ -57,9 +58,9 @@ async function testSummaryConcurrency() {
     await api.summarizeDocument({
     parsePackage: {
       source_name: 'test',
-      markdown: `${'甲'.repeat(120)}\n${'乙'.repeat(120)}\n${'丙'.repeat(120)}`,
+      markdown,
       evidence_index: {
-        source: { block_id: 'source', raw_text: '可验证来源块', locator: { scheme: 'line', value: '1' } }
+        source: { block_id: 'source', raw_text: markdown, locator: { scheme: 'line', value: '1' } }
       }
     },
     classification: { library: 'business', folder_type: 'test', document_type: 'test' },

@@ -157,12 +157,20 @@ async function main() {
   };
   harness.entries.set(parsedTask.artifacts.parsed,
     new TFile(parsedTask.artifacts.parsed, JSON.stringify(envelope)));
+  let migratedParsed = null;
+  harness.plugin.persistArtifact = async (_task, name, value) => {
+    if (name === 'parsed') migratedParsed = value;
+  };
   let outboundRequests = 0;
   const loaded = await harness.plugin.loadArtifact(parsedTask, 'parsed');
-  assert.deepStrictEqual(loaded, parsedPayload);
+  assert.strictEqual(loaded.markdown, parsedPayload.markdown);
+  assert.strictEqual(loaded.blocks.length, 1);
+  assert.strictEqual(loaded.blocks[0].locator.scheme, 'parsed-text-span');
+  assert.strictEqual(Object.keys(loaded.evidence_index).length, 1);
+  assert.deepStrictEqual(migratedParsed, loaded);
   assert.strictEqual(outboundRequests, 0);
   parsedTask.component_contract_hash = 'changed-downstream-contract';
-  assert.deepStrictEqual(await harness.plugin.loadArtifact(parsedTask, 'parsed'), parsedPayload,
+  assert.deepStrictEqual(await harness.plugin.loadArtifact(parsedTask, 'parsed'), loaded,
     'parsed fingerprint must stay independent of downstream component contracts');
   const baseFingerprint = harness.plugin.artifactInputFingerprint(parsedTask, 'parsed');
   for (const [key, value] of [
@@ -206,7 +214,12 @@ async function main() {
     JSON.stringify({ library: 'business', folder_type: '06-风险库', confidence: 1 })));
   const migratedStages = [];
   harness.plugin.persistArtifact = async (_task, stage, payload) => migratedStages.push({ stage, payload });
-  assert.deepStrictEqual(await harness.plugin.loadArtifact(legacyTask, 'parsed'), rawParsed);
+  const migratedLegacy = await harness.plugin.loadArtifact(legacyTask, 'parsed');
+  assert.strictEqual(migratedLegacy.markdown, rawParsed.markdown);
+  assert.strictEqual(migratedLegacy.blocks[0].block_id, 'b1');
+  assert.deepStrictEqual(migratedLegacy.blocks[0].locator, rawParsed.blocks[0].locator);
+  assert.strictEqual(migratedLegacy.evidence_index.b1.raw_text, '可验证正文');
+  assert(migratedLegacy.parse_contract.fingerprint);
   assert.deepStrictEqual(migratedStages.map((item) => item.stage), ['parsed'],
     'verified legacy parsed migrates once and can prevent repeated OCR');
   assert.strictEqual(await harness.plugin.loadArtifact(legacyTask, 'classification'), null,

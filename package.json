@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node esbuild.config.mjs watch",
     "build": "node scripts/embed-local-ocr.js --check && node scripts/embed-ooxml.js --check && node scripts/embed-structured-writer.js --check && node scripts/validate-bundle-build.js",
-    "pretest": "node scripts/regression-local-text-blocks.js && node scripts/regression-evidence-scope-v219.js && node scripts/regression-review-migration-v219.js && node scripts/regression-provenance-production-fix.js && node scripts/regression-summary-map-provenance-v219.js && node scripts/regression-production-canonical-boundaries.js",
+    "pretest": "node scripts/regression-local-text-blocks.js && node scripts/regression-parse-artifact-upgrade.js && node scripts/regression-evidence-scope-v219.js && node scripts/regression-review-migration-v219.js && node scripts/regression-provenance-production-fix.js && node scripts/regression-summary-map-provenance-v219.js && node scripts/regression-production-canonical-boundaries.js",
     "lint": "node --check main.js && node --check scripts/*.js && node --check src/*.js",
     "typecheck": "tsc -p tsconfig.json",
     "test:phase1": "node scripts/test-phase1-foundation.js",

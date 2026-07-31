@@ -8,6 +8,8 @@ The report includes plugin/runtime/platform versions, a non-secret settings allo
 
 Missing `schemas/block-v0.schema.json` and `schemas/parse-package.schema.json` may use the immutable built-in compatibility copies. The bounded `component.builtinFallback` event records only `relativePath`, `builtInVersion`, `hash`, and `reason=missing`. Existing invalid files never fall back; other missing components report that no built-in compatibility fallback was available.
 
+Universal writer runs use the truthful `universal-writer` checkpoint and do not load legacy component contracts. Every structured state/index path is validated as vault-relative before it reaches an Obsidian adapter; rejected host-absolute paths use `VAULT_PATH_INVALID` / `path_contract`, never `FILE_NOT_FOUND`. A missing component remains a `COMPONENT_*` error naming the component, while a resume with a valid parsed checkpoint may proceed even when the legacy ledger source path is empty.
+
 Privacy and bounds:
 
 - Source text, prompt text, provider response bodies, API keys, authorization headers, cookies, secrets, and full source/artifact paths are excluded or replaced with hashes.

@@ -1,5 +1,12 @@
 # 工程知识切片 变更记录
 
+## v2.20.3 — 2026-07-31 生产 vault 路径根边界修正
+
+- 结构化 writer 在读取持久化索引后先丢弃不合法记录，并在所有 `exists/read/write/rename` 前强制执行唯一的 vault 相对路径边界；Windows 盘符、UNC/主机绝对路径和目录穿越不再进入 Obsidian adapter 或被截断后重组，合法空格、Unicode 与 apostrophe 保持原样。
+- 通用生产不再显示虚假的 `component-contracts` checkpoint；旧组件契约只在 legacy 流程使用，组件缺失继续按 `COMPONENT_*` 分类并保留内置基础 Schema 回退，路径契约错误不再被通用 `ENOENT` 规则误报为源文件丢失。
+- 续传先读取 `parsed`，仅在没有可复用解析产物时要求源文件路径；已有 `universal-canonical` 与来源哈希匹配时直接复用，不重新上传、解析或调用翻译/provider，并继续生成或提交 write plan。
+- 新增生产根路径回归，覆盖带空格、中文与 apostrophe 的 Windows OneDrive vault 根、空 sourcePath、污染索引、组件 cache miss/内置回退、clean/resume、零主机路径读取及用户错误分类。
+
 ## v2.20.2 — 2026-07-31 中日英输入与简体中文输出
 
 - 通用管线按 canonical block/语义区域检测 `zh/ja/en/mixed/unknown`，记录置信度和字符证据；中日英义务、决策、行动、流程、方法、参数、风险、问题、经验、商务、计划、实体和往来信号归一到同一语义类型、路由和受控标签。

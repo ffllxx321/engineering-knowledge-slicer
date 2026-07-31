@@ -107,7 +107,8 @@ const {
   buildPlan: buildStructuredPlan,
   commitPlan: commitStructuredPlan,
   rollbackTransaction: rollbackStructuredTransaction,
-  emptyIndex: emptyStructuredIndex
+  emptyIndex: emptyStructuredIndex,
+  validateIndex: validateStructuredIndex
 } = require("src/structured-writer.js");
 
 // v1.1.9 / v1.1.10: 把诊断共享状态挂到 globalThis，让 src/core/ai-pipeline.js 等独立闭包模块也能调用 diag()
@@ -1250,14 +1251,22 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       // v1.1.2: 旧任务 / 第三方写入可能留下 source_path 为空的情况，统一兜底成空字符串
       // 防止后续 readBinary / Notice 拼接时出现 'undefined'/'null' 字面。
       // v1.4: 用 normalizePathForCompare 统一 normalize 顺序
-      current.source_path = normalizePathForCompare(current.source_path || '');
+      current.source_path = optionalVaultRelativePath(current.source_path);
       this.sessionStats.current = current.source_path;
       current.errors = [];
       current.review_atom_ids = current.review_atom_ids || [];
       current.written_card_ids = current.written_card_ids || [];
       await this.setTaskProgress(current, '准备处理源文件', { stage: 'start', startedAt: new Date(startedAt).toISOString() });
-      if (!current.source_path) throw new Error('源文件路径为空，请在扫描源文件后重试。');
-      if (!isProcessableSource(current.source_path)) {
+      let parsePackage = await this.loadArtifact(current, 'parsed');
+      if (!current.source_path && parsePackage) {
+        current.source_path = optionalVaultRelativePath(parsePackage.source_path);
+      }
+      if (!current.source_path && !parsePackage) {
+        const missingSource = new Error('源文件路径为空，且没有可复用的解析产物。');
+        missingSource.code = 'SOURCE_PATH_MISSING';
+        throw missingSource;
+      }
+      if (current.source_path && !isProcessableSource(current.source_path)) {
         current.status = 'unsupported';
         current.updated_at = new Date().toISOString();
         await this.saveTasks(upsertTask(tasks, current));
@@ -1266,7 +1275,6 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         return;
       }
 
-      let parsePackage = await this.loadArtifact(current, 'parsed');
       if (!parsePackage) {
         current.status = 'parsing';
         await this.setTaskProgress(current, '正在调用文档解析 API', { stage: 'parsing', elapsedMs: Date.now() - startedAt });
@@ -1380,12 +1388,15 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
       this.assertTaskCanContinue(current);
 
-      current.status = 'slicing';
-      await this.setTaskProgress(current, '正在加载运行时组件与路由配置', {
-        stage: 'component-contracts', elapsedMs: Date.now() - startedAt
-      });
       const universalProduction = this.settings.controlledWriterEnabled === true
         && ['structured-pilot', 'structured-write'].includes(this.settings.structuredWriterMode);
+      current.status = 'slicing';
+      await this.setTaskProgress(current, universalProduction
+        ? '正在生成或恢复统一知识产物'
+        : '正在加载运行时组件与路由配置', {
+        stage: universalProduction ? 'universal-writer' : 'component-contracts',
+        elapsedMs: Date.now() - startedAt
+      });
       const contracts = universalProduction ? null : await this.loadRuntimeContracts();
       if (contracts) current.component_contract_hash = contracts.contractHash;
       const tagLibrary = universalProduction ? null : parseTagLibrary(await this.loadTagLibraryText());
@@ -2691,13 +2702,21 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const stateFolder = normalizeVaultPath(`${this.settings.artifactsPath}/structured-writer`);
     const indexPath = normalizeVaultPath(`${stateFolder}/id-path-index.v1.json`);
     const registryPath = normalizeVaultPath(`${stateFolder}/project-registry.v1.json`);
-    const readJson = async (path, fallback) => {
+    const readJson = async (rawPath, fallback) => {
+      const path = vaultRelativePath(rawPath, 'structured state read');
       if (!(await this.app.vault.adapter.exists(path))) return fallback;
       try { return JSON.parse(await this.app.vault.adapter.read(path)); } catch (error) {
         throw new Error(`结构化状态文件损坏：${path}（${error.message}）`);
       }
     };
-    const index = await readJson(indexPath, emptyStructuredIndex());
+    const rawIndex = await readJson(indexPath, emptyStructuredIndex());
+    const { index, discarded: discardedIndexEntries = [] } = validateStructuredIndex(rawIndex);
+    if (discardedIndexEntries.length) {
+      diag('structuredWriter.indexEntriesDiscarded', {
+        count: discardedIndexEntries.length,
+        reasons: [...new Set(discardedIndexEntries.map((item) => item.cause))]
+      });
+    }
     const projectRegistry = await readJson(registryPath, []);
     if (!Array.isArray(projectRegistry)) throw new Error('项目登记表必须是数组');
     const blocks = Array.isArray(parsePackage?.blocks) ? parsePackage.blocks
@@ -2720,8 +2739,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     };
     const priorUniversal = await this.loadArtifact(task, 'universal-canonical');
     const translationCheckpoint = await this.loadArtifact(task, 'universal-translation-checkpoint');
-    let universal;
+    let universal = priorUniversal?.document?.source_hash === document.source_hash
+      && Array.isArray(priorUniversal?.knowledge_units) ? priorUniversal : null;
     try {
+      if (!universal) {
       universal = await runUniversalPipelineMultilingual({
         document,
         existing_tags: [],
@@ -2757,6 +2778,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           ].join('\n')
         })
       });
+      }
     } catch (error) {
       if (error?.checkpoint) {
         await this.persistArtifact(task, 'universal-translation-checkpoint', {
@@ -2798,7 +2820,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       index, existingFiles, logicalTime: task.created_at || '1970-01-01T00:00:00.000Z'
     });
     for (const action of plan.actions || []) {
-      for (const path of [action.path, action.from_path].filter(Boolean)) {
+      for (const rawPath of [action.path, action.from_path].filter(Boolean)) {
+        const path = vaultRelativePath(rawPath, 'structured plan read');
         if (Object.hasOwn(existingFiles, path)) continue;
         existingFiles[path] = await this.app.vault.adapter.exists(path)
           ? await this.app.vault.adapter.read(path) : undefined;
@@ -2806,8 +2829,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     }
     for (const entry of Object.values(index.records || {})) {
       if (entry?.path && !Object.hasOwn(existingFiles, entry.path)) {
-        existingFiles[entry.path] = await this.app.vault.adapter.exists(entry.path)
-          ? await this.app.vault.adapter.read(entry.path) : undefined;
+        const path = vaultRelativePath(entry.path, 'structured index record');
+        existingFiles[path] = await this.app.vault.adapter.exists(path)
+          ? await this.app.vault.adapter.read(path) : undefined;
       }
     }
     plan = buildStructuredPlan({
@@ -2821,11 +2845,17 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     if (plan.blocked) return { mode, plan, blocked: true, universalResult: universal };
     const adapter = this.app.vault.adapter;
     const vault = {
-      readIfExists: async (path) => adapter.exists(path) ? adapter.read(path) : null,
-      write: async (path, content) => writeFile(this.app, normalizeVaultPath(path), content),
-      rename: async (from, to) => adapter.rename(normalizeVaultPath(from), normalizeVaultPath(to)),
+      readIfExists: async (path) => {
+        const relative = vaultRelativePath(path, 'structured writer read');
+        return adapter.exists(relative) ? adapter.read(relative) : null;
+      },
+      write: async (path, content) => writeFile(this.app, vaultRelativePath(path, 'structured writer write'), content),
+      rename: async (from, to) => adapter.rename(
+        vaultRelativePath(from, 'structured writer rename source'),
+        vaultRelativePath(to, 'structured writer rename target')
+      ),
       mkdirp: async (folder) => {
-        const parts = normalizeVaultPath(folder).split('/');
+        const parts = vaultRelativePath(folder, 'structured writer directory').split('/');
         let current = '';
         for (const part of parts) {
           current = current ? `${current}/${part}` : part;
@@ -5545,7 +5575,7 @@ function stageLabel(stage) {
     start: '准备', discovered: '已发现', queued: '排队', parsing: '文档解析', parsed: '解析完成', classifying: '类型判定', classified: '类型判定完成', classification: '类型判定',
     summarizing: '结构化总结', 'summary-map': '逐段总结', 'summary-reduce': '合并总结', atomizing: '知识原子化', atomization: '知识原子化',
     summarized: '总结完成', validating: '可信度与契约校验', writing: '写入知识库', written: '已完成', archived: '已归档', complete: '完成', failed: '失败', paused: '已暂停', cancelled: '已取消',
-    extracting: '提取内容', slicing: '内容切片', skipped: '已跳过', unsupported: '不支持',
+    extracting: '提取内容', slicing: '内容切片', 'universal-writer': '统一知识写入', 'component-contracts': '组件契约', skipped: '已跳过', unsupported: '不支持',
     unsupported_media: '暂不支持的媒体', needs_ocr: '需要 OCR', rolled_back: '已回滚'
   };
   return labels[stage] || String(stage || '等待');
@@ -5563,7 +5593,7 @@ async function ensureFolder(app, folderPath) {
 }
 
 async function writeFile(app, path, content) {
-  const normalized = normalizeVaultPath(path);
+  const normalized = vaultRelativePath(path, 'vault write');
   await ensureFolder(app, normalized.split('/').slice(0, -1).join('/'));
   const adapter = app.vault.adapter;
   const expected = String(content);
@@ -8185,21 +8215,31 @@ function emptyIndex() {
 }
 
 function validateIndex(raw) {
-  const index = raw && typeof raw === 'object' ? raw : emptyIndex();
+  const candidate = raw && typeof raw === 'object' ? raw : emptyIndex();
+  const index = {
+    version: candidate.version || INDEX_VERSION,
+    revision: Number(candidate.revision || 0),
+    records: {},
+    source_versions: candidate.source_versions && typeof candidate.source_versions === 'object'
+      ? JSON.parse(JSON.stringify(candidate.source_versions)) : {},
+    updated_at: clean(candidate.updated_at, 100)
+  };
   const conflicts = [];
+  const discarded = [];
   const paths = new Map();
-  for (const [id, entry] of Object.entries(index.records || {})) {
+  for (const [id, entry] of Object.entries(candidate.records || {})) {
     if (!entry || !pathSafe(entry.path) || entry.record_id !== id) {
-      conflicts.push({ cause: 'malformed_index', record_id: id });
+      discarded.push({ cause: 'malformed_index', record_id: id });
       continue;
     }
+    index.records[id] = JSON.parse(JSON.stringify(entry));
     if (!paths.has(entry.path)) paths.set(entry.path, []);
     paths.get(entry.path).push(id);
   }
   for (const [path, ids] of paths) {
     if (ids.length > 1) conflicts.push({ cause: 'path_indexed_by_multiple_ids', path, record_ids: ids.sort() });
   }
-  return { index, conflicts };
+  return { index, conflicts, discarded };
 }
 
 function yamlScalar(value) {
@@ -9097,6 +9137,31 @@ const PROCESSABLE_TYPES = new Set(['md', 'txt', 'pdf', 'docx', 'pptx', 'xlsx', '
 
 function normalizeVaultPath(filePath) {
   return String(filePath || '').replace(/\\/g, '/').replace(/^[A-Za-z]:\/+/, '').replace(/^\/+/, '').replace(/\/+/g, '/').replace(/\/+$/, '');
+}
+
+function vaultRelativePath(value, context = 'vault path') {
+  const raw = String(value == null ? '' : value).trim();
+  const slashed = raw.replace(/\\/g, '/');
+  if (!raw || slashed.startsWith('/') || /^[A-Za-z]:\//.test(slashed)) {
+    const error = new Error(`${context} 必须是 Obsidian vault 相对路径。`);
+    error.code = 'VAULT_PATH_INVALID';
+    error.details = { reason: !raw ? 'empty' : 'host_absolute_path', pathContext: context };
+    throw error;
+  }
+  const normalized = slashed.replace(/\/+/g, '/').replace(/\/+$/, '').normalize('NFC');
+  if (!normalized || /[\0-\x1f\x7f]/.test(normalized)
+    || normalized.split('/').some((part) => !part || part === '.' || part === '..')) {
+    const error = new Error(`${context} 含无效路径片段。`);
+    error.code = 'VAULT_PATH_INVALID';
+    error.details = { reason: 'unsafe_segment', pathContext: context };
+    throw error;
+  }
+  return normalized;
+}
+
+function optionalVaultRelativePath(value) {
+  if (value == null || String(value).trim() === '') return '';
+  try { return vaultRelativePath(value, 'source path'); } catch { return ''; }
 }
 
 function normalizeConfiguredPath(value, fallback = '') {
@@ -17277,6 +17342,8 @@ function classifyFailure(input = {}) {
   if (code === 'COMPONENT_PATH_INVALID') return result(code, 'component_config', false, '组件路径配置无效', '修正组件相对路径后重试；路径必须是组件包内的 .md 或 .json 文件，不能是目录。');
   if (code === 'COMPONENT_NOT_FOUND') return result(code, 'component_config', false, '找不到组件文件', '该组件没有可用的内置兼容回退；恢复缺失的用户组件后重试，已有解析产物会复用，无需重新上传。');
   if (code === 'COMPONENT_CONFIG_INVALID') return result(code, 'component_config', false, '组件配置无效', '内置兼容回退不会替换已存在但无效的自定义内容；修正 folder-map、Schema 或 Prompt 后重试，已有解析产物会复用。');
+  if (code === 'VAULT_PATH_INVALID') return result(code, 'path_contract', false, '插件路径契约无效', '修复或移除包含主机绝对路径的旧索引/状态记录后重试；已有解析与统一知识产物会复用。');
+  if (code === 'SOURCE_PATH_MISSING') return result(code, 'file', false, '缺少源文件定位信息', '若已有解析产物请直接重试；否则重新扫描源文件以恢复 vault 相对路径。');
   if (code === 'SUMMARY_ALL_CHUNKS_UNSUPPORTED') return result(code, 'unsupported_knowledge', false,
     '所有分块均无可核验知识', '确认解析正文包含可引用原文；如正文正常，请改用能按 block_id 返回短小逐字引文的模型，然后从总结检查点重试。');
   if (code === 'PARSE_CONTRACT_SOURCE_BLOCKS_MISSING') return result(code, 'internal_parse_contract', false,
@@ -17305,7 +17372,7 @@ function result(code, category, retryable, message, suggestedAction) {
 function userMessage(category) {
   return ({ auth: '外部服务鉴权失败', rate_limit: '外部服务限流', timeout: '处理阶段超时',
     network: '外部服务暂时不可用', json_parse: '服务返回格式无法解析', schema: '模型输出未通过结构校验',
-    file: '找不到源文件', component_config: '组件配置加载失败', cancelled: '任务已取消', checkpoint: '已保存批次读取或写入失败',
+    file: '找不到源文件', path_contract: '插件路径契约无效', component_config: '组件配置加载失败', cancelled: '任务已取消', checkpoint: '已保存批次读取或写入失败',
     ai_provider: '知识原子化批次未完整完成', local_ocr: '本地 OCR 处理失败',
     internal_parse_contract: '解析产物内部契约不完整' })[category] || '工程知识切片处理失败';
 }

@@ -105,21 +105,31 @@ function emptyIndex() {
 }
 
 function validateIndex(raw) {
-  const index = raw && typeof raw === 'object' ? raw : emptyIndex();
+  const candidate = raw && typeof raw === 'object' ? raw : emptyIndex();
+  const index = {
+    version: candidate.version || INDEX_VERSION,
+    revision: Number(candidate.revision || 0),
+    records: {},
+    source_versions: candidate.source_versions && typeof candidate.source_versions === 'object'
+      ? JSON.parse(JSON.stringify(candidate.source_versions)) : {},
+    updated_at: clean(candidate.updated_at, 100)
+  };
   const conflicts = [];
+  const discarded = [];
   const paths = new Map();
-  for (const [id, entry] of Object.entries(index.records || {})) {
+  for (const [id, entry] of Object.entries(candidate.records || {})) {
     if (!entry || !pathSafe(entry.path) || entry.record_id !== id) {
-      conflicts.push({ cause: 'malformed_index', record_id: id });
+      discarded.push({ cause: 'malformed_index', record_id: id });
       continue;
     }
+    index.records[id] = JSON.parse(JSON.stringify(entry));
     if (!paths.has(entry.path)) paths.set(entry.path, []);
     paths.get(entry.path).push(id);
   }
   for (const [path, ids] of paths) {
     if (ids.length > 1) conflicts.push({ cause: 'path_indexed_by_multiple_ids', path, record_ids: ids.sort() });
   }
-  return { index, conflicts };
+  return { index, conflicts, discarded };
 }
 
 function yamlScalar(value) {

@@ -585,27 +585,43 @@ function hasSourceAssociation(content, sourceId) {
 
 async function verifyCommittedRecords(plan, vault) {
   const records = [];
+  const failures = [];
   for (const action of plan.actions) {
-    const content = await vault.readIfExists(action.path);
+    let content = null;
+    try { content = await vault.readIfExists(action.path); } catch (error) {
+      failures.push({ record_id: action.record_id, record_kind: action.record_kind,
+        path: action.path, reason: 'unreadable_file', error: String(error?.message || error) });
+      continue;
+    }
     const actualId = frontmatterValue(content, 'record_id');
     const actualKind = frontmatterValue(content, 'record_kind');
-    if (content === null || !action.path.endsWith('.md') || actualId !== action.record_id
+    if (content === null || !String(content).trim() || !action.path.endsWith('.md') || actualId !== action.record_id
       || actualKind !== action.record_kind
       || (KNOWLEDGE_RECORD_KINDS.has(action.record_kind)
         && !hasSourceAssociation(content, action.owner_source_id))) {
-      const error = new Error(`提交后验证失败：${action.record_id}（${action.path}）`);
-      error.code = 'STRUCTURED_RECORD_VERIFICATION_FAILED';
-      error.details = {
+      failures.push({
         record_id: action.record_id, record_kind: action.record_kind, path: action.path,
-        reason: content === null ? 'missing_file' : 'identity_or_source_mismatch'
-      };
-      throw error;
+        reason: content === null ? 'missing_file' : !String(content).trim() ? 'empty_file' : 'identity_or_source_mismatch'
+      });
+      continue;
     }
     records.push({
       record_id: action.record_id, record_kind: action.record_kind, path: action.path,
       disposition: action.action === 'noop' ? 'unchanged' : action.action,
       bytes: Buffer.byteLength(content), knowledge_record: KNOWLEDGE_RECORD_KINDS.has(action.record_kind)
     });
+  }
+  if (failures.length) {
+    const plannedKnowledge = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind));
+    const verifiedKnowledge = records.filter((item) => item.knowledge_record);
+    const error = new Error(`结构化提交未持久化：计划 ${plannedKnowledge.length} 个知识文件，仅验证 ${verifiedKnowledge.length} 个。`);
+    error.code = 'STRUCTURED_WRITE_NOT_PERSISTED';
+    error.stage = 'structured-post-commit-verification';
+    error.details = {
+      planned: plannedKnowledge.length, attempted: plannedKnowledge.filter((item) => item.action !== 'noop').length,
+      committed: verifiedKnowledge.length, verified: verifiedKnowledge.length, failures
+    };
+    throw error;
   }
   const knowledgeRecords = records.filter((record) => record.knowledge_record);
   return {

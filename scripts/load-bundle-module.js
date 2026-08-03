@@ -10,6 +10,7 @@ function loadBundleModule(id, dependencies = {}) {
   const bodyStart = start + marker.length;
   const endings = [
     code.indexOf('\n},\n/**', bodyStart),
+    code.indexOf('\n},\n/*', bodyStart),
     code.indexOf('\n},\n"', bodyStart),
     code.indexOf('\n}\n};', bodyStart)
   ].filter((position) => position >= 0);

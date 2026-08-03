@@ -404,8 +404,8 @@ async function main() {
   await assert.rejects(() => commitPlan({ ...plan22, mode: 'structured-write' }, {
     vault: noopVault, lock: lock(), stateRoot: '状态', index: emptyIndex(),
     logicalTime: TIME, saveIndex: async () => {}
-  }), (error) => error.code === 'STRUCTURED_RECORD_VERIFICATION_FAILED'
-    && error.details.reason === 'missing_file');
+  }), (error) => error.code === 'STRUCTURED_WRITE_NOT_PERSISTED'
+    && error.details.verified === 0 && error.details.failures[0].reason === 'missing_file');
 
   await realPhasePath();
   const production = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');

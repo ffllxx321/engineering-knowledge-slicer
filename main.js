@@ -1621,6 +1621,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         : (legacyReview.length || structuredHandlingGroups.length ? 'needs_review' : 'completed_no_output');
       current.result_counts = {
         generated: generatedCount,
+        planned: universalProduction ? (structured.plan?.actions || []).filter((item) => ['business_item', 'company_knowledge'].includes(item.record_kind)).length : generatedCount,
+        attempted: universalProduction ? (structured.plan?.actions || []).filter((item) => item.action !== 'noop' && ['business_item', 'company_knowledge'].includes(item.record_kind)).length : legacyAccepted.length,
+        committed: structuredVisible,
+        verified: structuredVisible,
         written: persistedCount,
         created: Number(verifiedStructured?.counts?.knowledge_created || 0),
         updated: Number(verifiedStructured?.counts?.knowledge_updated || 0),
@@ -1647,7 +1651,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         message: persistedCount === 0
           ? `处理完成但未写入：生成 ${generatedCount}，写入 0，硬拒绝 ${hardRejectedCount}。请查看按根因分组的诊断并修复来源解析/证据定位后重试。`
           : (structured.plan?.summary
-            ? `结构化处理完成：知识记录 ${structuredVisible}（新建 ${current.result_counts.created}，更新 ${current.result_counts.updated}，已存在 ${structuredExisting}）。`
+            ? `结构化处理完成：已验证写入 ${structuredVisible} 张知识卡片（新建 ${current.result_counts.created}，更新 ${current.result_counts.updated}，已存在 ${structuredExisting}）。目录：${current.output_paths?.[0]?.split('/').slice(0, -1).join('/') || '-'}；首个文件：${current.output_paths?.[0] || '-'}。`
             : `处理完成：写入 ${persistedCount} 张，异常 ${legacyReview.length} 项`),
         elapsedMs: Date.now() - startedAt,
         at: current.updated_at
@@ -1718,6 +1722,22 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
       current.status = 'failed';
       current.updated_at = new Date().toISOString();
+      if (error?.code === 'STRUCTURED_WRITE_NOT_PERSISTED') {
+        current.terminal_outcome = 'failed_no_output';
+        current.structured_transaction_id = null;
+        current.output_paths = [];
+        current.written_card_ids = [];
+        current.result_counts = Object.assign({}, current.result_counts || {}, {
+          planned: Number(error.details?.planned) || 0,
+          attempted: Number(error.details?.attempted) || 0,
+          committed: 0,
+          verified: 0, written: 0, created: 0, updated: 0, unchanged: 0, knowledge_records: 0
+        });
+        if (current.artifacts) {
+          delete current.artifacts.knowledge_records;
+          delete current.artifacts['structured-transaction'];
+        }
+      }
       const appError = toAppError(error, {
         stage: current.progress?.stage || 'process',
         taskId: current.task_id,
@@ -2988,16 +3008,54 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       throw error;
     }
     const adapter = this.app.vault.adapter;
+    const obsidianVault = this.app.vault;
+    const hasPublicFileApi = typeof obsidianVault.getAbstractFileByPath === 'function'
+      && typeof obsidianVault.read === 'function' && typeof obsidianVault.create === 'function'
+      && typeof obsidianVault.modify === 'function';
     const vault = {
       readIfExists: async (path) => {
         const relative = vaultRelativePath(path, 'structured writer read');
+        if (hasPublicFileApi) {
+          const file = obsidianVault.getAbstractFileByPath(relative);
+          if (!file || typeof file.path !== 'string' || file.path !== relative) return null;
+          return obsidianVault.read(file);
+        }
         return await adapter.exists(relative) ? adapter.read(relative) : null;
       },
-      write: async (path, content) => writeFile(this.app, vaultRelativePath(path, 'structured writer write'), content),
-      rename: async (from, to) => adapter.rename(
-        vaultRelativePath(from, 'structured writer rename source'),
-        vaultRelativePath(to, 'structured writer rename target')
-      ),
+      write: async (path, content) => {
+        const relative = vaultRelativePath(path, 'structured writer write');
+        const expected = String(content);
+        await ensureFolder(this.app, relative.split('/').slice(0, -1).join('/'));
+        if (!hasPublicFileApi) {
+          await adapter.write(relative, expected);
+          if (!await adapter.exists(relative) || String(await adapter.read(relative)) !== expected) {
+            throw Object.assign(new Error(`适配器写入后不可读取：${relative}`), { code: 'STRUCTURED_WRITE_NOT_PERSISTED' });
+          }
+          return relative;
+        }
+        const existing = obsidianVault.getAbstractFileByPath(relative);
+        if (existing) await obsidianVault.modify(existing, expected);
+        else await obsidianVault.create(relative, expected);
+        const committedFile = obsidianVault.getAbstractFileByPath(relative);
+        if (!committedFile || String(await obsidianVault.read(committedFile)) !== expected) {
+          throw Object.assign(new Error(`Obsidian 无法打开写入文件：${relative}`), { code: 'STRUCTURED_WRITE_NOT_PERSISTED' });
+        }
+        return relative;
+      },
+      rename: async (from, to) => {
+        const source = vaultRelativePath(from, 'structured writer rename source');
+        const target = vaultRelativePath(to, 'structured writer rename target');
+        if (hasPublicFileApi && typeof obsidianVault.rename === 'function') {
+          const file = obsidianVault.getAbstractFileByPath(source);
+          if (!file) throw Object.assign(new Error(`找不到待移动文件：${source}`), { code: 'STRUCTURED_WRITE_NOT_PERSISTED' });
+          await obsidianVault.rename(file, target);
+          if (!obsidianVault.getAbstractFileByPath(target)) {
+            throw Object.assign(new Error(`Obsidian 移动后无法打开文件：${target}`), { code: 'STRUCTURED_WRITE_NOT_PERSISTED' });
+          }
+          return;
+        }
+        await adapter.rename(source, target);
+      },
       mkdirp: async (folder) => {
         const parts = vaultRelativePath(folder, 'structured writer directory').split('/');
         let current = '';
@@ -3659,31 +3717,56 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
   async recoverCommittedStructuredTasks(tasks) {
     const adapter = this.app.vault.adapter;
-    if (typeof adapter.list !== 'function') return tasks;
     const directory = normalizeVaultPath(`${this.settings.artifactsPath}/structured-writer/transactions`);
-    if (!(await adapter.exists(directory))) return tasks;
-    const listing = await adapter.list(directory);
+    const listing = typeof adapter.list === 'function' && await adapter.exists(directory)
+      ? await adapter.list(directory) : { files: [] };
     const files = Array.isArray(listing?.files) ? listing.files.filter((path) => path.endsWith('.json')) : [];
+    const manifests = [];
+    for (const manifestPath of files) {
+      try { manifests.push({ manifestPath, manifest: JSON.parse(await adapter.read(manifestPath)) }); } catch (_) {}
+    }
+    const readVisibleFile = async (path) => {
+      const relative = vaultRelativePath(path, 'structured recovery verification');
+      if (typeof this.app.vault.getAbstractFileByPath === 'function' && typeof this.app.vault.read === 'function') {
+        const file = this.app.vault.getAbstractFileByPath(relative);
+        if (!file || file.path !== relative) return null;
+        return this.app.vault.read(file);
+      }
+      return await adapter.exists(relative) ? adapter.read(relative) : null;
+    };
     let changed = false;
     for (const task of tasks) {
-      if (task.structured_transaction_id || task.status === 'rolled_back') continue;
+      if (task.status === 'rolled_back') continue;
       const plan = await this.loadArtifact(task, 'structured-write-plan');
-      if (!plan?.plan_id) continue;
-      for (const manifestPath of files) {
-        let manifest;
-        try { manifest = JSON.parse(await adapter.read(manifestPath)); } catch (_) { continue; }
+      if (!plan?.plan_id) {
+        if (task.semantic_path === 'universal' && (task.structured_transaction_id || task.status === 'written')) {
+          task.status = 'queued'; task.terminal_outcome = null; task.structured_transaction_id = null;
+          task.output_paths = []; task.written_card_ids = [];
+          task.result_counts = Object.assign({}, task.result_counts || {}, { written: 0, created: 0, updated: 0, unchanged: 0, knowledge_records: 0, verified: 0 });
+          if (task.artifacts) { delete task.artifacts.knowledge_records; delete task.artifacts['structured-transaction']; }
+          task.updated_at = new Date().toISOString();
+          task.progress = { stage: 'queued', message: '旧版入库结果缺少可复核计划，已失效并等待安全重写。', at: task.updated_at };
+          changed = true;
+        }
+        continue;
+      }
+      const candidates = manifests.filter(({ manifest }) => manifest.status === 'committed'
+        && (manifest.transaction_id === task.structured_transaction_id || manifest.plan_id === plan.plan_id));
+      let recovered = false;
+      for (const { manifestPath, manifest } of candidates) {
         if (manifest.status !== 'committed' || manifest.plan_id !== plan.plan_id) continue;
         const knowledge = [];
         let valid = true;
-        for (const step of manifest.steps || []) {
-          if (!['business_item', 'company_knowledge'].includes(step.record_kind)) continue;
-          if (!(await adapter.exists(step.path)) || structuredContentHash(await adapter.read(step.path)) !== step.content_hash) { valid = false; break; }
+        const plannedKnowledge = ((plan.actions || []).length ? plan.actions : manifest.steps || [])
+          .filter((step) => ['business_item', 'company_knowledge'].includes(step.record_kind));
+        for (const step of plannedKnowledge) {
+          const content = await readVisibleFile(step.path);
+          const expectedId = new RegExp(`^record_id:\\s*["']?${String(step.record_id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?\\s*$`, 'm');
+          const expectedKind = new RegExp(`^record_kind:\\s*["']?${String(step.record_kind).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?\\s*$`, 'm');
+          if (!String(content || '').trim() || !expectedId.test(content) || !expectedKind.test(content)) { valid = false; break; }
           knowledge.push(step);
         }
         if (!valid) {
-          task.status = 'paused';
-          task.progress = { stage: 'recovery-required', message: '提交事务与磁盘内容不一致，请安全回滚或转人工。', at: new Date().toISOString() };
-          changed = true;
           break;
         }
         task.semantic_path = 'universal';
@@ -3691,6 +3774,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         task.output_paths = knowledge.map((step) => step.path);
         task.written_card_ids = [];
         task.result_counts = Object.assign({}, task.result_counts || {}, {
+          planned: knowledge.length, attempted: knowledge.filter((step) => step.action !== 'noop').length,
+          committed: knowledge.length, verified: knowledge.length,
           written: knowledge.length, knowledge_records: knowledge.length,
           created: knowledge.filter((step) => step.action === 'create').length,
           updated: knowledge.filter((step) => String(step.action).includes('update')).length,
@@ -3703,8 +3788,27 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           'structured-transaction': manifestPath, knowledge_records: task.output_paths
         });
         changed = true;
+        recovered = true;
         diag('startup.structuredCommitRecovered', { taskId: task.task_id, transactionId: manifest.transaction_id, knowledgeRecords: knowledge.length });
         break;
+      }
+      if (!recovered && (task.structured_transaction_id || ['written', 'completed_no_output'].includes(task.status))) {
+        task.status = 'queued';
+        task.terminal_outcome = null;
+        task.structured_transaction_id = null;
+        task.output_paths = [];
+        task.written_card_ids = [];
+        task.result_counts = Object.assign({}, task.result_counts || {}, {
+          written: 0, created: 0, updated: 0, unchanged: 0, knowledge_records: 0, committed: 0, verified: 0
+        });
+        if (task.artifacts) {
+          delete task.artifacts.knowledge_records;
+          delete task.artifacts['structured-transaction'];
+        }
+        task.updated_at = new Date().toISOString();
+        task.progress = { stage: 'queued', message: '旧版入库结果未通过 Obsidian 文件复核，已失效并等待安全重写。', at: task.updated_at };
+        changed = true;
+        diag('startup.structuredCommitInvalidated', { taskId: task.task_id, reason: 'visible_files_missing_or_invalid' });
       }
     }
     if (changed) {
@@ -4417,8 +4521,9 @@ class SlicerDashboardView extends ItemView {
         ['当前阶段', stageLabel(task.progress?.stage || task.status)],
         ['已用时间', formatDuration(task.progress?.elapsedMs || 0)],
         ['重试次数', String(task.retry_count || task.attempt || 0)],
-        ['结果数量', String(Number(task.result_counts?.knowledge_records)
-          || Number(task.result_counts?.written) || task.written_card_ids?.length || 0)],
+        ['结果数量', String(task.semantic_path === 'universal'
+          ? Number(task.result_counts?.verified) || 0
+          : Number(task.result_counts?.written) || task.written_card_ids?.length || 0)],
         ['最后更新', formatLocalTime(task.updated_at || task.progress?.at || '')],
         ['错误代码', error?.code || '-']
       ]) {
@@ -4432,7 +4537,9 @@ class SlicerDashboardView extends ItemView {
           text: `未生成可入库结果：生成 ${Number(counts.generated) || 0}，写入 ${Number(counts.written) || 0}。${safeDisplayText(task.progress?.message, '未发现可由来源逐字核验的知识；请检查正文解析与证据定位后重试。')}`
         });
       }
-      const outputPaths = Array.isArray(task.output_paths) ? task.output_paths : [];
+      const outputPaths = Array.isArray(task.output_paths)
+        ? (task.semantic_path === 'universal' ? task.output_paths.slice(0, Number(task.result_counts?.verified) || 0) : task.output_paths)
+        : [];
       if (outputPaths.length) {
         const outputs = details.createEl('details', { cls: 'eks-technical-details' });
         outputs.createEl('summary', { text: `知识记录路径（${outputPaths.length}）` });
@@ -9017,27 +9124,43 @@ function hasSourceAssociation(content, sourceId) {
 
 async function verifyCommittedRecords(plan, vault) {
   const records = [];
+  const failures = [];
   for (const action of plan.actions) {
-    const content = await vault.readIfExists(action.path);
+    let content = null;
+    try { content = await vault.readIfExists(action.path); } catch (error) {
+      failures.push({ record_id: action.record_id, record_kind: action.record_kind,
+        path: action.path, reason: 'unreadable_file', error: String(error?.message || error) });
+      continue;
+    }
     const actualId = frontmatterValue(content, 'record_id');
     const actualKind = frontmatterValue(content, 'record_kind');
-    if (content === null || !action.path.endsWith('.md') || actualId !== action.record_id
+    if (content === null || !String(content).trim() || !action.path.endsWith('.md') || actualId !== action.record_id
       || actualKind !== action.record_kind
       || (KNOWLEDGE_RECORD_KINDS.has(action.record_kind)
         && !hasSourceAssociation(content, action.owner_source_id))) {
-      const error = new Error(`提交后验证失败：${action.record_id}（${action.path}）`);
-      error.code = 'STRUCTURED_RECORD_VERIFICATION_FAILED';
-      error.details = {
+      failures.push({
         record_id: action.record_id, record_kind: action.record_kind, path: action.path,
-        reason: content === null ? 'missing_file' : 'identity_or_source_mismatch'
-      };
-      throw error;
+        reason: content === null ? 'missing_file' : !String(content).trim() ? 'empty_file' : 'identity_or_source_mismatch'
+      });
+      continue;
     }
     records.push({
       record_id: action.record_id, record_kind: action.record_kind, path: action.path,
       disposition: action.action === 'noop' ? 'unchanged' : action.action,
       bytes: Buffer.byteLength(content), knowledge_record: KNOWLEDGE_RECORD_KINDS.has(action.record_kind)
     });
+  }
+  if (failures.length) {
+    const plannedKnowledge = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind));
+    const verifiedKnowledge = records.filter((item) => item.knowledge_record);
+    const error = new Error(`结构化提交未持久化：计划 ${plannedKnowledge.length} 个知识文件，仅验证 ${verifiedKnowledge.length} 个。`);
+    error.code = 'STRUCTURED_WRITE_NOT_PERSISTED';
+    error.stage = 'structured-post-commit-verification';
+    error.details = {
+      planned: plannedKnowledge.length, attempted: plannedKnowledge.filter((item) => item.action !== 'noop').length,
+      committed: verifiedKnowledge.length, verified: verifiedKnowledge.length, failures
+    };
+    throw error;
   }
   const knowledgeRecords = records.filter((record) => record.knowledge_record);
   return {
@@ -9653,7 +9776,7 @@ function statusCounts(tasks) {
       || (Array.isArray(task.review_atom_ids) ? task.review_atom_ids.length : 0);
     if (task.status === 'failed') counts.failed += 1;
     if (task.status === 'rolled_back') counts.rolledBack += 1;
-    else if (task.semantic_path === 'universal' || task.structured_transaction_id || Array.isArray(task.output_paths)) counts.written += Number(task.result_counts?.knowledge_records) || 0;
+    else if (task.semantic_path === 'universal' || task.structured_transaction_id || Array.isArray(task.output_paths)) counts.written += Number(task.result_counts?.verified) || 0;
     else if (Array.isArray(task.written_card_ids) && task.written_card_ids.length) counts.written += task.written_card_ids.length;
     else if (Array.isArray(task.writtenFiles) && task.writtenFiles.length) counts.written += task.writtenFiles.length;
     else if (task.status === 'written' || task.status === 'archived') counts.written += 1;
@@ -17752,6 +17875,7 @@ function classifyFailure(input = {}) {
   if (code === 'COMPONENT_NOT_FOUND') return result(code, 'component_config', false, '找不到组件文件', '该组件没有可用的内置兼容回退；恢复缺失的用户组件后重试，已有解析产物会复用，无需重新上传。');
   if (code === 'COMPONENT_CONFIG_INVALID') return result(code, 'component_config', false, '组件配置无效', '内置兼容回退不会替换已存在但无效的自定义内容；修正 folder-map、Schema 或 Prompt 后重试，已有解析产物会复用。');
   if (code === 'VAULT_PATH_INVALID') return result(code, 'path_contract', false, '插件路径契约无效', '修复或移除包含主机绝对路径的旧索引/状态记录后重试；已有解析与统一知识产物会复用。');
+  if (code === 'STRUCTURED_WRITE_NOT_PERSISTED') return result(code, 'structured_state', true, '未写入任何知识卡片', '写入结果未能由 Obsidian 打开，事务和索引已安全回滚；请保留源文件并重试。');
   if (code === 'STRUCTURED_INDEX_CORRUPT') return result(code, 'structured_state', false, '结构化索引已损坏', '修复索引 JSON 后重试；插件不会覆盖原文件，解析与统一知识检查点会复用。');
   if (code === 'PROJECT_REGISTRY_CORRUPT' || code === 'PROJECT_REGISTRY_INVALID') return result(code, 'structured_state', false, '项目登记表损坏或格式无效', '修复项目登记表 JSON/数组格式后重试；插件不会覆盖原文件，已有检查点会复用。');
   if (code === 'TASK_LEDGER_CORRUPT') return result(code, 'task_ledger', false, '任务账本损坏或无法读取', '修复 tasks.json 或从滚动备份恢复；插件不会清空或覆盖损坏账本。');
@@ -18987,7 +19111,7 @@ function canonicalTaskUiState(tasks, completedTaskId) {
     failed: rows.filter((task) => task.status === 'failed').length,
     written: rows.reduce((sum, task) => sum + (
       task.semantic_path === 'universal' || task.structured_transaction_id || Array.isArray(task.output_paths)
-        ? Number(task.result_counts?.knowledge_records) || 0
+        ? Number(task.result_counts?.verified) || 0
         : Array.isArray(task.written_card_ids) && task.written_card_ids.length
         ? task.written_card_ids.length
         : task.status === 'written' ? 1 : 0

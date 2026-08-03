@@ -1,5 +1,13 @@
 # 工程知识切片 变更记录
 
+## v2.20.8 — 2026-08-03 Obsidian 可见写入与假成功修复
+
+- 根因修复：结构化生产桥不再通过同一个底层 adapter 写入并自证成功；可用时统一经 Obsidian Vault API 创建、修改、移动、逐文件打开和回读，adapter-only 环境保留严格读回兼容路径。
+- 提交结果明确区分 `planned`、`attempted`、`committed`、`verified`。`written`、`knowledge_records`、`output_paths`、状态栏、任务卡、完成提示、诊断和性能统计只消费真实可见、可读、非空且 `record_id` / `record_kind` 匹配的 verified 知识 Markdown。
+- 计划 22 个但实际为 0 或部分落盘时抛出 `STRUCTURED_WRITE_NOT_PERSISTED`，原子回滚文件与索引，清空成功计数和路径，任务明确失败并显示“未写入任何知识卡片”；源文件、解析产物和诊断证据保留。
+- 启动恢复不再信任 v2.20.7 的事务 ID 或缓存路径；每次重新使用 Obsidian 可见文件核验。缺文件、不可读、空内容、身份不符或缺少可复核计划时使旧成功缓存失效并重新排队，幂等重写不重复建卡。
+- 成功 UI 显示真实目录和首个可打开文件。新增真实 bundled `main.js` 回归，覆盖 22→0、22→部分、22→22、中文/日文/英文与空格路径、adapter-only、真实 `TFile` 打开、重复运行及旧 v2.20.7 假成功恢复。
+
 ## v2.20.6 — 2026-07-31 可见知识记录提交验证
 
 - 修复结构化事务把来源、项目等任意非 noop 动作当作知识卡片写入成功的问题。任务终态、结果数量和完成提示现在只依据回读验证通过的 `business_item` / `company_knowledge` Markdown，不再依据候选数或通用事务动作数。

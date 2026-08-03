@@ -13,6 +13,7 @@ data.json.*-backup
 # 临时测试
 tmp/
 test-out/
+test-artifacts/
 
 # Python 缓存（paddleocr_extract.py 引用）
 __pycache__/

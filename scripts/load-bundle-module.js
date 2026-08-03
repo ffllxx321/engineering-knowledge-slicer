@@ -20,6 +20,7 @@ function loadBundleModule(id, dependencies = {}) {
   new Function('require', 'module', 'exports', code.slice(bodyStart, end))(
     (name) => {
       if (Object.hasOwn(dependencies, name)) return dependencies[name];
+      if (name === 'src/knowledge-write-port.js') return loadBundleModule(name, { crypto });
       if (name === 'src/core/document-parser.js') {
         const block = loadBundleModule('src/core/block-v0.js', { crypto });
         const provenance = loadBundleModule('src/core/provenance.js', { crypto });

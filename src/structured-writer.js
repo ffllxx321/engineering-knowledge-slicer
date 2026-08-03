@@ -583,7 +583,7 @@ function hasSourceAssociation(content, sourceId) {
     || new RegExp(`^source_document_ids:\\s*\\[[^\\n]*["']?${sourceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?`, 'm').test(value);
 }
 
-async function verifyCommittedRecords(plan, vault) {
+async function verifyCommittedRecords(plan, vault, context = {}) {
   const records = [];
   const failures = [];
   for (const action of plan.actions) {
@@ -605,10 +605,21 @@ async function verifyCommittedRecords(plan, vault) {
       });
       continue;
     }
+    let authoritative = null;
+    try {
+      authoritative = typeof vault.verify === 'function'
+        ? await vault.verify(action, context.transactionId || '', context.verifiedAt || '') : null;
+    } catch (error) {
+      failures.push({ record_id: action.record_id, record_kind: action.record_kind,
+        path: action.path, reason: 'public_vault_verification_failed', error: String(error?.message || error) });
+      continue;
+    }
     records.push({
       record_id: action.record_id, record_kind: action.record_kind, path: action.path,
       disposition: action.action === 'noop' ? 'unchanged' : action.action,
-      bytes: Buffer.byteLength(content), knowledge_record: KNOWLEDGE_RECORD_KINDS.has(action.record_kind)
+      bytes: Buffer.byteLength(content), knowledge_record: KNOWLEDGE_RECORD_KINDS.has(action.record_kind),
+      content_hash: action.content_hash, verified_at: context.verifiedAt || '',
+      transaction_id: context.transactionId || '', state: 'visible_verified', ...(authoritative || {})
     });
   }
   if (failures.length) {
@@ -679,7 +690,9 @@ async function commitPlan(plan, options) {
       step.status = 'committed';
       await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
     }
-    const verified = await verifyCommittedRecords(plan, vault);
+    const verified = await verifyCommittedRecords(plan, vault, {
+      transactionId, verifiedAt: options.logicalTime || new Date().toISOString()
+    });
     const index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
     index.version = INDEX_VERSION;
     index.revision = Number(index.revision || 0) + 1;

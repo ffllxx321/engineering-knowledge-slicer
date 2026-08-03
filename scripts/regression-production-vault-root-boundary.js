@@ -122,7 +122,8 @@ function createVault(initialFiles) {
     read: async (file) => adapter.read(file.path),
     createFolder: async (rawPath) => adapter.mkdir(rawPath),
     create: async (rawPath, content) => adapter.write(rawPath, content),
-    modify: async (file, content) => adapter.write(file.path, content)
+    modify: async (file, content) => adapter.write(file.path, content),
+    rename: async (file, target) => adapter.rename(file.path, target)
   };
   return { vault, files, calls };
 }
@@ -303,14 +304,15 @@ async function main() {
   assert.strictEqual(task.result_counts.knowledge_records, 1);
   assert.strictEqual(task.result_counts.unchanged, 1);
   assert.strictEqual(task.output_paths.length, 1);
-  assert.deepStrictEqual(task.artifacts.knowledge_records, task.output_paths);
+  assert.strictEqual(task.artifacts.knowledge_records, undefined);
+  assert.strictEqual(task.verified_records.length, 1);
 
   await assert.rejects(
     () => PluginClass.prototype.loadComponentText.call(plugin, '提示词/业务库/刻意缺失.md'),
     (error) => error.code === 'COMPONENT_NOT_FOUND'
       && error.code !== 'FILE_NOT_FOUND'
   );
-  for (const operation of ['exists', 'read', 'write', 'rename']) {
+  for (const operation of ['exists', 'read', 'write']) {
     assert(vaultHarness.calls.some((call) => call.operation === operation),
       `mock adapter did not observe production ${operation}`);
   }

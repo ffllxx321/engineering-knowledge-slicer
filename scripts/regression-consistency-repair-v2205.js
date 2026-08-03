@@ -63,7 +63,8 @@ function vault(initial = {}) {
       read: async (file) => files.get(file.path),
       createFolder: adapter.mkdir,
       create: adapter.write,
-      modify: async (file, value) => adapter.write(file.path, value)
+      modify: async (file, value) => adapter.write(file.path, value),
+      rename: async (file, target) => adapter.rename(file.path, target)
     }
   };
 }

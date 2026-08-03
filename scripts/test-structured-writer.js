@@ -422,8 +422,10 @@ async function main() {
     'production adapter must add zero Phase 3 evaluations');
   assert(production.includes("if (mode === 'structured-pilot') return { mode, plan, universalResult: universal };"),
     'pilot must return before commit');
-  assert(production.includes('this.settings.controlledWriterEnabled === true'),
-    'universal production must have an explicit feature boundary');
+  assert(production.includes("process?.env?.EKS_ENABLE_NONPRODUCTION_LEGACY === '1'"),
+    'legacy workflow must be reachable only through an explicit nonproduction environment gate');
+  assert(production.includes("process?.env?.EKS_ENABLE_NONPRODUCTION_PILOT === '1'"),
+    'pilot mode must be reachable only through an explicit nonproduction environment gate');
   console.log('structured writer production tests: ok');
 }
 

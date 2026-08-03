@@ -109,6 +109,7 @@ const {
   buildPlan: buildStructuredPlan,
   commitPlan: commitStructuredPlan,
   rollbackTransaction: rollbackStructuredTransaction,
+  hash: structuredContentHash,
   emptyIndex: emptyStructuredIndex,
   validateIndex: validateStructuredIndex
 } = require("src/structured-writer.js");
@@ -1143,7 +1144,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
   async rollbackLastBatch() {
     const tasks = await this.loadTasks();
-    const candidates = tasks.filter((t) => ['written', 'archived', 'rolled_back'].includes(t.status)
+    const candidates = tasks.filter((t) => t.status !== 'rolled_back'
+      && (t.structured_transaction_id || ['written', 'archived'].includes(t.status))
       && (t.structured_transaction_id || (t.writtenFiles && t.writtenFiles.length)
         || (t.written_card_ids && t.written_card_ids.length)));
     if (!candidates.length) {
@@ -1186,6 +1188,13 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       await writeFile(this.app, manifestPath, JSON.stringify(manifest, null, 2));
       lastBatch.status = 'rolled_back';
       lastBatch.updated_at = manifest.rolled_back_at;
+      lastBatch.terminal_outcome = 'rolled_back';
+      lastBatch.result_counts = Object.assign({}, lastBatch.result_counts || {}, {
+        written: 0, created: 0, updated: 0, unchanged: 0, knowledge_records: 0, rolled_back: 1
+      });
+      lastBatch.output_paths = [];
+      if (lastBatch.artifacts) delete lastBatch.artifacts.knowledge_records;
+      lastBatch.structured_transaction_id = null;
       await this.saveTasks(tasks);
       await this.flushSaveTasksImmediate();
       new Notice('最近结构化文档事务已回滚；原始资料和其他文件未改动。');
@@ -1425,8 +1434,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
       this.assertTaskCanContinue(current);
 
-      const universalProduction = this.settings.controlledWriterEnabled === true
-        && ['structured-pilot', 'structured-write'].includes(this.settings.structuredWriterMode);
+      const universalProduction = !(typeof process === 'object'
+        && process?.env?.EKS_ENABLE_NONPRODUCTION_LEGACY === '1'
+        && this.settings.structuredWriterMode === 'legacy');
       current.status = 'slicing';
       await this.setTaskProgress(current, universalProduction
         ? '正在生成或恢复统一知识产物'
@@ -1571,9 +1581,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         }
       }
       const structuredHandlingGroups = [
-        ...(structured.plan?.phase3_handling_groups || []),
-        ...(structured.plan?.review_groups || []),
-        ...(structured.plan?.conflicts || [])
+        ...(structured.plan?.phase3_handling_groups || []).map((item) => Object.assign({ __kind: 'phase3' }, item)),
+        ...(structured.plan?.review_groups || []).map((item) => Object.assign({ __kind: 'review' }, item)),
+        ...(structured.plan?.conflicts || []).map((item) => Object.assign({ __kind: 'conflict', blocking: true }, item))
       ];
       if (universalProduction || (!universalProduction && (legacyReview.length || legacyRejected.length
         || workflow.documentWarnings.length || workflow.metrics?.hardRejected))
@@ -1597,8 +1607,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         + Number(verifiedStructured?.counts?.knowledge_updated || 0);
       const structuredExisting = Number(verifiedStructured?.counts?.knowledge_unchanged || 0);
       const structuredVisible = Number(verifiedStructured?.counts?.knowledge_records || 0);
-      const persistedCount = current.written_card_ids.length
-        + (universalProduction ? structuredVisible : structuredWrites);
+      const persistedCount = universalProduction ? structuredVisible : current.written_card_ids.length;
       const generatedCount = universalProduction
         ? Number(structured.universalResult?.knowledge_units?.length || 0)
         : Number(workflow.metrics?.generated ?? workflow.atomResult?.atoms?.length ?? 0);
@@ -1624,6 +1633,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         structured_commits: structuredWrites
       };
       if (universalProduction) {
+        current.semantic_path = 'universal';
+        current.written_card_ids = [];
         current.output_paths = [...(verifiedStructured?.knowledge_paths || [])];
         current.artifacts = Object.assign({}, current.artifacts || {}, {
           knowledge_records: current.output_paths
@@ -2774,8 +2785,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   async runStructuredWriterPhase(task, parsePackage) {
     // Universal production accepts only canonical source state. Legacy Phase 2/3
     // remains available through its explicit legacy workflow, never as writer input.
-    const mode = this.settings.structuredWriterMode === 'structured-pilot'
-      ? 'structured-pilot' : 'structured-write';
+    const mode = (typeof process === 'object' && process?.env?.EKS_ENABLE_NONPRODUCTION_PILOT === '1'
+      && this.settings.structuredWriterMode === 'structured-pilot') ? 'structured-pilot' : 'structured-write';
     const stateFolder = normalizeVaultPath(`${this.settings.artifactsPath}/structured-writer`);
     const indexPath = normalizeVaultPath(`${stateFolder}/id-path-index.v1.json`);
     const registryPath = normalizeVaultPath(`${stateFolder}/project-registry.v1.json`);
@@ -2890,6 +2901,21 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       translation_checkpoint: universal.translation_checkpoint,
       cache_key: universal.cache_key
     });
+    const priorUniversalReview = await this.loadArtifact(task, 'review');
+    const priorDecisions = priorUniversalReview?.semantic_path === 'universal'
+      ? (priorUniversalReview.decisions || []) : [];
+    for (const decision of priorDecisions.filter((item) => item.action === 'apply_correction')) {
+      const targetId = decision.original?.unit_id || decision.original?.knowledge_unit_id || '';
+      for (const unit of universal.knowledge_units || []) {
+        if (targetId && unit.unit_id !== targetId) continue;
+        const correction = decision.correction || {};
+        unit.route = Object.assign({}, unit.route || {}, {
+          library: correction.library || unit.route?.library,
+          category: correction.category || correction.directory_category || unit.route?.category
+        });
+        if (correction.record_kind) unit.record_kind = correction.record_kind;
+      }
+    }
     const settings = Object.assign({}, this.settings, {
       controlledWriterEnabled: true,
       structuredWriterMode: mode
@@ -2926,6 +2952,24 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       settings, document, projectRegistry, universalResult: universal,
       index, existingFiles, logicalTime: task.created_at || '1970-01-01T00:00:00.000Z'
     });
+    if (priorDecisions.length) {
+      const resolved = priorDecisions.filter((item) => item.action !== 'manual_group');
+      const matches = (item, decision) => {
+        const original = decision.original || {};
+        for (const key of ['decision_id', 'conflict_id', 'group_id', 'record_id', 'unit_id']) {
+          if (item?.[key] && original?.[key] && String(item[key]) === String(original[key])) return true;
+        }
+        return item?.cause && original?.cause && item.cause === original.cause
+          && String(item.path || '') === String(original.path || '');
+      };
+      plan.phase3_handling_groups = (plan.phase3_handling_groups || []).filter((item) => !resolved.some((decision) => matches(item, decision)));
+      plan.review_groups = (plan.review_groups || []).filter((item) => !resolved.some((decision) => matches(item, decision)));
+      plan.conflicts = (plan.conflicts || []).filter((item) => !resolved.some((decision) => matches(item, decision)));
+      const discardedRecordIds = new Set(priorDecisions.filter((item) => item.action === 'discard_group')
+        .map((item) => item.original?.record_id).filter(Boolean));
+      if (discardedRecordIds.size) plan.actions = (plan.actions || []).filter((item) => !discardedRecordIds.has(item.record_id));
+      plan.blocked = plan.phase3_handling_groups.length > 0 || plan.review_groups.length > 0 || plan.conflicts.length > 0;
+    }
     await this.persistArtifact(task, 'structured-write-plan', Object.assign({}, plan, {
       actions: plan.actions.map(({ prior_content, content, ...action }) => action)
     }));
@@ -3032,6 +3076,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     if (!task) throw new Error('未找到审核任务');
     const artifact = await this.loadArtifact(task, 'review');
     if (!artifact) throw new Error('未找到审核产物');
+    if (artifact.semantic_path === 'universal') {
+      return this.applyUniversalReviewAction(task, artifact, groupId, action, correction);
+    }
     const group = groupReviewItems(artifact.items).find((item) => item.group_id === groupId);
     if (!group) throw new Error('未找到审核分组');
 
@@ -3106,6 +3153,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     if (!task) throw new Error('未找到审核任务');
     const artifact = await this.loadArtifact(task, 'review');
     if (!artifact) throw new Error('未找到审核产物');
+    if (artifact.semantic_path === 'universal') {
+      throw new Error('UNIVERSAL_REVIEW_SELECTION_MISMATCH: 统一审核不得调用旧卡片逐项处理函数');
+    }
     const group = groupReviewItems(artifact.items).find((item) => item.group_id === groupId);
     if (!group) throw new Error('未找到审核分组');
     const selected = new Set(atomIds || []);
@@ -3173,6 +3223,72 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       remaining: artifact.items.length,
       remainingItems: artifact.items
     };
+  }
+
+  async applyUniversalReviewAction(task, artifact, groupId, action, correction = {}) {
+    const groups = Array.isArray(artifact.structured_handling_groups) ? artifact.structured_handling_groups : [];
+    const index = groups.findIndex((item, position) =>
+      String(item.decision_id || item.conflict_id || item.group_id || `universal-${position}`) === String(groupId));
+    if (index < 0) throw new Error('未找到统一审核项');
+    const group = groups[index];
+    const kind = group.__kind || (group.conflict_id || group.cause?.includes('conflict') ? 'conflict' : 'review');
+    const hard = kind === 'conflict' || group.hard === true || group.blocking === true;
+    const accepted = ['approve_group', 'accept_suggestion'].includes(action);
+    if (accepted && hard) throw new Error('硬冲突不能强制批准；请修正规则/路由、重新规划或转人工。');
+    if (!['approve_group', 'accept_suggestion', 'discard_group', 'apply_correction', 'regenerate_group', 'manual_group'].includes(action)) {
+      throw new Error(`不支持的统一审核操作：${action}`);
+    }
+    const now = new Date().toISOString();
+    if (action === 'regenerate_group') {
+      for (const name of ['universal-canonical', 'structured-write-plan', 'review']) delete task.artifacts?.[name];
+      task.review_atom_ids = [];
+      task.status = 'queued';
+      task.updated_at = now;
+      await this.saveTasks(upsertTask(await this.loadTasks(), task));
+      return this.processTask(task);
+    }
+    if (action === 'manual_group') {
+      group.manual = { status: 'pending_human', at: now, next_step: '由知识管理员修正规则或路由后点击重新规划' };
+      await this.persistArtifact(task, 'review', artifact);
+      await this.saveTasks(upsertTask(await this.loadTasks(), task));
+      await this.refreshViews();
+      return { handled: 0, remaining: groups.length };
+    }
+    const decision = {
+      group_id: groupId, action, at: now,
+      correction: action === 'apply_correction' ? this.validateUniversalCorrection(correction) : undefined,
+      original: group
+    };
+    artifact.decisions = [...(artifact.decisions || []), decision];
+    artifact.structured_handling_groups = groups.filter((_, position) => position !== index);
+    await this.persistArtifact(task, 'review', artifact);
+    task.review_atom_ids = artifact.structured_handling_groups.map((item, position) =>
+      item.decision_id || item.conflict_id || item.group_id || `universal-${position}`);
+    task.updated_at = now;
+    if (task.review_atom_ids.length) {
+      task.status = 'needs_review';
+      await this.saveTasks(upsertTask(await this.loadTasks(), task));
+      await this.refreshViews();
+      return { handled: 1, remaining: task.review_atom_ids.length };
+    }
+    task.status = action === 'discard_group' ? 'completed_no_output' : 'queued';
+    task.terminal_outcome = action === 'discard_group' ? 'completed_no_output' : undefined;
+    await this.saveTasks(upsertTask(await this.loadTasks(), task));
+    if (task.status === 'queued') return this.processTask(task);
+    await this.refreshViews();
+    return { handled: 1, remaining: 0 };
+  }
+
+  validateUniversalCorrection(correction) {
+    if (!correction || typeof correction !== 'object' || Array.isArray(correction)) throw new Error('修正规则必须是 JSON 对象');
+    const allowed = new Set(['library', 'category', 'directory_category', 'record_kind', 'route']);
+    const clean = {};
+    for (const [key, value] of Object.entries(correction)) {
+      if (!allowed.has(key) || typeof value !== 'string' || !value.trim() || value.length > 200) throw new Error(`无效的统一路由修正字段：${key}`);
+      clean[key] = value.trim();
+    }
+    if (!Object.keys(clean).length) throw new Error('没有可应用的路由修正');
+    return clean;
   }
 
   async regenerateSelectedReview(task, artifact, chosen) {
@@ -3492,7 +3608,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   //   2) 上次关闭时处于解析/总结/原子化/写入/排队中的任务，弹窗询问
   //      继续（重新入队，artifact 缓存自动断点续传）或放弃（移除记录）。
   async sessionStartupCleanup() {
-    const tasks = await this.loadTasks();
+    const tasks = await this.recoverCommittedStructuredTasks(await this.loadTasks());
     const failedTasks = tasks.filter((task) => task.status === 'failed');
     if (failedTasks.length) {
       for (const task of failedTasks) this._terminalTaskIds.add(task.task_id);
@@ -3524,11 +3640,78 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       },
       onDiscard: async () => {
         const latest = await this.loadTasks();
-        await this.saveTasks(latest.filter((task) => !interruptedIds.has(task.task_id)));
+        const retained = [];
+        for (const task of latest) {
+          if (!interruptedIds.has(task.task_id)) { retained.push(task); continue; }
+          if (task.structured_transaction_id) {
+            task.status = 'paused';
+            task.updated_at = new Date().toISOString();
+            task.progress = { stage: 'recovery-required', message: '检测到已提交事务；任务已保留，请先安全回滚后再放弃。', at: task.updated_at };
+            retained.push(task);
+          }
+        }
+        await this.saveTasks(retained);
         await this.refreshViews();
-        diag('startup.interruptedDiscarded', { count: interrupted.length });
+        diag('startup.interruptedDiscarded', { count: interrupted.length, retainedCommitted: retained.filter((task) => interruptedIds.has(task.task_id)).length });
       }
     }).open();
+  }
+
+  async recoverCommittedStructuredTasks(tasks) {
+    const adapter = this.app.vault.adapter;
+    if (typeof adapter.list !== 'function') return tasks;
+    const directory = normalizeVaultPath(`${this.settings.artifactsPath}/structured-writer/transactions`);
+    if (!(await adapter.exists(directory))) return tasks;
+    const listing = await adapter.list(directory);
+    const files = Array.isArray(listing?.files) ? listing.files.filter((path) => path.endsWith('.json')) : [];
+    let changed = false;
+    for (const task of tasks) {
+      if (task.structured_transaction_id || task.status === 'rolled_back') continue;
+      const plan = await this.loadArtifact(task, 'structured-write-plan');
+      if (!plan?.plan_id) continue;
+      for (const manifestPath of files) {
+        let manifest;
+        try { manifest = JSON.parse(await adapter.read(manifestPath)); } catch (_) { continue; }
+        if (manifest.status !== 'committed' || manifest.plan_id !== plan.plan_id) continue;
+        const knowledge = [];
+        let valid = true;
+        for (const step of manifest.steps || []) {
+          if (!['business_item', 'company_knowledge'].includes(step.record_kind)) continue;
+          if (!(await adapter.exists(step.path)) || structuredContentHash(await adapter.read(step.path)) !== step.content_hash) { valid = false; break; }
+          knowledge.push(step);
+        }
+        if (!valid) {
+          task.status = 'paused';
+          task.progress = { stage: 'recovery-required', message: '提交事务与磁盘内容不一致，请安全回滚或转人工。', at: new Date().toISOString() };
+          changed = true;
+          break;
+        }
+        task.semantic_path = 'universal';
+        task.structured_transaction_id = manifest.transaction_id;
+        task.output_paths = knowledge.map((step) => step.path);
+        task.written_card_ids = [];
+        task.result_counts = Object.assign({}, task.result_counts || {}, {
+          written: knowledge.length, knowledge_records: knowledge.length,
+          created: knowledge.filter((step) => step.action === 'create').length,
+          updated: knowledge.filter((step) => String(step.action).includes('update')).length,
+          unchanged: Number(plan.counts?.noop || 0), review: 0
+        });
+        task.status = knowledge.length ? 'written' : 'completed_no_output';
+        task.terminal_outcome = knowledge.length ? 'completed_with_output' : 'completed_no_output';
+        task.updated_at = new Date().toISOString();
+        task.artifacts = Object.assign({}, task.artifacts || {}, {
+          'structured-transaction': manifestPath, knowledge_records: task.output_paths
+        });
+        changed = true;
+        diag('startup.structuredCommitRecovered', { taskId: task.task_id, transactionId: manifest.transaction_id, knowledgeRecords: knowledge.length });
+        break;
+      }
+    }
+    if (changed) {
+      await this.saveTasks(tasks);
+      await this.flushSaveTasksImmediate();
+    }
+    return tasks;
   }
 
   async setTaskProgress(task, message, details = {}) {
@@ -4562,6 +4745,33 @@ class SlicerDashboardView extends ItemView {
       const artifact = await this.plugin.loadArtifact(task, 'review');
       if (renderVersion !== this._renderVersion) return;
       if (!artifact) continue;
+      if (artifact.semantic_path === 'universal') {
+        const groups = Array.isArray(artifact.structured_handling_groups) ? artifact.structured_handling_groups : [];
+        const summary = parent.createDiv('eks-review-document-summary');
+        summary.createEl('h4', { text: `统一结构化审核 · ${safeDisplayText(task.source_path, '源文件')}` });
+        summary.createDiv({ text: `${safeDisplayText(artifact.structured_summary, '计划需要确认')} · 待处理 ${groups.length} 项` });
+        for (const [position, group] of groups.entries()) {
+          const id = String(group.decision_id || group.conflict_id || group.group_id || `universal-${position}`);
+          const kind = group.__kind || (group.conflict_id ? 'conflict' : 'review');
+          const hard = kind === 'conflict' || group.hard === true || group.blocking === true;
+          const block = parent.createDiv('eks-review-group');
+          block.createEl('h4', { text: hard ? '需要修正的硬冲突' : '需要确认的处理建议' });
+          block.createDiv({ cls: 'eks-review-reason', text: safeDisplayText(group.reason || group.cause || group.summary || group.message, '当前规则无法安全自动决定。') });
+          block.createDiv({ cls: 'eks-task-meta', text: safeDisplayText(group.title || group.label || group.record_id || group.unit_id, '未命名知识项') });
+          const actions = block.createDiv('eks-actions');
+          if (!hard) button(actions, '接受建议', () => this.plugin.applyReviewGroup(task.task_id, id, 'accept_suggestion'));
+          button(actions, '丢弃此项', () => this.plugin.applyReviewGroup(task.task_id, id, 'discard_group'));
+          button(actions, '修正规则或路由', async () => {
+            const raw = window.prompt('输入 JSON，可用字段：library / category / directory_category / record_kind / route', '{"category":""}');
+            if (!raw) return;
+            try { await this.plugin.applyReviewGroup(task.task_id, id, 'apply_correction', JSON.parse(raw)); }
+            catch (error) { new Notice(error.message); }
+          });
+          button(actions, '重新生成/重新规划', () => this.plugin.applyReviewGroup(task.task_id, id, 'regenerate_group'));
+          button(actions, '转人工', () => this.plugin.applyReviewGroup(task.task_id, id, 'manual_group'));
+        }
+        continue;
+      }
       if (artifact.outcome?.kind === 'review_required') {
         const block = parent.createDiv('eks-review-group');
         block.createEl('h4', { text: `源文件需要审核 · ${artifact.outcome.code}` });
@@ -4751,28 +4961,9 @@ class SlicerSettingTab extends PluginSettingTab {
   renderAdvancedSettings(containerEl) {
     containerEl.createEl('h2', { text: '高级设置' });
     new Setting(containerEl)
-      .setName('受控结构化写入器')
-      .setDesc('默认关闭。仅显式开启后运行 Phase 2/3；现有用户不会被自动启用。')
-      .addToggle((toggle) => toggle
-        .setValue(this.plugin.settings.controlledWriterEnabled === true)
-        .onChange(async (value) => {
-          this.plugin.settings.controlledWriterEnabled = value === true;
-          if (!value) this.plugin.settings.structuredWriterMode = 'legacy';
-          await this.plugin.saveSafeSettings();
-          this.display();
-        }));
-    if (this.plugin.settings.controlledWriterEnabled === true) {
-      new Setting(containerEl)
-        .setName('结构化写入模式')
-        .setDesc('Pilot 只生成可检查计划且不写结构化记录；正式写入与旧卡写入互斥，并受冲突、审核、限额和事务回滚门禁保护。')
-        .addDropdown((dropdown) => dropdown
-          .addOption('structured-pilot', 'Pilot：只生成计划')
-          .addOption('structured-write', 'Cutover：结构化事务写入')
-          .setValue(this.plugin.settings.structuredWriterMode === 'structured-write' ? 'structured-write' : 'structured-pilot')
-          .onChange(async (value) => {
-            this.plugin.settings.structuredWriterMode = value;
-            await this.plugin.saveSafeSettings();
-          }));
+      .setName('结构化事务写入')
+      .setDesc('生产会话始终启用；写入受冲突审核、限额、验证和安全回滚保护。');
+    {
       new Setting(containerEl)
         .setName('两库根目录')
         .setDesc(`在办：${this.plugin.settings.structuredActiveRoot}；长期：${this.plugin.settings.structuredBusinessRoot}。仅允许 vault 内安全相对路径，首次运行前仍会再次校验。`);
@@ -9160,8 +9351,9 @@ function migrateSettings(stored = {}) {
   // production integrity boundary and is therefore enabled for every migration.
   migrated.advancedSettingsEnabled = source.advancedSettingsEnabled === true;
   migrated.controlledWriterEnabled = true;
-  migrated.structuredWriterMode = source.structuredWriterMode === 'structured-pilot'
-    ? 'structured-pilot' : 'structured-write';
+  migrated.structuredWriterMode = (typeof process === 'object'
+    && process?.env?.EKS_ENABLE_NONPRODUCTION_PILOT === '1'
+    && source.structuredWriterMode === 'structured-pilot') ? 'structured-pilot' : 'structured-write';
   migrated.structuredActiveRoot = normalizeConfiguredPath(source.structuredActiveRoot, DEFAULT_SETTINGS.structuredActiveRoot);
   migrated.structuredBusinessRoot = normalizeConfiguredPath(source.structuredBusinessRoot, DEFAULT_SETTINGS.structuredBusinessRoot);
   migrated.structuredMaxRecords = Math.max(1, Math.min(250, Math.round(Number(source.structuredMaxRecords) || DEFAULT_SETTINGS.structuredMaxRecords)));
@@ -9457,11 +9649,11 @@ function statusCounts(tasks) {
   for (const task of tasks) {
     if (task.status === 'queued' || task.status === 'discovered') counts.pending += 1;
     if (PROCESSING_STATUSES.has(task.status)) counts.processing += 1;
-    if (task.status === 'needs_review' && task.artifacts?.review) {
-      counts.needsReview += Array.isArray(task.review_atom_ids) ? task.review_atom_ids.length : 0;
-    }
+    if (task.status === 'needs_review' && task.artifacts?.review) counts.needsReview += Number(task.result_counts?.review)
+      || (Array.isArray(task.review_atom_ids) ? task.review_atom_ids.length : 0);
     if (task.status === 'failed') counts.failed += 1;
     if (task.status === 'rolled_back') counts.rolledBack += 1;
+    else if (task.semantic_path === 'universal' || task.structured_transaction_id || Array.isArray(task.output_paths)) counts.written += Number(task.result_counts?.knowledge_records) || 0;
     else if (Array.isArray(task.written_card_ids) && task.written_card_ids.length) counts.written += task.written_card_ids.length;
     else if (Array.isArray(task.writtenFiles) && task.writtenFiles.length) counts.written += task.writtenFiles.length;
     else if (task.status === 'written' || task.status === 'archived') counts.written += 1;
@@ -18776,7 +18968,7 @@ const TERMINAL = new Set(['written', 'needs_review', 'completed_no_output', 'nee
 function pendingReviewCount(tasks) {
   return (tasks || []).reduce((sum, task) => {
     if (!['needs_review', 'completed_no_output'].includes(task.status) || !task.artifacts?.review) return sum;
-    return sum + (Array.isArray(task.review_atom_ids) ? new Set(task.review_atom_ids.map(String).filter(Boolean)).size : 0);
+    return sum + (Number(task.result_counts?.review) || (Array.isArray(task.review_atom_ids) ? new Set(task.review_atom_ids.map(String).filter(Boolean)).size : 0));
   }, 0);
 }
 
@@ -18794,7 +18986,9 @@ function canonicalTaskUiState(tasks, completedTaskId) {
     processing: rows.filter((task) => PROCESSING.has(task.status)).length,
     failed: rows.filter((task) => task.status === 'failed').length,
     written: rows.reduce((sum, task) => sum + (
-      Array.isArray(task.written_card_ids) && task.written_card_ids.length
+      task.semantic_path === 'universal' || task.structured_transaction_id || Array.isArray(task.output_paths)
+        ? Number(task.result_counts?.knowledge_records) || 0
+        : Array.isArray(task.written_card_ids) && task.written_card_ids.length
         ? task.written_card_ids.length
         : task.status === 'written' ? 1 : 0
     ), 0),

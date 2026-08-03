@@ -19,11 +19,16 @@ async function main() {
   const content = '---\nrecord_id: "bi-test"\nrecord_kind: "business_item"\nsource_document_ids: ["src-test"]\n---\n\n正文\n- 归属来源：src-test\n';
   const action = { record_id: 'bi-test', record_kind: 'business_item', path: '知识 空格/中文 日本語.md', content,
     content_hash: digest(content), owner_source_id: 'src-test' };
-  await port.write(action.path, content); const verified = await port.verify(action, 'txn-1', '2026-08-03T00:00:00.000Z');
-  const task = { task_id: 't1', status: 'written', result_counts: {} }; applyVerifiedFacts(task, [verified]);
+  const context = { runId: 'run-1', targetRoots: { business: '知识 空格', active_tender: '招投标' } };
+  await port.write(action.path, content); const verified = await port.verify(action, 'txn-1', '2026-08-03T00:00:00.000Z', context);
+  const task = { task_id: 't1', run_id: 'run-1', status: 'written', result_counts: {} }; applyVerifiedFacts(task, [verified]);
   assert.strictEqual(deriveVerifiedFacts(task).count, 1); assert.strictEqual(auditTaskInvariants([task]).ok, true);
-  files.set(action.path, content.replace('正文', '替换')); await assert.rejects(() => port.verify(action, 'txn-1', ''), /校验失败/);
-  files.delete(action.path); await assert.rejects(() => port.verify(action, 'txn-1', ''), /校验失败/);
+  const otherRun = { ...task, run_id: 'run-2', result_counts: { written: 0, verified: 0, knowledge_records: 0 }, output_paths: [] };
+  assert.strictEqual(deriveVerifiedFacts(otherRun).count, 0, 'a prior run manifest must never prove current-run success');
+  const duplicatePath = { ...task, verified_records: [verified, { ...verified, record_id: 'bi-duplicate' }] };
+  assert.strictEqual(deriveVerifiedFacts(duplicatePath).count, 1, 'cardsWritten is unique final_path cardinality');
+  files.set(action.path, content.replace('正文', '替换')); await assert.rejects(() => port.verify(action, 'txn-1', '', context), /校验失败/);
+  files.delete(action.path); await assert.rejects(() => port.verify(action, 'txn-1', '', context), /校验失败/);
   const stale = normalizeTaskForPersistence({ status: 'written', written_card_ids: ['lie'], writtenFiles: ['missing.md'], result_counts: { written: 9 } });
   assert.strictEqual(stale.status, 'verification_required'); assert.strictEqual(stale.result_counts.written, 0);
   const drift = JSON.parse(JSON.stringify(task)); drift.result_counts.written = 9; assert.strictEqual(auditTaskInvariants([drift]).ok, false);

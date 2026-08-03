@@ -608,14 +608,14 @@ async function verifyCommittedRecords(plan, vault, context = {}) {
     let authoritative = null;
     try {
       authoritative = typeof vault.verify === 'function'
-        ? await vault.verify(action, context.transactionId || '', context.verifiedAt || '') : null;
+        ? await vault.verify(action, context.transactionId || '', context.verifiedAt || '', context) : null;
     } catch (error) {
       failures.push({ record_id: action.record_id, record_kind: action.record_kind,
         path: action.path, reason: 'public_vault_verification_failed', error: String(error?.message || error) });
       continue;
     }
     records.push({
-      record_id: action.record_id, record_kind: action.record_kind, path: action.path,
+      record_id: action.record_id, record_kind: action.record_kind, final_path: action.path, path: action.path,
       disposition: action.action === 'noop' ? 'unchanged' : action.action,
       bytes: Buffer.byteLength(content), knowledge_record: KNOWLEDGE_RECORD_KINDS.has(action.record_kind),
       content_hash: action.content_hash, verified_at: context.verifiedAt || '',
@@ -662,12 +662,14 @@ async function commitPlan(plan, options) {
   if (plan.blocked) throw new Error('计划包含冲突或待处理项，禁止提交');
   const vault = options.vault;
   const release = await options.lock.acquire('structured-writer');
-  const transactionId = `txn-${hash([plan.plan_id, options.logicalTime || '']).slice(0, 24)}`;
+  if (!options.runId) throw Object.assign(new Error('结构化提交缺少当前 run_id'), { code: 'CURRENT_RUN_REQUIRED' });
+  const transactionId = `txn-${hash([plan.plan_id, options.runId, options.logicalTime || '']).slice(0, 24)}`;
   const quarantine = joinPath(options.stateRoot, 'structured-writer', 'quarantine', transactionId);
   const manifestPath = joinPath(options.stateRoot, 'structured-writer', 'transactions', `${transactionId}.json`);
   const manifest = {
     version: WRITER_VERSION, transaction_id: transactionId, plan_id: plan.plan_id,
-    source_document_id: plan.source_document_id, status: 'staging', steps: [], created_at: options.logicalTime || ''
+    source_document_id: plan.source_document_id, run_id: options.runId, task_id: options.taskId || '',
+    status: 'staging', steps: [], created_at: options.logicalTime || ''
   };
   manifest.previous_index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
   let indexSaved = false;
@@ -690,9 +692,6 @@ async function commitPlan(plan, options) {
       step.status = 'committed';
       await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
     }
-    const verified = await verifyCommittedRecords(plan, vault, {
-      transactionId, verifiedAt: options.logicalTime || new Date().toISOString()
-    });
     const index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
     index.version = INDEX_VERSION;
     index.revision = Number(index.revision || 0) + 1;
@@ -705,8 +704,32 @@ async function commitPlan(plan, options) {
     index.source_versions[plan.source_document_id] = { source_hash: plan.source_hash, source_version: plan.source_version };
     await options.saveIndex(index);
     indexSaved = true;
-    manifest.status = 'committed';
+    manifest.status = 'files_committed';
     manifest.index_revision = index.revision;
+    await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+    const targetRoots = options.targetRoots || { active_tender: '在办投标库', business: '长期业务库' };
+    const verified = await verifyCommittedRecords(plan, vault, {
+      transactionId, verifiedAt: new Date().toISOString(), runId: options.runId, targetRoots
+    });
+    const plannedPaths = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind)).map((item) => item.path);
+    const committedPaths = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind)
+      && (item.action === 'noop' || manifest.steps.some((step) => step.record_id === item.record_id && step.status === 'committed'))).map((item) => item.path);
+    const visiblePaths = verified.knowledge_records.map((item) => item.final_path);
+    const sortedUnique = (rows) => [...new Set(rows)].sort();
+    const sets = { planned: sortedUnique(plannedPaths), committed: sortedUnique(committedPaths), visible_verified: sortedUnique(visiblePaths) };
+    const pathSetHashes = Object.fromEntries(Object.entries(sets).map(([key, rows]) => [key, rows.map((path) => hash(path))]));
+    if (JSON.stringify(sets.planned) !== JSON.stringify(sets.committed)
+      || JSON.stringify(sets.planned) !== JSON.stringify(sets.visible_verified)) {
+      const mismatch = new Error('最终知识文件集合不一致，禁止完成任务');
+      mismatch.code = 'AUTHORITATIVE_MANIFEST_SET_MISMATCH'; mismatch.details = { path_set_hashes: pathSetHashes,
+        missing_from_committed: sets.planned.filter((path) => !sets.committed.includes(path)).map(hash),
+        missing_from_visible: sets.planned.filter((path) => !sets.visible_verified.includes(path)).map(hash) }; throw mismatch;
+    }
+    manifest.status = 'committed';
+    manifest.authoritative_manifest_schema = 'eks/authoritative-visible-manifest/2.0';
+    manifest.authoritative_manifest = verified.knowledge_records;
+    manifest.path_sets = sets;
+    manifest.path_set_hashes = pathSetHashes;
     await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
     return { transactionId, manifestPath, manifest, index, verified };
   } catch (error) {

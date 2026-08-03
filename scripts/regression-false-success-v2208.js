@@ -31,14 +31,14 @@ class Vault {
   async mkdirp() {}
 }
 const lock = { acquire: async () => () => {} };
-async function commit(vault, index = writer.emptyIndex()) { return writer.commitPlan(plan22(), { vault, lock, stateRoot: '系统 状态', index, logicalTime: '2026-08-03T00:00:00.000Z', saveIndex: async (next) => { vault.index = next; } }); }
+async function commit(vault, index = writer.emptyIndex()) { return writer.commitPlan(plan22(), { vault, lock, stateRoot: '系统 状态', index, runId: 'run-v2208', taskId: 'task-v2208', logicalTime: '2026-08-03T00:00:00.000Z', saveIndex: async (next) => { vault.index = next; } }); }
 async function main() {
   globalThis.__eksDiag = { state: { buffer: [], events: [] } };
   for (const limit of [0, 7]) {
     const vault = new Vault(limit);
     await assert.rejects(() => commit(vault), (error) => { assert.strictEqual(error.code, 'STRUCTURED_WRITE_NOT_PERSISTED'); assert.strictEqual(error.details.planned, 22); assert(error.details.verified < 22); assert.strictEqual(error.transactionManifest.status, 'rolled_back'); return true; });
     assert.strictEqual([...vault.files.keys()].filter((path) => path.startsWith('长期业务库/') && path.endsWith('.md')).length, 0);
-    assert.strictEqual(vault.index, undefined);
+    assert.deepStrictEqual(vault.index, writer.emptyIndex());
   }
   const vault = new Vault();
   const first = await commit(vault);
@@ -47,7 +47,7 @@ async function main() {
   for (const outputPath of first.verified.knowledge_paths) assert(String(await vault.readIfExists(outputPath)).trim());
   const rerunPlan = plan22();
   rerunPlan.actions = rerunPlan.actions.map((action) => ({ ...action, action: 'noop', prior_hash: action.content_hash }));
-  const rerun = await writer.commitPlan(rerunPlan, { vault, lock, stateRoot: '系统 状态', index: first.index, logicalTime: '2026-08-03T00:00:01.000Z', saveIndex: async () => {} });
+  const rerun = await writer.commitPlan(rerunPlan, { vault, lock, stateRoot: '系统 状态', index: first.index, runId: 'run-v2208-rerun', taskId: 'task-v2208', logicalTime: '2026-08-03T00:00:01.000Z', saveIndex: async () => {} });
   assert.strictEqual(rerun.verified.counts.knowledge_records, 22);
   assert.strictEqual(rerun.verified.counts.knowledge_unchanged, 22);
   assert.strictEqual([...vault.files.keys()].filter((path) => path.startsWith('长期业务库/') && path.endsWith('.md')).length, 22);

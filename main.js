@@ -118,6 +118,7 @@ const {
   rollbackTransaction: rollbackStructuredTransaction,
   hash: structuredContentHash,
   emptyIndex: emptyStructuredIndex,
+  normalizeSettings: normalizeStructuredSettings,
   validateIndex: validateStructuredIndex
 } = require("src/structured-writer.js");
 
@@ -744,8 +745,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   async runRealObsidianGateProbe() {
     const port = new KnowledgeWritePort(this.app.vault);
     const gateRoot = 'EKS Release Gate';
-    const base = `${gateRoot}/records`;
-    const transactionId = `real-host-${this.manifest.version}`;
+    const settings = normalizeStructuredSettings(this.settings);
+    const base = `${settings.businessRoot}/EKS 发布门/多语言 空格`;
+    const runId = `run-real-host-${Date.now()}`;
     const fixtures = [
       ['bi-gate-zh', 'business_item', `${base}/中文/安全检查.md`, '安全检查'],
       ['ck-gate-ja', 'company_knowledge', `${base}/日本語/品質 基準.md`, '品質基準'],
@@ -755,13 +757,25 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const content = `---\nrecord_id: "${record_id}"\nrecord_kind: "${record_kind}"\nsource_document_ids: ["src-real-gate"]\n---\n\n# ${title}\n\n- 归属来源：src-real-gate\n`;
       return { record_id, record_kind, path, content, content_hash: structuredContentHash(content), owner_source_id: 'src-real-gate' };
     });
-    const existed = [];
+    const existed = await Promise.all(actions.map(async (action) => ({ path: action.path, content: await port.readIfExists(action.path) })));
     try {
       for (const action of actions) {
-        existed.push({ path: action.path, content: await port.readIfExists(action.path) });
-        await port.write(action.path, action.content);
+        action.prior_content = await port.readIfExists(action.path);
+        action.prior_hash = action.prior_content === null ? null : structuredContentHash(action.prior_content);
+        action.action = action.prior_hash === action.content_hash ? 'noop' : action.prior_content === null ? 'create' : 'update';
       }
-      const first = await Promise.all(actions.map((action) => port.verify(action, transactionId, new Date().toISOString())));
+      const plan = { mode: 'structured-write', blocked: false, plan_id: `plan-real-host-${runId}`,
+        source_document_id: 'src-real-gate', source_hash: 'real-gate', source_version: this.manifest.version, actions };
+      const committed = await commitStructuredPlan(plan, {
+        vault: port, lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
+        index: emptyStructuredIndex(), logicalTime: new Date().toISOString(), runId, taskId: 'task-real-host',
+        targetRoots: { active_tender: settings.activeRoot, business: settings.businessRoot }, saveIndex: async () => {}
+      });
+      const task = { task_id: 'task-real-host', run_id: runId, semantic_path: 'universal', status: 'writing', result_counts: {} };
+      applyVerifiedFacts(task, committed.verified.knowledge_records);
+      task.status = task.result_counts.verified === actions.length ? 'written' : 'failed';
+      task.terminal_outcome = task.status === 'written' ? 'completed_with_output' : 'failed_no_output';
+      const ui = completionUiSnapshot([task], task.task_id);
       const openedPaths = [];
       for (const action of actions) {
         const file = this.app.vault.getAbstractFileByPath(action.path);
@@ -771,12 +785,13 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         if (leaf.view?.file?.path !== action.path) throw new Error(`Obsidian 叶片未打开目标文件：${action.path}`);
         openedPaths.push(action.path);
       }
-      for (const action of actions) await port.write(action.path, action.content);
-      const second = await Promise.all(actions.map((action) => port.verify(action, transactionId, new Date().toISOString())));
+      const second = await Promise.all(actions.map((action) => port.verify(action, committed.transactionId,
+        new Date().toISOString(), { runId, targetRoots: { active_tender: settings.activeRoot, business: settings.businessRoot } })));
       const deletedFile = this.app.vault.getAbstractFileByPath(actions[1].path);
       await this.app.vault.delete(deletedFile, true);
       let deletionInvalidated = false;
-      try { await port.verify(actions[1], transactionId, new Date().toISOString()); } catch (_) { deletionInvalidated = true; }
+      try { await port.verify(actions[1], committed.transactionId, new Date().toISOString(),
+        { runId, targetRoots: { active_tender: settings.activeRoot, business: settings.businessRoot } }); } catch (_) { deletionInvalidated = true; }
       await port.write(actions[1].path, actions[1].content);
       const rollbackPaths = [`${base}/rollback/partial-a.md`, `${base}/rollback/partial-b.md`];
       const partialCommitted = [];
@@ -796,14 +811,18 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
       const rollbackClean = rollbackPaths.every((path) => !this.app.vault.getAbstractFileByPath(path));
       await port.write(`${gateRoot}/result.json`, JSON.stringify({
-        ok: first.length === 3 && openedPaths.length === 3 && second.length === 3
+        ok: committed.verified.knowledge_records.length === 3 && task.result_counts.verified === 3
+          && ui?.counts?.written === 3 && openedPaths.length === 3 && second.length === 3
           && deletionInvalidated && injectedFailureObserved && rollbackClean,
         real_host: true, host_api: 'Obsidian Vault', plugin_version: this.manifest.version,
-        visible_openable: first.map((item) => item.path), opened_paths: openedPaths,
+        production_completion_chain: ['write_plan', 'commit', 'authoritative_manifest', 'task_completion', 'ui_statistics', 'open_each_final_path'],
+        visible_openable: committed.verified.knowledge_records.map((item) => item.final_path), opened_paths: openedPaths,
+        authoritative_manifest: committed.verified.knowledge_records, path_sets: committed.manifest.path_sets,
+        task_status: task.status, terminal_outcome: task.terminal_outcome, ui_written: ui?.counts?.written,
         idempotent_rerun_count: second.length,
         deletion_invalidated: deletionInvalidated, injected_partial_failure_observed: injectedFailureObserved,
         partial_failure_rollback_clean: rollbackClean, rollback_paths: rollbackPaths,
-        transaction_id: transactionId
+        transaction_id: committed.transactionId, run_id: runId
       }, null, 2));
     } catch (error) {
       for (const prior of existed.reverse()) {
@@ -1756,7 +1775,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         autoApproved: universalProduction ? generatedCount - structuredHandlingGroups.length : workflow.metrics?.autoApproved,
         reviewPending: universalProduction ? structuredHandlingGroups.length : workflow.metrics?.reviewPending,
         cardsMerged: universalProduction ? 0 : workflow.metrics?.merged,
-        cardsWritten: universalProduction ? structuredWrites : current.written_card_ids.length,
+        cardsWritten: universalProduction ? structuredVisible : current.written_card_ids.length,
         bytesWritten: universalProduction ? Number(verifiedStructured?.bytes_written || 0) : 0
       }));
       if (!universalProduction) diag('review.routing', {
@@ -1777,7 +1796,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       diag('performance.counters', Object.assign({ taskId: current.task_id, runId: current.run_id }, this.operationCounters));
       this.sessionStats.processed += 1;
       this.sessionStats.review += universalProduction ? structuredHandlingGroups.length : legacyReview.length;
-      this.sessionStats.written += universalProduction ? structuredWrites : legacyAccepted.length;
+      this.sessionStats.written += universalProduction ? structuredVisible : legacyAccepted.length;
       this.sessionStats.lastMessage = current.progress.message;
       new Notice(current.progress.message);
     } catch (error) {
@@ -3084,7 +3103,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const vault = new KnowledgeWritePort(obsidianVault);
     const committed = await commitStructuredPlan(plan, {
       vault, lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
-      index, logicalTime: new Date().toISOString(),
+      index, logicalTime: new Date().toISOString(), runId: task.run_id, taskId: task.task_id,
+      targetRoots: { active_tender: normalizeStructuredSettings(settings).activeRoot,
+        business: normalizeStructuredSettings(settings).businessRoot },
       saveIndex: async (next) => vault.write(indexPath, JSON.stringify(next, null, 2))
     });
     await this.persistArtifact(task, 'structured-transaction', {
@@ -3784,14 +3805,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
             content_hash: structuredContentHash(content), verified_at: new Date().toISOString(),
             transaction_id: `migration-${task.task_id}`, state: 'visible_verified' });
         }
-        if (migrated.length === paths.length && migrated.length > 0) {
-          applyVerifiedFacts(task, migrated);
-          task.status = 'written'; task.terminal_outcome = 'completed_with_output';
-        } else {
-          applyVerifiedFacts(task, []);
-          task.status = 'queued'; task.terminal_outcome = null;
-          task.progress = { stage: 'queued', message: '旧版结果未通过定点文件身份核验，保留解析/AI 检查点并等待重新写入。', at: new Date().toISOString() };
-        }
+        // Legacy files may still exist, but an old run is never evidence for this
+        // run. Preserve expensive checkpoints and force the normal writer to
+        // re-verify/rewrite them into a current-run authoritative manifest.
+        applyVerifiedFacts(task, []);
+        task.status = 'queued'; task.terminal_outcome = null;
+        task.progress = { stage: 'queued', message: '旧版结果不属于当前运行的最终权威清单；已保留解析/AI 检查点并等待重新验证或重写。', at: new Date().toISOString() };
         changed = true;
       }
       const plan = await this.loadArtifact(task, 'structured-write-plan');
@@ -3808,10 +3827,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         continue;
       }
       const candidates = manifests.filter(({ manifest }) => manifest.status === 'committed'
-        && (manifest.transaction_id === task.structured_transaction_id || manifest.plan_id === plan.plan_id));
+        && manifest.transaction_id === task.structured_transaction_id
+        && manifest.run_id === task.run_id && manifest.task_id === task.task_id);
       let recovered = false;
       for (const { manifestPath, manifest } of candidates) {
-        if (manifest.status !== 'committed' || manifest.plan_id !== plan.plan_id) continue;
+        if (manifest.status !== 'committed' || manifest.plan_id !== plan.plan_id
+          || manifest.run_id !== task.run_id || manifest.task_id !== task.task_id) continue;
         const knowledge = [];
         let valid = true;
         const plannedKnowledge = ((plan.actions || []).length ? plan.actions : manifest.steps || [])
@@ -3821,7 +3842,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           const expectedId = new RegExp(`^record_id:\\s*["']?${String(step.record_id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?\\s*$`, 'm');
           const expectedKind = new RegExp(`^record_kind:\\s*["']?${String(step.record_kind).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?\\s*$`, 'm');
           if (!String(content || '').trim() || !expectedId.test(content) || !expectedKind.test(content)) { valid = false; break; }
-          knowledge.push({ ...step, verified_content_hash: structuredContentHash(content) });
+          const roots = { active_tender: normalizeVaultPath(this.settings.structuredActiveRoot || '在办投标库'),
+            business: normalizeVaultPath(this.settings.structuredBusinessRoot || '长期业务库') };
+          const targetLibrary = Object.entries(roots).find(([, root]) => step.path.startsWith(`${root}/`))?.[0];
+          if (!step.path.toLowerCase().endsWith('.md') || !targetLibrary
+            || structuredContentHash(content) !== step.content_hash) { valid = false; break; }
+          knowledge.push({ ...step, verified_content_hash: structuredContentHash(content), target_library: targetLibrary });
         }
         if (!valid) {
           break;
@@ -3830,6 +3856,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         task.structured_transaction_id = manifest.transaction_id;
         applyVerifiedFacts(task, knowledge.map((step) => ({
           record_id: step.record_id, record_kind: step.record_kind, path: step.path,
+          final_path: step.path, run_id: task.run_id, vault_file_type: 'markdown', target_library: step.target_library,
           content_hash: step.verified_content_hash, verified_at: new Date().toISOString(),
           transaction_id: manifest.transaction_id, source_association: step.owner_source_id || '',
           state: 'visible_verified'
@@ -8606,7 +8633,7 @@ const RECORD_STATES = Object.freeze([
   'planned', 'attempted', 'vault_committed', 'visible_verified',
   'failed', 'rollback_required', 'rolled_back'
 ]);
-const VERIFIED_SCHEMA = 'eks/verified-records/1.0';
+const VERIFIED_SCHEMA = 'eks/authoritative-visible-manifest/2.0';
 const KNOWLEDGE_KINDS = new Set(['business_item', 'company_knowledge']);
 
 const digest = (value) => crypto.createHash('sha256').update(String(value ?? '')).digest('hex');
@@ -8621,18 +8648,23 @@ const sourceMatches = (content, sourceId) => !sourceId || String(content).includ
 function verifiedRecordsOf(task) {
   const rows = Array.isArray(task?.verified_records) ? task.verified_records : [];
   return rows.filter((record) => record && record.state === 'visible_verified'
-    && record.record_id && KNOWLEDGE_KINDS.has(record.record_kind) && normalizePath(record.path)
+    && record.record_id && KNOWLEDGE_KINDS.has(record.record_kind) && normalizePath(record.final_path)
+    && record.run_id === task.run_id && record.vault_file_type === 'markdown'
+    && ['business', 'active_tender'].includes(record.target_library)
     && /^[a-f0-9]{64}$/.test(String(record.content_hash || '')) && record.transaction_id);
 }
 
 function deriveVerifiedFacts(task) {
   const records = verifiedRecordsOf(task);
-  return { records, count: records.length, paths: records.map((item) => item.path) };
+  const unique = new Map(records.map((item) => [normalizePath(item.final_path), item]));
+  return { records: [...unique.values()], count: unique.size, paths: [...unique.keys()] };
 }
 
 function applyVerifiedFacts(task, records) {
   task.verified_records_schema = VERIFIED_SCHEMA;
-  task.verified_records = (records || []).map((record) => ({ ...record, state: 'visible_verified' }));
+  task.verified_records = (records || []).map((record) => ({ ...record,
+    final_path: normalizePath(record.final_path || record.path), path: normalizePath(record.final_path || record.path),
+    state: 'visible_verified' }));
   // Compatibility-only projections. They are overwritten from the authority on every save.
   const facts = deriveVerifiedFacts(task);
   task.output_paths = facts.paths;
@@ -8739,19 +8771,26 @@ class KnowledgeWritePort {
     if (!this.vault.getAbstractFileByPath(target)) throw new Error(`移动后文件不可见：${target}`);
   }
 
-  async verify(action, transactionId, verifiedAt) {
-    const content = await this.readIfExists(action.path);
+  async verify(action, transactionId, verifiedAt, context = {}) {
+    const finalPath = normalizePath(action.final_path || action.path);
+    const roots = context.targetRoots || {};
+    const targetLibrary = Object.entries(roots).find(([, root]) => finalPath === normalizePath(root)
+      || finalPath.startsWith(`${normalizePath(root)}/`))?.[0] || '';
+    const file = this.vault.getAbstractFileByPath(finalPath);
+    const content = file && file.path === finalPath ? await this.vault.read(file) : null;
     const valid = String(content || '').trim() && frontmatter(content, 'record_id') === action.record_id
       && frontmatter(content, 'record_kind') === action.record_kind
       && digest(content) === action.content_hash
+      && finalPath.toLowerCase().endsWith('.md') && (!KNOWLEDGE_KINDS.has(action.record_kind) || targetLibrary)
       && (!KNOWLEDGE_KINDS.has(action.record_kind) || sourceMatches(content, action.owner_source_id));
     if (!valid) {
-      const error = new Error(`记录可见性/身份/hash/来源校验失败：${action.path}`);
+      const error = new Error(`记录最终可见性/身份/hash/来源/目标根校验失败：${finalPath}`);
       error.code = 'VAULT_RECORD_VERIFICATION_FAILED';
       throw error;
     }
     return {
-      record_id: action.record_id, record_kind: action.record_kind, path: action.path,
+      record_id: action.record_id, record_kind: action.record_kind, run_id: context.runId || '',
+      final_path: finalPath, path: finalPath, vault_file_type: 'markdown', target_library: targetLibrary,
       content_hash: action.content_hash, verified_at: verifiedAt, transaction_id: transactionId,
       source_association: action.owner_source_id || '', state: 'visible_verified'
     };
@@ -9373,14 +9412,14 @@ async function verifyCommittedRecords(plan, vault, context = {}) {
     let authoritative = null;
     try {
       authoritative = typeof vault.verify === 'function'
-        ? await vault.verify(action, context.transactionId || '', context.verifiedAt || '') : null;
+        ? await vault.verify(action, context.transactionId || '', context.verifiedAt || '', context) : null;
     } catch (error) {
       failures.push({ record_id: action.record_id, record_kind: action.record_kind,
         path: action.path, reason: 'public_vault_verification_failed', error: String(error?.message || error) });
       continue;
     }
     records.push({
-      record_id: action.record_id, record_kind: action.record_kind, path: action.path,
+      record_id: action.record_id, record_kind: action.record_kind, final_path: action.path, path: action.path,
       disposition: action.action === 'noop' ? 'unchanged' : action.action,
       bytes: Buffer.byteLength(content), knowledge_record: KNOWLEDGE_RECORD_KINDS.has(action.record_kind),
       content_hash: action.content_hash, verified_at: context.verifiedAt || '',
@@ -9427,12 +9466,14 @@ async function commitPlan(plan, options) {
   if (plan.blocked) throw new Error('计划包含冲突或待处理项，禁止提交');
   const vault = options.vault;
   const release = await options.lock.acquire('structured-writer');
-  const transactionId = `txn-${hash([plan.plan_id, options.logicalTime || '']).slice(0, 24)}`;
+  if (!options.runId) throw Object.assign(new Error('结构化提交缺少当前 run_id'), { code: 'CURRENT_RUN_REQUIRED' });
+  const transactionId = `txn-${hash([plan.plan_id, options.runId, options.logicalTime || '']).slice(0, 24)}`;
   const quarantine = joinPath(options.stateRoot, 'structured-writer', 'quarantine', transactionId);
   const manifestPath = joinPath(options.stateRoot, 'structured-writer', 'transactions', `${transactionId}.json`);
   const manifest = {
     version: WRITER_VERSION, transaction_id: transactionId, plan_id: plan.plan_id,
-    source_document_id: plan.source_document_id, status: 'staging', steps: [], created_at: options.logicalTime || ''
+    source_document_id: plan.source_document_id, run_id: options.runId, task_id: options.taskId || '',
+    status: 'staging', steps: [], created_at: options.logicalTime || ''
   };
   manifest.previous_index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
   let indexSaved = false;
@@ -9455,9 +9496,6 @@ async function commitPlan(plan, options) {
       step.status = 'committed';
       await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
     }
-    const verified = await verifyCommittedRecords(plan, vault, {
-      transactionId, verifiedAt: options.logicalTime || new Date().toISOString()
-    });
     const index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
     index.version = INDEX_VERSION;
     index.revision = Number(index.revision || 0) + 1;
@@ -9470,8 +9508,32 @@ async function commitPlan(plan, options) {
     index.source_versions[plan.source_document_id] = { source_hash: plan.source_hash, source_version: plan.source_version };
     await options.saveIndex(index);
     indexSaved = true;
-    manifest.status = 'committed';
+    manifest.status = 'files_committed';
     manifest.index_revision = index.revision;
+    await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+    const targetRoots = options.targetRoots || { active_tender: '在办投标库', business: '长期业务库' };
+    const verified = await verifyCommittedRecords(plan, vault, {
+      transactionId, verifiedAt: new Date().toISOString(), runId: options.runId, targetRoots
+    });
+    const plannedPaths = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind)).map((item) => item.path);
+    const committedPaths = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind)
+      && (item.action === 'noop' || manifest.steps.some((step) => step.record_id === item.record_id && step.status === 'committed'))).map((item) => item.path);
+    const visiblePaths = verified.knowledge_records.map((item) => item.final_path);
+    const sortedUnique = (rows) => [...new Set(rows)].sort();
+    const sets = { planned: sortedUnique(plannedPaths), committed: sortedUnique(committedPaths), visible_verified: sortedUnique(visiblePaths) };
+    const pathSetHashes = Object.fromEntries(Object.entries(sets).map(([key, rows]) => [key, rows.map((path) => hash(path))]));
+    if (JSON.stringify(sets.planned) !== JSON.stringify(sets.committed)
+      || JSON.stringify(sets.planned) !== JSON.stringify(sets.visible_verified)) {
+      const mismatch = new Error('最终知识文件集合不一致，禁止完成任务');
+      mismatch.code = 'AUTHORITATIVE_MANIFEST_SET_MISMATCH'; mismatch.details = { path_set_hashes: pathSetHashes,
+        missing_from_committed: sets.planned.filter((path) => !sets.committed.includes(path)).map(hash),
+        missing_from_visible: sets.planned.filter((path) => !sets.visible_verified.includes(path)).map(hash) }; throw mismatch;
+    }
+    manifest.status = 'committed';
+    manifest.authoritative_manifest_schema = 'eks/authoritative-visible-manifest/2.0';
+    manifest.authoritative_manifest = verified.knowledge_records;
+    manifest.path_sets = sets;
+    manifest.path_set_hashes = pathSetHashes;
     await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
     return { transactionId, manifestPath, manifest, index, verified };
   } catch (error) {

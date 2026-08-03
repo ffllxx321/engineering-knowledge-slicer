@@ -6,7 +6,7 @@ const RECORD_STATES = Object.freeze([
   'planned', 'attempted', 'vault_committed', 'visible_verified',
   'failed', 'rollback_required', 'rolled_back'
 ]);
-const VERIFIED_SCHEMA = 'eks/verified-records/1.0';
+const VERIFIED_SCHEMA = 'eks/authoritative-visible-manifest/2.0';
 const KNOWLEDGE_KINDS = new Set(['business_item', 'company_knowledge']);
 
 const digest = (value) => crypto.createHash('sha256').update(String(value ?? '')).digest('hex');
@@ -21,18 +21,23 @@ const sourceMatches = (content, sourceId) => !sourceId || String(content).includ
 function verifiedRecordsOf(task) {
   const rows = Array.isArray(task?.verified_records) ? task.verified_records : [];
   return rows.filter((record) => record && record.state === 'visible_verified'
-    && record.record_id && KNOWLEDGE_KINDS.has(record.record_kind) && normalizePath(record.path)
+    && record.record_id && KNOWLEDGE_KINDS.has(record.record_kind) && normalizePath(record.final_path)
+    && record.run_id === task.run_id && record.vault_file_type === 'markdown'
+    && ['business', 'active_tender'].includes(record.target_library)
     && /^[a-f0-9]{64}$/.test(String(record.content_hash || '')) && record.transaction_id);
 }
 
 function deriveVerifiedFacts(task) {
   const records = verifiedRecordsOf(task);
-  return { records, count: records.length, paths: records.map((item) => item.path) };
+  const unique = new Map(records.map((item) => [normalizePath(item.final_path), item]));
+  return { records: [...unique.values()], count: unique.size, paths: [...unique.keys()] };
 }
 
 function applyVerifiedFacts(task, records) {
   task.verified_records_schema = VERIFIED_SCHEMA;
-  task.verified_records = (records || []).map((record) => ({ ...record, state: 'visible_verified' }));
+  task.verified_records = (records || []).map((record) => ({ ...record,
+    final_path: normalizePath(record.final_path || record.path), path: normalizePath(record.final_path || record.path),
+    state: 'visible_verified' }));
   // Compatibility-only projections. They are overwritten from the authority on every save.
   const facts = deriveVerifiedFacts(task);
   task.output_paths = facts.paths;
@@ -139,19 +144,26 @@ class KnowledgeWritePort {
     if (!this.vault.getAbstractFileByPath(target)) throw new Error(`移动后文件不可见：${target}`);
   }
 
-  async verify(action, transactionId, verifiedAt) {
-    const content = await this.readIfExists(action.path);
+  async verify(action, transactionId, verifiedAt, context = {}) {
+    const finalPath = normalizePath(action.final_path || action.path);
+    const roots = context.targetRoots || {};
+    const targetLibrary = Object.entries(roots).find(([, root]) => finalPath === normalizePath(root)
+      || finalPath.startsWith(`${normalizePath(root)}/`))?.[0] || '';
+    const file = this.vault.getAbstractFileByPath(finalPath);
+    const content = file && file.path === finalPath ? await this.vault.read(file) : null;
     const valid = String(content || '').trim() && frontmatter(content, 'record_id') === action.record_id
       && frontmatter(content, 'record_kind') === action.record_kind
       && digest(content) === action.content_hash
+      && finalPath.toLowerCase().endsWith('.md') && (!KNOWLEDGE_KINDS.has(action.record_kind) || targetLibrary)
       && (!KNOWLEDGE_KINDS.has(action.record_kind) || sourceMatches(content, action.owner_source_id));
     if (!valid) {
-      const error = new Error(`记录可见性/身份/hash/来源校验失败：${action.path}`);
+      const error = new Error(`记录最终可见性/身份/hash/来源/目标根校验失败：${finalPath}`);
       error.code = 'VAULT_RECORD_VERIFICATION_FAILED';
       throw error;
     }
     return {
-      record_id: action.record_id, record_kind: action.record_kind, path: action.path,
+      record_id: action.record_id, record_kind: action.record_kind, run_id: context.runId || '',
+      final_path: finalPath, path: finalPath, vault_file_type: 'markdown', target_library: targetLibrary,
       content_hash: action.content_hash, verified_at: verifiedAt, transaction_id: transactionId,
       source_association: action.owner_source_id || '', state: 'visible_verified'
     };

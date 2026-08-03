@@ -339,7 +339,7 @@ async function main() {
   const vault = new MemoryVault();
   let savedIndex;
   const committed = await commitPlan(writePlan, {
-    vault, lock: lock(), stateRoot: '状态', index: emptyIndex(), logicalTime: TIME,
+    vault, lock: lock(), stateRoot: '状态', index: emptyIndex(), logicalTime: TIME, runId: 'run-basic',
     saveIndex: async (value) => { savedIndex = value; }
   });
   assert.strictEqual(committed.manifest.status, 'committed');
@@ -358,7 +358,7 @@ async function main() {
     try {
       await commitPlan(writePlan, {
         vault: failedVault, lock: lock(), stateRoot: '状态', index: emptyIndex(),
-        logicalTime: TIME, saveIndex: async () => {}
+        logicalTime: TIME, runId: `run-failure-${failAt}`, saveIndex: async () => {}
       });
     } catch (error) {
       assert(error.transactionManifest);
@@ -380,7 +380,7 @@ async function main() {
   const vault22 = new MemoryVault();
   const first22 = await commitPlan({ ...plan22, mode: 'structured-write' }, {
     vault: vault22, lock: lock(), stateRoot: '状态', index: emptyIndex(),
-    logicalTime: TIME, saveIndex: async () => {}
+    logicalTime: TIME, runId: 'run-22-first', saveIndex: async () => {}
   });
   assert.strictEqual(first22.verified.counts.knowledge_records, 22);
   assert.strictEqual(first22.verified.counts.knowledge_created, 22);
@@ -394,7 +394,7 @@ async function main() {
   });
   const second22 = await commitPlan({ ...rerun22, mode: 'structured-write' }, {
     vault: vault22, lock: lock(), stateRoot: '状态', index: first22.index,
-    logicalTime: TIME, saveIndex: async () => {}
+    logicalTime: TIME, runId: 'run-22-second', saveIndex: async () => {}
   });
   assert.strictEqual(second22.verified.counts.knowledge_records, 22);
   assert.strictEqual(second22.verified.counts.knowledge_unchanged, 22);
@@ -403,7 +403,7 @@ async function main() {
   const noopVault = new NoopRecordVault();
   await assert.rejects(() => commitPlan({ ...plan22, mode: 'structured-write' }, {
     vault: noopVault, lock: lock(), stateRoot: '状态', index: emptyIndex(),
-    logicalTime: TIME, saveIndex: async () => {}
+    logicalTime: TIME, runId: 'run-22-noop', saveIndex: async () => {}
   }), (error) => error.code === 'STRUCTURED_WRITE_NOT_PERSISTED'
     && error.details.verified === 0 && error.details.failures[0].reason === 'missing_file');
 
@@ -422,7 +422,7 @@ async function main() {
     'production adapter must add zero Phase 3 evaluations');
   assert(production.includes("if (mode === 'structured-pilot') return { mode, plan, universalResult: universal };"),
     'pilot must return before commit');
-  assert(production.includes("process?.env?.EKS_ENABLE_NONPRODUCTION_LEGACY === '1'"),
+  assert(production.includes("process?.env?.EKS_ENABLE_NONPRODUCTION_LEGACY !== '1'"),
     'legacy workflow must be reachable only through an explicit nonproduction environment gate');
   assert(production.includes("process?.env?.EKS_ENABLE_NONPRODUCTION_PILOT === '1'"),
     'pilot mode must be reachable only through an explicit nonproduction environment gate');

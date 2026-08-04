@@ -695,6 +695,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.addCommand({ id: 'retry-failed-source-files', name: '重试失败任务并自动处理', callback: () => this.retryFailedAndAutoProcess(true) });
     this.addCommand({ id: 'rollback-last-batch', name: '回滚最近一批卡片', callback: () => this.rollbackLastBatch() });
     this.addCommand({ id: 'open-ai-settings', name: '打开工程知识切片密钥设置', callback: () => this.openPluginSettings() });
+    this.addCommand({ id: 'clear-plugin-cache', name: '清空工程知识切片缓存', callback: () => this.confirmAndClearPluginCache() });
     if (typeof process === 'object' && process?.env?.EKS_ENABLE_DEVELOPMENT_SHADOW === '1') {
       this.addCommand({ id: 'run-shadow-evaluation', name: '[开发] 运行影子评估', callback: () => this.runShadowEvaluation() });
       this.addCommand({ id: 'export-shadow-evaluation', name: '[开发] 导出影子评估', callback: () => this.exportShadowReport() });
@@ -4063,11 +4064,27 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
 
   async clearPluginCache() {
     await this.ensureFolders();
-    await deleteFolderContents(this.app, this.settings.artifactsPath);
+    const outcome = await deleteFolderContents(this.app, this.settings.artifactsPath);
     this.sessionStats = { scanned: 0, processed: 0, written: 0, review: 0, failed: 0, skipped: 0, current: '', lastMessage: '缓存已清空，等待重新扫描' };
     await this.ensureFolders();
     await this.refreshViews();
-    new Notice('工程知识切片缓存已清空。源文件和已入库 wiki 卡片未删除。');
+    new Notice(`缓存清理完成：删除 ${outcome.deletedFiles} 个缓存文件、${outcome.deletedFolders} 个缓存目录。源文档和已入库知识 Markdown 未删除。`);
+    return outcome;
+  }
+
+  async confirmAndClearPluginCache(confirmAction = null) {
+    const message = '确认清空任务队列、处理日志、待审核草稿与解析/OCR/AI 中间产物？不会删除源文档或已入库知识 Markdown。';
+    const confirm = confirmAction || (typeof window !== 'undefined' && typeof window.confirm === 'function'
+      ? window.confirm.bind(window) : null);
+    if (!confirm || !confirm(message)) return { ok: false, cancelled: true, deletedFiles: 0, deletedFolders: 0 };
+    try {
+      const outcome = await this.clearPluginCache();
+      return Object.assign({ ok: true, cancelled: false }, outcome);
+    } catch (error) {
+      await this.refreshViews();
+      new Notice(`缓存清理失败：${error.message}。未报告清理成功，请检查库权限后重试。`);
+      return { ok: false, cancelled: false, error };
+    }
   }
 
   async writeTaskLog(task) {
@@ -5326,6 +5343,18 @@ class SlicerSettingTab extends PluginSettingTab {
       text: '密钥不会写入知识库、诊断报告或日志。'
     });
 
+    containerEl.createEl('h3', { text: '缓存维护' });
+    new Setting(containerEl)
+      .setName('清空缓存')
+      .setDesc('清空任务队列、处理日志、待审核草稿与解析/OCR/AI 中间产物。不会删除源文档或已入库知识 Markdown。')
+      .addButton((button) => button
+        .setButtonText('清空缓存')
+        .setWarning()
+        .onClick(async () => {
+          const result = await this.plugin.confirmAndClearPluginCache();
+          if (result.ok) this.display();
+        }));
+
     new Setting(containerEl)
       .setName('高级设置')
       .setDesc('默认关闭。开启后显示功能开关、解析参数、性能与维护选项；关闭不会清除已保存的配置。')
@@ -6375,11 +6404,33 @@ async function writeUnique(app, targetPath, content) {
 
 async function deleteFolderContents(app, folderPath) {
   const folder = app.vault.getAbstractFileByPath(normalizeVaultPath(folderPath));
-  if (!(folder instanceof TFolder)) return;
+  if (!(folder instanceof TFolder)) return { deletedFiles: 0, deletedFolders: 0 };
   const children = [...folder.children];
+  const before = countFolderEntries(folder);
   for (const child of children) {
     await app.vault.delete(child, true);
   }
+  const remainingFolder = app.vault.getAbstractFileByPath(normalizeVaultPath(folderPath));
+  const remaining = remainingFolder instanceof TFolder ? countFolderEntries(remainingFolder) : { files: 0, folders: 0 };
+  if (remaining.files || remaining.folders) {
+    throw new Error(`缓存目录仍剩 ${remaining.files} 个文件、${remaining.folders} 个目录`);
+  }
+  return { deletedFiles: before.files, deletedFolders: before.folders };
+}
+
+function countFolderEntries(folder) {
+  const counts = { files: 0, folders: 0 };
+  for (const child of folder.children || []) {
+    if (child instanceof TFolder) {
+      counts.folders += 1;
+      const nested = countFolderEntries(child);
+      counts.files += nested.files;
+      counts.folders += nested.folders;
+    } else {
+      counts.files += 1;
+    }
+  }
+  return counts;
 }
 
 function upsertTask(tasks, task) {

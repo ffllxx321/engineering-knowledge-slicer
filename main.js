@@ -112,6 +112,13 @@ const {
   normalizeTaskForPersistence,
   auditTaskInvariants
 } = require("src/knowledge-write-port.js");
+const { PRODUCTION_FLOW_CONTRACT } = require("src/production-flow-contract.js");
+const {
+  transitionProductionState,
+  invalidateProductionSuccess,
+  visibleFacts: productionVisibleFacts
+} = require("src/production-state-machine.js");
+const { ProductionCommitService } = require("src/production-commit-service.js");
 const {
   buildPlan: buildStructuredPlan,
   commitPlan: commitStructuredPlan,
@@ -746,12 +753,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const port = new KnowledgeWritePort(this.app.vault);
     const gateRoot = 'EKS Release Gate';
     const settings = normalizeStructuredSettings(this.settings);
-    const base = `${settings.businessRoot}/EKS 发布门/多语言 空格`;
+    const businessBase = `${settings.businessRoot}/EKS 发布门/多语言 空格`;
+    const tenderBase = `${settings.activeRoot}/EKS 发布门/在办项目`;
     const runId = `run-real-host-${Date.now()}`;
     const fixtures = [
-      ['bi-gate-zh', 'business_item', `${base}/中文/安全检查.md`, '安全检查'],
-      ['ck-gate-ja', 'company_knowledge', `${base}/日本語/品質 基準.md`, '品質基準'],
-      ['ck-gate-en', 'company_knowledge', `${base}/English Space/Field Note.md`, 'Field Note']
+      ['bi-gate-zh', 'business_item', `${businessBase}/中文/安全检查.md`, '安全检查'],
+      ['ck-gate-ja', 'company_knowledge', `${businessBase}/日本語/品質 基準.md`, '品質基準'],
+      ['ck-gate-en', 'company_knowledge', `${businessBase}/English Space/Field Note.md`, 'Field Note'],
+      ['bi-gate-tender', 'business_item', `${tenderBase}/投标检查.md`, '投标检查']
     ];
     const actions = fixtures.map(([record_id, record_kind, path, title]) => {
       const content = `---\nrecord_id: "${record_id}"\nrecord_kind: "${record_kind}"\nsource_document_ids: ["src-real-gate"]\n---\n\n# ${title}\n\n- 归属来源：src-real-gate\n`;
@@ -766,16 +775,17 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
       const plan = { mode: 'structured-write', blocked: false, plan_id: `plan-real-host-${runId}`,
         source_document_id: 'src-real-gate', source_hash: 'real-gate', source_version: this.manifest.version, actions };
-      const committed = await commitStructuredPlan(plan, {
-        vault: port, lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
+      const service = new ProductionCommitService(port, commitStructuredPlan);
+      const committed = await service.commit(plan, {
+        lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
         index: emptyStructuredIndex(), logicalTime: new Date().toISOString(), runId, taskId: 'task-real-host',
         targetRoots: { active_tender: settings.activeRoot, business: settings.businessRoot }, saveIndex: async () => {}
       });
-      const task = { task_id: 'task-real-host', run_id: runId, semantic_path: 'universal', status: 'writing', result_counts: {} };
+      const task = { task_id: 'task-real-host', run_id: runId, semantic_path: 'universal', production_state: 'processing', result_counts: {} };
       applyVerifiedFacts(task, committed.verified.knowledge_records);
-      task.status = task.result_counts.verified === actions.length ? 'written' : 'failed';
-      task.terminal_outcome = task.status === 'written' ? 'completed_with_output' : 'failed_no_output';
-      const ui = completionUiSnapshot([task], task.task_id);
+      task.current_run_manifest = committed.authoritativeManifest;
+      transitionProductionState(task, 'stored', { stage: 'complete', manifest: committed.authoritativeManifest });
+      const facts = productionVisibleFacts(task);
       const openedPaths = [];
       for (const action of actions) {
         const file = this.app.vault.getAbstractFileByPath(action.path);
@@ -793,7 +803,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       try { await port.verify(actions[1], committed.transactionId, new Date().toISOString(),
         { runId, targetRoots: { active_tender: settings.activeRoot, business: settings.businessRoot } }); } catch (_) { deletionInvalidated = true; }
       await port.write(actions[1].path, actions[1].content);
-      const rollbackPaths = [`${base}/rollback/partial-a.md`, `${base}/rollback/partial-b.md`];
+      const rollbackPaths = [`${businessBase}/rollback/partial-a.md`, `${businessBase}/rollback/partial-b.md`];
       const partialCommitted = [];
       let injectedFailureObserved = false;
       try {
@@ -811,14 +821,15 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
       const rollbackClean = rollbackPaths.every((path) => !this.app.vault.getAbstractFileByPath(path));
       await port.write(`${gateRoot}/result.json`, JSON.stringify({
-        ok: committed.verified.knowledge_records.length === 3 && task.result_counts.verified === 3
-          && ui?.counts?.written === 3 && openedPaths.length === 3 && second.length === 3
+        ok: committed.verified.knowledge_records.length === 4 && facts.count === 4
+          && openedPaths.length === 4 && second.length === 4
           && deletionInvalidated && injectedFailureObserved && rollbackClean,
         real_host: true, host_api: 'Obsidian Vault', plugin_version: this.manifest.version,
         production_completion_chain: ['write_plan', 'commit', 'authoritative_manifest', 'task_completion', 'ui_statistics', 'open_each_final_path'],
         visible_openable: committed.verified.knowledge_records.map((item) => item.final_path), opened_paths: openedPaths,
         authoritative_manifest: committed.verified.knowledge_records, path_sets: committed.manifest.path_sets,
-        task_status: task.status, terminal_outcome: task.terminal_outcome, ui_written: ui?.counts?.written,
+        task_status: task.production_state, terminal_outcome: task.terminal_outcome, ui_written: facts.count,
+        ui_states: PRODUCTION_FLOW_CONTRACT.user_states,
         idempotent_rerun_count: second.length,
         deletion_invalidated: deletionInvalidated, injected_partial_failure_observed: injectedFailureObserved,
         partial_failure_rollback_clean: rollbackClean, rollback_paths: rollbackPaths,
@@ -1043,8 +1054,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     for (const path of [
       this.settings.bidIntakePath,
       this.settings.businessIntakePath,
-      this.settings.bidOutputPath,
-      this.settings.businessOutputPath,
+      this.settings.knowledgeTenderRoot,
+      this.settings.knowledgeBusinessRoot,
       this.settings.artifactsPath,
       this.settings.draftPath,
       this.settings.logPath
@@ -1376,7 +1387,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       acquired_at: executionRun.startedAt,
       heartbeat_at: executionRun.startedAt
     };
-    current.run_id = current.run_id || executionRun.runId;
+    // Every explicit process/retry owns a fresh run. Expensive parse/model
+    // artifacts may be reused, but prior final-write evidence is never reused.
+    current.run_id = executionRun.runId;
+    current.current_run_manifest = null;
+    applyVerifiedFacts(current, []);
+    transitionProductionState(current, 'processing', {
+      stage: 'intake', at: executionRun.startedAt, message: '已开始当前运行'
+    });
     await this.saveTasks(upsertTask(tasks, current));
     await this.flushSaveTasksImmediate();
     this._terminalTaskIds.delete(current.task_id);
@@ -1656,7 +1674,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const legacyAccepted = workflow?.accepted || [];
       const legacyReview = workflow?.review || [];
       const legacyRejected = workflow?.hardRejected || [];
-      current.status = 'writing';
+      transitionProductionState(current, 'processing', { stage: 'write_plan' });
       await this.setTaskProgress(current, structuredWriteMode
         ? `正在提交结构化计划（${structured.plan?.actions?.length || 0} 项）`
         : universalProduction
@@ -1705,12 +1723,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         : Number(workflow.metrics?.generated ?? workflow.atomResult?.atoms?.length ?? 0);
       const hardRejectedCount = universalProduction ? 0
         : Number(workflow.metrics?.hardRejected ?? legacyRejected.length ?? 0);
-      current.terminal_outcome = persistedCount > 0
-        ? 'completed_with_output'
-        : (legacyReview.length || structuredHandlingGroups.length ? 'needs_attention' : 'completed_no_output');
-      current.status = persistedCount > 0
-        ? (legacyReview.length || structuredHandlingGroups.length ? 'needs_review' : 'written')
-        : (legacyReview.length || structuredHandlingGroups.length ? 'needs_review' : 'completed_no_output');
+      current.current_run_manifest = structured.transaction?.authoritativeManifest || null;
       current.result_counts = {
         generated: generatedCount,
         planned: universalProduction ? (structured.plan?.actions || []).filter((item) => ['business_item', 'company_knowledge'].includes(item.record_kind)).length : generatedCount,
@@ -1731,6 +1744,19 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       if (universalProduction) {
         current.semantic_path = 'universal';
         applyVerifiedFacts(current, verifiedStructured?.knowledge_records || []);
+      }
+      if (structuredHandlingGroups.length || legacyReview.length) {
+        transitionProductionState(current, 'pending_confirmation', {
+          stage: 'confirmation', message: `有 ${structuredHandlingGroups.length || legacyReview.length} 项知识内容需要确认`
+        });
+      } else if (persistedCount > 0) {
+        transitionProductionState(current, 'stored', {
+          stage: 'complete', manifest: current.current_run_manifest, message: `已逐一验证 ${persistedCount} 个最终 Markdown 文件`
+        });
+      } else {
+        const emptyError = new Error('当前运行没有最终可见的知识 Markdown，不能标记为已入库。');
+        emptyError.code = 'NO_VISIBLE_KNOWLEDGE_OUTPUT';
+        throw emptyError;
       }
       delete current.regeneration_mode;
       current.updated_at = new Date().toISOString();
@@ -1809,6 +1835,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         return;
       }
       current.status = 'failed';
+      transitionProductionState(current, 'failed', {
+        stage: current.progress?.stage || 'processing', message: String(error?.message || error)
+      });
       current.updated_at = new Date().toISOString();
       if (error?.code === 'STRUCTURED_WRITE_NOT_PERSISTED') {
         current.terminal_outcome = 'failed_no_output';
@@ -3034,8 +3063,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     });
     const existingFiles = {};
     const structuredRoots = [
-      normalizeVaultPath(this.settings.structuredActiveRoot),
-      normalizeVaultPath(this.settings.structuredBusinessRoot)
+      normalizeVaultPath(this.settings.knowledgeTenderRoot),
+      normalizeVaultPath(this.settings.knowledgeBusinessRoot)
     ];
     const generatedFiles = this.app.vault.getMarkdownFiles()
       .filter((file) => structuredRoots.some((root) => file.path.startsWith(`${root}/`)))
@@ -3101,8 +3130,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     }
     const obsidianVault = this.app.vault;
     const vault = new KnowledgeWritePort(obsidianVault);
-    const committed = await commitStructuredPlan(plan, {
-      vault, lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
+    const productionCommit = new ProductionCommitService(vault, commitStructuredPlan);
+    const committed = await productionCommit.commit(plan, {
+      lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
       index, logicalTime: new Date().toISOString(), runId: task.run_id, taskId: task.task_id,
       targetRoots: { active_tender: normalizeStructuredSettings(settings).activeRoot,
         business: normalizeStructuredSettings(settings).businessRoot },
@@ -3766,6 +3796,48 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async recoverCommittedStructuredTasks(tasks) {
+    let changed = false;
+    for (const task of tasks) {
+      const migratedState = task.production_state
+        || (PROCESSING_STATUSES.has(task.status) ? 'processing'
+          : task.status === 'needs_review' ? 'pending_confirmation'
+            : ['queued', 'discovered', 'paused'].includes(task.status) ? 'waiting' : '');
+      if (migratedState === 'processing' || migratedState === 'pending_confirmation' || migratedState === 'waiting') {
+        if (task.production_state !== migratedState) { task.production_state = migratedState; changed = true; }
+        continue;
+      }
+      // A restart never promotes an old transaction to success. Even a formerly
+      // stored task must enter a fresh run and re-open every final file.
+      task.current_run_manifest = null;
+      applyVerifiedFacts(task, []);
+      task.production_state = 'waiting';
+      task.status = 'queued'; // compatibility projection for the v3 ledger reader
+      task.internal_stage = 'visible_verify';
+      task.terminal_outcome = null;
+      task.run_id = null;
+      task.structured_transaction_id = null;
+      task.output_paths = [];
+      task.written_card_ids = [];
+      task.writtenFiles = [];
+      task.result_counts = Object.assign({}, task.result_counts || {}, {
+        committed: 0, verified: 0, written: 0, knowledge_records: 0
+      });
+      task.progress = { stage: 'visible_verify', message: '启动后需在新运行中重新验证最终文件', at: new Date().toISOString() };
+      changed = true;
+    }
+    if (changed) {
+      await this.saveTasks(tasks);
+      await this.flushSaveTasksImmediate();
+    }
+    return tasks;
+  }
+
+  async recoverLegacyCommittedStructuredTasks(tasks) {
+    if (typeof process !== 'object' || process?.env?.EKS_ENABLE_NONPRODUCTION_LEGACY !== '1') {
+      throw Object.assign(new Error('旧事务恢复入口已隔离；生产启动只能恢复等待、处理中和待确认。'), {
+        code: 'LEGACY_RECOVERY_REMOVED'
+      });
+    }
     const adapter = this.app.vault.adapter;
     const directory = normalizeVaultPath(`${this.settings.artifactsPath}/structured-writer/transactions`);
     const listing = typeof adapter.list === 'function' && await adapter.exists(directory)
@@ -3842,8 +3914,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
           const expectedId = new RegExp(`^record_id:\\s*["']?${String(step.record_id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?\\s*$`, 'm');
           const expectedKind = new RegExp(`^record_kind:\\s*["']?${String(step.record_kind).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?\\s*$`, 'm');
           if (!String(content || '').trim() || !expectedId.test(content) || !expectedKind.test(content)) { valid = false; break; }
-          const roots = { active_tender: normalizeVaultPath(this.settings.structuredActiveRoot || '在办投标库'),
-            business: normalizeVaultPath(this.settings.structuredBusinessRoot || '长期业务库') };
+          const roots = { active_tender: normalizeVaultPath(this.settings.knowledgeTenderRoot || '在办投标库'),
+            business: normalizeVaultPath(this.settings.knowledgeBusinessRoot || '长期业务库') };
           const targetLibrary = Object.entries(roots).find(([, root]) => step.path.startsWith(`${root}/`))?.[0];
           if (!step.path.toLowerCase().endsWith('.md') || !targetLibrary
             || structuredContentHash(content) !== step.content_hash) { valid = false; break; }
@@ -4544,7 +4616,7 @@ class SlicerDashboardView extends ItemView {
     const context = container.createEl('details', { cls: 'eks-context' });
     context.createEl('summary', { text: '路径与规则' });
     context.createDiv({ text: `源文件：${safeDisplayText(this.plugin.settings.bidIntakePath)}；${safeDisplayText(this.plugin.settings.businessIntakePath)}` });
-    context.createDiv({ text: `输出：${safeDisplayText(this.plugin.settings.bidOutputPath)}；${safeDisplayText(this.plugin.settings.businessOutputPath)}` });
+    context.createDiv({ text: `输出：${safeDisplayText(this.plugin.settings.knowledgeTenderRoot)}；${safeDisplayText(this.plugin.settings.knowledgeBusinessRoot)}` });
   }
 
   handleTabKey(event, ids) {
@@ -4571,9 +4643,8 @@ class SlicerDashboardView extends ItemView {
     });
     const filter = controls.createEl('select', { attr: { 'aria-label': '按状态筛选任务' } });
     for (const [value, label] of [
-      ['all', '全部状态'], ['queued', '待处理队列'], ['processing', '处理中'],
-      ['needs_review', '待审核'], ['needs_ocr', '需要 OCR'], ['unsupported_media', '暂不支持媒体'],
-      ['failed', '失败'], ['written', '已完成'], ['rolled_back', '已回滚']
+      ['all', '全部状态'], ['waiting', '等待'], ['processing', '处理中'],
+      ['pending_confirmation', '待确认'], ['failed', '失败'], ['stored', '已入库']
     ]) {
       const option = filter.createEl('option', { text: label, attr: { value } });
       option.selected = this.taskFilter === value;
@@ -4609,9 +4680,7 @@ class SlicerDashboardView extends ItemView {
         ['当前阶段', stageLabel(task.progress?.stage || task.status)],
         ['已用时间', formatDuration(task.progress?.elapsedMs || 0)],
         ['重试次数', String(task.retry_count || task.attempt || 0)],
-        ['结果数量', String(task.semantic_path === 'universal'
-          ? Number(task.result_counts?.verified) || 0
-          : Number(task.result_counts?.written) || task.written_card_ids?.length || 0)],
+        ['结果数量', String(productionVisibleFacts(task).count)],
         ['最后更新', formatLocalTime(task.updated_at || task.progress?.at || '')],
         ['错误代码', error?.code || '-']
       ]) {
@@ -4625,9 +4694,7 @@ class SlicerDashboardView extends ItemView {
           text: `未生成可入库结果：生成 ${Number(counts.generated) || 0}，写入 ${Number(counts.written) || 0}。${safeDisplayText(task.progress?.message, '未发现可由来源逐字核验的知识；请检查正文解析与证据定位后重试。')}`
         });
       }
-      const outputPaths = Array.isArray(task.output_paths)
-        ? (task.semantic_path === 'universal' ? task.output_paths.slice(0, Number(task.result_counts?.verified) || 0) : task.output_paths)
-        : [];
+      const outputPaths = productionVisibleFacts(task).paths;
       if (outputPaths.length) {
         const outputs = details.createEl('details', { cls: 'eks-technical-details' });
         outputs.createEl('summary', { text: `知识记录路径（${outputPaths.length}）` });
@@ -4925,7 +4992,7 @@ class SlicerDashboardView extends ItemView {
       }
     }
     const reviewTasks = tasks.filter((task) =>
-      ['needs_review', 'completed_no_output'].includes(task.status)
+      task.production_state === 'pending_confirmation'
       && Array.isArray(task.review_atom_ids)
       && task.review_atom_ids.length > 0
       && task.artifacts?.review
@@ -5161,7 +5228,7 @@ class SlicerSettingTab extends PluginSettingTab {
     {
       new Setting(containerEl)
         .setName('两库根目录')
-        .setDesc(`在办：${this.plugin.settings.structuredActiveRoot}；长期：${this.plugin.settings.structuredBusinessRoot}。仅允许 vault 内安全相对路径，首次运行前仍会再次校验。`);
+        .setDesc(`在办：${this.plugin.settings.knowledgeTenderRoot}；长期：${this.plugin.settings.knowledgeBusinessRoot}。仅允许 vault 内安全相对路径，首次运行前仍会再次校验。`);
     }
     // v1.2: 一键打开诊断日志，方便没 DevTools 环境的用户直接查看文件路径
     // v1.3: 默认日志在 vault 之外（~/.eks/logs/diag.log），避开同步冲突；
@@ -5276,8 +5343,8 @@ class SlicerSettingTab extends PluginSettingTab {
       .addButton((control) => control.setButtonText('导出报告').onClick(() => this.plugin.exportShadowReport()));
     pathSetting(containerEl, this.plugin, '招投标源文件路径', '固定读取招投标源文件。', 'bidIntakePath');
     pathSetting(containerEl, this.plugin, '业务库源文件路径', '固定读取业务库源文件。', 'businessIntakePath');
-    pathSetting(containerEl, this.plugin, '招投标输出路径', '招投标知识卡片固定输出根目录。', 'bidOutputPath');
-    pathSetting(containerEl, this.plugin, '业务库输出路径', '业务知识卡片固定输出根目录。', 'businessOutputPath');
+    pathSetting(containerEl, this.plugin, '在办招投标库根目录', '当前生产流程的唯一招投标知识输出根。', 'knowledgeTenderRoot');
+    pathSetting(containerEl, this.plugin, '业务库根目录', '当前生产流程的唯一业务知识输出根。', 'knowledgeBusinessRoot');
     pathSetting(containerEl, this.plugin, '中间产物路径', '解析包、结构化总结、审核项和脱敏日志目录。', 'artifactsPath');
     pathSetting(containerEl, this.plugin, '组件包路径', '标签库、提示词、模板和映射规则所在目录。', 'componentPackPath');
 
@@ -6670,6 +6737,157 @@ module.exports = {
 
 },
 /** STRUCTURED_PHASE_MODULES_START */
+"src/production-flow-contract.js": function(require, module, exports) {
+const PRODUCTION_FLOW_CONTRACT = Object.freeze({
+  schema: 'eks/production-flow-contract/1.0',
+  entrypoint: 'EngineeringKnowledgeSlicerPlugin.processTask',
+  stages: Object.freeze([
+    'intake', 'parse_normalize', 'understand', 'quality_check', 'confirmation',
+    'write_plan', 'atomic_commit', 'visible_verify', 'complete'
+  ]),
+  user_states: Object.freeze(['waiting', 'processing', 'pending_confirmation', 'stored', 'failed']),
+  transitions: Object.freeze({
+    waiting: Object.freeze(['processing', 'failed']),
+    processing: Object.freeze(['pending_confirmation', 'stored', 'failed']),
+    pending_confirmation: Object.freeze(['processing', 'failed']),
+    stored: Object.freeze(['waiting', 'failed']),
+    failed: Object.freeze(['waiting', 'processing'])
+  }),
+  authority: Object.freeze({
+    success: 'task.current_run_manifest',
+    count: 'task.current_run_manifest.path_sets.visible_verified.length',
+    paths: 'task.current_run_manifest.records[].final_path',
+    equality: 'planned == committed == visible_verified',
+    run_binding: 'manifest.run_id == task.run_id'
+  }),
+  knowledge_write_entrypoint: 'ProductionCommitService.commit',
+  knowledge_write_port: 'KnowledgeWritePort',
+  auxiliary_writes: Object.freeze(['task_ledger', 'diagnostics', 'intermediate_cache', 'transaction_manifest', 'index']),
+  legacy_policy: 'reject_in_production',
+  forbidden_success_evidence: Object.freeze([
+    'cardsGenerated', 'cardsWritten', 'plan.actions.length', 'writtenFiles',
+    'written_card_ids', 'result_counts.written', 'prior_run_manifest', 'source_hash', 'plan_id'
+  ])
+});
+
+module.exports = { PRODUCTION_FLOW_CONTRACT };
+},
+"src/production-state-machine.js": function(require, module, exports) {
+const { PRODUCTION_FLOW_CONTRACT } = require("src/production-flow-contract.js");
+
+const LABELS = Object.freeze({
+  waiting: '等待', processing: '处理中', pending_confirmation: '待确认', stored: '已入库', failed: '失败'
+});
+
+function assertManifest(task, manifest) {
+  if (!manifest || manifest.schema !== 'eks/authoritative-visible-manifest/3.0') return false;
+  if (!task?.run_id || manifest.run_id !== task.run_id || manifest.task_id !== task.task_id) return false;
+  const sets = manifest.path_sets || {};
+  const planned = [...new Set(sets.planned || [])].sort();
+  const committed = [...new Set(sets.committed || [])].sort();
+  const verified = [...new Set(sets.visible_verified || [])].sort();
+  if (!planned.length || JSON.stringify(planned) !== JSON.stringify(committed)
+    || JSON.stringify(planned) !== JSON.stringify(verified)) return false;
+  const records = Array.isArray(manifest.records) ? manifest.records : [];
+  const roots = manifest.target_roots || {};
+  return records.length === verified.length && records.every((record) => record.run_id === task.run_id
+    && record.state === 'visible_verified' && verified.includes(record.final_path)
+    && String(record.final_path || '').toLowerCase().endsWith('.md')
+    && ['business', 'active_tender'].includes(record.target_library)
+    && normalizedUnderRoot(record.final_path, roots[record.target_library])
+    && /^[a-f0-9]{64}$/.test(String(record.content_hash || '')));
+}
+
+function normalizedUnderRoot(path, root) {
+  const clean = (value) => String(value || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  const candidate = clean(path); const target = clean(root);
+  return Boolean(target && candidate.startsWith(`${target}/`));
+}
+
+function transitionProductionState(task, next, context = {}) {
+  const current = PRODUCTION_FLOW_CONTRACT.user_states.includes(task?.production_state)
+    ? task.production_state : 'waiting';
+  if (!PRODUCTION_FLOW_CONTRACT.user_states.includes(next)) throw new Error(`未知生产状态：${next}`);
+  if (current !== next && !(PRODUCTION_FLOW_CONTRACT.transitions[current] || []).includes(next)) {
+    const error = new Error(`不允许从“${LABELS[current]}”转为“${LABELS[next]}”`);
+    error.code = 'PRODUCTION_STATE_TRANSITION_REJECTED';
+    throw error;
+  }
+  if (next === 'stored' && !assertManifest(task, context.manifest || task.current_run_manifest)) {
+    const error = new Error('当前运行的计划、提交、最终可见文件不完全一致，不能标记为已入库。');
+    error.code = 'AUTHORITATIVE_MANIFEST_REQUIRED';
+    throw error;
+  }
+  task.production_state = next;
+  task.status = next;
+  task.internal_stage = String(context.stage || task.internal_stage || (next === 'stored' ? 'complete' : next));
+  task.updated_at = context.at || new Date().toISOString();
+  if (context.message) task.progress = { ...(task.progress || {}), stage: task.internal_stage, message: context.message, at: task.updated_at };
+  if (next !== 'stored') task.terminal_outcome = next === 'failed' ? 'failed' : null;
+  else task.terminal_outcome = 'completed_with_output';
+  return task;
+}
+
+function invalidateProductionSuccess(task, message) {
+  task.current_run_manifest = null;
+  return transitionProductionState(task, 'waiting', { stage: 'visible_verify', message });
+}
+
+function visibleFacts(task) {
+  if (!assertManifest(task, task?.current_run_manifest)) return { count: 0, paths: [], records: [] };
+  const records = task.current_run_manifest.records;
+  return { count: records.length, paths: records.map((item) => item.final_path), records };
+}
+
+module.exports = { LABELS, assertManifest, transitionProductionState, invalidateProductionSuccess, visibleFacts };
+},
+"src/production-commit-service.js": function(require, module, exports) {
+const crypto = require('crypto');
+const { KnowledgeWritePort } = require("src/knowledge-write-port.js");
+
+const normalized = (value) => String(value || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+const uniqueSorted = (values) => [...new Set(values.map(normalized).filter(Boolean))].sort();
+const hash = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
+
+class ProductionCommitService {
+  constructor(obsidianVault, commitPlan) {
+    this.port = obsidianVault instanceof KnowledgeWritePort ? obsidianVault : new KnowledgeWritePort(obsidianVault);
+    this.commitPlan = commitPlan;
+  }
+
+  async commit(plan, options) {
+    if (!options?.runId || !options?.taskId) throw Object.assign(new Error('生产提交必须绑定当前 run_id 和 task_id。'), { code: 'CURRENT_RUN_REQUIRED' });
+    const result = await this.commitPlan(plan, { ...options, vault: this.port });
+    const planned = uniqueSorted((plan.actions || []).filter((item) => ['business_item', 'company_knowledge'].includes(item.record_kind)).map((item) => item.path));
+    const records = result?.verified?.knowledge_records || [];
+    const committed = uniqueSorted(records.map((item) => item.final_path || item.path));
+    const visible = [];
+    for (const record of records) {
+      const action = (plan.actions || []).find((item) => item.record_id === record.record_id);
+      const verified = await this.port.verify(action, result.transactionId, new Date().toISOString(), {
+        runId: options.runId, targetRoots: options.targetRoots
+      });
+      visible.push(verified.final_path);
+    }
+    const visibleVerified = uniqueSorted(visible);
+    if (!planned.length || JSON.stringify(planned) !== JSON.stringify(committed)
+      || JSON.stringify(planned) !== JSON.stringify(visibleVerified)) {
+      const error = new Error('生产提交集合不一致：planned、committed、visible_verified 必须完全相同。');
+      error.code = 'PRODUCTION_COMMIT_SET_MISMATCH';
+      error.details = { planned: planned.map(hash), committed: committed.map(hash), visible_verified: visibleVerified.map(hash) };
+      throw error;
+    }
+    return { ...result, authoritativeManifest: {
+      schema: 'eks/authoritative-visible-manifest/3.0', run_id: options.runId, task_id: options.taskId,
+      transaction_id: result.transactionId, created_at: new Date().toISOString(),
+      target_roots: options.targetRoots,
+      path_sets: { planned, committed, visible_verified: visibleVerified }, records
+    } };
+  }
+}
+
+module.exports = { ProductionCommitService };
+},
 "src/phase1-foundation.js": function(require, module, exports) {
 /**
  * Phase 1 的纯本地并行基础。
@@ -8866,8 +9084,8 @@ function normalizeSettings(settings = {}) {
   return {
     enabled,
     mode: enabled ? mode : 'legacy',
-    activeRoot: clean(settings.structuredActiveRoot || '在办投标库', 400),
-    businessRoot: clean(settings.structuredBusinessRoot || '长期业务库', 400),
+    activeRoot: clean(settings.knowledgeTenderRoot || '在办投标库', 400),
+    businessRoot: clean(settings.knowledgeBusinessRoot || '长期业务库', 400),
     stateRoot: clean(settings.artifactsPath || '06-知识库/源文件/_slicer_artifacts', 600),
     limits: {
       max_records: Math.max(1, Math.min(PLAN_LIMITS.max_records, Number(settings.structuredMaxRecords) || 100)),
@@ -9624,6 +9842,7 @@ module.exports = {
 const crypto = require("crypto");
 const path = require("path");
 const { deriveVerifiedFacts } = require("src/knowledge-write-port.js");
+const { visibleFacts } = require("src/production-state-machine.js");
 const TASK_STATUSES = new Set([
   'discovered', 'queued', 'extracting', 'parsing', 'parsed', 'slicing',
   'classifying', 'classified', 'summarizing', 'summarized', 'atomizing',
@@ -9637,6 +9856,8 @@ const DEFAULT_SETTINGS = {
   advancedSettingsEnabled: false,
   controlledWriterEnabled: true,
   structuredWriterMode: 'structured-write',
+  knowledgeTenderRoot: '在办投标库',
+  knowledgeBusinessRoot: '长期业务库',
   structuredActiveRoot: '在办投标库',
   structuredBusinessRoot: '长期业务库',
   structuredMaxRecords: 100,
@@ -9779,8 +10000,17 @@ function migrateSettings(stored = {}) {
   migrated.structuredWriterMode = (typeof process === 'object'
     && process?.env?.EKS_ENABLE_NONPRODUCTION_PILOT === '1'
     && source.structuredWriterMode === 'structured-pilot') ? 'structured-pilot' : 'structured-write';
-  migrated.structuredActiveRoot = normalizeConfiguredPath(source.structuredActiveRoot, DEFAULT_SETTINGS.structuredActiveRoot);
-  migrated.structuredBusinessRoot = normalizeConfiguredPath(source.structuredBusinessRoot, DEFAULT_SETTINGS.structuredBusinessRoot);
+  migrated.knowledgeTenderRoot = normalizeConfiguredPath(
+    source.knowledgeTenderRoot || source.structuredActiveRoot || source.bidOutputPath,
+    DEFAULT_SETTINGS.knowledgeTenderRoot
+  );
+  migrated.knowledgeBusinessRoot = normalizeConfiguredPath(
+    source.knowledgeBusinessRoot || source.structuredBusinessRoot || source.businessOutputPath,
+    DEFAULT_SETTINGS.knowledgeBusinessRoot
+  );
+  // Read-only compatibility projections; production never consumes these.
+  migrated.structuredActiveRoot = migrated.knowledgeTenderRoot;
+  migrated.structuredBusinessRoot = migrated.knowledgeBusinessRoot;
   migrated.structuredMaxRecords = Math.max(1, Math.min(250, Math.round(Number(source.structuredMaxRecords) || DEFAULT_SETTINGS.structuredMaxRecords)));
   migrated.structuredMaxActions = Math.max(1, Math.min(600, Math.round(Number(source.structuredMaxActions) || DEFAULT_SETTINGS.structuredMaxActions)));
   migrated.structuredMaxLinkFanout = Math.max(1, Math.min(40, Math.round(Number(source.structuredMaxLinkFanout) || DEFAULT_SETTINGS.structuredMaxLinkFanout)));
@@ -9986,7 +10216,7 @@ function normalizeConfiguredPath(value, fallback = '') {
 }
 
 function validateConfiguredPathSet(settings) {
-  const keys = ['bidIntakePath', 'businessIntakePath', 'bidOutputPath', 'businessOutputPath', 'artifactsPath', 'draftPath', 'logPath', 'componentPackPath'];
+  const keys = ['bidIntakePath', 'businessIntakePath', 'knowledgeTenderRoot', 'knowledgeBusinessRoot', 'artifactsPath', 'draftPath', 'logPath', 'componentPackPath'];
   const errors = [];
   for (const key of keys) {
     const raw = String(settings[key] == null ? '' : settings[key]).trim();
@@ -10072,6 +10302,14 @@ function statusCounts(tasks) {
     rolledBack: 0
   };
   for (const task of tasks) {
+    if (task.production_state) {
+      if (task.production_state === 'waiting') counts.pending += 1;
+      if (task.production_state === 'processing') counts.processing += 1;
+      if (task.production_state === 'pending_confirmation') counts.needsReview += Number(task.review_atom_ids?.length || 0);
+      if (task.production_state === 'failed') counts.failed += 1;
+      if (task.production_state === 'stored') counts.written += visibleFacts(task).count;
+      continue;
+    }
     if (task.status === 'queued' || task.status === 'discovered') counts.pending += 1;
     if (PROCESSING_STATUSES.has(task.status)) counts.processing += 1;
     if (task.status === 'needs_review' && task.artifacts?.review) counts.needsReview += Number(task.result_counts?.review)

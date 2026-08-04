@@ -21,6 +21,10 @@ function loadBundleModule(id, dependencies = {}) {
     (name) => {
       if (Object.hasOwn(dependencies, name)) return dependencies[name];
       if (name === 'src/knowledge-write-port.js') return loadBundleModule(name, { crypto });
+      if (name === 'src/production-flow-contract.js') return loadBundleModule(name);
+      if (name === 'src/production-state-machine.js') return loadBundleModule(name, {
+        'src/production-flow-contract.js': loadBundleModule('src/production-flow-contract.js')
+      });
       if (name === 'src/core/document-parser.js') {
         const block = loadBundleModule('src/core/block-v0.js', { crypto });
         const provenance = loadBundleModule('src/core/provenance.js', { crypto });

@@ -104,9 +104,10 @@ assert.strictEqual(snapshot.reviewCount, 2);
 
 // Structural regression for the durability boundary and dashboard-only navigation.
 const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+const terminalStart = main.indexOf("transitionProductionState(current, 'stored'");
 const terminalBlock = main.slice(
-  main.indexOf("current.terminal_outcome = persistedCount > 0"),
-  main.indexOf("diag('performance.task'", main.indexOf("current.terminal_outcome = persistedCount > 0"))
+  terminalStart,
+  main.indexOf("diag('performance.task'", terminalStart)
 );
 const saveAt = terminalBlock.indexOf('await this.saveTasks');
 const flushAt = terminalBlock.indexOf('await this.flushSaveTasksImmediate()');

@@ -19,9 +19,10 @@ for (const run of [evidence.first_launch, evidence.restart]) {
   assert.strictEqual(run.ok, true);
   assert.strictEqual(run.real_host, true);
   assert.strictEqual(run.host_api, 'Obsidian Vault');
-  assert.strictEqual(run.visible_openable?.length, 3);
+  assert.strictEqual(run.visible_openable?.length, 4);
   assert.deepStrictEqual(run.opened_paths, run.visible_openable);
-  assert.strictEqual(run.idempotent_rerun_count, 3);
+  assert.strictEqual(run.idempotent_rerun_count, 4);
+  assert.deepStrictEqual(run.ui_states, ['waiting', 'processing', 'pending_confirmation', 'stored', 'failed']);
   assert.strictEqual(run.deletion_invalidated, true);
   assert.strictEqual(run.injected_partial_failure_observed, true);
   assert.strictEqual(run.partial_failure_rollback_clean, true);

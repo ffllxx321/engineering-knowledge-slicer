@@ -62,8 +62,8 @@ function normalizeSettings(settings = {}) {
   return {
     enabled,
     mode: enabled ? mode : 'legacy',
-    activeRoot: clean(settings.structuredActiveRoot || '在办投标库', 400),
-    businessRoot: clean(settings.structuredBusinessRoot || '长期业务库', 400),
+    activeRoot: clean(settings.knowledgeTenderRoot || '在办投标库', 400),
+    businessRoot: clean(settings.knowledgeBusinessRoot || '长期业务库', 400),
     stateRoot: clean(settings.artifactsPath || '06-知识库/源文件/_slicer_artifacts', 600),
     limits: {
       max_records: Math.max(1, Math.min(PLAN_LIMITS.max_records, Number(settings.structuredMaxRecords) || 100)),

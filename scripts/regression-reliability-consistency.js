@@ -25,7 +25,7 @@ assert.strictEqual(emptyPath.pathMigrationDiagnostics.bidIntakePath.code, 'SETTI
 const hostPath = task.migrateSettings({ bidIntakePath: 'C:\\outside\\data' });
 assert.strictEqual(hostPath.bidIntakePath, 'C:/outside/data');
 assert.strictEqual(hostPath.pathMigrationDiagnostics.bidIntakePath.code, 'SETTINGS_PATH_INVALID');
-assert(task.validateConfiguredPathSet(Object.assign({}, custom, { bidOutputPath: '成果', businessOutputPath: '成果/业务' }))
+assert(task.validateConfiguredPathSet(Object.assign({}, custom, { knowledgeTenderRoot: '成果', knowledgeBusinessRoot: '成果/业务' }))
   .some((item) => item.reason === 'overlap'));
 
 const folderMap = { routes: [

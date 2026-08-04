@@ -298,9 +298,9 @@ async function main() {
   assert(counters.progress.some((entry) => entry.stage === 'writing'));
   assert(!counters.progress.some((entry) => entry.stage === 'component-contracts'),
     'universal resume must never enter component-contracts');
-  assert(['written', 'needs_review', 'completed_no_output'].includes(task.status),
+  assert(['stored', 'pending_confirmation', 'failed'].includes(task.status),
     `unexpected final status: ${task.status}`);
-  assert.strictEqual(task.status, 'written');
+  assert.strictEqual(task.status, 'stored');
   assert.strictEqual(task.result_counts.knowledge_records, 1);
   assert.strictEqual(task.result_counts.unchanged, 1);
   assert.strictEqual(task.output_paths.length, 1);

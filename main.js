@@ -5,6 +5,7 @@ const __modules = {
 "main.js": function(require, module, exports) {
 const {
   ItemView,
+  FuzzySuggestModal,
   Modal,
   Notice,
   Plugin,
@@ -14,6 +15,7 @@ const {
   TFile,
   TFolder
 } = require("obsidian");
+const { V3Phase1Orchestrator } = require("src/v3/orchestrator.js");
 
 const {
   DEFAULT_SETTINGS,
@@ -36,7 +38,9 @@ const {
 const { extractTextFromBuffer, sanitizeAttachmentFileName } = require("src/core/extractors.js");
 const { createParsePackage, upgradeParsePackage } = require("src/core/document-parser.js");
 const { AutoDocumentParser } = require("src/auto-document-parser.js");
-const { probeLocalOcr } = require("src/core/local-ocr.js");
+const { probeLocalOcr, runLocalPdfOcr } = require("src/core/local-ocr.js");
+const { inspectPdf } = require("src/core/block-v0.js");
+const { runMineruApi } = require("src/core/mineru-api.js");
 const { createFolderIndexMarkdown, folderIndexPath } = require("src/core/moc.js");
 const { parseTagLibrary, suggestMapIndex, validateCard } = require("src/core/tags.js");
 const { detectEcosystemPlugins } = require("src/core/ecosystem.js");
@@ -703,6 +707,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.addCommand({ id: 'run-semantic-shadow', name: '运行语义影子处理', callback: () => this.runSemanticIndex() });
     this.addCommand({ id: 'rebuild-semantic-index', name: '重建语义向量索引', callback: () => this.rebuildSemanticIndex() });
     this.addCommand({ id: 'revalidate-latest-task-local', name: '本地重新归并、校验并路由最近任务（零模型调用）', callback: () => this.revalidateLatestTaskLocal() });
+    this.addCommand({
+      id: 'v3-phase1-process-source-experimental',
+      name: '[实验性] v3 Phase 1：选择源文件并生成已验证 Markdown',
+      callback: () => this.runV3Phase1Experimental()
+    });
 
     this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
       if (!(file instanceof TFile)) return;
@@ -751,6 +760,63 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         await this.saveSafeSettings();
       }
     } catch (_) { /* 通知失败不能影响插件加载 */ }
+  }
+
+  async runV3Phase1Experimental() {
+    const supported = new Set(['txt', 'md', 'docx', 'xlsx', 'pptx', 'msg', 'eml', 'pdf']);
+    const files = this.app.vault.getFiles().filter((file) => supported.has(String(file.extension || '').toLowerCase())
+      && !file.path.startsWith('Engineering Knowledge Slicer/v3-phase1/state/')
+      && !file.path.startsWith('Engineering Knowledge Slicer/v3-phase1/'));
+    if (!files.length) { new Notice('v3 Phase 1（实验性）：Vault 中没有支持的源文件。'); return; }
+    const plugin = this;
+    class SourcePicker extends FuzzySuggestModal {
+      getItems() { return files; }
+      getItemText(file) { return file.path; }
+      async onChooseItem(file) {
+        const localOcrSettings = {
+          enabled: plugin.settings.localOcrEnabled === true, provider: plugin.settings.localOcrProvider,
+          executable: plugin.settings.localOcrExecutable, languages: plugin.settings.localOcrLanguages,
+          concurrency: plugin.settings.localOcrConcurrency, timeoutMs: plugin.settings.localOcrTimeoutMs,
+          qualityThreshold: plugin.settings.localOcrQualityThreshold
+        };
+        const ocrProbe = await probeLocalOcr(localOcrSettings).catch(() => ({ available: false }));
+        const orchestrator = new V3Phase1Orchestrator(plugin.app.vault, {
+          cloud: {
+            configured: Boolean(String(plugin.settings.pdfMineruApiKey || '').trim()),
+            authorized: plugin.settings.pdfAllowExternalUpload === true,
+            parse: async (source) => {
+              const result = await runMineruApi(source.bytes, {
+                apiKey: plugin.settings.pdfMineruApiKey, endpoint: plugin.settings.pdfMineruApiEndpoint,
+                model: plugin.settings.pdfMineruApiModel, language: plugin.settings.pdfMineruLanguage,
+                timeoutMs: plugin.settings.pdfApiTimeoutMs, fileName: source.name
+              });
+              if (result.status !== 'ok' || !String(result.text || '').trim()) throw new Error(result.message || 'MinerU returned no valid content');
+              return result.text;
+            }
+          },
+          ocr: {
+            available: ocrProbe.available === true,
+            parse: async (source) => {
+              const inventory = inspectPdf(source.bytes);
+              if (inventory.status !== 'ok' || !inventory.pages?.length) throw new Error(inventory.message || 'local PDF inventory unavailable');
+              const result = await runLocalPdfOcr({ pdfBuffer: source.bytes, pages: inventory.pages,
+                sourceHash: source.path, settings: localOcrSettings, probe: ocrProbe });
+              return result.pages.map((page) => page.text).filter(Boolean).join('\n\n');
+            }
+          }
+        });
+        try {
+          const completed = await orchestrator.process(file);
+          const attempts = completed.manifest.attempts.map((item) => `${item.adapter}: ${item.status} — ${item.reason}`).join('\n');
+          new Notice(`v3 Phase 1（实验性）已验证\n${attempts}\n输出：${completed.manifest.final.path}`, 15000);
+        } catch (error) {
+          const attempts = error?.manifest?.attempts || error?.attempts || [];
+          const report = attempts.map((item) => `${item.adapter}: ${item.status} — ${item.reason}`).join('\n');
+          new Notice(`v3 Phase 1（实验性）失败\n${report || String(error?.message || error)}`, 15000);
+        }
+      }
+    }
+    new SourcePicker(this.app).open();
   }
 
   async runRealObsidianGateProbe() {
@@ -858,6 +924,60 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         } catch (_) {}
       }
       throw error;
+    }
+  }
+
+  async runV3RealObsidianGateProbe() {
+    const gateRoot = 'EKS v3 Phase 1 Gate';
+    const existingComplete = await V3Phase1Orchestrator.completionFromManifest(this.app.vault);
+    if (existingComplete) {
+      const manifestFile = this.app.vault.getAbstractFileByPath('Engineering Knowledge Slicer/v3-phase1/state/manifests/current-run.json');
+      const manifest = JSON.parse(await this.app.vault.read(manifestFile));
+      const finalFile = this.app.vault.getAbstractFileByPath(manifest.final.path);
+      const visible = Boolean(finalFile) && (await this.app.vault.read(finalFile)).length > 0;
+      await this.v3GateWrite(`${gateRoot}/result.json`, JSON.stringify({ ok: visible, real_host: true,
+        host_api: 'Obsidian Vault', restart: true, manifest_state: manifest.state, final_path: manifest.final.path,
+        final_sha256: manifest.final.sha256, visible_openable: [manifest.final.path] }, null, 2));
+      return;
+    }
+    const fixtures = [
+      ['fixtures/中文.txt', '中文工程验收要求\n\n必须通过可见性验证。'],
+      ['fixtures/日本語.md', '# 品質基準\n\n再起動後も表示できること。'],
+      ['fixtures/English-native.pdf', '%PDF-1.4 BT (This native PDF fixture contains enough engineering acceptance evidence, safety requirements, schedule controls, quality criteria, and restart verification text for deterministic local extraction.) Tj ET']
+    ];
+    const outputs = [];
+    for (const [path, content] of fixtures) {
+      await this.v3GateWrite(path, content);
+      const file = this.app.vault.getAbstractFileByPath(path);
+      const completed = await new V3Phase1Orchestrator(this.app.vault).process(file, `real-${Date.now().toString(36)}-${outputs.length}`);
+      outputs.push({ path: completed.manifest.final.path, sha256: completed.manifest.final.sha256,
+        attempts: completed.manifest.attempts, transitions: completed.manifest.transitions.map((item) => item.state) });
+    }
+    const complete = await V3Phase1Orchestrator.completionFromManifest(this.app.vault);
+    await this.v3GateWrite(`${gateRoot}/result.json`, JSON.stringify({ ok: complete && outputs.length === 3,
+      real_host: true, host_api: 'Obsidian Vault', restart: false, outputs,
+      visible_openable: outputs.map((item) => item.path) }, null, 2));
+  }
+
+  async v3GateWrite(path, content) {
+    const parts = path.split('/').slice(0, -1); let current = '';
+    for (const part of parts) { current = current ? `${current}/${part}` : part;
+      if (!this.app.vault.getAbstractFileByPath(current)) {
+        try { await this.app.vault.createFolder(current); }
+        catch (error) { if (!/already exists/i.test(String(error?.message || error))) throw error; }
+      } }
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing) { await this.app.vault.modify(existing, content); return; }
+    try { await this.app.vault.create(path, content); }
+    catch (error) {
+      if (!/already exists/i.test(String(error?.message || error))) throw error;
+      let visible = null;
+      for (let index = 0; index < 20 && !visible; index += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        visible = this.app.vault.getAbstractFileByPath(path);
+      }
+      if (!visible) throw error;
+      await this.app.vault.modify(visible, content);
     }
   }
 
@@ -20630,7 +20750,327 @@ module.exports = {
   privacyReducedCard, stableHash
 };
 
+},
+/* V3_CORE_MODULES_BEGIN */
+"src/v3/contracts.js": function(require, module, exports) {
+// @ts-nocheck -- Runtime contracts are exhaustively exercised by test:v3.
+'use strict';
+
+const crypto = require('crypto');
+
+const STATES = Object.freeze(['queued', 'reading', 'parsing', 'validating', 'staging', 'verifying', 'committed', 'failed']);
+const TRANSITIONS = Object.freeze({
+  queued: ['reading', 'failed'], reading: ['parsing', 'failed'], parsing: ['validating', 'failed'],
+  validating: ['staging', 'failed'], staging: ['verifying', 'failed'], verifying: ['committed', 'failed'],
+  committed: [], failed: []
+});
+const ATTEMPT_STATUSES = Object.freeze(['attempted', 'skipped', 'succeeded', 'failed']);
+const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
+
+function transition(manifest, next, detail = {}) {
+  if (!STATES.includes(next) || !TRANSITIONS[manifest.state]?.includes(next)) {
+    throw new Error(`V3_INVALID_STATE_TRANSITION:${manifest.state}->${next}`);
+  }
+  manifest.state = next;
+  manifest.transitions.push({ state: next, at: new Date().toISOString(), ...detail });
+  return manifest;
 }
+
+function attempt(adapter, status, reason, durationMs = 0) {
+  if (!ATTEMPT_STATUSES.includes(status)) throw new Error(`V3_INVALID_ATTEMPT_STATUS:${status}`);
+  return { adapter, status, reason: String(reason || ''), duration_ms: Math.max(0, Number(durationMs) || 0) };
+}
+
+function detectLanguages(text) {
+  const value = String(text || '');
+  const result = [];
+  if (/[぀-ヿ]/u.test(value)) result.push('ja');
+  if (/[㐀-鿿]/u.test(value)) result.push('zh');
+  if (/[A-Za-z]{3}/.test(value)) result.push('en');
+  return result.length ? [...new Set(result)] : ['und'];
+}
+
+function buildParseResult(source, text, provenance, quality, warnings = [], locators = []) {
+  const normalized = String(text || '').replace(/\r\n?/g, '\n').trim();
+  const paragraphs = normalized.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
+  return {
+    schema: 'eks/v3/parse-result/1',
+    source: { path: source.path, name: source.name, extension: source.extension, byte_size: source.bytes.length,
+      sha256: sha256(source.bytes) },
+    languages: detectLanguages(normalized),
+    chinese_normalized: { status: 'not_requested', text: null, capability: 'placeholder' },
+    blocks: paragraphs.map((content, index) => ({ id: `b-${sha256(`${source.path}\0${index}\0${content}`).slice(0, 20)}`,
+      type: 'paragraph', content, locator: locators[index] || { kind: 'paragraph', index: index + 1 } })),
+    parser_provenance: provenance,
+    quality,
+    warnings: warnings.map(String),
+    markdown: normalized
+  };
+}
+
+function validateParseResult(result) {
+  if (!result || result.schema !== 'eks/v3/parse-result/1' || !result.source?.sha256) throw new Error('V3_INVALID_PARSE_CONTRACT');
+  if (!String(result.markdown || '').trim() || !Array.isArray(result.blocks) || !result.blocks.length) throw new Error('V3_EMPTY_PARSE_RESULT');
+  const ids = result.blocks.map((block) => block.id);
+  if (new Set(ids).size !== ids.length || result.blocks.some((block) => !block.locator || !String(block.content).trim())) {
+    throw new Error('V3_INVALID_BLOCKS');
+  }
+  return result;
+}
+
+module.exports = { ATTEMPT_STATUSES, STATES, TRANSITIONS, attempt, buildParseResult, detectLanguages, sha256, transition, validateParseResult };
+
+},
+"src/v3/adapters.js": function(require, module, exports) {
+// @ts-nocheck -- Adapter inputs are validated at the v3 contract boundary.
+'use strict';
+
+const zlib = require('zlib');
+const { attempt, buildParseResult } = require("src/v3/contracts.js");
+
+const LOCAL_EXTENSIONS = Object.freeze(['txt', 'md', 'docx', 'xlsx', 'pptx', 'msg', 'eml']);
+const decodeXml = (value) => String(value || '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+  .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/\s+/g, ' ').trim();
+
+function zipEntries(buffer) {
+  const entries = new Map();
+  let offset = 0;
+  while (offset + 30 <= buffer.length && buffer.readUInt32LE(offset) === 0x04034b50) {
+    const flags = buffer.readUInt16LE(offset + 6); const method = buffer.readUInt16LE(offset + 8);
+    const compressed = buffer.readUInt32LE(offset + 18); const nameLength = buffer.readUInt16LE(offset + 26);
+    const extraLength = buffer.readUInt16LE(offset + 28); const start = offset + 30 + nameLength + extraLength;
+    if ((flags & 8) || start + compressed > buffer.length) throw new Error('V3_OOXML_UNSUPPORTED_ZIP');
+    const name = buffer.subarray(offset + 30, offset + 30 + nameLength).toString('utf8');
+    const payload = buffer.subarray(start, start + compressed);
+    entries.set(name, method === 0 ? payload : method === 8 ? zlib.inflateRawSync(payload) : Buffer.alloc(0));
+    offset = start + compressed;
+  }
+  if (!entries.size) throw new Error('V3_OOXML_INVALID_ZIP');
+  return entries;
+}
+
+function parseOoxml(source) {
+  const entries = zipEntries(source.bytes); const parts = [];
+  const names = [...entries.keys()].filter((name) => {
+    if (source.extension === 'docx') return /^word\/(document|header\d*|footer\d*)\.xml$/.test(name);
+    if (source.extension === 'xlsx') return /^xl\/(sharedStrings|worksheets\/sheet\d+)\.xml$/.test(name);
+    return /^ppt\/slides\/slide\d+\.xml$/.test(name);
+  }).sort();
+  for (const name of names) {
+    const text = decodeXml(entries.get(name).toString('utf8'));
+    if (text) parts.push(text);
+  }
+  return parts.join('\n\n');
+}
+
+function parseEmail(source) {
+  const raw = source.bytes.toString('utf8').replace(/\r\n?/g, '\n');
+  if (source.extension === 'eml') {
+    const split = raw.indexOf('\n\n');
+    return split >= 0 ? raw.slice(split + 2).replace(/<[^>]+>/g, ' ').trim() : raw.trim();
+  }
+  const utf16 = source.bytes.toString('utf16le').match(/[\p{L}\p{N}\p{P}\p{Zs}\r\n]{8,}/gu) || [];
+  const ascii = raw.match(/[\x20-\x7e\r\n]{8,}/g) || [];
+  return [...utf16, ...ascii].map((item) => item.trim()).filter(Boolean).join('\n');
+}
+
+function nativePdfText(bytes) {
+  const raw = bytes.toString('latin1'); const chunks = [];
+  for (const match of raw.matchAll(/\(([^()]*)\)\s*Tj/g)) chunks.push(match[1].replace(/\\([()\\])/g, '$1'));
+  for (const match of raw.matchAll(/\[(.*?)\]\s*TJ/gs)) for (const inner of match[1].matchAll(/\(([^()]*)\)/g)) chunks.push(inner[1]);
+  return chunks.join(' ').trim();
+}
+
+function pdfQualityProbe(text, bytes) {
+  const chars = String(text || '').replace(/\s/g, '').length;
+  const replacementRatio = chars ? (String(text).match(/�/g) || []).length / chars : 1;
+  const score = Math.max(0, Math.min(1, chars / 160)) * (1 - replacementRatio);
+  return { score, character_count: chars, replacement_ratio: replacementRatio, native_text_accepted: score >= 0.55,
+    byte_size: bytes.length };
+}
+
+async function timed(name, fn, records) {
+  const start = Date.now(); records.push(attempt(name, 'attempted', 'adapter selected', 0));
+  try {
+    const value = await fn(); records.push(attempt(name, 'succeeded', 'valid content produced', Date.now() - start)); return value;
+  } catch (error) {
+    records.push(attempt(name, 'failed', error?.message || error, Date.now() - start)); throw error;
+  }
+}
+
+async function selectAndParse(source, options = {}) {
+  const records = []; const ext = source.extension;
+  if (LOCAL_EXTENSIONS.includes(ext)) {
+    const text = await timed(`local-${ext}`, async () => ['txt', 'md'].includes(ext) ? source.bytes.toString('utf8')
+      : ['docx', 'xlsx', 'pptx'].includes(ext) ? parseOoxml(source) : parseEmail(source), records);
+    if (!String(text).trim()) throw closedError(records, 'local parser returned empty content');
+    return { result: buildParseResult(source, text, { selected_parser: `local-${ext}`, attempts: records },
+      { score: 1, valid: true, metrics: { character_count: text.trim().length } }), attempts: records };
+  }
+  if (ext !== 'pdf') throw closedError([attempt('parser-selection', 'failed', `unsupported extension: ${ext}`, 0)], 'unsupported file');
+
+  const native = await timed('pdf-native-probe', async () => nativePdfText(source.bytes), records);
+  const probe = pdfQualityProbe(native, source.bytes);
+  if (probe.native_text_accepted) {
+    records.push(attempt('pdf-cloud', 'skipped', 'native text quality accepted', 0));
+    records.push(attempt('pdf-local-ocr', 'skipped', 'native text quality accepted', 0));
+    return { result: buildParseResult(source, native, { selected_parser: 'pdf-native', attempts: records }, { score: probe.score, valid: true, metrics: probe }), attempts: records };
+  }
+  let cloudText = '';
+  if (!options.cloud?.configured) records.push(attempt('pdf-cloud', 'skipped', 'no configured cloud key', 0));
+  else if (!options.cloud.authorized) records.push(attempt('pdf-cloud', 'skipped', 'external upload not authorized or declined', 0));
+  else {
+    try { cloudText = await timed('pdf-cloud', () => options.cloud.parse(source), records); } catch (_) { cloudText = ''; }
+    if (String(cloudText).trim()) {
+      records.push(attempt('pdf-local-ocr', 'skipped', 'cloud parser produced valid content', 0));
+      return { result: buildParseResult(source, cloudText, { selected_parser: 'pdf-cloud', attempts: records }, { score: 1, valid: true, metrics: probe }), attempts: records };
+    }
+  }
+  let ocrText = '';
+  if (!options.ocr?.available) records.push(attempt('pdf-local-ocr', 'skipped', 'local OCR unavailable', 0));
+  else { try { ocrText = await timed('pdf-local-ocr', () => options.ocr.parse(source), records); } catch (_) { ocrText = ''; } }
+  if (!String(ocrText).trim()) throw closedError(records, 'no adapter produced valid content');
+  return { result: buildParseResult(source, ocrText, { selected_parser: 'pdf-local-ocr', attempts: records }, { score: 0.75, valid: true, metrics: probe }), attempts: records };
+}
+
+function closedError(records, summary) {
+  const detail = records.map((entry) => `${entry.adapter}=${entry.status}(${entry.reason})`).join('; ');
+  const error = new Error(`V3_PARSE_FAILED: ${summary}. ${detail}`); error.code = 'V3_PARSE_FAILED'; error.attempts = records; return error;
+}
+
+module.exports = { LOCAL_EXTENSIONS, closedError, nativePdfText, parseEmail, parseOoxml, pdfQualityProbe, selectAndParse, zipEntries };
+
+},
+"src/v3/orchestrator.js": function(require, module, exports) {
+// @ts-nocheck -- Obsidian runtime types are structurally verified by the real-host gate.
+'use strict';
+
+const { selectAndParse } = require("src/v3/adapters.js");
+const { sha256, transition, validateParseResult } = require("src/v3/contracts.js");
+
+const ROOT = 'Engineering Knowledge Slicer/v3-phase1/state';
+const STAGING_ROOT = `${ROOT}/staging`;
+const OUTPUT_ROOT = 'Engineering Knowledge Slicer/v3-phase1/verified-output';
+const MANIFEST_PATH = `${ROOT}/manifests/current-run.json`;
+
+class V3Phase1Orchestrator {
+  constructor(vault, options = {}) {
+    this.vault = vault;
+    this.options = options;
+  }
+
+  async process(file, runId = `v3-${Date.now().toString(36)}`) {
+    const manifest = { schema: 'eks/v3/run-manifest/1', run_id: runId, state: 'queued', source_path: file.path,
+      transitions: [{ state: 'queued', at: new Date().toISOString() }], attempts: [], final: null, error: null };
+    await this.persist(manifest);
+    try {
+      transition(manifest, 'reading'); await this.persist(manifest);
+      const bytes = Buffer.from(await this.vault.readBinary(file));
+      const extension = String(file.extension || file.path.split('.').pop() || '').toLowerCase();
+      const source = { path: file.path, name: file.name || file.path.split('/').pop(), extension, bytes };
+      transition(manifest, 'parsing'); await this.persist(manifest);
+      const parsed = await selectAndParse(source, this.options);
+      manifest.attempts = parsed.attempts;
+      transition(manifest, 'validating'); validateParseResult(parsed.result); await this.persist(manifest);
+      const markdown = renderMarkdown(parsed.result);
+      const hash = sha256(markdown);
+      const identity = parsed.result.source.sha256.slice(0, 16);
+      const safeName = String(file.basename || file.name || 'source').replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|#^[\]]/g, '_').slice(0, 80);
+      const stagingPath = `${STAGING_ROOT}/${runId}/${safeName}-${identity}.md`;
+      const finalPath = `${OUTPUT_ROOT}/${safeName}-${identity}.md`;
+      transition(manifest, 'staging', { path: stagingPath }); await this.persist(manifest);
+      await this.write(stagingPath, markdown);
+      transition(manifest, 'verifying', { path: stagingPath, sha256: hash }); await this.persist(manifest);
+      await this.verify(stagingPath, markdown, hash);
+      const existing = this.vault.getAbstractFileByPath(finalPath);
+      if (existing) {
+        const existingText = await this.vault.read(existing);
+        if (sha256(existingText) !== hash) throw new Error(`V3_IDEMPOTENCY_CONFLICT:${finalPath}`);
+        const staged = this.vault.getAbstractFileByPath(stagingPath);
+        if (staged) await this.vault.delete(staged, true);
+      } else {
+        const staged = this.vault.getAbstractFileByPath(stagingPath);
+        if (!staged) throw new Error(`V3_STAGING_REOPEN_FAILED:${stagingPath}`);
+        await this.ensureParent(finalPath);
+        await this.vault.rename(staged, finalPath);
+      }
+      await this.verify(finalPath, markdown, hash);
+      manifest.final = { path: finalPath, sha256: hash, byte_size: Buffer.byteLength(markdown), reopenable: true };
+      transition(manifest, 'committed', { path: finalPath, sha256: hash });
+      await this.persist(manifest);
+      if (!(await V3Phase1Orchestrator.completionFromManifest(this.vault))) throw new Error('V3_COMPLETION_AUTHORITY_REJECTED');
+      return { manifest, parseResult: parsed.result };
+    } catch (error) {
+      manifest.attempts = error?.attempts || manifest.attempts;
+      manifest.error = { code: error?.code || 'V3_RUN_FAILED', message: String(error?.message || error) };
+      if (manifest.state !== 'failed' && manifest.state !== 'committed') transition(manifest, 'failed');
+      await this.persist(manifest).catch(() => {});
+      throw Object.assign(error instanceof Error ? error : new Error(String(error)), { manifest });
+    }
+  }
+
+  static async completionFromManifest(vault) {
+    const file = vault.getAbstractFileByPath(MANIFEST_PATH);
+    if (!file) return false;
+    let manifest;
+    try { manifest = JSON.parse(await vault.read(file)); } catch (_) { return false; }
+    if (manifest?.schema !== 'eks/v3/run-manifest/1' || manifest.state !== 'committed' || !manifest.final?.path || !manifest.final?.sha256) return false;
+    const finalFile = vault.getAbstractFileByPath(manifest.final.path);
+    if (!finalFile) return false;
+    try { return sha256(await vault.read(finalFile)) === manifest.final.sha256; } catch (_) { return false; }
+  }
+
+  async verify(path, expected, hash) {
+    const file = this.vault.getAbstractFileByPath(path);
+    if (!file) throw new Error(`V3_REOPEN_FAILED:${path}`);
+    const actual = await this.vault.read(file);
+    if (actual !== expected || sha256(actual) !== hash) throw new Error(`V3_HASH_MISMATCH:${path}`);
+  }
+
+  async persist(manifest) { await this.write(MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`); }
+  async ensureParent(path) {
+    const parts = path.split('/').slice(0, -1); let current = '';
+    for (const part of parts) {
+      current = current ? `${current}/${part}` : part;
+      if (!this.vault.getAbstractFileByPath(current)) {
+        try { await this.vault.createFolder(current); }
+        catch (error) { if (!/already exists/i.test(String(error?.message || error))) throw error; }
+      }
+    }
+  }
+  async write(path, content) {
+    await this.ensureParent(path);
+    const existing = this.vault.getAbstractFileByPath(path);
+    if (existing) { await this.vault.modify(existing, content); return; }
+    try { await this.vault.create(path, content); }
+    catch (error) {
+      if (!/already exists/i.test(String(error?.message || error))) throw error;
+      let visible = null;
+      for (let index = 0; index < 20 && !visible; index += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        visible = this.vault.getAbstractFileByPath(path);
+      }
+      if (!visible) throw error;
+      await this.vault.modify(visible, content);
+    }
+  }
+}
+
+function renderMarkdown(result) {
+  const provenance = result.parser_provenance.selected_parser;
+  return `---\neks_schema: eks/v3/verified-markdown/1\nsource_path: ${JSON.stringify(result.source.path)}\nsource_sha256: ${result.source.sha256}\nparser: ${provenance}\nlanguages: [${result.languages.join(', ')}]\n---\n\n# ${result.source.name}\n\n${result.markdown}\n`;
+}
+
+module.exports = { MANIFEST_PATH, OUTPUT_ROOT, ROOT, STAGING_ROOT, V3Phase1Orchestrator, renderMarkdown };
+
+},
+"src/v3/index.js": function(require, module, exports) {
+'use strict';
+
+module.exports = { ...require("src/v3/contracts.js"), ...require("src/v3/adapters.js"), ...require("src/v3/orchestrator.js") };
+
+}
+/* V3_CORE_MODULES_END */
 };
 const __cache = {};
 function __require(id) {

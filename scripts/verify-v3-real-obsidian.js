@@ -54,9 +54,11 @@ async function launch(vault, config, resultPath, restartExpected) {
   assert(first.visible_openable.includes(restart.final_path));
   assert.strictEqual(first.phase2_complete, true); assert.strictEqual(restart.phase2_complete, true);
   assert.strictEqual(first.phase3_complete, true); assert.strictEqual(restart.phase3_complete, true);
+  assert.strictEqual(first.phase4_complete, true); assert.strictEqual(restart.phase4_complete, true);
   assert(first.phase2_counts.accepted > 0); assert(first.phase2_preview.path.endsWith('.preview.md')); assert(first.phase2_artifact.path.endsWith('.candidates.json'));
   assert.strictEqual(first.phase3_counts.created, 4); assert.strictEqual(first.phase3_links_valid, true); assert.strictEqual(restart.phase3_links_valid, true);
   assert(first.phase3_index.path.endsWith('id-path-index.json')); assert(restart.phase3_paths.every((p) => first.phase3_paths.includes(p)));
+  assert.strictEqual(first.phase4_counts.planned, 3); assert(first.phase4_paths.length >= 5); assert(first.phase4_index.path.endsWith('entity-index.json')); assert(restart.phase4_paths.every((p) => first.phase4_paths.includes(p)));
   const artifact = { schema: 'eks/v3/real-obsidian-evidence/1', passed: true, generated_at: new Date().toISOString(), first, restart };
   fs.mkdirSync(path.join(root, 'test-artifacts'), { recursive: true });
   fs.writeFileSync(path.join(root, 'test-artifacts/v3-real-obsidian-evidence.json'), JSON.stringify(artifact, null, 2));

@@ -1,4 +1,4 @@
-# v3 core rebuild — Phases 1–3
+# v3 core rebuild — Phases 1–4
 
 ## Boundary
 
@@ -103,4 +103,22 @@ Evidence recorded on 2026-08-04:
 
 ## Phase 4 entry criteria
 
-Phase 4 may begin only after all Phase 1–3 gates remain green, the Phase 3 manifest survives representative Vault restarts and archival moves, and every persisted-contract change has an explicit migration. Phase 4 must define human approval and correction authority, provenance-preserving relation/entity disambiguation, repair for incomplete rollback under hostile storage failure, and measured real-provider validation before any stable-release proposal. Promotion out of experimental roots requires a separate reviewed migration and must not silently reuse legacy v2 workflow, cache, checkpoint, review, shadow, routing, or atomization modules.
+Phase 4 began only after the Phase 1–3 contracts and gates were retained. It is still experimental and does not promote data into stable roots.
+
+## Phase 4 identity, entities, batches, and lifecycle
+
+Phase 4 introduces `eks/v3/project-identity/1`, `eks/v3/entity/1`, `eks/v3/entity-index/1`, `eks/v3/phase4-batch/1`, and `eks/v3/lifecycle-ledger/1`. Project identity first uses normalized Chinese/Japanese/English aliases plus contract/package/organization metadata. A narrowly scoped provider may only select an existing candidate when deterministic evidence is genuinely non-unique; its candidate ID and literal evidence are contract-validated, and malformed, fabricated, or out-of-set decisions fail closed. A new project is created only from an explicit project name with literal source evidence.
+
+The entity resolver covers projects, organizations, people, standards/specifications, contracts/packages, and materials/equipment. IDs are content-derived and stable. NFKC/case/punctuation/legal-suffix normalization supports multilingual aliases, while conflicting discriminators produce explicit conflicts instead of merges. Missing, invalid, or non-unique relations remain a compact plain-Chinese pending set. Phase 3 IDs and Markdown are not rewritten or duplicated by entity resolution.
+
+Heterogeneous document batches use bounded concurrency (1–8), per-document validation, stable source hashes, cancellation, idempotent fixed paths, and validated provider caches only under `v3-phase4/state/v1`. A batch commits only when every document verifies. Counts separately report planned, attempted, verified, written, updated, unchanged, rolled back, and failed; planned or attempted work is never presented as a successful write.
+
+Project lifecycle transitions support active, completed, suspended, and cancelled. Allowed forward and reverse transitions are explicit. Each accepted transition appends an immutable-ID ledger entry, updates the fixed-ID entity index, moves the project between the isolated active-tender and reusable-business/history trees, rewrites managed backlinks, and verifies the transaction. A persisted journal snapshots every touched path; partial failures roll back, and `recovery_required` journals are repaired on restart before new work.
+
+The only Phase 4 roots are `Engineering Knowledge Slicer/v3-phase4/state/v1/` and `Engineering Knowledge Slicer/v3-phase4/experimental-libraries/v1/`. The single command `[实验性] v3 Phase 4：解析实体与项目身份` reports concise Chinese quantitative results. It adds no settings and imports no legacy workflow, cache, checkpoint, review, shadow, routing, atomization, or structured-writer module.
+
+Honest limitations: automatic mention extraction is not claimed; callers must supply source-bound mentions, while the experimental command deliberately emits only the explicit source/project identity. Alias normalization is lexical and conservative rather than a general transliteration engine. Provider validation is deterministic-gate-only; no measured real-provider cohort exists yet. Lifecycle rollback cannot guarantee repair while storage remains permanently hostile, but the journal preserves restart-safe recovery intent. Human correction/approval authority and a reviewed migration are not yet implemented, so Phase 4 cannot write stable production roots.
+
+## Phase 5 cutover-readiness criteria
+
+Phase 5 may propose cutover only after: a versioned, auditable human approval/correction contract exists; Phase 3-to-4 migrations preserve every ID, relation, and exact evidence; hostile-storage recovery is demonstrated across repeated restarts; real-provider precision/false-merge/false-split measurements meet reviewed thresholds on representative general-contractor documents; lifecycle/archive permissions and reverse-transition policy receive review; all Phase 1→2→3→4 gates remain green on two official-host launches; and a separately reviewed transactional migration proves no writes outside approved roots. Stable promotion must never silently reuse legacy v2 workflow, cache, checkpoint, review, shadow, routing, or atomization code.

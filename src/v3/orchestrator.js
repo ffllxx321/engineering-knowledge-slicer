@@ -7,6 +7,7 @@ const { sha256, transition, validateParseResult } = require('./contracts');
 const ROOT = 'Engineering Knowledge Slicer/v3-phase1/state';
 const STAGING_ROOT = `${ROOT}/staging`;
 const OUTPUT_ROOT = 'Engineering Knowledge Slicer/v3-phase1/verified-output';
+const ARTIFACT_ROOT = 'Engineering Knowledge Slicer/v3-phase1/verified-artifacts';
 const MANIFEST_PATH = `${ROOT}/manifests/current-run.json`;
 
 class V3Phase1Orchestrator {
@@ -34,6 +35,9 @@ class V3Phase1Orchestrator {
       const safeName = String(file.basename || file.name || 'source').replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|#^[\]]/g, '_').slice(0, 80);
       const stagingPath = `${STAGING_ROOT}/${runId}/${safeName}-${identity}.md`;
       const finalPath = `${OUTPUT_ROOT}/${safeName}-${identity}.md`;
+      const artifactPath = `${ARTIFACT_ROOT}/${safeName}-${identity}.json`;
+      const artifactText = `${JSON.stringify(parsed.result, null, 2)}\n`;
+      const artifactHash = sha256(artifactText);
       transition(manifest, 'staging', { path: stagingPath }); await this.persist(manifest);
       await this.write(stagingPath, markdown);
       transition(manifest, 'verifying', { path: stagingPath, sha256: hash }); await this.persist(manifest);
@@ -51,7 +55,10 @@ class V3Phase1Orchestrator {
         await this.vault.rename(staged, finalPath);
       }
       await this.verify(finalPath, markdown, hash);
+      await this.write(artifactPath, artifactText);
+      await this.verify(artifactPath, artifactText, artifactHash);
       manifest.final = { path: finalPath, sha256: hash, byte_size: Buffer.byteLength(markdown), reopenable: true };
+      manifest.parse_artifact = { path: artifactPath, sha256: artifactHash, byte_size: Buffer.byteLength(artifactText), reopenable: true };
       transition(manifest, 'committed', { path: finalPath, sha256: hash });
       await this.persist(manifest);
       if (!(await V3Phase1Orchestrator.completionFromManifest(this.vault))) throw new Error('V3_COMPLETION_AUTHORITY_REJECTED');
@@ -70,10 +77,17 @@ class V3Phase1Orchestrator {
     if (!file) return false;
     let manifest;
     try { manifest = JSON.parse(await vault.read(file)); } catch (_) { return false; }
-    if (manifest?.schema !== 'eks/v3/run-manifest/1' || manifest.state !== 'committed' || !manifest.final?.path || !manifest.final?.sha256) return false;
+    if (manifest?.schema !== 'eks/v3/run-manifest/1' || manifest.state !== 'committed' || !manifest.final?.path || !manifest.final?.sha256
+      || !manifest.parse_artifact?.path || !manifest.parse_artifact?.sha256) return false;
     const finalFile = vault.getAbstractFileByPath(manifest.final.path);
     if (!finalFile) return false;
-    try { return sha256(await vault.read(finalFile)) === manifest.final.sha256; } catch (_) { return false; }
+    const artifactFile = vault.getAbstractFileByPath(manifest.parse_artifact.path);
+    if (!artifactFile) return false;
+    try {
+      const artifactText = await vault.read(artifactFile);
+      validateParseResult(JSON.parse(artifactText));
+      return sha256(await vault.read(finalFile)) === manifest.final.sha256 && sha256(artifactText) === manifest.parse_artifact.sha256;
+    } catch (_) { return false; }
   }
 
   async verify(path, expected, hash) {
@@ -117,4 +131,4 @@ function renderMarkdown(result) {
   return `---\neks_schema: eks/v3/verified-markdown/1\nsource_path: ${JSON.stringify(result.source.path)}\nsource_sha256: ${result.source.sha256}\nparser: ${provenance}\nlanguages: [${result.languages.join(', ')}]\n---\n\n# ${result.source.name}\n\n${result.markdown}\n`;
 }
 
-module.exports = { MANIFEST_PATH, OUTPUT_ROOT, ROOT, STAGING_ROOT, V3Phase1Orchestrator, renderMarkdown };
+module.exports = { ARTIFACT_ROOT, MANIFEST_PATH, OUTPUT_ROOT, ROOT, STAGING_ROOT, V3Phase1Orchestrator, renderMarkdown };

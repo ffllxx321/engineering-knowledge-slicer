@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const root = path.join(__dirname, '..');
 const bundlePath = path.join(root, 'main.js');
-const ids = ['contracts', 'adapters', 'orchestrator', 'index'];
+const ids = ['contracts', 'adapters', 'orchestrator', 'candidate-contract', 'candidate-orchestrator', 'index'];
 const begin = '/* V3_CORE_MODULES_BEGIN */';
 const end = '/* V3_CORE_MODULES_END */';
 let bundle = fs.readFileSync(bundlePath, 'utf8');
@@ -12,7 +12,9 @@ const modules = ids.map((name) => {
   let source = fs.readFileSync(path.join(root, 'src', 'v3', `${name}.js`), 'utf8');
   source = source.replace(/require\('\.\/contracts'\)/g, 'require("src/v3/contracts.js")')
     .replace(/require\('\.\/adapters'\)/g, 'require("src/v3/adapters.js")')
-    .replace(/require\('\.\/orchestrator'\)/g, 'require("src/v3/orchestrator.js")');
+    .replace(/require\('\.\/orchestrator'\)/g, 'require("src/v3/orchestrator.js")')
+    .replace(/require\('\.\/candidate-contract'\)/g, 'require("src/v3/candidate-contract.js")')
+    .replace(/require\('\.\/candidate-orchestrator'\)/g, 'require("src/v3/candidate-orchestrator.js")');
   if (name === 'index') source = source.replace(/require\('\.\/contracts'\)/g, 'require("src/v3/contracts.js")');
   return `"src/v3/${name}.js": function(require, module, exports) {\n${source}\n}`;
 }).join(',\n');

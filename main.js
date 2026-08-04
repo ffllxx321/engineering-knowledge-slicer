@@ -16,6 +16,7 @@ const {
   TFolder
 } = require("obsidian");
 const { V3Phase1Orchestrator } = require("src/v3/orchestrator.js");
+const { V3Phase2CandidateOrchestrator } = require("src/v3/candidate-orchestrator.js");
 
 const {
   DEFAULT_SETTINGS,
@@ -712,6 +713,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       name: '[实验性] v3 Phase 1：选择源文件并生成已验证 Markdown',
       callback: () => this.runV3Phase1Experimental()
     });
+    this.addCommand({
+      id: 'v3-phase2-build-candidates-experimental',
+      name: '[实验性] v3 Phase 2：处理最新有效 Phase 1 并预览候选',
+      callback: () => this.runV3Phase2Experimental()
+    });
 
     this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
       if (!(file instanceof TFile)) return;
@@ -817,6 +823,24 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
     }
     new SourcePicker(this.app).open();
+  }
+
+  async runV3Phase2Experimental() {
+    const orchestrator = new V3Phase2CandidateOrchestrator(this.app.vault, {
+      model: this.settings.minimaxModel || 'configured-provider',
+      provider: { request: (prompt, context) => requestMiniMaxJson({ settings: this.settings, prompt,
+        context: { ...context, stage: 'v3-phase2-candidate' }, fetchImpl: obsidianRequest }) }
+    });
+    try {
+      const completed = await orchestrator.processLatest(); const counts = completed.manifest.counts;
+      const reasons = completed.artifact.rejected.slice(0, 8).map((item) => `${item.block_ids.join('、') || '未知块'}：${item.reason_zh}`).join('\n');
+      new Notice(`v3 Phase 2（实验性）完成\n接受 ${counts.accepted}，拒绝 ${counts.rejected}\n${reasons || '无拒绝项'}`, 15000);
+      const preview = this.app.vault.getAbstractFileByPath(completed.manifest.final.preview.path);
+      if (preview) await this.app.workspace.getLeaf(true).openFile(preview);
+    } catch (error) {
+      const attempts = error?.manifest?.attempts || []; const report = attempts.map((item) => `${item.status} ${item.model}：${item.reason}`).join('\n');
+      new Notice(`v3 Phase 2（实验性）失败\n${report || String(error?.message || error)}`, 15000);
+    }
   }
 
   async runRealObsidianGateProbe() {
@@ -935,9 +959,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const manifest = JSON.parse(await this.app.vault.read(manifestFile));
       const finalFile = this.app.vault.getAbstractFileByPath(manifest.final.path);
       const visible = Boolean(finalFile) && (await this.app.vault.read(finalFile)).length > 0;
-      await this.v3GateWrite(`${gateRoot}/result.json`, JSON.stringify({ ok: visible, real_host: true,
+      const phase2Complete = await V3Phase2CandidateOrchestrator.completionFromManifest(this.app.vault);
+      await this.v3GateWrite(`${gateRoot}/result.json`, JSON.stringify({ ok: visible && phase2Complete, real_host: true,
         host_api: 'Obsidian Vault', restart: true, manifest_state: manifest.state, final_path: manifest.final.path,
-        final_sha256: manifest.final.sha256, visible_openable: [manifest.final.path] }, null, 2));
+        final_sha256: manifest.final.sha256, phase2_complete: phase2Complete, visible_openable: [manifest.final.path] }, null, 2));
       return;
     }
     const fixtures = [
@@ -954,9 +979,17 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         attempts: completed.manifest.attempts, transitions: completed.manifest.transitions.map((item) => item.state) });
     }
     const complete = await V3Phase1Orchestrator.completionFromManifest(this.app.vault);
-    await this.v3GateWrite(`${gateRoot}/result.json`, JSON.stringify({ ok: complete && outputs.length === 3,
+    const fakeProvider = { request: async (prompt) => { const payload = JSON.parse(prompt.slice(prompt.indexOf('\n\n') + 2));
+      return { proposals: payload.blocks.map((block) => ({ title_zh: '工程资料要求', body_zh: `应遵守以下原文要求：${block.content}`,
+        knowledge_kind: 'requirement', reusable_scope: 'general', block_ids: [block.id], evidence: { [block.id]: block.content },
+        translation_status: /[A-Za-z]/.test(block.content) ? 'translated' : 'original_zh', confidence: { evidence: 1, completeness: .9, translation: .8 }, warnings: [] })), rejections: [] }; } };
+    const phase2 = await new V3Phase2CandidateOrchestrator(this.app.vault, { provider: fakeProvider, model: 'deterministic-in-host-fake/1' }).processLatest('real-phase2');
+    const previewFile = this.app.vault.getAbstractFileByPath(phase2.manifest.final.preview.path); const artifactFile = this.app.vault.getAbstractFileByPath(phase2.manifest.final.artifact.path);
+    const phase2Complete = await V3Phase2CandidateOrchestrator.completionFromManifest(this.app.vault);
+    await this.v3GateWrite(`${gateRoot}/result.json`, JSON.stringify({ ok: complete && outputs.length === 3 && phase2Complete && Boolean(previewFile) && Boolean(artifactFile),
       real_host: true, host_api: 'Obsidian Vault', restart: false, outputs,
-      visible_openable: outputs.map((item) => item.path) }, null, 2));
+      phase2_complete: phase2Complete, phase2_counts: phase2.manifest.counts, phase2_preview: phase2.manifest.final.preview,
+      phase2_artifact: phase2.manifest.final.artifact, visible_openable: [...outputs.map((item) => item.path), phase2.manifest.final.preview.path] }, null, 2));
   }
 
   async v3GateWrite(path, content) {
@@ -20951,6 +20984,7 @@ const { sha256, transition, validateParseResult } = require("src/v3/contracts.js
 const ROOT = 'Engineering Knowledge Slicer/v3-phase1/state';
 const STAGING_ROOT = `${ROOT}/staging`;
 const OUTPUT_ROOT = 'Engineering Knowledge Slicer/v3-phase1/verified-output';
+const ARTIFACT_ROOT = 'Engineering Knowledge Slicer/v3-phase1/verified-artifacts';
 const MANIFEST_PATH = `${ROOT}/manifests/current-run.json`;
 
 class V3Phase1Orchestrator {
@@ -20978,6 +21012,9 @@ class V3Phase1Orchestrator {
       const safeName = String(file.basename || file.name || 'source').replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|#^[\]]/g, '_').slice(0, 80);
       const stagingPath = `${STAGING_ROOT}/${runId}/${safeName}-${identity}.md`;
       const finalPath = `${OUTPUT_ROOT}/${safeName}-${identity}.md`;
+      const artifactPath = `${ARTIFACT_ROOT}/${safeName}-${identity}.json`;
+      const artifactText = `${JSON.stringify(parsed.result, null, 2)}\n`;
+      const artifactHash = sha256(artifactText);
       transition(manifest, 'staging', { path: stagingPath }); await this.persist(manifest);
       await this.write(stagingPath, markdown);
       transition(manifest, 'verifying', { path: stagingPath, sha256: hash }); await this.persist(manifest);
@@ -20995,7 +21032,10 @@ class V3Phase1Orchestrator {
         await this.vault.rename(staged, finalPath);
       }
       await this.verify(finalPath, markdown, hash);
+      await this.write(artifactPath, artifactText);
+      await this.verify(artifactPath, artifactText, artifactHash);
       manifest.final = { path: finalPath, sha256: hash, byte_size: Buffer.byteLength(markdown), reopenable: true };
+      manifest.parse_artifact = { path: artifactPath, sha256: artifactHash, byte_size: Buffer.byteLength(artifactText), reopenable: true };
       transition(manifest, 'committed', { path: finalPath, sha256: hash });
       await this.persist(manifest);
       if (!(await V3Phase1Orchestrator.completionFromManifest(this.vault))) throw new Error('V3_COMPLETION_AUTHORITY_REJECTED');
@@ -21014,10 +21054,17 @@ class V3Phase1Orchestrator {
     if (!file) return false;
     let manifest;
     try { manifest = JSON.parse(await vault.read(file)); } catch (_) { return false; }
-    if (manifest?.schema !== 'eks/v3/run-manifest/1' || manifest.state !== 'committed' || !manifest.final?.path || !manifest.final?.sha256) return false;
+    if (manifest?.schema !== 'eks/v3/run-manifest/1' || manifest.state !== 'committed' || !manifest.final?.path || !manifest.final?.sha256
+      || !manifest.parse_artifact?.path || !manifest.parse_artifact?.sha256) return false;
     const finalFile = vault.getAbstractFileByPath(manifest.final.path);
     if (!finalFile) return false;
-    try { return sha256(await vault.read(finalFile)) === manifest.final.sha256; } catch (_) { return false; }
+    const artifactFile = vault.getAbstractFileByPath(manifest.parse_artifact.path);
+    if (!artifactFile) return false;
+    try {
+      const artifactText = await vault.read(artifactFile);
+      validateParseResult(JSON.parse(artifactText));
+      return sha256(await vault.read(finalFile)) === manifest.final.sha256 && sha256(artifactText) === manifest.parse_artifact.sha256;
+    } catch (_) { return false; }
   }
 
   async verify(path, expected, hash) {
@@ -21061,13 +21108,233 @@ function renderMarkdown(result) {
   return `---\neks_schema: eks/v3/verified-markdown/1\nsource_path: ${JSON.stringify(result.source.path)}\nsource_sha256: ${result.source.sha256}\nparser: ${provenance}\nlanguages: [${result.languages.join(', ')}]\n---\n\n# ${result.source.name}\n\n${result.markdown}\n`;
 }
 
-module.exports = { MANIFEST_PATH, OUTPUT_ROOT, ROOT, STAGING_ROOT, V3Phase1Orchestrator, renderMarkdown };
+module.exports = { ARTIFACT_ROOT, MANIFEST_PATH, OUTPUT_ROOT, ROOT, STAGING_ROOT, V3Phase1Orchestrator, renderMarkdown };
+
+},
+"src/v3/candidate-contract.js": function(require, module, exports) {
+// @ts-nocheck -- Runtime validation is covered by the v3 Phase 2 contract gate.
+'use strict';
+
+const { detectLanguages, sha256 } = require("src/v3/contracts.js");
+
+const CANDIDATE_SCHEMA = 'eks/v3/candidate/1';
+const ARTIFACT_SCHEMA = 'eks/v3/candidate-artifact/1';
+const PROMPT_VERSION = 'eks-v3-candidate-prompt/1';
+const KINDS = Object.freeze(['requirement', 'procedure', 'acceptance', 'risk', 'method', 'definition', 'reference', 'lesson']);
+const SCOPES = Object.freeze(['project', 'trade', 'organization', 'general']);
+const TRANSLATION = Object.freeze(['original_zh', 'translated', 'uncertain_literal', 'mixed_normalized']);
+
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+  return value;
+}
+function stableCandidateId(candidate) {
+  const identity = canonical({ source_sha256: candidate.source?.sha256, block_ids: [...(candidate.evidence || [])].map((e) => e.block_id).sort(),
+    title_zh: candidate.title_zh, body_zh: candidate.body_zh, facts: candidate.facts || [] });
+  return `cand-${sha256(JSON.stringify(identity)).slice(0, 24)}`;
+}
+function extractFacts(text) {
+  const value = String(text || ''); const facts = [];
+  const patterns = [
+    ['number_unit', /(?:\d+(?:\.\d+)?|[一二三四五六七八九十百千万]+)\s*(?:mm|cm|m|km|kg|t|MPa|kPa|℃|°C|%|天|日|小时|h|层|次)/giu],
+    ['date', /\b\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?\b/gu],
+    ['version', /\b(?:v|version)\s*\d+(?:\.\d+){1,3}\b/giu],
+    ['standard_clause', /(?:GB|JGJ|ISO|EN|ASTM)\s*[A-Z0-9./-]+(?:\s*第?\d+(?:\.\d+)*条)?/giu]
+  ];
+  for (const [type, regex] of patterns) for (const match of value.match(regex) || []) facts.push({ type, value: match.trim() });
+  return facts.filter((item, index) => facts.findIndex((other) => other.type === item.type && other.value === item.value) === index);
+}
+function factSignature(facts) { return JSON.stringify((facts || []).map((f) => `${f.type}:${f.value}`).sort()); }
+function validateCandidate(candidate, source, blockMap) {
+  if (!candidate || candidate.schema !== CANDIDATE_SCHEMA || !KINDS.includes(candidate.knowledge_kind) || !SCOPES.includes(candidate.reusable_scope)) throw new Error('候选合同无效');
+  if (!String(candidate.title_zh || '').trim() || !String(candidate.body_zh || '').trim() || !/[\u3400-\u9fff]/u.test(`${candidate.title_zh}${candidate.body_zh}`)) throw new Error('候选标题和正文必须为中文');
+  if (candidate.source?.sha256 !== source.sha256 || candidate.source?.path !== source.path) throw new Error('候选来源绑定不匹配');
+  if (!Array.isArray(candidate.evidence) || !candidate.evidence.length) throw new Error('缺少原文证据');
+  for (const evidence of candidate.evidence) {
+    const block = blockMap.get(evidence.block_id);
+    if (!block || JSON.stringify(block.locator) !== JSON.stringify(evidence.locator) || !String(evidence.original || '').trim() || !block.content.includes(evidence.original)) throw new Error('证据不存在或定位不准确');
+  }
+  if (!TRANSLATION.includes(candidate.translation_status) || !Array.isArray(candidate.source_language) || !candidate.source_language.length) throw new Error('翻译状态无效');
+  for (const key of ['evidence', 'completeness', 'translation']) if (!(Number(candidate.confidence?.[key]) >= 0 && Number(candidate.confidence[key]) <= 1)) throw new Error('置信度无效');
+  const originalFacts = extractFacts(candidate.evidence.map((item) => item.original).join('\n'));
+  if (factSignature(candidate.facts) !== factSignature(originalFacts)) throw new Error('数字、单位、日期、版本或标准条款发生漂移');
+  candidate.id = stableCandidateId(candidate);
+  if ('final_folder_path' in candidate || 'approval' in candidate || 'backlinks' in candidate) throw new Error('候选包含越界字段');
+  return candidate;
+}
+
+function normalizeProposal(raw, source, blocks) {
+  const evidence = (raw.block_ids || []).map((id) => blocks.get(id)).filter(Boolean).map((block) => ({ block_id: block.id, locator: block.locator,
+    original: String(raw.evidence?.[block.id] || block.content).slice(0, 500) }));
+  const languages = [...new Set(evidence.flatMap((item) => detectLanguages(item.original)))];
+  const candidate = { schema: CANDIDATE_SCHEMA, id: '', title_zh: String(raw.title_zh || '').trim(), body_zh: String(raw.body_zh || '').trim(),
+    knowledge_kind: raw.knowledge_kind, reusable_scope: raw.reusable_scope, source: { path: source.path, name: source.name, sha256: source.sha256 }, evidence,
+    source_language: languages, translation_status: raw.translation_status || (languages.length === 1 && languages[0] === 'zh' ? 'original_zh' : 'translated'),
+    facts: extractFacts(evidence.map((item) => item.original).join('\n')), confidence: { evidence: Number(raw.confidence?.evidence), completeness: Number(raw.confidence?.completeness), translation: Number(raw.confidence?.translation) },
+    warnings: (raw.warnings || []).map(String) };
+  return validateCandidate(candidate, source, blocks);
+}
+
+module.exports = { ARTIFACT_SCHEMA, CANDIDATE_SCHEMA, KINDS, PROMPT_VERSION, SCOPES, TRANSLATION, canonical, extractFacts, factSignature,
+  normalizeProposal, stableCandidateId, validateCandidate };
+
+},
+"src/v3/candidate-orchestrator.js": function(require, module, exports) {
+// @ts-nocheck -- Obsidian runtime structures are verified by unit and official-host gates.
+'use strict';
+
+const { sha256, validateParseResult } = require("src/v3/contracts.js");
+const { ARTIFACT_SCHEMA, CANDIDATE_SCHEMA, PROMPT_VERSION, factSignature, normalizeProposal, validateCandidate } = require("src/v3/candidate-contract.js");
+const { MANIFEST_PATH: PHASE1_MANIFEST_PATH, V3Phase1Orchestrator } = require("src/v3/orchestrator.js");
+
+const PHASE2_ROOT = 'Engineering Knowledge Slicer/v3-phase2';
+const PHASE2_STATE_ROOT = `${PHASE2_ROOT}/state/v1`;
+const PHASE2_OUTPUT_ROOT = `${PHASE2_ROOT}/experimental-output/v1`;
+const PHASE2_MANIFEST_PATH = `${PHASE2_STATE_ROOT}/manifests/current-run.json`;
+const CACHE_ROOT = `${PHASE2_STATE_ROOT}/model-cache`;
+const RESUME_ROOT = `${PHASE2_STATE_ROOT}/runs`;
+const CANDIDATE_ARTIFACT_SCHEMA = ARTIFACT_SCHEMA;
+
+const SYSTEM_PROMPT = `你是施工总承包企业的知识候选整理器。只根据给定块及其ID，把可复用事实整理为中文候选。不得补充、推断或改写数字、单位、日期、版本、名称、标准条款、例外和义务。翻译不确定时使用安全直译并标记 uncertain_literal。每项只表达一个独立主题或义务。返回严格JSON：{"proposals":[{"title_zh":"","body_zh":"","knowledge_kind":"requirement|procedure|acceptance|risk|method|definition|reference|lesson","reusable_scope":"project|trade|organization|general","block_ids":[""],"evidence":{"块ID":"原文紧凑片段"},"translation_status":"original_zh|translated|uncertain_literal|mixed_normalized","confidence":{"evidence":0,"completeness":0,"translation":0},"warnings":[]}],"rejections":[{"block_ids":[""],"reason_zh":""}]}`;
+
+function cacheKey(sourceHash, schema, promptVersion, model) { return sha256(JSON.stringify([sourceHash, schema, promptVersion, model])); }
+function eligible(block) {
+  const text = String(block.content || '').trim();
+  if (!text) return '空白内容';
+  if (/^(目录|目次|table of contents)\b/i.test(text) || /\.{3,}\s*\d+$/m.test(text)) return '目录内容不可作为知识';
+  if (/^(第?\s*\d+\s*页|page\s+\d+|页眉|页脚)$/i.test(text)) return '页眉页脚或页码不可作为知识';
+  if (/(unsubscribe|退订|tracking pixel|view in browser|查看网页版)/i.test(text)) return '营销退订或跟踪噪声不可作为知识';
+  if (text.length < 8) return '内容过短，缺少可复用知识';
+  return null;
+}
+function stableBatches(blocks, size = 8) {
+  const result = []; for (let i = 0; i < blocks.length; i += size) result.push({ id: `batch-${String(i / size + 1).padStart(4, '0')}`, blocks: blocks.slice(i, i + size) }); return result;
+}
+function sanitizeReason(error) { return String(error?.message || error || '未知错误').replace(/(?:sk|key|ghp|eyJ)[-_A-Za-z0-9.]{12,}/g, '[已隐藏]').slice(0, 300); }
+function providerRecord(status, model, started, inputSize, outputSize, reason) { return { adapter: 'v3-candidate-provider', status, duration_ms: Math.max(0, Date.now() - started), model,
+  input_size: inputSize, output_size: outputSize, reason: sanitizeReason(reason) }; }
+
+function consolidate(candidates) {
+  const result = [];
+  for (const candidate of candidates.sort((a, b) => a.id.localeCompare(b.id))) {
+    const evidenceIds = new Set(candidate.evidence.map((e) => e.block_id));
+    const compatible = result.find((prior) => prior.knowledge_kind === candidate.knowledge_kind && prior.reusable_scope === candidate.reusable_scope
+      && factSignature(prior.facts) === factSignature(candidate.facts) && prior.evidence.some((e) => evidenceIds.has(e.block_id)));
+    if (!compatible) { result.push(candidate); continue; }
+    compatible.evidence = [...compatible.evidence, ...candidate.evidence].filter((item, index, all) => all.findIndex((x) => x.block_id === item.block_id && x.original === item.original) === index);
+    compatible.warnings = [...new Set([...compatible.warnings, ...candidate.warnings])];
+    compatible.body_zh = compatible.body_zh.length >= candidate.body_zh.length ? compatible.body_zh : candidate.body_zh;
+    compatible.title_zh = compatible.title_zh.length >= candidate.title_zh.length ? compatible.title_zh : candidate.title_zh;
+    compatible.id = require("src/v3/candidate-contract.js").stableCandidateId(compatible);
+  }
+  return result;
+}
+
+class V3Phase2CandidateOrchestrator {
+  constructor(vault, options = {}) { this.vault = vault; this.provider = options.provider; this.model = String(options.model || 'configured-provider'); this.batchSize = options.batchSize || 8; }
+
+  async processLatest(runId = `v3-p2-${Date.now().toString(36)}`) {
+    const binding = await this.loadPhase1Binding(); const sourceHash = binding.parse.source.sha256;
+    const key = cacheKey(sourceHash, CANDIDATE_SCHEMA, PROMPT_VERSION, this.model);
+    const manifest = { schema: 'eks/v3/phase2-manifest/1', run_id: runId, state: 'running', source_phase1: binding.bound,
+      candidate_schema: CANDIDATE_SCHEMA, prompt_version: PROMPT_VERSION, model: this.model, attempts: [], counts: null, final: null, error: null };
+    await this.write(PHASE2_MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`);
+    try {
+      const deterministicRejected = []; const blocks = [];
+      for (const block of binding.parse.blocks) { const reason = eligible(block); if (reason) deterministicRejected.push({ block_ids: [block.id], reason_zh: reason }); else blocks.push(block); }
+      const blockMap = new Map(binding.parse.blocks.map((block) => [block.id, block]));
+      const batches = stableBatches(blocks, this.batchSize); const proposed = []; const rejected = [...deterministicRejected];
+      for (const batch of batches) {
+        const resumePath = `${RESUME_ROOT}/${key}/${batch.id}.json`; let response = await this.readValidatedResponse(resumePath, batch, blockMap);
+        if (response) manifest.attempts.push(providerRecord('skipped', this.model, Date.now(), 0, Buffer.byteLength(JSON.stringify(response)), '已验证的同批次续传产物'));
+        else {
+          const cachePath = `${CACHE_ROOT}/${key}/${batch.id}.json`; response = await this.readValidatedResponse(cachePath, batch, blockMap);
+          if (response) manifest.attempts.push(providerRecord('skipped', this.model, Date.now(), 0, Buffer.byteLength(JSON.stringify(response)), '命中已验证缓存'));
+          else {
+            if (!this.provider || typeof this.provider.request !== 'function') throw new Error('未配置 Phase 2 候选 provider');
+            const payload = { schema: CANDIDATE_SCHEMA, source: binding.parse.source, blocks: batch.blocks };
+            const input = `${SYSTEM_PROMPT}\n\n${JSON.stringify(payload)}`; const started = Date.now();
+            manifest.attempts.push(providerRecord('attempted', this.model, started, Buffer.byteLength(input), 0, '开始请求'));
+            try {
+              const raw = await this.provider.request(input, { model: this.model, batch_id: batch.id, prompt_version: PROMPT_VERSION });
+              const output = typeof raw === 'string' ? raw : JSON.stringify(raw); response = JSON.parse(output);
+              this.validateResponse(response, batch, blockMap);
+              manifest.attempts.push(providerRecord('succeeded', this.model, started, Buffer.byteLength(input), Buffer.byteLength(output), '响应合同有效'));
+              await this.write(cachePath, `${JSON.stringify(response, null, 2)}\n`); await this.write(resumePath, `${JSON.stringify(response, null, 2)}\n`);
+            } catch (error) { manifest.attempts.push(providerRecord('failed', this.model, started, Buffer.byteLength(input), 0, error)); throw error; }
+          }
+        }
+        for (const raw of response.proposals) { try { proposed.push(normalizeProposal(raw, binding.parse.source, blockMap)); } catch (error) { rejected.push({ block_ids: raw.block_ids || [], reason_zh: sanitizeReason(error) }); } }
+        for (const item of response.rejections || []) rejected.push({ block_ids: item.block_ids || [], reason_zh: String(item.reason_zh || '模型未提供可复用知识').slice(0, 200) });
+      }
+      const accepted = consolidate(proposed); if (!accepted.length) throw new Error('没有通过质量门的候选知识');
+      const covered = new Set([...accepted.flatMap((c) => c.evidence.map((e) => e.block_id)), ...rejected.flatMap((r) => r.block_ids)]);
+      const uncovered = blocks.filter((block) => !covered.has(block.id)).map((block) => block.id);
+      for (const id of uncovered) rejected.push({ block_ids: [id], reason_zh: '模型响应未覆盖该有效来源块' });
+      const artifact = { schema: ARTIFACT_SCHEMA, source_phase1: binding.bound, candidate_schema: CANDIDATE_SCHEMA, prompt_version: PROMPT_VERSION,
+        model: this.model, candidates: accepted, rejected, audit: { source_blocks: binding.parse.blocks.length, proposed: proposed.length, accepted: accepted.length,
+          rejected: rejected.length, consolidated: proposed.length - accepted.length, uncovered_eligible_blocks: uncovered.length } };
+      for (const candidate of artifact.candidates) validateCandidate(candidate, binding.parse.source, blockMap);
+      const slug = sourceHash.slice(0, 16); const artifactPath = `${PHASE2_OUTPUT_ROOT}/${slug}.candidates.json`; const previewPath = `${PHASE2_OUTPUT_ROOT}/${slug}.preview.md`;
+      const artifactText = `${JSON.stringify(artifact, null, 2)}\n`; const preview = renderPreview(artifact);
+      await this.write(artifactPath, artifactText); await this.verify(artifactPath, sha256(artifactText));
+      await this.write(previewPath, preview); await this.verify(previewPath, sha256(preview));
+      manifest.counts = artifact.audit; manifest.final = { artifact: { path: artifactPath, sha256: sha256(artifactText) }, preview: { path: previewPath, sha256: sha256(preview) } }; manifest.state = 'committed';
+      await this.write(PHASE2_MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`);
+      if (!(await V3Phase2CandidateOrchestrator.completionFromManifest(this.vault))) throw new Error('Phase 2 完成权威校验失败');
+      return { manifest, artifact };
+    } catch (error) { manifest.state = 'failed'; manifest.error = { message: sanitizeReason(error) }; await this.write(PHASE2_MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`).catch(() => {}); throw Object.assign(error, { manifest }); }
+  }
+
+  async loadPhase1Binding() {
+    if (!(await V3Phase1Orchestrator.completionFromManifest(this.vault))) throw new Error('Phase 1 清单未提交、不可重开或哈希无效');
+    const manifestText = await this.vault.read(this.vault.getAbstractFileByPath(PHASE1_MANIFEST_PATH)); const manifest = JSON.parse(manifestText);
+    const artifactText = await this.vault.read(this.vault.getAbstractFileByPath(manifest.parse_artifact.path)); const parse = validateParseResult(JSON.parse(artifactText));
+    return { parse, bound: { manifest_path: PHASE1_MANIFEST_PATH, manifest_sha256: sha256(manifestText),
+      parse_artifact_path: manifest.parse_artifact.path, parse_artifact_sha256: manifest.parse_artifact.sha256, preview_path: manifest.final.path, preview_sha256: manifest.final.sha256,
+      source_sha256: parse.source.sha256 } };
+  }
+  validateResponse(response, batch, blockMap) {
+    if (!response || !Array.isArray(response.proposals) || !Array.isArray(response.rejections)) throw new Error('provider JSON 合同无效');
+    const allowed = new Set(batch.blocks.map((b) => b.id));
+    for (const item of [...response.proposals, ...response.rejections]) if (!(item.block_ids || []).length || item.block_ids.some((id) => !allowed.has(id) || !blockMap.has(id))) throw new Error('provider 返回了虚构证据');
+    return response;
+  }
+  async readValidatedResponse(path, batch, blockMap) { const file = this.vault.getAbstractFileByPath(path); if (!file) return null; try { const parsed = JSON.parse(await this.vault.read(file)); return this.validateResponse(parsed, batch, blockMap); } catch (_) { return null; } }
+  async verify(path, hash) { const file = this.vault.getAbstractFileByPath(path); if (!file) throw new Error(`无法重开：${path}`); if (sha256(await this.vault.read(file)) !== hash) throw new Error(`哈希不匹配：${path}`); }
+  async ensureParent(path) { let current = ''; for (const part of path.split('/').slice(0, -1)) { current = current ? `${current}/${part}` : part; if (!this.vault.getAbstractFileByPath(current)) try { await this.vault.createFolder(current); } catch (error) { if (!/already exists/i.test(sanitizeReason(error))) throw error; } } }
+  async write(path, content) { await this.ensureParent(path); const existing = this.vault.getAbstractFileByPath(path); if (existing) return this.vault.modify(existing, content); return this.vault.create(path, content); }
+
+  static async completionFromManifest(vault) {
+    try {
+      const file = vault.getAbstractFileByPath(PHASE2_MANIFEST_PATH); if (!file) return false; const manifest = JSON.parse(await vault.read(file));
+      if (manifest.schema !== 'eks/v3/phase2-manifest/1' || manifest.state !== 'committed' || !manifest.final?.artifact || !manifest.final?.preview) return false;
+      if (!(await V3Phase1Orchestrator.completionFromManifest(vault))) return false;
+      const phase1Text = await vault.read(vault.getAbstractFileByPath(PHASE1_MANIFEST_PATH)); const phase1 = JSON.parse(phase1Text);
+      if (manifest.source_phase1.manifest_sha256 !== sha256(phase1Text)) return false;
+      if (manifest.source_phase1.parse_artifact_sha256 !== phase1.parse_artifact.sha256 || manifest.source_phase1.preview_sha256 !== phase1.final.sha256) return false;
+      const artifactFile = vault.getAbstractFileByPath(manifest.final.artifact.path); const previewFile = vault.getAbstractFileByPath(manifest.final.preview.path); if (!artifactFile || !previewFile) return false;
+      const artifactText = await vault.read(artifactFile); const artifact = JSON.parse(artifactText); if (artifact.schema !== ARTIFACT_SCHEMA || !artifact.candidates?.length) return false;
+      return sha256(artifactText) === manifest.final.artifact.sha256 && sha256(await vault.read(previewFile)) === manifest.final.preview.sha256;
+    } catch (_) { return false; }
+  }
+}
+
+function renderPreview(artifact) {
+  const rows = artifact.candidates.map((c) => `## ${c.title_zh}\n\n${c.body_zh}\n\n- 类型：${c.knowledge_kind}\n- 复用范围：${c.reusable_scope}\n- 证据：${c.evidence.map((e) => `${e.block_id}（${JSON.stringify(e.locator)}）`).join('；')}\n- 原文：${c.evidence.map((e) => e.original).join(' / ')}\n- 翻译状态：${c.translation_status}\n- 警告：${c.warnings.join('；') || '无'}\n`).join('\n');
+  const rejects = artifact.rejected.map((r) => `- ${r.block_ids.join('、') || '未知块'}：${r.reason_zh}`).join('\n') || '- 无';
+  return `---\neks_schema: eks/v3/candidate-preview/1\nsource_sha256: ${artifact.source_phase1.source_sha256}\n---\n\n# 实验性候选知识预览\n\n> 仅供 Phase 2 实验验证，不是最终知识库内容。\n\n${rows}\n## 拒绝记录\n\n${rejects}\n`;
+}
+
+module.exports = { CACHE_ROOT, CANDIDATE_ARTIFACT_SCHEMA, PHASE2_MANIFEST_PATH, PHASE2_OUTPUT_ROOT, PHASE2_ROOT, PHASE2_STATE_ROOT, RESUME_ROOT,
+  SYSTEM_PROMPT, V3Phase2CandidateOrchestrator, cacheKey, consolidate, eligible, providerRecord, renderPreview, stableBatches };
 
 },
 "src/v3/index.js": function(require, module, exports) {
 'use strict';
 
-module.exports = { ...require("src/v3/contracts.js"), ...require("src/v3/adapters.js"), ...require("src/v3/orchestrator.js") };
+module.exports = { ...require("src/v3/contracts.js"), ...require("src/v3/adapters.js"), ...require("src/v3/orchestrator.js"), ...require("src/v3/candidate-contract.js"), ...require("src/v3/candidate-orchestrator.js") };
 
 }
 /* V3_CORE_MODULES_END */

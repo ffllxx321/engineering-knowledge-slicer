@@ -1,4 +1,4 @@
-# v3 core rebuild — Phases 1–2
+# v3 core rebuild — Phases 1–3
 
 ## Boundary
 
@@ -64,8 +64,27 @@ The concise generic prompt and response schema live entirely under `src/v3`. Pro
 - Language detection is script-based and may report both Chinese and Japanese for mixed CJK text.
 - Chinese normalization is contract space only in Phase 1; no translation or rewriting is performed.
 - MinerU remains a user-authorized network operation and was not used by the offline official-host gate.
-- Phase 2 is candidate formulation only. It does not classify into business/tender folders, route review, write final knowledge Markdown, create backlinks, run semantic shadow, or use legacy workflow/cache/checkpoint/atomization modules.
+- Phase 2 is candidate formulation only. Phase 3 alone performs experimental routing and final Markdown writes; it does not use the legacy review, workflow, cache, checkpoint, shadow, structured-writer, or production commit path.
 - Literal fact preservation is enforced locally; broader semantic faithfulness still depends on provider output and is exposed through evidence, translation status, confidence, warnings, and rejection records rather than being presented as approved knowledge.
+
+## Phase 3 transactional two-library write
+
+Phase 3 consumes only the sole committed Phase 2 manifest after reopening and SHA-256 validating the candidate artifact. `eks/v3/two-library-routing/1` routes each candidate to either the isolated active-tender/project library or the isolated reusable-business/history library. Deterministic local scope and textual signals decide clear cases; the configured provider receives only the ambiguous candidate and may return only a library plus a short Chinese reason. It is not allowed to invent taxonomies, content, paths, or relationships.
+
+The deterministic `eks/v3/write-plan/1` produces the four standard record kinds: project, source document, business item, and company knowledge. Markdown uses stable content-derived IDs, Chinese title/body, tags, status, source hash/path, exact Phase 2 block IDs, locators and verbatim evidence, routing provenance, and readable metadata. `eks/v3/id-path-index/1` is the fixed ID-to-path authority. Filenames include the stable ID, and deterministic suffixing protects against occupied-path collisions.
+
+Wikilinks are emitted only when one stable target ID resolves to one indexed path. Missing or explicitly ambiguous relations remain in a short plain-Chinese “待处理关系” section. Links are rendered from the current index, so project completion, suspension, or cancellation moves update the project path and all managed backlinks without changing record IDs.
+
+All changed records and the index are first staged and reopened/hash-verified through public Vault APIs. Creates use Vault rename from staging; updates are snapshotted. Any write, rename, reopen, hash, index, or manifest/completion-authority failure rolls back touched final paths. `Engineering Knowledge Slicer/v3-phase3/state/v1/manifests/current-run.json` is the sole Phase 3 completion authority. Its created/updated/unchanged counts are assigned only after verified final writes; planned counts are never reported as written counts.
+
+The two writable knowledge roots are exclusively:
+
+- `Engineering Knowledge Slicer/v3-phase3/experimental-libraries/v1/active-tender/`
+- `Engineering Knowledge Slicer/v3-phase3/experimental-libraries/v1/reusable-business/`
+
+The command `[实验性] v3 Phase 3：提交最新有效候选到隔离双库` reports planned, created, updated, unchanged, rolled-back, and failed counts plus actual paths in Chinese. It does not replace stable production commands.
+
+Additional limitations: local routing signals intentionally remain conservative and generic, so neutral prose can require one provider decision; entity extraction is not yet a Phase 3 responsibility; only ID-explicit relationships become links; rollback is best-effort if the Vault itself keeps rejecting restoration writes; and no real provider has been validated for Phase 3. Official gates use deterministic fake providers without network or API keys.
 
 ## Test evidence
 
@@ -82,6 +101,6 @@ Evidence recorded on 2026-08-04:
 - `npm run test:v3-phase2`: covers candidate contracts/source binding/stable IDs, Chinese/Japanese/English/mixed normalization, exact fact preservation, rejection reasons, compatible consolidation/conflict separation, cache invalidation, partial failure/resume, idempotency, completion authority, malformed output, fabricated evidence, drift, write/reopen/hash failures, restart, duplicate run, and quantitative audit fields.
 - The official-host v3 gate also runs Phase 2 with a deterministic in-host fake provider, reopens the candidate artifact and preview through public Vault APIs, and revalidates their Phase 1 bindings and hashes after restart. No real provider validation is claimed.
 
-## Phase 3 entry criteria
+## Phase 4 entry criteria
 
-Phase 3 may begin only after every Phase 1 and Phase 2 gate remains green on representative real Vault fixtures and candidate-contract changes are versioned deliberately. Phase 3 must consume only a committed, reopenable, hash-valid Phase 2 manifest/artifact; define an independent review/decision contract; preserve exact evidence and facts; keep classification/routing separate from candidate formulation; introduce no final knowledge write until approval authority is explicit and restart-safe; and add migrations before changing any persisted v3 contract. Legacy v2 workflow, prompts, cache, checkpoints, routing, review, and atomization remain forbidden dependencies.
+Phase 4 may begin only after all Phase 1–3 gates remain green, the Phase 3 manifest survives representative Vault restarts and archival moves, and every persisted-contract change has an explicit migration. Phase 4 must define human approval and correction authority, provenance-preserving relation/entity disambiguation, repair for incomplete rollback under hostile storage failure, and measured real-provider validation before any stable-release proposal. Promotion out of experimental roots requires a separate reviewed migration and must not silently reuse legacy v2 workflow, cache, checkpoint, review, shadow, routing, or atomization modules.

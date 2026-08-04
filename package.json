@@ -11,6 +11,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "test:v3": "node scripts/test-v3-core.js",
     "test:v3-phase2": "node scripts/test-v3-phase2.js",
+    "test:v3-phase3": "node scripts/test-v3-phase3.js",
     "gate:v3-architecture": "node scripts/gate-v3-architecture.js",
     "gate:v3-obsidian": "node scripts/verify-v3-real-obsidian.js",
     "test:multilingual": "node scripts/test-multilingual-zh-output.js",

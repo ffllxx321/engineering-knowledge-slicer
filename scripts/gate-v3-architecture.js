@@ -10,10 +10,13 @@ const forbidden = ['core/workflow', 'phase2-candidate-pipeline', 'review-service
 for (const term of forbidden) assert(!new RegExp(`require\\([^)]*${term}`, 'i').test(source), `v3 imports forbidden legacy module: ${term}`);
 assert.strictEqual((source.match(/class V3Phase1Orchestrator/g) || []).length, 1, 'exactly one v3 orchestrator required');
 assert.strictEqual((source.match(/class V3Phase2CandidateOrchestrator/g) || []).length, 1, 'exactly one Phase 2 candidate orchestrator required');
-assert.strictEqual((source.match(/static async completionFromManifest/g) || []).length, 2, 'exactly one completion authority per phase required');
+assert.strictEqual((source.match(/class V3Phase3WriteOrchestrator/g) || []).length, 1, 'exactly one Phase 3 write orchestrator required');
+assert.strictEqual((source.match(/static async completionFromManifest/g) || []).length, 3, 'exactly one completion authority per phase required');
 assert(!/result_counts|success_count|processed_count/.test(source), 'independent completion counter found');
 assert(/Engineering Knowledge Slicer\/v3-phase1\/state/.test(source));
 assert(/v3-phase1\/verified-output/.test(source));
 assert(/v3-phase2/.test(source) && /experimental-output\/v1/.test(source));
+assert(/v3-phase3/.test(source) && /experimental-libraries\/v1/.test(source));
+assert(!/require\([^)]*(phase3-review-gate|structured-writer|production-commit-service)/i.test(source), 'Phase 3 imports forbidden legacy writer/review');
 assert.strictEqual((source.match(/class V3Phase2CandidateOrchestrator/g) || []).length, 1);
 console.log('v3 architecture gate: PASS');

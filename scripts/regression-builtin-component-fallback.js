@@ -196,7 +196,7 @@ async function main() {
   }
   harness.plugin.settings.pdfExtractionOrder = 'paddleocr-api,mineru-api';
   harness.plugin.providerLimiters = { paddleocr: { run: () => {} }, mineru: { run: () => {} } };
-  assert.strictEqual((await harness.plugin.getPdfExtractorConfig()).order, 'paddleocr-api,mineru-api');
+  assert.strictEqual((await harness.plugin.getPdfExtractorConfig()).order, 'mineru-api');
 
   const legacyTask = {
     task_id: 'legacy-selective', run_id: 'legacy-selective', source_hash: 'b'.repeat(64),

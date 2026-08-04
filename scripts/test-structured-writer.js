@@ -68,7 +68,7 @@ function input(overrides = {}) {
   return {
     settings: {
       controlledWriterEnabled: true, structuredWriterMode: 'structured-pilot',
-      structuredActiveRoot: '在办投标库', structuredBusinessRoot: '长期业务库',
+      knowledgeTenderRoot: '06-知识库/招投标库', knowledgeBusinessRoot: '06-知识库/业务库',
       artifactsPath: '状态', structuredMaxRecords: 100, structuredMaxActions: 300,
       structuredMaxLinkFanout: 20
     },
@@ -196,7 +196,7 @@ async function main() {
   assert.strictEqual(plan.blocked, false);
   assert.deepStrictEqual(plan.counts, { create: 2 });
   assert(plan.summary.includes('新建 2'));
-  assert(plan.actions.every((item) => item.path.startsWith('长期业务库/')));
+  assert(plan.actions.every((item) => item.path.startsWith('06-知识库/业务库/')));
   assert(plan.actions.some((item) => item.content.includes('[[src-')));
 
   const idsByKind = Object.fromEntries(plan.actions.map((item) => [item.record_kind, item.record_id]));
@@ -238,8 +238,8 @@ async function main() {
   const duplicatePhysical = buildPlan({
     ...base,
     existingFiles: {
-      '长期业务库/a.md': plan.actions[0].content,
-      '长期业务库/b.md': plan.actions[0].content
+      '06-知识库/业务库/a.md': plan.actions[0].content,
+      '06-知识库/业务库/b.md': plan.actions[0].content
     }
   });
   assert(duplicatePhysical.conflicts.some((item) => item.cause === 'same_id_multiple_paths'));
@@ -256,7 +256,7 @@ async function main() {
     phase3Result: activePhase.phase3
   });
   assert(active.actions.some((item) => item.record_kind === 'project'));
-  assert(active.actions.every((item) => item.path.startsWith('在办投标库/P-001/')));
+  assert(active.actions.every((item) => item.path.startsWith('06-知识库/招投标库/P-001/')));
   const activeIndex = emptyIndex();
   const activeFiles = {};
   for (const action of active.actions) {
@@ -271,8 +271,8 @@ async function main() {
     index: activeIndex, existingFiles: activeFiles,
     archiveTransition: { from: 'lost', archive_outcome: 'lost' }
   });
-  assert(archived.actions.every((item) => item.from_path?.startsWith('在办投标库/P-001/')));
-  assert(archived.actions.every((item) => item.path.startsWith('长期业务库/complete_historical_projects/')));
+  assert(archived.actions.every((item) => item.from_path?.startsWith('06-知识库/招投标库/P-001/')));
+  assert(archived.actions.every((item) => item.path.startsWith('06-知识库/业务库/complete_historical_projects/')));
   assert(archived.actions.some((item) => item.content.includes('[[src-')),
     'stable basename links survive archive moves');
 

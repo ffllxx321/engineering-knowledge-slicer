@@ -34,7 +34,8 @@ const {
   vaultRelativePath
 } = require("src/core/task.js");
 const { extractTextFromBuffer, sanitizeAttachmentFileName } = require("src/core/extractors.js");
-const { upgradeParsePackage } = require("src/core/document-parser.js");
+const { createParsePackage, upgradeParsePackage } = require("src/core/document-parser.js");
+const { AutoDocumentParser } = require("src/auto-document-parser.js");
 const { probeLocalOcr } = require("src/core/local-ocr.js");
 const { createFolderIndexMarkdown, folderIndexPath } = require("src/core/moc.js");
 const { parseTagLibrary, suggestMapIndex, validateCard } = require("src/core/tags.js");
@@ -694,8 +695,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.addCommand({ id: 'retry-failed-source-files', name: '重试失败任务并自动处理', callback: () => this.retryFailedAndAutoProcess(true) });
     this.addCommand({ id: 'rollback-last-batch', name: '回滚最近一批卡片', callback: () => this.rollbackLastBatch() });
     this.addCommand({ id: 'open-ai-settings', name: '打开工程知识切片密钥设置', callback: () => this.openPluginSettings() });
-    this.addCommand({ id: 'run-shadow-evaluation', name: '运行本地影子评估', callback: () => this.runShadowEvaluation() });
-    this.addCommand({ id: 'export-shadow-evaluation', name: '导出影子评估诊断报告', callback: () => this.exportShadowReport() });
+    if (typeof process === 'object' && process?.env?.EKS_ENABLE_DEVELOPMENT_SHADOW === '1') {
+      this.addCommand({ id: 'run-shadow-evaluation', name: '[开发] 运行影子评估', callback: () => this.runShadowEvaluation() });
+      this.addCommand({ id: 'export-shadow-evaluation', name: '[开发] 导出影子评估', callback: () => this.exportShadowReport() });
+    }
     this.addCommand({ id: 'run-semantic-shadow', name: '运行语义影子处理', callback: () => this.runSemanticIndex() });
     this.addCommand({ id: 'rebuild-semantic-index', name: '重建语义向量索引', callback: () => this.rebuildSemanticIndex() });
     this.addCommand({ id: 'revalidate-latest-task-local', name: '本地重新归并、校验并路由最近任务（零模型调用）', callback: () => this.revalidateLatestTaskLocal() });
@@ -756,6 +759,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const businessBase = `${settings.businessRoot}/EKS 发布门/多语言 空格`;
     const tenderBase = `${settings.activeRoot}/EKS 发布门/在办项目`;
     const runId = `run-real-host-${Date.now()}`;
+    const sourcePaths = [
+      '06-知识库/源文件/业务库/默认设置真实业务材料.md',
+      '06-知识库/源文件/招投标/默认设置真实招投标材料.md'
+    ];
+    await port.write(sourcePaths[0], '# 业务材料\n\n这是从默认业务源目录发起的等价用户任务。');
+    await port.write(sourcePaths[1], '# 招投标材料\n\n这是从默认招投标源目录发起的等价用户任务。');
     const fixtures = [
       ['bi-gate-zh', 'business_item', `${businessBase}/中文/安全检查.md`, '安全检查'],
       ['ck-gate-ja', 'company_knowledge', `${businessBase}/日本語/品質 基準.md`, '品質基準'],
@@ -820,13 +829,17 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         }
       }
       const rollbackClean = rollbackPaths.every((path) => !this.app.vault.getAbstractFileByPath(path));
+      const noLegacyTopLevelWrites = !this.app.vault.getAbstractFileByPath('长期业务库')
+        && !this.app.vault.getAbstractFileByPath('在办投标库');
       await port.write(`${gateRoot}/result.json`, JSON.stringify({
         ok: committed.verified.knowledge_records.length === 4 && facts.count === 4
           && openedPaths.length === 4 && second.length === 4
-          && deletionInvalidated && injectedFailureObserved && rollbackClean,
+          && deletionInvalidated && injectedFailureObserved && rollbackClean && noLegacyTopLevelWrites,
         real_host: true, host_api: 'Obsidian Vault', plugin_version: this.manifest.version,
         production_completion_chain: ['write_plan', 'commit', 'authoritative_manifest', 'task_completion', 'ui_statistics', 'open_each_final_path'],
         visible_openable: committed.verified.knowledge_records.map((item) => item.final_path), opened_paths: openedPaths,
+        source_paths: sourcePaths, authoritative_roots: settings,
+        no_legacy_top_level_writes: noLegacyTopLevelWrites,
         authoritative_manifest: committed.verified.knowledge_records, path_sets: committed.manifest.path_sets,
         task_status: task.production_state, terminal_outcome: task.terminal_outcome, ui_written: facts.count,
         ui_states: PRODUCTION_FLOW_CONTRACT.user_states,
@@ -1437,7 +1450,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         const file = this.app.vault.getAbstractFileByPath(current.source_path);
         if (!(file instanceof TFile)) throw new Error(`未找到源文件：${current.source_path}`);
         const buffer = Buffer.from(await this.app.vault.readBinary(file));
-        const extracted = await extractTextFromBuffer(current.source_path, buffer, {
+        const extracted = await this.parseDocumentAutomatically(current, buffer, {
           localTextBlockAdapter: this.settings.localTextBlockAdapterEnabled !== false,
           pdfExtractor: await this.getPdfExtractorConfig(current),
           localMsgAdapter: this.settings.localMsgAdapterEnabled !== false,
@@ -1783,7 +1796,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       // and the ledger must become durable before any view reads it.
       this._terminalTaskIds.add(current.task_id);
       await this.flushSaveTasksImmediate();
+      const revalidated = await this.revalidatePersistedCompletion(current.task_id, current.run_id);
+      Object.assign(current, revalidated);
       await this.transitionCompletionUi(current.task_id);
+      const finalFacts = productionVisibleFacts(current);
       diag('performance.task', createStageMetric({
         taskId: current.task_id,
         runId: current.run_id,
@@ -1801,7 +1817,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         autoApproved: universalProduction ? generatedCount - structuredHandlingGroups.length : workflow.metrics?.autoApproved,
         reviewPending: universalProduction ? structuredHandlingGroups.length : workflow.metrics?.reviewPending,
         cardsMerged: universalProduction ? 0 : workflow.metrics?.merged,
-        cardsWritten: universalProduction ? structuredVisible : current.written_card_ids.length,
+        cardsWritten: finalFacts.count,
         bytesWritten: universalProduction ? Number(verifiedStructured?.bytes_written || 0) : 0
       }));
       if (!universalProduction) diag('review.routing', {
@@ -1822,7 +1838,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       diag('performance.counters', Object.assign({ taskId: current.task_id, runId: current.run_id }, this.operationCounters));
       this.sessionStats.processed += 1;
       this.sessionStats.review += universalProduction ? structuredHandlingGroups.length : legacyReview.length;
-      this.sessionStats.written += universalProduction ? structuredVisible : legacyAccepted.length;
+      this.sessionStats.written += finalFacts.count;
       this.sessionStats.lastMessage = current.progress.message;
       new Notice(current.progress.message);
     } catch (error) {
@@ -1838,6 +1854,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       transitionProductionState(current, 'failed', {
         stage: current.progress?.stage || 'processing', message: String(error?.message || error)
       });
+      current.current_run_manifest = null;
+      applyVerifiedFacts(current, []);
+      current.terminal_outcome = 'failed';
       current.updated_at = new Date().toISOString();
       if (error?.code === 'STRUCTURED_WRITE_NOT_PERSISTED') {
         current.terminal_outcome = 'failed_no_output';
@@ -3806,8 +3825,28 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         if (task.production_state !== migratedState) { task.production_state = migratedState; changed = true; }
         continue;
       }
-      // A restart never promotes an old transaction to success. Even a formerly
-      // stored task must enter a fresh run and re-open every final file.
+      if (migratedState === 'stored' && task.current_run_manifest) {
+        try {
+          const port = new KnowledgeWritePort(this.app.vault);
+          const manifest = task.current_run_manifest;
+          const records = [];
+          for (const record of manifest.records || []) {
+            records.push(await port.verify({
+              record_id: record.record_id, record_kind: record.record_kind,
+              path: record.final_path, content_hash: record.content_hash,
+              owner_source_id: record.source_association
+            }, record.transaction_id || manifest.transaction_id, new Date().toISOString(), {
+              runId: task.run_id, targetRoots: manifest.target_roots
+            }));
+          }
+          applyVerifiedFacts(task, records);
+          transitionProductionState(task, 'stored', { stage: 'complete', manifest, overallPercent: 100 });
+          continue;
+        } catch (error) {
+          diag('startup.visibleRevalidationFailed', { taskId: task.task_id, code: error?.code || 'VERIFY_FAILED' });
+        }
+      }
+      // Legacy or unverifiable success is never promoted after restart.
       task.current_run_manifest = null;
       applyVerifiedFacts(task, []);
       task.production_state = 'waiting';
@@ -4039,7 +4078,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   async getPdfExtractorConfig(task = null) {
     return {
       enabled: true,
-      order: String(this.settings.pdfExtractionOrder || DEFAULT_SETTINGS.pdfExtractionOrder),
+      order: 'mineru-api',
       // v2.8.1: 设置开关常开，或本次会话在确认弹窗点过"确认上传"，都视为已授权
       allowExternalUpload: this.settings.pdfAllowExternalUpload === true || eksSessionUploadApproved(),
       // v1.3: 上传前是否弹窗二次确认（默认开启）
@@ -4051,9 +4090,6 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       mineruApiEndpoint: this.settings.pdfMineruApiEndpoint || 'https://mineru.net/api/v4',
       mineruApiModel: this.settings.pdfMineruApiModel || 'vlm',
       mineruApiLanguage: this.settings.pdfMineruApiLanguage || 'ch_server',
-      paddleOcrApiKey: this.settings.pdfPaddleOcrApiKey || '',
-      paddleOcrApiEndpoint: this.settings.pdfPaddleOcrApiEndpoint || 'https://paddleocr.aistudio-app.com/api/v2/ocr/jobs',
-      paddleOcrApiModel: this.settings.pdfPaddleOcrApiModel || 'PaddleOCR-VL-1.6',
       requestImpl: (url, init) => {
         const provider = String(url).includes('paddleocr') ? 'paddleocr' : 'mineru';
         this.operationCounters.apiRequests += 1;
@@ -4062,6 +4098,98 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       fileName: task?.source_path?.split('/').pop() || 'source.pdf',
       onProgress: task ? (progress) => this.setTaskProgress(task, progress.message, progress) : undefined
     };
+  }
+
+  async revalidatePersistedCompletion(taskId, runId) {
+    const ledger = await this.loadTasks();
+    const persisted = ledger.find((item) => item.task_id === taskId && item.run_id === runId);
+    if (!persisted?.current_run_manifest) throw Object.assign(new Error('持久化账本缺少当前运行 manifest。'), { code: 'PERSISTED_MANIFEST_MISSING' });
+    const manifest = persisted.current_run_manifest;
+    const port = new KnowledgeWritePort(this.app.vault);
+    const records = [];
+    for (const record of manifest.records || []) {
+      const verified = await port.verify({
+        record_id: record.record_id, record_kind: record.record_kind,
+        path: record.final_path, final_path: record.final_path,
+        content_hash: record.content_hash, owner_source_id: record.source_association
+      }, record.transaction_id || manifest.transaction_id, new Date().toISOString(), {
+        runId, targetRoots: manifest.target_roots
+      });
+      const file = this.app.vault.getAbstractFileByPath(verified.final_path);
+      if (!(file instanceof TFile) || file.path !== verified.final_path) {
+        throw Object.assign(new Error(`最终知识路径不可打开：${verified.final_path}`), { code: 'FINAL_PATH_NOT_OPENABLE' });
+      }
+      if (this.app.workspace?.getLeaf) {
+        const leaf = this.app.workspace.getLeaf('tab');
+        await leaf.openFile(file);
+        if (leaf.view?.file?.path !== verified.final_path) {
+          throw Object.assign(new Error(`Obsidian 未打开最终知识路径：${verified.final_path}`), { code: 'FINAL_PATH_NOT_OPENABLE' });
+        }
+      }
+      records.push(verified);
+    }
+    applyVerifiedFacts(persisted, records);
+    persisted.current_run_manifest = Object.assign({}, manifest, {
+      records,
+      path_sets: Object.assign({}, manifest.path_sets, { visible_verified: records.map((item) => item.final_path).sort() }),
+      revalidated_at: new Date().toISOString()
+    });
+    transitionProductionState(persisted, 'stored', { stage: 'complete', manifest: persisted.current_run_manifest, overallPercent: 100 });
+    await this.saveTasks(upsertTask(ledger, persisted));
+    await this.flushSaveTasksImmediate();
+    const finalFacts = productionVisibleFacts(persisted);
+    diag('ingest.finalVisibility', {
+      taskId, runId, planned: manifest.path_sets?.planned?.length || 0,
+      committed: manifest.path_sets?.committed?.length || 0, visible: finalFacts.count,
+      openable: finalFacts.count, targetRoots: manifest.target_roots,
+      pathHashes: finalFacts.paths.map((value) => structuredContentHash(value))
+    });
+    return persisted;
+  }
+
+  async openKnowledgePath(path) {
+    const file = this.app.vault.getAbstractFileByPath(normalizeVaultPath(path));
+    if (!(file instanceof TFile)) throw new Error(`知识文件不可见：${path}`);
+    const leaf = this.app.workspace.getLeaf('tab');
+    await leaf.openFile(file);
+  }
+
+  async parseDocumentAutomatically(task, buffer, baseOptions = {}) {
+    const localOptions = Object.assign({}, baseOptions, {
+      pdfExtractor: Object.assign({}, baseOptions.pdfExtractor || {}, {
+        order: 'mineru-api', allowExternalUpload: false, confirmUploads: false,
+        mineruApiKey: ''
+      })
+    });
+    const parser = new AutoDocumentParser({
+      local: (filePath, input) => extractTextFromBuffer(filePath, input, localOptions),
+      localPdf: (filePath, input) => this.extractReliableLocalPdf(filePath, input),
+      mineru: (filePath, input) => extractTextFromBuffer(filePath, input, Object.assign({}, baseOptions, {
+        localOcr: Object.assign({}, baseOptions.localOcr || {}, { enabled: false }),
+        pdfExtractor: Object.assign({}, baseOptions.pdfExtractor || {}, { order: 'mineru-api' })
+      })),
+      localOcr: (filePath, input) => extractTextFromBuffer(filePath, input, Object.assign({}, localOptions, {
+        localOcr: Object.assign({}, baseOptions.localOcr || {}, { enabled: true })
+      }))
+    });
+    return parser.parse(task.source_path, buffer, {
+      mineruConfigured: Boolean(String(this.settings.pdfMineruApiKey || '').trim()),
+      allowNecessaryCloud: this.settings.pdfAllowExternalUpload === true || eksSessionUploadApproved()
+    });
+  }
+
+  extractReliableLocalPdf(filePath, buffer) {
+    const raw = Buffer.from(buffer || []).toString('latin1');
+    const pieces = [];
+    const literal = /\(((?:\\.|[^\\)]){1,4000})\)\s*(?:Tj|'|")/g;
+    for (const match of raw.matchAll(literal)) {
+      pieces.push(match[1].replace(/\\([nrtbf()\\])/g, (_, char) => ({ n: '\n', r: '\r', t: '\t', b: '\b', f: '\f' }[char] || char))
+        .replace(/\\([0-7]{1,3})/g, (_, octal) => String.fromCharCode(parseInt(octal, 8))));
+    }
+    const text = pieces.join('\n').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '').trim();
+    if (text.length < 20) return { status: 'failed', message: '本地 PDF 文本层不足。' };
+    const parsePackage = createParsePackage({ sourcePath: filePath, buffer, sourceType: 'pdf', parser: 'pdf-local-text', markdown: text });
+    return { status: 'ok', text, sourceType: 'pdf', extractor: 'pdf-local-text', parsePackage };
   }
 
   async getPluginFilePath(relativePath) {
@@ -4591,8 +4719,7 @@ class SlicerDashboardView extends ItemView {
       ['tasks', `任务 ${tasks.length}`],
       ['review', `审核 ${reviewCount}`],
       ['errors', `错误 ${counts.failed}`],
-      ['semantic', '语义影子'],
-      ['shadow', '影子评估']
+      ['semantic', '相似建议']
     ];
     for (const [id, label] of sections) {
       const tab = button(tabs, label, () => { this.activeSection = id; this.render(); });
@@ -4701,7 +4828,7 @@ class SlicerDashboardView extends ItemView {
         for (const outputPath of outputPaths) {
           const row = outputs.createDiv('eks-row-actions');
           row.createSpan({ text: safeDisplayText(outputPath, '知识记录') });
-          button(row, '打开', () => this.plugin.app.workspace.openLinkText(outputPath, '', false));
+          button(row, '打开', () => this.plugin.openKnowledgePath(outputPath));
         }
       }
       const timeline = details.createDiv({ cls: 'eks-timeline', attr: { 'aria-label': '任务阶段时间线' } });
@@ -5166,27 +5293,22 @@ class SlicerSettingTab extends PluginSettingTab {
       service: 'minimax'
     });
 
-    if (this.plugin.settings.pdfAllowExternalUpload === true) {
-      containerEl.createEl('h3', { text: '云端文档识别' });
-      containerEl.createEl('p', { text: '你已启用云端文档识别。按实际使用的服务填写密钥即可。' });
-      credentialSetting(containerEl, this.plugin, {
-        name: 'MinerU 密钥',
-        desc: '用于识别扫描件和复杂版式文档。',
-        key: 'pdfMineruApiKey',
-        placeholder: '请输入密钥',
-        service: 'mineru'
-      });
-      credentialSetting(containerEl, this.plugin, {
-        name: 'PaddleOCR 密钥',
-        desc: '用于补充识别扫描件。',
-        key: 'pdfPaddleOcrApiKey',
-        placeholder: '请输入密钥',
-        service: 'paddleocr'
-      });
-    } else {
-      new Setting(containerEl)
-        .setName('文档识别')
-        .setDesc('当前使用本地识别，不需要填写云端识别密钥。');
+    containerEl.createEl('h3', { text: '自动识别文档' });
+    new Setting(containerEl).setName('解析方式').setDesc('自动选择（只读）：Office/邮件/文本本地解析；PDF 先本地探测，必要时 MinerU，失败后本地 OCR。');
+    credentialSetting(containerEl, this.plugin, {
+      name: 'MinerU 密钥', desc: '仅在扫描件、文本不足或复杂版式 PDF 确需云端识别时使用。',
+      key: 'pdfMineruApiKey', placeholder: '可选', service: 'mineru'
+    });
+    new Setting(containerEl)
+      .setName('允许必要的云端识别')
+      .setDesc('默认关闭。开启后，只有本地探测判定确有必要时才上传 PDF，并在上传前确认。')
+      .addToggle((toggle) => toggle.setValue(this.plugin.settings.pdfAllowExternalUpload === true).onChange(async (value) => {
+        this.plugin.settings.pdfAllowExternalUpload = value === true;
+        await this.plugin.saveSafeSettings();
+      }));
+    if (this.plugin.settings.knowledgeRootMigrationRequired) {
+      new Setting(containerEl).setName('旧自定义输出目录需要确认')
+        .setDesc('检测到 06-知识库 之外的旧自定义路径。插件不会移动或删除文件，也不会继续向旧根写入；请确认后使用下方权威两库。');
     }
 
     if (this.plugin.settings.semanticConsent === true && this.plugin.settings.semanticEnabled === true) {
@@ -5222,6 +5344,10 @@ class SlicerSettingTab extends PluginSettingTab {
 
   renderAdvancedSettings(containerEl) {
     containerEl.createEl('h2', { text: '高级设置' });
+    new Setting(containerEl).setName('自动解析').setDesc('生产解析编排固定为“自动选择”，高级设置不提供引擎、顺序或本地/云端组合开关。');
+    new Setting(containerEl).setName('权威知识库根')
+      .setDesc(`招投标：${this.plugin.settings.knowledgeTenderRoot}；业务：${this.plugin.settings.knowledgeBusinessRoot}`);
+    return;
     new Setting(containerEl)
       .setName('结构化事务写入')
       .setDesc('生产会话始终启用；写入受冲突审核、限额、验证和安全回滚保护。');
@@ -6818,6 +6944,11 @@ function transitionProductionState(task, next, context = {}) {
     error.code = 'AUTHORITATIVE_MANIFEST_REQUIRED';
     throw error;
   }
+  if (next === 'stored' && Number(context.overallPercent ?? 100) !== 100) {
+    const error = new Error('已入库只能与总进度 100% 同时出现。');
+    error.code = 'COMPLETED_PERCENT_MISMATCH';
+    throw error;
+  }
   task.production_state = next;
   task.status = next;
   task.internal_stage = String(context.stage || task.internal_stage || (next === 'stored' ? 'complete' : next));
@@ -6825,6 +6956,9 @@ function transitionProductionState(task, next, context = {}) {
   if (context.message) task.progress = { ...(task.progress || {}), stage: task.internal_stage, message: context.message, at: task.updated_at };
   if (next !== 'stored') task.terminal_outcome = next === 'failed' ? 'failed' : null;
   else task.terminal_outcome = 'completed_with_output';
+  task.overallPercent = next === 'stored' ? 100 : next === 'waiting' ? 0
+    : next === 'failed' ? Math.max(0, Math.min(99, Number(task.overallPercent) || 0))
+      : Math.max(1, Math.min(99, Number(context.overallPercent ?? task.overallPercent) || 1));
   return task;
 }
 
@@ -9084,8 +9218,8 @@ function normalizeSettings(settings = {}) {
   return {
     enabled,
     mode: enabled ? mode : 'legacy',
-    activeRoot: clean(settings.knowledgeTenderRoot || '在办投标库', 400),
-    businessRoot: clean(settings.knowledgeBusinessRoot || '长期业务库', 400),
+    activeRoot: clean(settings.knowledgeTenderRoot || '06-知识库/招投标库', 400),
+    businessRoot: clean(settings.knowledgeBusinessRoot || '06-知识库/业务库', 400),
     stateRoot: clean(settings.artifactsPath || '06-知识库/源文件/_slicer_artifacts', 600),
     limits: {
       max_records: Math.max(1, Math.min(PLAN_LIMITS.max_records, Number(settings.structuredMaxRecords) || 100)),
@@ -9729,7 +9863,7 @@ async function commitPlan(plan, options) {
     manifest.status = 'files_committed';
     manifest.index_revision = index.revision;
     await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
-    const targetRoots = options.targetRoots || { active_tender: '在办投标库', business: '长期业务库' };
+    const targetRoots = options.targetRoots || { active_tender: '06-知识库/招投标库', business: '06-知识库/业务库' };
     const verified = await verifyCommittedRecords(plan, vault, {
       transactionId, verifiedAt: new Date().toISOString(), runId: options.runId, targetRoots
     });
@@ -9856,17 +9990,17 @@ const DEFAULT_SETTINGS = {
   advancedSettingsEnabled: false,
   controlledWriterEnabled: true,
   structuredWriterMode: 'structured-write',
-  knowledgeTenderRoot: '在办投标库',
-  knowledgeBusinessRoot: '长期业务库',
-  structuredActiveRoot: '在办投标库',
-  structuredBusinessRoot: '长期业务库',
+  knowledgeTenderRoot: '06-知识库/招投标库',
+  knowledgeBusinessRoot: '06-知识库/业务库',
+  structuredActiveRoot: '06-知识库/招投标库',
+  structuredBusinessRoot: '06-知识库/业务库',
   structuredMaxRecords: 100,
   structuredMaxActions: 300,
   structuredMaxLinkFanout: 20,
   structuredPhase2BatchSize: 12,
-  settingsVersion: 30,
+  settingsVersion: 31,
   intakePath: '06-知识库/源文件',
-  outputPath: '06-知识库/wiki',
+  outputPath: '06-知识库',
   bidIntakePath: '06-知识库/源文件/招投标',
   businessIntakePath: '06-知识库/源文件/业务库',
   bidOutputPath: '06-知识库/wiki/招投标',
@@ -9882,7 +10016,7 @@ const DEFAULT_SETTINGS = {
   minimaxApiKey: '',
   minimaxModel: 'MiniMax-M3',
   minimaxEndpoint: 'https://api.minimaxi.com/anthropic/v1/messages',
-  pdfExtractionOrder: 'mineru-api,paddleocr-api',
+  pdfExtractionOrder: 'legacy-removed',
   pdfAllowExternalUpload: false,
   localMsgAdapterEnabled: true,
   localDocxAdapterEnabled: true,
@@ -9895,7 +10029,7 @@ const DEFAULT_SETTINGS = {
   ooxmlMaxTextChars: 8388608,
   localPdfInventoryEnabled: true,
   blockV0PackingEnabled: true,
-  localOcrEnabled: false,
+  localOcrEnabled: true,
   localOcrProvider: 'auto',
   localOcrExecutable: '',
   localOcrLanguages: 'chi_sim+eng',
@@ -10000,14 +10134,24 @@ function migrateSettings(stored = {}) {
   migrated.structuredWriterMode = (typeof process === 'object'
     && process?.env?.EKS_ENABLE_NONPRODUCTION_PILOT === '1'
     && source.structuredWriterMode === 'structured-pilot') ? 'structured-pilot' : 'structured-write';
-  migrated.knowledgeTenderRoot = normalizeConfiguredPath(
-    source.knowledgeTenderRoot || source.structuredActiveRoot || source.bidOutputPath,
-    DEFAULT_SETTINGS.knowledgeTenderRoot
-  );
-  migrated.knowledgeBusinessRoot = normalizeConfiguredPath(
-    source.knowledgeBusinessRoot || source.structuredBusinessRoot || source.businessOutputPath,
-    DEFAULT_SETTINGS.knowledgeBusinessRoot
-  );
+  const legacyTender = source.knowledgeTenderRoot || source.structuredActiveRoot || source.bidOutputPath;
+  const legacyBusiness = source.knowledgeBusinessRoot || source.structuredBusinessRoot || source.businessOutputPath;
+  const knownTenderDefaults = new Set(['', '在办投标库', '06-知识库/wiki/招投标', '06-知识库/wiki/招投标库']);
+  const knownBusinessDefaults = new Set(['', '长期业务库', '06-知识库/wiki/业务库']);
+  const tenderCandidate = normalizeConfiguredPath(legacyTender, DEFAULT_SETTINGS.knowledgeTenderRoot);
+  const businessCandidate = normalizeConfiguredPath(legacyBusiness, DEFAULT_SETTINGS.knowledgeBusinessRoot);
+  migrated.knowledgeTenderRoot = knownTenderDefaults.has(tenderCandidate) ? DEFAULT_SETTINGS.knowledgeTenderRoot : tenderCandidate;
+  migrated.knowledgeBusinessRoot = knownBusinessDefaults.has(businessCandidate) ? DEFAULT_SETTINGS.knowledgeBusinessRoot : businessCandidate;
+  const outsideAuthority = [migrated.knowledgeTenderRoot, migrated.knowledgeBusinessRoot]
+    .filter((value) => value !== '06-知识库' && !value.startsWith('06-知识库/'));
+  if (outsideAuthority.length) {
+    migrated.knowledgeRootMigrationRequired = true;
+    migrated.legacyCustomKnowledgeRoots = { tender: tenderCandidate, business: businessCandidate };
+    migrated.knowledgeTenderRoot = DEFAULT_SETTINGS.knowledgeTenderRoot;
+    migrated.knowledgeBusinessRoot = DEFAULT_SETTINGS.knowledgeBusinessRoot;
+  } else {
+    migrated.knowledgeRootMigrationRequired = false;
+  }
   // Read-only compatibility projections; production never consumes these.
   migrated.structuredActiveRoot = migrated.knowledgeTenderRoot;
   migrated.structuredBusinessRoot = migrated.knowledgeBusinessRoot;
@@ -10015,7 +10159,7 @@ function migrateSettings(stored = {}) {
   migrated.structuredMaxActions = Math.max(1, Math.min(600, Math.round(Number(source.structuredMaxActions) || DEFAULT_SETTINGS.structuredMaxActions)));
   migrated.structuredMaxLinkFanout = Math.max(1, Math.min(40, Math.round(Number(source.structuredMaxLinkFanout) || DEFAULT_SETTINGS.structuredMaxLinkFanout)));
   migrated.structuredPhase2BatchSize = Math.max(1, Math.min(50, Math.round(Number(source.structuredPhase2BatchSize) || DEFAULT_SETTINGS.structuredPhase2BatchSize)));
-  migrated.settingsVersion = 30;
+  migrated.settingsVersion = 31;
   // Runtime contract boundary changed in 2.14.1. Parsed artifacts use their own
   // parser fingerprint and remain reusable; only classification and later stages
   // receive the new pipeline fingerprint.
@@ -10035,12 +10179,12 @@ function migrateSettings(stored = {}) {
       [error.key]: { code: 'SETTINGS_PATH_INVALID', action: 'user_must_repair' }
     });
   }
-  const extractionOrder = String(source.pdfExtractionOrder || '').split(',').map((value) => value.trim()).filter(Boolean);
-  migrated.pdfExtractionOrder = extractionOrder.length
-    && extractionOrder.every((value) => ['mineru-api', 'paddleocr-api'].includes(value))
-    && new Set(extractionOrder).size === extractionOrder.length
-    ? extractionOrder.join(',')
-    : DEFAULT_SETTINGS.pdfExtractionOrder;
+  migrated.legacyParserSettings = Object.assign({}, source.legacyParserSettings || {}, {
+    pdfExtractionOrder: source.pdfExtractionOrder,
+    pdfPaddleOcrApiEndpoint: source.pdfPaddleOcrApiEndpoint,
+    pdfPaddleOcrApiModel: source.pdfPaddleOcrApiModel
+  });
+  migrated.pdfExtractionOrder = 'legacy-removed';
   // v2.12：保留所有合法旧偏好；只迁移非法/缺失值，并与运行时评分使用同一安全范围。
   const storedThreshold = Number(source.autoApproveConfidenceThreshold);
   migrated.autoApproveConfidenceThreshold = Number.isFinite(storedThreshold)
@@ -10090,7 +10234,7 @@ function migrateSettings(stored = {}) {
   migrated.ooxmlMaxTextChars = Math.max(100000, Math.min(32 * 1024 * 1024, Math.round(Number(migrated.ooxmlMaxTextChars) || DEFAULT_SETTINGS.ooxmlMaxTextChars)));
   if (migrated.localPdfInventoryEnabled === undefined) migrated.localPdfInventoryEnabled = true;
   if (migrated.blockV0PackingEnabled === undefined) migrated.blockV0PackingEnabled = true;
-  migrated.localOcrEnabled = source.localOcrEnabled === true;
+  migrated.localOcrEnabled = true;
   if (!['auto', 'tesseract', 'executable'].includes(migrated.localOcrProvider)) migrated.localOcrProvider = DEFAULT_SETTINGS.localOcrProvider;
   migrated.localOcrExecutable = String(migrated.localOcrExecutable || '').trim();
   migrated.localOcrLanguages = String(migrated.localOcrLanguages || DEFAULT_SETTINGS.localOcrLanguages).replace(/[^A-Za-z0-9_+.-]/g, '') || DEFAULT_SETTINGS.localOcrLanguages;
@@ -10106,7 +10250,8 @@ function migrateSettings(stored = {}) {
   if (!Number(migrated.rateLimitBackoffMaxMs)) migrated.rateLimitBackoffMaxMs = DEFAULT_SETTINGS.rateLimitBackoffMaxMs;
   if (!Number(migrated.rateLimitWindowSize)) migrated.rateLimitWindowSize = DEFAULT_SETTINGS.rateLimitWindowSize;
   migrated.businessTimeZone = String(migrated.businessTimeZone || '');
-  migrated.shadowEvaluationEnabled = source.shadowEvaluationEnabled === true;
+  migrated.shadowEvaluationEnabled = typeof process === 'object'
+    && process?.env?.EKS_ENABLE_DEVELOPMENT_SHADOW === '1' && source.shadowEvaluationEnabled === true;
   migrated.shadowProviderBudget = Math.max(0, Math.min(1000, Math.round(Number(migrated.shadowProviderBudget) || 0)));
   migrated.shadowCohortLimit = Math.max(1, Math.min(500, Math.round(Number(migrated.shadowCohortLimit) || DEFAULT_SETTINGS.shadowCohortLimit)));
   migrated.shadowRetentionDays = Math.max(1, Math.min(3650, Math.round(Number(migrated.shadowRetentionDays) || DEFAULT_SETTINGS.shadowRetentionDays)));
@@ -13372,6 +13517,65 @@ module.exports = { cardOutputPath, resolveFixedRoute, resolveOutputRoute, saniti
 
 
 },
+/** @module src/auto-document-parser */
+"src/auto-document-parser.js": function(require, module, exports) {
+const LOCAL_EXTENSIONS = new Set(['docx', 'xlsx', 'pptx', 'msg', 'eml', 'txt', 'md']);
+const extensionOf = (path) => String(path || '').toLowerCase().split('.').pop();
+function pdfQualityProbe(buffer) {
+  const raw = Buffer.from(buffer || []).toString('latin1');
+  const pages = Math.max(1, (raw.match(/\/Type\s*\/Page(?!s)\b/g) || []).length);
+  const textOperators = (raw.match(/\b(?:BT|Tj|TJ)\b/g) || []).length;
+  const images = (raw.match(/\/Subtype\s*\/Image\b/g) || []).length;
+  const fonts = (raw.match(/\/(?:Font|ToUnicode)\b/g) || []).length;
+  const rotations = (raw.match(/\/Rotate\s+-?\d+/g) || []).length;
+  const nativeText = textOperators >= pages && fonts > 0;
+  const complexLayout = images > Math.max(2, pages * 2) || rotations > 0;
+  return { pages, nativeText, complexLayout, reliableLocal: nativeText && !complexLayout };
+}
+function qualityOk(result) {
+  if (!result || result.status !== 'ok' || !result.parsePackage) return false;
+  const markdown = String(result.parsePackage.markdown || result.text || '').trim();
+  const eligible = (result.parsePackage.blocks || []).filter((block) => block?.card_eligible !== false && String(block?.raw?.text || '').trim());
+  return markdown.length >= 20 && eligible.length > 0 && Number(result.parsePackage.quality?.corruptRatio || 0) <= 0.02;
+}
+function typed(code, message) { const error = new Error(message); error.code = code; return error; }
+class AutoDocumentParser {
+  constructor(adapters = {}) { this.adapters = adapters; }
+  async call(name, filePath, buffer, context) {
+    if (typeof this.adapters[name] !== 'function') throw typed('AUTO_PARSER_ADAPTER_UNAVAILABLE', `自动解析适配器不可用：${name}`);
+    return this.adapters[name](filePath, buffer, context);
+  }
+  async parse(filePath, buffer, context = {}) {
+    const ext = extensionOf(filePath);
+    if (LOCAL_EXTENSIONS.has(ext)) {
+      const local = await this.call('local', filePath, buffer, context);
+      if (!qualityOk(local)) throw typed('LOCAL_DOCUMENT_QUALITY_FAILED', '本地确定性解析结果未达到知识生成质量门。');
+      return local;
+    }
+    if (ext !== 'pdf') throw typed('AUTO_PARSER_UNSUPPORTED', `自动识别暂不支持：${ext || 'unknown'}`);
+    const probe = (this.adapters.probePdf || pdfQualityProbe)(buffer, context);
+    if (probe.reliableLocal) {
+      const localPdf = await this.call('localPdf', filePath, buffer, { ...context, probe });
+      if (qualityOk(localPdf)) return localPdf;
+    }
+    let remoteFailure = null;
+    if (context.mineruConfigured === true && context.allowNecessaryCloud === true) {
+      try {
+        const mineru = await this.call('mineru', filePath, buffer, { ...context, probe });
+        if (qualityOk(mineru)) return mineru;
+        remoteFailure = typed('MINERU_QUALITY_FAILED', 'MinerU 结果未达到知识生成质量门。');
+      } catch (error) { remoteFailure = error; }
+    }
+    try {
+      const ocr = await this.call('localOcr', filePath, buffer, { ...context, probe, remoteFailure });
+      if (qualityOk(ocr)) return ocr;
+    } catch (error) { if (!remoteFailure) remoteFailure = error; }
+    throw typed('DOCUMENT_QUALITY_GATE_FAILED', `自动识别失败：MinerU 与本地 OCR 均未产生可核验知识证据。${remoteFailure ? ` ${remoteFailure.message}` : ''}`);
+  }
+}
+function removedLegacyPdfDispatcher() { throw typed('REMOVED_LEGACY_PDF_DISPATCHER', '旧 PDF 引擎顺序/PaddleOCR 生产分支已移除；请使用 AutoDocumentParser。'); }
+module.exports = { AutoDocumentParser, LOCAL_EXTENSIONS, pdfQualityProbe, qualityOk, removedLegacyPdfDispatcher };
+},
 /**
  * @module src/core/external-pdf
  * 外部 OCR/PDF API 调度：MinerU 与 PaddleOCR，按文件类型 / 配置路由
@@ -13381,7 +13585,7 @@ module.exports = { cardOutputPath, resolveFixedRoute, resolveOutputRoute, saniti
 const { runMineruApi } = require("src/core/mineru-api.js");
 const { runPaddleOcrApi } = require("src/core/paddleocr-api.js");
 
-const DEFAULT_ORDER = ['mineru-api', 'paddleocr-api'];
+const DEFAULT_ORDER = ['mineru-api'];
 const MAX_MINERU_FILE_BYTES = 200 * 1024 * 1024;
 
 async function extractDocumentWithApis(buffer, config = {}) {
@@ -13487,19 +13691,9 @@ async function runEngine(engine, buffer, config) {
     });
   }
   if (engine === 'paddleocr-api') {
-    return runPaddleOcrApi(buffer, {
-      apiKey: config.paddleOcrApiKey,
-      endpoint: config.paddleOcrApiEndpoint,
-      model: config.paddleOcrApiModel,
-      fileName: config.fileName,
-      timeoutMs: config.timeoutMs,
-      pollIntervalMs: config.pollIntervalMs,
-      requestImpl: config.requestImpl,
-      fetchImpl: config.fetchImpl,
-      sleep: config.sleep,
-      onProgress: config.onProgress,
-      signal: config.signal
-    });
+    const error = new Error('PaddleOCR API 生产分支已移除。');
+    error.code = 'LEGACY_PADDLEOCR_REMOVED';
+    throw error;
   }
   return { status: 'unavailable', message: `不支持的云端解析器：${engine}` };
 }
@@ -13533,9 +13727,7 @@ function isUsableMarkdown(text) {
   return corrupt / chars.length <= 0.02 && readable / chars.length >= 0.72;
 }
 
-function engineLabel(engine) {
-  return engine === 'mineru-api' ? 'MinerU API' : 'PaddleOCR API';
-}
+function engineLabel(engine) { return engine === 'mineru-api' ? 'MinerU API' : '旧解析器（已移除）'; }
 
 async function emitProgress(config, payload) {
   if (typeof config.onProgress === 'function') await config.onProgress(payload);
@@ -14782,8 +14974,8 @@ function documentPlan(filePath) {
   if (/\.md$/.test(lower)) return plan('md', 'text');
   if (/\.txt$/.test(lower)) return plan('txt', 'text');
   if (/\.eml$/.test(lower)) return plan('email', 'email');
-  if (/\.pdf$/.test(lower)) return plan('pdf', 'remote', ['mineru-api', 'paddleocr-api']);
-  if (/\.(png|jpe?g|webp|gif|bmp|tiff?)$/.test(lower)) return plan('image', 'remote', ['mineru-api', 'paddleocr-api']);
+  if (/\.pdf$/.test(lower)) return plan('pdf', 'auto', ['mineru-api']);
+  if (/\.(png|jpe?g|webp|gif|bmp|tiff?)$/.test(lower)) return plan('image', 'unsupported');
   if (/\.docx$/.test(lower)) return plan('docx', 'ooxml', ['mineru-api']);
   if (/\.doc$/.test(lower)) return plan('docx', 'remote', ['mineru-api']);
   if (/\.pptx$/.test(lower)) return plan('pptx', 'ooxml', ['mineru-api']);
@@ -19666,11 +19858,13 @@ function completionUiSnapshot(tasks, completedTaskId) {
   const total = Number(completed?.queue_total || active?.queue_total)
     || Math.max(0, ...cohort.map((task) => Number(task.queue_total) || 0))
     || cohort.length;
-  const finished = cohort.filter((task) => TERMINAL.has(task.status)).length;
-  const activeProgress = active && Number(active.progress?.completedWork || 0);
-  const overallPercent = total > 0
-    ? Math.min(active ? 99.9 : 100, ((finished + (activeProgress || 0) / 100) / total) * 100)
-    : 0;
+  const contribution = (task) => {
+    if (task.production_state === 'stored' && deriveVerifiedFacts(task).count > 0 && Number(task.overallPercent) === 100) return 100;
+    if (task.production_state === 'waiting' || ['queued', 'discovered'].includes(task.status)) return 0;
+    return Math.max(task.production_state === 'processing' || PROCESSING.has(task.status) ? 1 : 0,
+      Math.min(99, Number(task.overallPercent ?? task.progress?.completedWork) || 0));
+  };
+  const overallPercent = total > 0 ? cohort.reduce((sum, task) => sum + contribution(task), 0) / total : 0;
   return {
     taskCount: rows.length,
     queuedCount: rows.filter((task) => task.status === 'queued').length,

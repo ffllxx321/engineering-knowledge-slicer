@@ -51,7 +51,7 @@ async function run() {
   assert.equal(legacy.parsePackage.blocks[0].locator.scheme, 'parsed-text-span');
   assert.equal(externalCalls, 0);
   const migrated = loadBundleModule('src/core/task.js', { crypto, path: require('path') }).migrateSettings({ settingsVersion: 24 });
-  assert.equal(migrated.settingsVersion, 30);
+  assert.equal(migrated.settingsVersion, 31);
   assert.equal(migrated.localTextBlockAdapterEnabled, true);
   const main = require('fs').readFileSync(require('path').join(__dirname, '..', 'main.js'), 'utf8');
   assert(main.includes('packedChunks.length <= legacyChunks.length ? packedChunks : legacyChunks'));

@@ -33,7 +33,7 @@ const reviewComplete = task({
 });
 let snapshot = completionUiSnapshot([reviewComplete], reviewComplete.task_id);
 assert.strictEqual(snapshot.reviewCount, 11);
-assert.strictEqual(snapshot.overallPercent, 100);
+assert.strictEqual(snapshot.overallPercent, 99);
 assert.strictEqual(snapshot.activeCount, 0);
 assert.strictEqual(pendingReviewCount([reviewComplete]), 11);
 const noOutput = task({
@@ -44,7 +44,7 @@ const noOutput = task({
 snapshot = completionUiSnapshot([noOutput], noOutput.task_id);
 assert.strictEqual(snapshot.reviewCount, 0);
 assert.strictEqual(snapshot.persistedReviewItemCount, 0);
-assert.strictEqual(snapshot.overallPercent, 100);
+assert.strictEqual(snapshot.overallPercent, 99);
 
 // Terminal state always wins over a late heartbeat/progress callback.
 assert.strictEqual(shouldAcceptIncrementalProgress(reviewComplete, new Set()), false);
@@ -56,7 +56,9 @@ assert.strictEqual(shouldAcceptIncrementalProgress(task(), new Set()), true);
 
 // No-review completion is the ordinary completed state.
 snapshot = completionUiSnapshot([
-  task({ status: 'written', progress: { stage: 'complete', completedWork: 100 } })
+  task({ status: 'stored', production_state: 'stored', overallPercent: 100, run_id: 'run-current',
+    verified_records: [{ record_id: 'r1', record_kind: 'business_item', state: 'visible_verified', final_path: '06-知识库/业务库/a.md',
+      run_id: 'run-current', vault_file_type: 'markdown', target_library: 'business', content_hash: 'a'.repeat(64), transaction_id: 'tx' }] })
 ], 'task-1');
 assert.strictEqual(snapshot.reviewCount, 0);
 assert.strictEqual(snapshot.overallPercent, 100);
@@ -78,7 +80,7 @@ snapshot = completionUiSnapshot([
     status: 'queued'
   })
 ], 'task-1');
-assert.strictEqual(snapshot.overallPercent, 50);
+assert.strictEqual(snapshot.overallPercent, 49.5);
 assert.strictEqual(snapshot.queuedCount, 1);
 assert.strictEqual(snapshot.reviewCount, 2);
 
@@ -98,7 +100,7 @@ snapshot = completionUiSnapshot([
     progress: { stage: 'atomizing', completedWork: 60 }
   })
 ], 'task-1');
-assert.strictEqual(snapshot.overallPercent, 80);
+assert.strictEqual(snapshot.overallPercent, 79.5);
 assert.strictEqual(snapshot.activeCount, 1);
 assert.strictEqual(snapshot.reviewCount, 2);
 

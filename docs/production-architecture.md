@@ -2,7 +2,9 @@
 
 ## 唯一流程
 
-生产处理只有一条路径：源文件进入解析与规范化，形成通用知识单元；本地质量检查把少量不确定内容送到确认；确认后的内容生成两库写入计划；`ProductionCommitService` 通过 `KnowledgeWritePort` 原子提交；最后逐一从 Obsidian Vault 公共 API 重新打开 Markdown，核对记录身份、来源、内容哈希和目标库根目录。只有计划、提交、最终可见三个路径集合完全相同，任务才是“已入库”。
+生产处理只有一条路径：`AutoDocumentParser` 自动识别文档，形成通用知识单元；本地质量检查把少量不确定内容送到确认；确认后的内容生成两库写入计划；`ProductionCommitService` 通过 `KnowledgeWritePort` 原子提交；最后从持久化账本重新加载当前运行 manifest，并逐一从 Obsidian Vault 公共 API 打开 Markdown，核对记录身份、来源、内容哈希和目标库根目录。只有计划、提交、最终可见三个路径集合完全相同，任务才是“已入库”。
+
+自动解析没有用户可编排的引擎顺序。DOCX、XLSX、PPTX、MSG、EML、TXT、MD 在本地确定性解析。PDF 先检查文本层和版式质量；可靠文本 PDF 在本地解析，扫描件、文本不足或复杂版式才在隐私许可下使用 MinerU；MinerU 不可用或失败后自动尝试本地 OCR，仍未达到质量门则失败。PaddleOCR API 只保留旧配置导入兼容，生产调用会得到 `LEGACY_PADDLEOCR_REMOVED`。影子评估只可通过 `EKS_ENABLE_DEVELOPMENT_SHADOW=1` 在开发环境运行，不能影响任务、写入、审核或成功。
 
 机器可检查的约束位于 `src/production-flow-contract.js`。生产入口是 `EngineeringKnowledgeSlicerPlugin.processTask`，生产知识写入入口是 `ProductionCommitService.commit`。
 
@@ -20,11 +22,11 @@
 
 解析、OCR、翻译和模型规范化等昂贵中间结果可以复用。每次处理或重试都会生成新的 `run_id`，并清空旧运行的最终写入证据。写入计划、旧事务、旧 `writtenFiles`、数组长度和源文件哈希都不能证明当前运行成功。
 
-启动只保留等待、处理中和待确认。历史完成记录会回到等待，并在新运行中重新提交或逐文件验证。源文件目录、中间产物、任务账本、诊断和缓存从不计入知识文件数量。
+启动时，带当前权威 manifest 的已入库记录会再次逐文件验证并保持可见；任何旧式、缺失或不可验证的成功记录都会回到等待重新验证。源文件目录、中间产物、任务账本、诊断和缓存从不计入知识文件数量。
 
 ## 设置迁移
 
-生产只读取 `knowledgeTenderRoot` 和 `knowledgeBusinessRoot`。旧的 `structuredActiveRoot`、`structuredBusinessRoot`、`bidOutputPath` 和 `businessOutputPath` 只在加载旧设置时用于一次迁移，之后是只读兼容投影，不参与生产路由。源文件根和两个知识输出根必须互不重叠。
+生产只读取 `knowledgeTenderRoot` 和 `knowledgeBusinessRoot`，默认且权威值分别是 `06-知识库/招投标库` 和 `06-知识库/业务库`。旧顶层默认值与旧 wiki 默认值在加载时迁移；旧自定义根不会被移动或删除，并要求用户确认。旧的 `structuredActiveRoot`、`structuredBusinessRoot`、`bidOutputPath` 和 `businessOutputPath` 之后仅是兼容数据，不参与生产路由。
 
 ## 旧入口
 

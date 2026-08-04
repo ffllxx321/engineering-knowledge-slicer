@@ -2,11 +2,12 @@
 
 > 当前版本 **v2.19.1**（settingsVersion 29）· Obsidian Desktop 1.5.0+ · MIT
 
-通过 **MinerU / PaddleOCR + MiniMax M3**，把工程资料（PDF、Word、PPT、图片、邮件等）批量转化为**中文、可追溯、固定目录归档**的 Obsidian 知识卡片。
+通过**自动本地解析、必要时 MinerU + MiniMax M3**，把工程资料（PDF、Word、PPT、邮件、文本等）批量转化为**中文、可追溯、固定目录归档**的 Obsidian 知识卡片。
 
 ## 核心能力
 
-- **端到端流水线**：源文件 → 云端文档解析（MinerU 主 / PaddleOCR 补盲）→ 类型判定 → 结构化总结 → 知识原子化 → 自动入库 / 审核台
+- **唯一自动流水线**：本地确定性解析/质量探测 → 必要时 MinerU → MinerU 失败时本地 OCR → 质量门 → 知识原子化 → 权威两库入库
+- **固定权威两库**：业务知识写入 `06-知识库/业务库`，招投标知识写入 `06-知识库/招投标库`；顶层旧目录不再是生产输出
 - **低成本本地摄取**：DOCX / XLSX / PPTX 默认使用零运行时依赖的本地 OOXML 结构解析；失败或关闭时只有显式外传授权成立才会上传。PDF 可选本地页清单与 OCR，MSG 默认本地只读解析
 - **邮件附件闭环（v2.9）**：.eml 的附件保存到 `_attachments/` 并自动入队切片；邮件卡与附件卡互相「[[…]]」双向链接，附件文件→卡片方向由 Obsidian 反向链接面板提供
 - **本地文本证据块（v2.14）**：MD / TXT / EML 默认归一化为稳定行定位的 `block_v0`，与 Office、MSG、PDF/OCR 共用 evidence index、结构 packing 和分类抽样；不增加 AI 请求，EML 附件保存与入队语义保持不变
@@ -24,7 +25,7 @@
 - **受控结构化写入（未发布）**：仅在高级设置显式开启。Pilot 复用真实 normalized block 和既有 AI 产物生成四类记录的 dry-run 计划，零结构化写入；Cutover 与旧卡 writer 互斥，并通过稳定 ID/路径索引、Phase 3 硬风险、事务 manifest、乐观 hash 与失败恢复后才写两库。
 - **诊断日志**：全链路脱敏 diag 日志，默认写到 `~/.eks/logs/diag.log`，保留为本地深度排查兼容入口
 - **安全检查点与结构化错误**：阶段产物以 source/pipeline/prompt/schema 指纹校验后复用；错误提供稳定代码、可重试性和建议操作，日志递归脱敏 Header、JWT 和敏感 URL 参数
-- **可取消的外部工作**：取消会中止 MiniMax 排队/JSON/SSE 请求以及 MinerU/PaddleOCR 上传、轮询等待和下载，不再等当前远程阶段自然超时
+- **可取消的外部工作**：取消会中止 MiniMax 与必要 MinerU 请求、上传、轮询等待和下载，不再等当前远程阶段自然超时
 - **任务与错误中心**：状态卡可直接筛选，任务支持文件搜索、状态筛选、阶段时间线和折叠详情；错误按稳定代码分组并显示位置与建议操作
 - **增强切片溯源**：在保留旧 `chunk_id` 的同时提供稳定 chunk ID、内容指纹、标题路径、页码范围、token 估算和 overlap 元数据
 - **可验证 OCR 来源**：保留解析器实际返回的页/块/行/bbox 与文本偏移；卡片写入前按摘录哈希和区间回查持久化解析产物。纯文本 OCR 明确标注“解析文本级”，不会虚构页码或坐标
@@ -69,7 +70,7 @@
 
 1. 把 `manifest.json` / `main.js` / `styles.css` 拷贝到 vault 的 `.obsidian/plugins/engineering-knowledge-slicer/` 目录
 2. 在 Obsidian → 设置 → 第三方插件 → 启用「工程知识切片」
-3. 命令面板 → 「打开工程知识切片控制台」，按提示填写三大 API 密钥
+3. 命令面板 → 「打开工程知识切片控制台」，填写 MiniMax 密钥；MinerU 密钥仅在允许必要云端识别时需要
 
 ### 密钥配置（推荐）
 
@@ -78,8 +79,7 @@
 ```json
 {
   "minimaxApiKey": "你的 MiniMax API Key",
-  "pdfMineruApiKey": "你的 MinerU JWT Token",
-  "pdfPaddleOcrApiKey": "你的 PaddleOCR API Key"
+  "pdfMineruApiKey": "可选的 MinerU JWT Token"
 }
 ```
 
@@ -170,7 +170,7 @@ node scripts/smoke-v292.js           # 诊断日志故障回归（v2.9.2，22 �
 ## 已知限制
 
 - 回滚目前仅删除已入库文件，不恢复 MOC 索引
-- PaddleOCR 走云端时不支持 OCR 模型参数调整，使用默认 `PaddleOCR-VL-1.6`
+- 本地文本 PDF 解析目前只覆盖可可靠读取的文本层；复杂字体编码或复杂版式会转 MinerU，本地 OCR 还取决于系统是否安装可用的 Tesseract/配置实现
 - SSE 流式输出为 POC 状态，MiniMax 接口行为变化时可能回退为整包接收
 - 切分结果自 v2.7 起与旧版不再逐字节一致（按标题边界 + 合并 + 重叠重排），artifact 缓存在任务重跑时自动覆盖
 - 生产实现仍是自包含 JavaScript bundle；`npm run typecheck` 对新增 JSDoc 契约执行 strict TypeScript 检查，`npm run build` 在临时目录真实打包并断言不改写生产 bundle。

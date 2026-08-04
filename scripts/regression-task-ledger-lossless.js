@@ -42,7 +42,8 @@ assert.strictEqual(legacy.status, 'failed');
 assert.strictEqual(legacy.unknown_legacy_payload, undefined);
 assert(legacy.errors.some((item) => item.stage === 'migration'));
 
-assert.strictEqual(taskModule.migrateSettings({ pdfExtractionOrder: 'paddleocr-api,mineru-api' }).pdfExtractionOrder, 'paddleocr-api,mineru-api');
+assert.strictEqual(taskModule.migrateSettings({ pdfExtractionOrder: 'paddleocr-api,mineru-api' }).pdfExtractionOrder, 'legacy-removed');
+assert.strictEqual(taskModule.migrateSettings({ pdfExtractionOrder: 'paddleocr-api,mineru-api' }).legacyParserSettings.pdfExtractionOrder, 'paddleocr-api,mineru-api');
 assert.strictEqual(taskModule.migrateSettings({ pdfExtractionOrder: 'unknown' }).pdfExtractionOrder, taskModule.DEFAULT_SETTINGS.pdfExtractionOrder);
 
 console.log('regression-task-ledger-lossless: ok');

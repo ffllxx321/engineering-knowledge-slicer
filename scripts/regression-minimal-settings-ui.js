@@ -14,7 +14,7 @@ assert(advancedEnd > advancedStart, 'complete advanced renderer must be identifi
 const advanced = source.slice(advancedStart, advancedEnd);
 
 for (const allowed of [
-  'MiniMax 密钥', 'MinerU 密钥', 'PaddleOCR 密钥', '阿里云百炼密钥',
+  'MiniMax 密钥', 'MinerU 密钥', '阿里云百炼密钥',
   "text.inputEl.type = 'password'", "setButtonText('保存')",
   "setButtonText('测试')", "setButtonText('清除')"
 ]) assert(source.includes(allowed), `missing credential behavior: ${allowed}`);
@@ -28,12 +28,12 @@ for (const advancedLabel of [
     `advanced setting leaked before gate: ${advancedLabel}`);
 }
 
-assert(display.includes('pdfAllowExternalUpload === true'), 'cloud OCR credentials must be conditional');
+assert(!display.includes('PaddleOCR 密钥'), 'legacy PaddleOCR credential must not be rendered');
+assert(display.includes("setName('解析方式')") && display.includes('自动选择（只读）'), 'single automatic parser explanation must be rendered');
+assert(display.includes("setName('允许必要的云端识别')"), 'single privacy control must be rendered');
 assert(display.includes('semanticConsent === true') && display.includes('semanticEnabled === true'),
   'optional Qwen credential must only appear when the existing feature is enabled');
 assert(source.includes("inputEl.autocomplete = 'new-password'"), 'credential inputs must disable secret autofill exposure');
-assert(!display.slice(0, display.indexOf(".setName('高级设置')")).includes('.setValue(this.plugin.settings.'),
-  'credential section must delegate masked values to the canonical helper');
 assert(display.includes(".setName('高级设置')"), 'plain advanced toggle must be present');
 assert(display.includes('.setValue(this.plugin.settings.advancedSettingsEnabled === true)'),
   'toggle rendering must use strict persisted true');
@@ -45,8 +45,8 @@ assert(display.includes('if (this.plugin.settings.advancedSettingsEnabled === tr
   'advanced renderer must only be reachable through the gate');
 assert.strictEqual((display.match(/this\.renderAdvancedSettings\(containerEl\)/g) || []).length, 1,
   'advanced renderer must have exactly one production call site');
-assert(advanced.includes("setName('诊断日志')") && advanced.includes("setName('清空当前插件缓存')"),
-  'the full legacy renderer endpoints must remain available');
+assert(advanced.indexOf('return;') > 0 && advanced.slice(0, advanced.indexOf('return;')).includes("setName('自动解析')"),
+  'advanced renderer must stop after the read-only automatic parser contract');
 for (const key of ['minimaxApiKey', 'pdfMineruApiKey', 'pdfPaddleOcrApiKey', 'embeddingApiKey']) {
   assert(!advanced.includes(`'${key}'`), `advanced renderer duplicated credential input: ${key}`);
 }

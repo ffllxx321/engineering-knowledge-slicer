@@ -45,6 +45,11 @@ function transitionProductionState(task, next, context = {}) {
     error.code = 'AUTHORITATIVE_MANIFEST_REQUIRED';
     throw error;
   }
+  if (next === 'stored' && Number(context.overallPercent ?? 100) !== 100) {
+    const error = new Error('已入库只能与总进度 100% 同时出现。');
+    error.code = 'COMPLETED_PERCENT_MISMATCH';
+    throw error;
+  }
   task.production_state = next;
   task.status = next;
   task.internal_stage = String(context.stage || task.internal_stage || (next === 'stored' ? 'complete' : next));
@@ -52,6 +57,9 @@ function transitionProductionState(task, next, context = {}) {
   if (context.message) task.progress = { ...(task.progress || {}), stage: task.internal_stage, message: context.message, at: task.updated_at };
   if (next !== 'stored') task.terminal_outcome = next === 'failed' ? 'failed' : null;
   else task.terminal_outcome = 'completed_with_output';
+  task.overallPercent = next === 'stored' ? 100 : next === 'waiting' ? 0
+    : next === 'failed' ? Math.max(0, Math.min(99, Number(task.overallPercent) || 0))
+      : Math.max(1, Math.min(99, Number(context.overallPercent ?? task.overallPercent) || 1));
   return task;
 }
 

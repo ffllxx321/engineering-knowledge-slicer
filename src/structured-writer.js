@@ -62,8 +62,8 @@ function normalizeSettings(settings = {}) {
   return {
     enabled,
     mode: enabled ? mode : 'legacy',
-    activeRoot: clean(settings.knowledgeTenderRoot || '在办投标库', 400),
-    businessRoot: clean(settings.knowledgeBusinessRoot || '长期业务库', 400),
+    activeRoot: clean(settings.knowledgeTenderRoot || '06-知识库/招投标库', 400),
+    businessRoot: clean(settings.knowledgeBusinessRoot || '06-知识库/业务库', 400),
     stateRoot: clean(settings.artifactsPath || '06-知识库/源文件/_slicer_artifacts', 600),
     limits: {
       max_records: Math.max(1, Math.min(PLAN_LIMITS.max_records, Number(settings.structuredMaxRecords) || 100)),
@@ -707,7 +707,7 @@ async function commitPlan(plan, options) {
     manifest.status = 'files_committed';
     manifest.index_revision = index.revision;
     await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
-    const targetRoots = options.targetRoots || { active_tender: '在办投标库', business: '长期业务库' };
+    const targetRoots = options.targetRoots || { active_tender: '06-知识库/招投标库', business: '06-知识库/业务库' };
     const verified = await verifyCommittedRecords(plan, vault, {
       transactionId, verifiedAt: new Date().toISOString(), runId: options.runId, targetRoots
     });

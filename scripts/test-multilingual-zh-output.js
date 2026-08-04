@@ -66,7 +66,7 @@ async function main() {
   result.knowledge_units[0].statement = '供应商须提交 MX-200。';
   assert.strictEqual(result.knowledge_units[0].fingerprint, fingerprint);
   const plan = buildPlan({ settings: { controlledWriterEnabled: true, structuredWriterMode: 'structured-write',
-    structuredActiveRoot: '在办投标库', structuredBusinessRoot: '长期业务库', artifactsPath: '状态',
+    knowledgeTenderRoot: '06-知识库/招投标库', knowledgeBusinessRoot: '06-知识库/业务库', artifactsPath: '状态',
     structuredMaxRecords: 100, structuredMaxActions: 300 }, document: result.document,
     universalResult: result, projectRegistry: [], index: emptyIndex(), existingFiles: {},
     logicalTime: '2026-07-31T00:00:00.000Z' });

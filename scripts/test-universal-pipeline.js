@@ -93,7 +93,7 @@ function writerInput(result, index = emptyIndex(), existingFiles = {}, archiveTr
   return {
     settings: {
       controlledWriterEnabled: true, structuredWriterMode: 'structured-write',
-      structuredActiveRoot: '在办投标库', structuredBusinessRoot: '长期业务库',
+      knowledgeTenderRoot: '06-知识库/招投标库', knowledgeBusinessRoot: '06-知识库/业务库',
       artifactsPath: '状态', structuredMaxRecords: 100, structuredMaxActions: 300
     },
     document: result.document, universalResult: result, phase3Result: { handling_groups: [] },
@@ -121,7 +121,7 @@ function testWriterEndToEndIdempotenceArchiveAndMarkdown() {
   const archived = buildPlan(writerInput(result, index, existing, {
     from: 'terminated', archive_outcome: 'terminated', archive_decided_at: '2026-07-31'
   }));
-  assert(archived.actions.some((action) => action.path.startsWith('长期业务库/complete_historical_projects/')));
+  assert(archived.actions.some((action) => action.path.startsWith('06-知识库/业务库/complete_historical_projects/')));
   assert(archived.actions.every((action) => existing[action.from_path] === undefined || action.record_id.includes(action.path.split('/').at(-1).replace('.md', ''))));
 }
 

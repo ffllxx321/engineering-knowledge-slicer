@@ -45,7 +45,7 @@ async function main() {
     bidIntakePath: 'custom/bid',
     artifactsPath: 'custom/artifacts'
   });
-  assert.strictEqual(migrated.settingsVersion, 30);
+  assert.strictEqual(migrated.settingsVersion, 31);
   assert.strictEqual(migrated.embeddingProvider, 'aliyun-bailian-qwen37');
   assert.strictEqual(migrated.embeddingProtocol, 'dashscope-native-v1');
   assert.strictEqual(migrated.embeddingModel, 'qwen3.7-text-embedding');

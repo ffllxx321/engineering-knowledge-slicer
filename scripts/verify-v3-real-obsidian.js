@@ -41,6 +41,7 @@ async function launch(vault, config, resultPath, restartExpected) {
 }
 
 (async () => {
+  const exactKinds = ['contract_package', 'material_equipment', 'organization', 'person', 'project', 'standard_specification'];
   assert(fs.existsSync(binary), `Official Obsidian AppImage missing: ${binary}`);
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'eks-v3-obsidian-')); const vault = path.join(temporary, 'vault');
   const config = path.join(temporary, 'config'); const plugin = path.join(vault, '.obsidian/plugins/engineering-knowledge-slicer');
@@ -58,7 +59,10 @@ async function launch(vault, config, resultPath, restartExpected) {
   assert(first.phase2_counts.accepted > 0); assert(first.phase2_preview.path.endsWith('.preview.md')); assert(first.phase2_artifact.path.endsWith('.candidates.json'));
   assert.strictEqual(first.phase3_counts.created, 4); assert.strictEqual(first.phase3_links_valid, true); assert.strictEqual(restart.phase3_links_valid, true);
   assert(first.phase3_index.path.endsWith('id-path-index.json')); assert(restart.phase3_paths.every((p) => first.phase3_paths.includes(p)));
-  assert.strictEqual(first.phase4_counts.planned, 3); assert(first.phase4_paths.length >= 5); assert(first.phase4_index.path.endsWith('entity-index.json')); assert(restart.phase4_paths.every((p) => first.phase4_paths.includes(p)));
+  assert.strictEqual(first.phase4_counts.planned, 3); assert.deepStrictEqual(first.phase4_kinds, exactKinds); assert.deepStrictEqual(restart.phase4_kinds, exactKinds);
+  assert.strictEqual(first.phase4_lifecycle_valid, true); assert.strictEqual(restart.phase4_lifecycle_valid, true); assert(first.phase4_index.path.endsWith('entity-index.json'));
+  assert.deepStrictEqual(restart.phase4_paths, first.phase4_paths); assert.strictEqual(first.phase4_entities.length, first.phase4_paths.length); assert.deepStrictEqual(restart.phase4_entities, first.phase4_entities);
+  assert(first.phase4_entities.every((item) => item.path.endsWith('.md') && /^[a-f0-9]{64}$/.test(item.sha256)));
   const artifact = { schema: 'eks/v3/real-obsidian-evidence/1', passed: true, generated_at: new Date().toISOString(), first, restart };
   fs.mkdirSync(path.join(root, 'test-artifacts'), { recursive: true });
   fs.writeFileSync(path.join(root, 'test-artifacts/v3-real-obsidian-evidence.json'), JSON.stringify(artifact, null, 2));

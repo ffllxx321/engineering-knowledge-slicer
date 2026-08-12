@@ -22,7 +22,12 @@ function qualityOk(result) {
   if (!result || result.status !== 'ok' || !result.parsePackage) return false;
   const markdown = String(result.parsePackage.markdown || result.text || '').trim();
   const eligible = (result.parsePackage.blocks || []).filter((block) => block?.card_eligible !== false && String(block?.raw?.text || '').trim());
-  return markdown.length >= 20 && eligible.length > 0 && result.parsePackage.quality?.corruptRatio <= 0.02;
+  const quality = result.parsePackage.quality || {};
+  const directRatio = quality.corruptRatio == null ? NaN : Number(quality.corruptRatio);
+  const nestedRatio = quality.components?.corrupt_ratio == null ? NaN : Number(quality.components.corrupt_ratio);
+  const corruptRatio = Number.isFinite(directRatio) ? directRatio : nestedRatio;
+  return markdown.length >= 20 && eligible.length > 0
+    && quality.readable !== false && Number.isFinite(corruptRatio) && corruptRatio <= 0.02;
 }
 
 class AutoDocumentParser {
@@ -63,7 +68,7 @@ class AutoDocumentParser {
     }
     // Preserve actionable parser outcomes. Converting these to an internal,
     // non-retryable quality-gate error hides the actual remediation from users.
-    if (ocr && ['ocr_required', 'review_required', 'cancelled'].includes(ocr.status)) return ocr;
+    if (ocr && (ocr.actionable || ['ocr_required', 'review_required', 'cancelled'].includes(ocr.status))) return ocr;
     throw typed('DOCUMENT_QUALITY_GATE_FAILED', `自动识别失败：MinerU 与本地 OCR 均未产生可核验知识证据。${mineruError ? ` ${mineruError.message}` : ''}`);
   }
 

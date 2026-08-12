@@ -2112,6 +2112,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         version: runtimeVersions(this.settings),
         details: {
           requestCount: Math.max(0, this.operationCounters.apiRequests - Number(counterBaseline.apiRequests || 0)),
+          bytesRead: Math.max(0, this.operationCounters.bytesRead - Number(counterBaseline.bytesRead || 0)),
           retryCount: Math.max(0, this.operationCounters.aiRetries - Number(counterBaseline.aiRetries || 0)),
           inputCharacters: Math.max(0, this.operationCounters.promptCharacters - Number(counterBaseline.promptCharacters || 0)),
           estimatedInputTokens: Math.ceil(Math.max(0, this.operationCounters.promptCharacters - Number(counterBaseline.promptCharacters || 0)) / 3),
@@ -13830,7 +13831,12 @@ function qualityOk(result) {
   if (!result || result.status !== 'ok' || !result.parsePackage) return false;
   const markdown = String(result.parsePackage.markdown || result.text || '').trim();
   const eligible = (result.parsePackage.blocks || []).filter((block) => block?.card_eligible !== false && String(block?.raw?.text || '').trim());
-  return markdown.length >= 20 && eligible.length > 0 && Number(result.parsePackage.quality?.corruptRatio || 0) <= 0.02;
+  const quality = result.parsePackage.quality || {};
+  const directRatio = quality.corruptRatio == null ? NaN : Number(quality.corruptRatio);
+  const nestedRatio = quality.components?.corrupt_ratio == null ? NaN : Number(quality.components.corrupt_ratio);
+  const corruptRatio = Number.isFinite(directRatio) ? directRatio : nestedRatio;
+  return markdown.length >= 20 && eligible.length > 0
+    && quality.readable !== false && Number.isFinite(corruptRatio) && corruptRatio <= 0.02;
 }
 function typed(code, message) { const error = new Error(message); error.code = code; return error; }
 class AutoDocumentParser {
@@ -13868,7 +13874,7 @@ class AutoDocumentParser {
       ocr = await this.call('localOcr', filePath, buffer, { ...context, probe, remoteFailure });
       if (qualityOk(ocr)) return ocr;
     } catch (error) { if (!remoteFailure) remoteFailure = error; }
-    if (ocr && ['ocr_required', 'review_required', 'cancelled'].includes(ocr.status)) return ocr;
+    if (ocr && (ocr.actionable || ['ocr_required', 'review_required', 'cancelled'].includes(ocr.status))) return ocr;
     throw typed('DOCUMENT_QUALITY_GATE_FAILED', `自动识别失败：MinerU 与本地 OCR 均未产生可核验知识证据。${remoteFailure ? ` ${remoteFailure.message}` : ''}`);
   }
 }
@@ -15304,18 +15310,21 @@ function createParsePackage(options) {
   // Every parser crosses the same block-v0 boundary before any AI work. Remote
   // markdown-only parsers do not get invented page metadata: page locators are
   // emitted only when the parser supplied page text.
-  if (!blocks.length && markdown) {
+  const hasEligibleText = blocks.some((block) => block?.card_eligible !== false
+    && String(block?.raw?.text || '').trim() && block?.locator);
+  if (!hasEligibleText && markdown) {
     const suppliedPages = Array.isArray(artifact?.pages) ? artifact.pages : [];
     const textPages = suppliedPages.filter((page) => positivePage(page?.page) && typeof page?.text === 'string' && page.text.trim());
     if (textPages.length) {
-      blocks = textPages.map((page, index) => createBlock({
-        source_hash: sourceHash, order: index, kind: 'page-text', raw_text: page.text,
+      const generated = textPages.map((page, index) => createBlock({
+        source_hash: sourceHash, order: blocks.length + index, kind: 'page-text', raw_text: page.text,
         locator: { scheme: 'page', value: String(page.page), page: positivePage(page.page) },
         parse_method: normalizeParser(options.parser), metadata: { generated_fallback: true }
       }));
+      blocks = [...blocks, ...generated];
     } else {
-      blocks = [createBlock({
-        source_hash: sourceHash, order: 0, kind: 'parsed-markdown', raw_text: markdown,
+      blocks = [...blocks, createBlock({
+        source_hash: sourceHash, order: blocks.length, kind: 'parsed-markdown', raw_text: markdown,
         locator: { scheme: 'parsed-text-span', value: `chars:0-${markdown.length}`, text_start: 0, text_end: markdown.length },
         parse_method: normalizeParser(options.parser), metadata: { generated_fallback: true, page_claimed: false }
       })];

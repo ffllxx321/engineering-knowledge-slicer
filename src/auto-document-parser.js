@@ -34,15 +34,17 @@ class AutoDocumentParser {
     if (ext !== 'pdf') throw typed('AUTO_PARSER_UNSUPPORTED', `自动识别暂不支持：${ext || 'unknown'}`);
 
     const probe = (this.adapters.probePdf || pdfQualityProbe)(buffer, context);
-    if (probe.reliableLocal) {
-      const local = await this.call('localPdf', filePath, buffer, { ...context, probe });
-      if (qualityOk(local)) return local;
-    }
+    // The probe is deliberately conservative and cannot see text stored in
+    // compressed/content streams. Always give the deterministic local reader
+    // one bounded attempt; the parse-package quality gate remains authoritative.
+    const local = await this.call('localPdf', filePath, buffer, { ...context, probe });
+    if (qualityOk(local)) return local;
 
     let mineruError = null;
-    if (context.mineruConfigured === true && context.allowNecessaryCloud === true) {
+    const canRequestCloudConsent = typeof context.confirmNecessaryUpload === 'function';
+    if (context.mineruConfigured === true && (context.allowNecessaryCloud === true || canRequestCloudConsent)) {
       try {
-        if (typeof context.confirmNecessaryUpload === 'function') {
+        if (context.allowNecessaryCloud !== true && canRequestCloudConsent) {
           const accepted = await context.confirmNecessaryUpload({ filePath, sizeBytes: Number(buffer?.length || 0), reason: 'PDF 文本不足、扫描件或复杂版式' });
           if (!accepted) throw typed('NECESSARY_UPLOAD_DECLINED', '用户未允许本次必要云端识别。');
         }
@@ -52,12 +54,16 @@ class AutoDocumentParser {
       } catch (error) { mineruError = error; }
     }
 
+    let ocr = null;
     try {
-      const ocr = await this.call('localOcr', filePath, buffer, { ...context, probe, mineruError });
+      ocr = await this.call('localOcr', filePath, buffer, { ...context, probe, mineruError });
       if (qualityOk(ocr)) return ocr;
     } catch (error) {
       if (!mineruError) mineruError = error;
     }
+    // Preserve actionable parser outcomes. Converting these to an internal,
+    // non-retryable quality-gate error hides the actual remediation from users.
+    if (ocr && ['ocr_required', 'review_required', 'cancelled'].includes(ocr.status)) return ocr;
     throw typed('DOCUMENT_QUALITY_GATE_FAILED', `自动识别失败：MinerU 与本地 OCR 均未产生可核验知识证据。${mineruError ? ` ${mineruError.message}` : ''}`);
   }
 

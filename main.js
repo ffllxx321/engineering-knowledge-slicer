@@ -1679,6 +1679,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         const file = this.app.vault.getAbstractFileByPath(current.source_path);
         if (!(file instanceof TFile)) throw new Error(`未找到源文件：${current.source_path}`);
         const buffer = Buffer.from(await this.app.vault.readBinary(file));
+        this.operationCounters.bytesRead += buffer.length;
         const extracted = await this.parseDocumentAutomatically(current, buffer, {
           localTextBlockAdapter: this.settings.localTextBlockAdapterEnabled !== false,
           pdfExtractor: await this.getPdfExtractorConfig(current),
@@ -4400,6 +4401,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async parseDocumentAutomatically(task, buffer, baseOptions = {}) {
+    const uploadAlreadyApproved = this.settings.pdfAllowExternalUpload === true || eksSessionUploadApproved();
+    const canPromptForUpload = !uploadAlreadyApproved
+      && this.settings.confirmUploads !== false
+      && typeof globalThis.__eksUploadConfirm === 'function';
     const localOptions = Object.assign({}, baseOptions, {
       pdfExtractor: Object.assign({}, baseOptions.pdfExtractor || {}, {
         order: 'mineru-api', allowExternalUpload: false, confirmUploads: false,
@@ -4409,9 +4414,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const parser = new AutoDocumentParser({
       local: (filePath, input) => extractTextFromBuffer(filePath, input, localOptions),
       localPdf: (filePath, input) => this.extractReliableLocalPdf(filePath, input),
+      // AutoDocumentParser has already verified persistent/session consent or
+      // obtained explicit per-file consent. Avoid a second prompt and pass the
+      // resulting authorization into the lower-level MinerU gate.
       mineru: (filePath, input) => extractTextFromBuffer(filePath, input, Object.assign({}, baseOptions, {
         localOcr: Object.assign({}, baseOptions.localOcr || {}, { enabled: false }),
-        pdfExtractor: Object.assign({}, baseOptions.pdfExtractor || {}, { order: 'mineru-api' })
+        pdfExtractor: Object.assign({}, baseOptions.pdfExtractor || {}, {
+          order: 'mineru-api', allowExternalUpload: true, confirmUploads: false
+        })
       })),
       localOcr: (filePath, input) => extractTextFromBuffer(filePath, input, Object.assign({}, localOptions, {
         localOcr: Object.assign({}, baseOptions.localOcr || {}, { enabled: true })
@@ -4419,7 +4429,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     });
     return parser.parse(task.source_path, buffer, {
       mineruConfigured: Boolean(String(this.settings.pdfMineruApiKey || '').trim()),
-      allowNecessaryCloud: this.settings.pdfAllowExternalUpload === true || eksSessionUploadApproved()
+      allowNecessaryCloud: uploadAlreadyApproved,
+      confirmNecessaryUpload: canPromptForUpload ? async ({ filePath, sizeBytes }) => globalThis.__eksUploadConfirm({
+        fileName: String(filePath || '').split(/[\\/]/).pop() || 'source.pdf',
+        sizeBytes,
+        engine: 'MinerU API'
+      }) : undefined
     });
   }
 
@@ -13833,22 +13848,27 @@ class AutoDocumentParser {
     }
     if (ext !== 'pdf') throw typed('AUTO_PARSER_UNSUPPORTED', `自动识别暂不支持：${ext || 'unknown'}`);
     const probe = (this.adapters.probePdf || pdfQualityProbe)(buffer, context);
-    if (probe.reliableLocal) {
-      const localPdf = await this.call('localPdf', filePath, buffer, { ...context, probe });
-      if (qualityOk(localPdf)) return localPdf;
-    }
+    const localPdf = await this.call('localPdf', filePath, buffer, { ...context, probe });
+    if (qualityOk(localPdf)) return localPdf;
     let remoteFailure = null;
-    if (context.mineruConfigured === true && context.allowNecessaryCloud === true) {
+    const canRequestCloudConsent = typeof context.confirmNecessaryUpload === 'function';
+    if (context.mineruConfigured === true && (context.allowNecessaryCloud === true || canRequestCloudConsent)) {
       try {
+        if (context.allowNecessaryCloud !== true && canRequestCloudConsent) {
+          const accepted = await context.confirmNecessaryUpload({ filePath, sizeBytes: Number(buffer?.length || 0), reason: 'PDF 文本不足、扫描件或复杂版式' });
+          if (!accepted) throw typed('NECESSARY_UPLOAD_DECLINED', '用户未允许本次必要云端识别。');
+        }
         const mineru = await this.call('mineru', filePath, buffer, { ...context, probe });
         if (qualityOk(mineru)) return mineru;
         remoteFailure = typed('MINERU_QUALITY_FAILED', 'MinerU 结果未达到知识生成质量门。');
       } catch (error) { remoteFailure = error; }
     }
+    let ocr = null;
     try {
-      const ocr = await this.call('localOcr', filePath, buffer, { ...context, probe, remoteFailure });
+      ocr = await this.call('localOcr', filePath, buffer, { ...context, probe, remoteFailure });
       if (qualityOk(ocr)) return ocr;
     } catch (error) { if (!remoteFailure) remoteFailure = error; }
+    if (ocr && ['ocr_required', 'review_required', 'cancelled'].includes(ocr.status)) return ocr;
     throw typed('DOCUMENT_QUALITY_GATE_FAILED', `自动识别失败：MinerU 与本地 OCR 均未产生可核验知识证据。${remoteFailure ? ` ${remoteFailure.message}` : ''}`);
   }
 }

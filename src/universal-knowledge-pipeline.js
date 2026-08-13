@@ -6,6 +6,7 @@
  * content, order, provenance and structural hints.
  */
 const crypto = require('crypto');
+const { analyzeText } = require('./content-integrity.js');
 
 const PIPELINE_VERSION = '3.1';
 const OUTPUT_LANGUAGE = 'zh-CN';
@@ -141,7 +142,8 @@ function canonicalizeDocument(input = {}) {
     : Array.isArray(source.normalized_blocks) ? source.normalized_blocks
       : clean(source.text || source.markdown) ? [{ kind: 'text', raw: { text: source.text || source.markdown } }] : [];
   const blocks = rawBlocks.map((raw, order) => {
-    const rawText = clean(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown, 30000);
+    const originalText = String(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown || '');
+    const rawText = clean(originalText, 30000);
     const kind = BLOCK_KINDS.has(clean(raw?.kind, 80)) ? clean(raw.kind, 80) : 'text';
     const metadata = raw?.metadata && typeof raw.metadata === 'object' ? { ...raw.metadata } : {};
     const hierarchy = uniq([
@@ -155,9 +157,11 @@ function canonicalizeDocument(input = {}) {
       source_language: detectLanguage(rawText),
       hierarchy, locator: normalizeLocator(raw?.locator, blockId),
       parse_status: clean(raw?.parse?.status, 40) || (rawText ? 'present' : 'missing'),
-      metadata, provenance: Array.isArray(raw?.provenance) ? raw.provenance : []
+      metadata, provenance: Array.isArray(raw?.provenance) ? raw.provenance : [],
+      content_integrity: analyzeText(originalText)
     };
-  }).filter((block) => block.text || ['figure', 'attachment', 'page', 'sheet'].includes(block.kind));
+  }).filter((block) => block.content_integrity.ok
+    && (block.text || ['figure', 'attachment', 'page', 'sheet'].includes(block.kind)));
   const sourceId = clean(source.source_document_id || source.source_identity, 300)
     || `src-${digest([source.source_hash, source.source_path, blocks.map((block) => block.text)]).slice(0, 24)}`;
   return {
@@ -750,6 +754,11 @@ function runUniversalPipeline(input = {}) {
 
 async function runUniversalPipelineMultilingual(input = {}) {
   const document = canonicalizeDocument(input.document || input);
+  if (!document.blocks.some((block) => block.text)) {
+    const error = new Error('未发现可核验的自然语言证据；不会翻译或生成知识卡片。');
+    error.code = 'NO_VERIFIABLE_NATURAL_LANGUAGE_EVIDENCE';
+    throw error;
+  }
   const profile = inferProfile(document);
   const regions = segmentDocument(document);
   const translated = await translateRegions(regions, input);

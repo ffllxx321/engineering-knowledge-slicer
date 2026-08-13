@@ -1,5 +1,7 @@
 'use strict';
 
+const { analyzeText, blockText, quarantineInvalidBlocks } = require('./content-integrity.js');
+
 const LOCAL_EXTENSIONS = new Set(['docx', 'xlsx', 'pptx', 'msg', 'eml', 'txt', 'md']);
 
 function extensionOf(filePath) {
@@ -21,7 +23,8 @@ function pdfQualityProbe(buffer) {
 function qualityOk(result) {
   if (!result || result.status !== 'ok' || !result.parsePackage) return false;
   const markdown = String(result.parsePackage.markdown || result.text || '').trim();
-  const eligible = (result.parsePackage.blocks || []).filter((block) => block?.card_eligible !== false && String(block?.raw?.text || '').trim());
+  const eligible = (result.parsePackage.blocks || []).filter((block) => block?.card_eligible !== false
+    && analyzeText(blockText(block)).ok);
   const quality = result.parsePackage.quality || {};
   const directRatio = quality.corruptRatio == null ? NaN : Number(quality.corruptRatio);
   const nestedRatio = quality.components?.corrupt_ratio == null ? NaN : Number(quality.components.corrupt_ratio);
@@ -43,7 +46,7 @@ class AutoDocumentParser {
     // compressed/content streams. Always give the deterministic local reader
     // one bounded attempt; the parse-package quality gate remains authoritative.
     const local = await this.call('localPdf', filePath, buffer, { ...context, probe });
-    if (qualityOk(local)) return local;
+    if (qualityOk(local)) return this.sanitize(local);
 
     let mineruError = null;
     const canRequestCloudConsent = typeof context.confirmNecessaryUpload === 'function';
@@ -54,7 +57,7 @@ class AutoDocumentParser {
           if (!accepted) throw typed('NECESSARY_UPLOAD_DECLINED', '用户未允许本次必要云端识别。');
         }
         const remote = await this.call('mineru', filePath, buffer, { ...context, probe });
-        if (qualityOk(remote)) return remote;
+        if (qualityOk(remote)) return this.sanitize(remote);
         mineruError = typed('MINERU_QUALITY_FAILED', 'MinerU 结果未达到知识生成质量门。');
       } catch (error) { mineruError = error; }
     }
@@ -62,7 +65,7 @@ class AutoDocumentParser {
     let ocr = null;
     try {
       ocr = await this.call('localOcr', filePath, buffer, { ...context, probe, mineruError });
-      if (qualityOk(ocr)) return ocr;
+      if (qualityOk(ocr)) return this.sanitize(ocr);
     } catch (error) {
       if (!mineruError) mineruError = error;
     }
@@ -79,8 +82,10 @@ class AutoDocumentParser {
 
   requireQuality(result, code) {
     if (!qualityOk(result)) throw typed(code, '本地确定性解析结果未达到知识生成质量门。');
-    return result;
+    return this.sanitize(result);
   }
+
+  sanitize(result) { quarantineInvalidBlocks(result.parsePackage); return result; }
 }
 
 function removedLegacyPdfDispatcher() {

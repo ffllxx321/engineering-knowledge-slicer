@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const { KnowledgeWritePort } = require('./knowledge-write-port.js');
+const { assertKnowledgeActions } = require('./content-integrity.js');
 
 const normalized = (value) => String(value || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
 const uniqueSorted = (values) => [...new Set(values.map(normalized).filter(Boolean))].sort();
@@ -15,6 +16,7 @@ class ProductionCommitService {
 
   async commit(plan, options) {
     if (!options?.runId || !options?.taskId) throw Object.assign(new Error('生产提交必须绑定当前 run_id 和 task_id。'), { code: 'CURRENT_RUN_REQUIRED' });
+    assertKnowledgeActions(plan?.actions);
     const result = await this.commitPlan(plan, { ...options, vault: this.port });
     const planned = uniqueSorted((plan.actions || []).filter((item) => ['business_item', 'company_knowledge'].includes(item.record_kind)).map((item) => item.path));
     const records = result?.verified?.knowledge_records || [];

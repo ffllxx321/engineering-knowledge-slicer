@@ -42,6 +42,7 @@ const {
 const { extractTextFromBuffer, sanitizeAttachmentFileName } = require("src/core/extractors.js");
 const { createParsePackage, upgradeParsePackage } = require("src/core/document-parser.js");
 const { AutoDocumentParser } = require("src/auto-document-parser.js");
+const { quarantineInvalidBlocks } = require("src/content-integrity.js");
 const { probeLocalOcr, runLocalPdfOcr } = require("src/core/local-ocr.js");
 const { inspectPdf } = require("src/core/block-v0.js");
 const { runMineruApi } = require("src/core/mineru-api.js");
@@ -1784,6 +1785,13 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         }
         current.status = 'parsed';
         await this.persistArtifact(current, 'parsed', parsePackage);
+      }
+
+      const integrity = quarantineInvalidBlocks(parsePackage);
+      if (!integrity.valid.length) {
+        const evidenceError = new Error('未发现可核验的自然语言证据；任务不会翻译、写入或标记为已存储。');
+        evidenceError.code = 'NO_VERIFIABLE_NATURAL_LANGUAGE_EVIDENCE';
+        throw evidenceError;
       }
 
       this.assertTaskCanContinue(current);
@@ -7204,6 +7212,86 @@ module.exports = {
 
 },
 /** STRUCTURED_PHASE_MODULES_START */
+"src/content-integrity.js": function(require, module, exports) {
+// Fail-closed checks for text that can never be knowledge evidence.  These are
+// deliberately format/content signals rather than document-specific keywords.
+const META_FAILURE = [
+  /(?:cannot|can't|unable to).{0,40}(?:translate|translated|extract|read|interpret)|no\s+(?:meaningful|coherent|readable)\s+(?:natural[- ]language\s+)?(?:text|content)/i,
+  /(?:无法|不能|未能)(?:翻译|提取|读取|识别|理解)|(?:没有|无)(?:有意义|可读|连贯)的?(?:自然语言|文本|内容)/
+];
+const CONTRACT_FIELDS = /\b(?:region_id|preserve_exactly|translated_text|expected_region_ids|actual_region_ids|schema_version|output_schema)\b/gi;
+const CONTRACT_INSTRUCTION = /(?:return|respond|output|preserve|copy|include|must|仅返回|请返回|输出|保留|逐字|必须).{0,80}(?:json|schema|field|字段|格式|region|标识)/i;
+const PROMPT_LEAKAGE = /(?:you are|system prompt|parser instructions?|translation instructions?).{0,160}(?:return|respond|output|must)|(?:"required"\s*:.*"properties"\s*:)|(?:请|必须|仅)(?:严格)?(?:返回|输出).{0,80}(?:JSON|字段|schema)/is;
+const PDF_CONTAINER = /(?:^|[\r\n])\s*%PDF-\d|\b(?:xref|startxref|endobj)\b|\d+\s+\d+\s+obj\b|\/Type\s*\/Page\b|\/Filter\s*\/(?:FlateDecode|DCTDecode)|\bstream[\r\n]/i;
+const MOJIBAKE = /(?:\uFFFD|Ã.|Â.|â..|(?:æ|å|ä|ç|é).{1,2})/g;
+
+function analyzeText(value) {
+  const text = String(value || '').trim();
+  const reasons = [];
+  if (!text) return { ok: false, reasons: ['empty'] };
+  const controls = (text.match(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g) || []).length;
+  const replacement = (text.match(/\uFFFD/g) || []).length;
+  const mojibake = (text.match(MOJIBAKE) || []).length;
+  const printable = (text.match(/[\p{L}\p{N}\p{P}\p{S}\s]/gu) || []).length;
+  const letters = (text.match(/\p{L}/gu) || []).length;
+  const contractFields = (text.match(CONTRACT_FIELDS) || []).length;
+  if (PDF_CONTAINER.test(text)) reasons.push('pdf_or_container_bytes');
+  if (controls / text.length > 0.01 || printable / text.length < 0.86
+      || /(?:[A-Za-z0-9+/]{120,}={0,2}|(?:\\x[0-9a-f]{2}){8,})/i.test(text)) reasons.push('control_heavy_or_binary');
+  if (replacement >= 2 || mojibake >= 3 || (replacement + mojibake) / Math.max(1, letters) > 0.08) reasons.push('mojibake');
+  if ((contractFields >= 2 && (CONTRACT_INSTRUCTION.test(text) || /[{}[\]":]/.test(text)))
+      || (contractFields >= 1 && CONTRACT_INSTRUCTION.test(text)) || PROMPT_LEAKAGE.test(text)) reasons.push('parser_or_schema_contract_leakage');
+  if (META_FAILURE.some((pattern) => pattern.test(text))) reasons.push('non_content_meta_statement');
+  return { ok: reasons.length === 0, reasons: [...new Set(reasons)] };
+}
+
+function blockText(block) {
+  return String(block?.raw?.text || block?.raw_text || block?.text || block?.content || '').trim();
+}
+
+function quarantineInvalidBlocks(parsePackage) {
+  if (!parsePackage || typeof parsePackage !== 'object') return { valid: [], invalid: [] };
+  const valid = [];
+  const invalid = [];
+  for (const block of Array.isArray(parsePackage.blocks) ? parsePackage.blocks : []) {
+    if (block?.card_eligible === false) continue;
+    const analysis = analyzeText(blockText(block));
+    if (analysis.ok) valid.push(block);
+    else {
+      block.card_eligible = false;
+      block.exclusion_reason = `content_integrity:${analysis.reasons.join(',')}`;
+      invalid.push({ block_id: String(block?.block_id || ''), reasons: analysis.reasons });
+    }
+  }
+  if (invalid.length && parsePackage.evidence_index && typeof parsePackage.evidence_index === 'object') {
+    for (const [key, entry] of Object.entries(parsePackage.evidence_index)) {
+      if (!analyzeText(entry?.raw_text).ok) delete parsePackage.evidence_index[key];
+    }
+  }
+  if (invalid.length) {
+    parsePackage.markdown = valid.map(blockText).filter(Boolean).join('\n\n');
+    parsePackage.quality = { ...(parsePackage.quality || {}), content_integrity_rejections: invalid };
+  }
+  return { valid, invalid };
+}
+
+function assertKnowledgeActions(actions) {
+  const failures = [];
+  for (const action of actions || []) {
+    if (!['business_item', 'company_knowledge'].includes(action?.record_kind)) continue;
+    const analysis = analyzeText(action.content);
+    if (!analysis.ok) failures.push({ record_id: action.record_id, reasons: analysis.reasons });
+  }
+  if (failures.length) {
+    const error = new Error('生产提交拒绝：知识记录包含不可核验的二进制、乱码、解析指令、契约泄漏或非内容元陈述。');
+    error.code = 'INVALID_KNOWLEDGE_CONTENT';
+    error.details = failures;
+    throw error;
+  }
+}
+
+module.exports = { analyzeText, blockText, quarantineInvalidBlocks, assertKnowledgeActions };
+},
 "src/production-flow-contract.js": function(require, module, exports) {
 const PRODUCTION_FLOW_CONTRACT = Object.freeze({
   schema: 'eks/production-flow-contract/1.0',
@@ -7319,6 +7407,7 @@ module.exports = { LABELS, assertManifest, transitionProductionState, invalidate
 "src/production-commit-service.js": function(require, module, exports) {
 const crypto = require('crypto');
 const { KnowledgeWritePort } = require("src/knowledge-write-port.js");
+const { assertKnowledgeActions } = require("src/content-integrity.js");
 
 const normalized = (value) => String(value || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
 const uniqueSorted = (values) => [...new Set(values.map(normalized).filter(Boolean))].sort();
@@ -7332,6 +7421,7 @@ class ProductionCommitService {
 
   async commit(plan, options) {
     if (!options?.runId || !options?.taskId) throw Object.assign(new Error('生产提交必须绑定当前 run_id 和 task_id。'), { code: 'CURRENT_RUN_REQUIRED' });
+    assertKnowledgeActions(plan?.actions);
     const result = await this.commitPlan(plan, { ...options, vault: this.port });
     const planned = uniqueSorted((plan.actions || []).filter((item) => ['business_item', 'company_knowledge'].includes(item.record_kind)).map((item) => item.path));
     const records = result?.verified?.knowledge_records || [];
@@ -8364,6 +8454,7 @@ module.exports = {
  */
 
 const crypto = require('crypto');
+const { analyzeText } = require("src/content-integrity.js");
 
 const PHASE3_SCHEMA_VERSION = '3.0';
 const PHASE3_SETTINGS_DEFAULTS = Object.freeze({
@@ -8404,7 +8495,7 @@ function evidenceIsVerifiable(candidate) {
   const blockId = text(evidence.block_id || candidate.block_id, 300);
   const locator = object(evidence.locator) &&
     text(evidence.locator.scheme, 80) && text(evidence.locator.value, 500);
-  return Boolean(quote && blockId && locator);
+  return Boolean(quote && blockId && locator && analyzeText(quote).ok);
 }
 
 function conflictSignature(candidate) {
@@ -8626,6 +8717,7 @@ module.exports = {
  * content, order, provenance and structural hints.
  */
 const crypto = require('crypto');
+const { analyzeText } = require("src/content-integrity.js");
 
 const PIPELINE_VERSION = '3.1';
 const OUTPUT_LANGUAGE = 'zh-CN';
@@ -8761,7 +8853,8 @@ function canonicalizeDocument(input = {}) {
     : Array.isArray(source.normalized_blocks) ? source.normalized_blocks
       : clean(source.text || source.markdown) ? [{ kind: 'text', raw: { text: source.text || source.markdown } }] : [];
   const blocks = rawBlocks.map((raw, order) => {
-    const rawText = clean(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown, 30000);
+    const originalText = String(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown || '');
+    const rawText = clean(originalText, 30000);
     const kind = BLOCK_KINDS.has(clean(raw?.kind, 80)) ? clean(raw.kind, 80) : 'text';
     const metadata = raw?.metadata && typeof raw.metadata === 'object' ? { ...raw.metadata } : {};
     const hierarchy = uniq([
@@ -8775,9 +8868,11 @@ function canonicalizeDocument(input = {}) {
       source_language: detectLanguage(rawText),
       hierarchy, locator: normalizeLocator(raw?.locator, blockId),
       parse_status: clean(raw?.parse?.status, 40) || (rawText ? 'present' : 'missing'),
-      metadata, provenance: Array.isArray(raw?.provenance) ? raw.provenance : []
+      metadata, provenance: Array.isArray(raw?.provenance) ? raw.provenance : [],
+      content_integrity: analyzeText(originalText)
     };
-  }).filter((block) => block.text || ['figure', 'attachment', 'page', 'sheet'].includes(block.kind));
+  }).filter((block) => block.content_integrity.ok
+    && (block.text || ['figure', 'attachment', 'page', 'sheet'].includes(block.kind)));
   const sourceId = clean(source.source_document_id || source.source_identity, 300)
     || `src-${digest([source.source_hash, source.source_path, blocks.map((block) => block.text)]).slice(0, 24)}`;
   return {
@@ -9370,6 +9465,11 @@ function runUniversalPipeline(input = {}) {
 
 async function runUniversalPipelineMultilingual(input = {}) {
   const document = canonicalizeDocument(input.document || input);
+  if (!document.blocks.some((block) => block.text)) {
+    const error = new Error('未发现可核验的自然语言证据；不会翻译或生成知识卡片。');
+    error.code = 'NO_VERIFIABLE_NATURAL_LANGUAGE_EVIDENCE';
+    throw error;
+  }
   const profile = inferProfile(document);
   const regions = segmentDocument(document);
   const translated = await translateRegions(regions, input);
@@ -13959,8 +14059,14 @@ module.exports = { cardOutputPath, resolveFixedRoute, resolveOutputRoute, saniti
 },
 /** @module src/auto-document-parser */
 "src/auto-document-parser.js": function(require, module, exports) {
+const { analyzeText, blockText, quarantineInvalidBlocks } = require("src/content-integrity.js");
+
 const LOCAL_EXTENSIONS = new Set(['docx', 'xlsx', 'pptx', 'msg', 'eml', 'txt', 'md']);
-const extensionOf = (path) => String(path || '').toLowerCase().split('.').pop();
+
+function extensionOf(filePath) {
+  return String(filePath || '').toLowerCase().split('.').pop();
+}
+
 function pdfQualityProbe(buffer) {
   const raw = Buffer.from(buffer || []).toString('latin1');
   const pages = Math.max(1, (raw.match(/\/Type\s*\/Page(?!s)\b/g) || []).length);
@@ -13972,10 +14078,12 @@ function pdfQualityProbe(buffer) {
   const complexLayout = images > Math.max(2, pages * 2) || rotations > 0;
   return { pages, nativeText, complexLayout, reliableLocal: nativeText && !complexLayout };
 }
+
 function qualityOk(result) {
   if (!result || result.status !== 'ok' || !result.parsePackage) return false;
   const markdown = String(result.parsePackage.markdown || result.text || '').trim();
-  const eligible = (result.parsePackage.blocks || []).filter((block) => block?.card_eligible !== false && String(block?.raw?.text || '').trim());
+  const eligible = (result.parsePackage.blocks || []).filter((block) => block?.card_eligible !== false
+    && analyzeText(blockText(block)).ok);
   const quality = result.parsePackage.quality || {};
   const directRatio = quality.corruptRatio == null ? NaN : Number(quality.corruptRatio);
   const nestedRatio = quality.components?.corrupt_ratio == null ? NaN : Number(quality.components.corrupt_ratio);
@@ -13983,25 +14091,23 @@ function qualityOk(result) {
   return markdown.length >= 20 && eligible.length > 0
     && quality.readable !== false && Number.isFinite(corruptRatio) && corruptRatio <= 0.02;
 }
-function typed(code, message) { const error = new Error(message); error.code = code; return error; }
+
 class AutoDocumentParser {
   constructor(adapters = {}) { this.adapters = adapters; }
-  async call(name, filePath, buffer, context) {
-    if (typeof this.adapters[name] !== 'function') throw typed('AUTO_PARSER_ADAPTER_UNAVAILABLE', `自动解析适配器不可用：${name}`);
-    return this.adapters[name](filePath, buffer, context);
-  }
+
   async parse(filePath, buffer, context = {}) {
     const ext = extensionOf(filePath);
-    if (LOCAL_EXTENSIONS.has(ext)) {
-      const local = await this.call('local', filePath, buffer, context);
-      if (!qualityOk(local)) throw typed('LOCAL_DOCUMENT_QUALITY_FAILED', '本地确定性解析结果未达到知识生成质量门。');
-      return local;
-    }
+    if (LOCAL_EXTENSIONS.has(ext)) return this.requireQuality(await this.call('local', filePath, buffer, context), 'LOCAL_DOCUMENT_QUALITY_FAILED');
     if (ext !== 'pdf') throw typed('AUTO_PARSER_UNSUPPORTED', `自动识别暂不支持：${ext || 'unknown'}`);
+
     const probe = (this.adapters.probePdf || pdfQualityProbe)(buffer, context);
-    const localPdf = await this.call('localPdf', filePath, buffer, { ...context, probe });
-    if (qualityOk(localPdf)) return localPdf;
-    let remoteFailure = null;
+    // The probe is deliberately conservative and cannot see text stored in
+    // compressed/content streams. Always give the deterministic local reader
+    // one bounded attempt; the parse-package quality gate remains authoritative.
+    const local = await this.call('localPdf', filePath, buffer, { ...context, probe });
+    if (qualityOk(local)) return this.sanitize(local);
+
+    let mineruError = null;
     const canRequestCloudConsent = typeof context.confirmNecessaryUpload === 'function';
     if (context.mineruConfigured === true && (context.allowNecessaryCloud === true || canRequestCloudConsent)) {
       try {
@@ -14009,21 +14115,44 @@ class AutoDocumentParser {
           const accepted = await context.confirmNecessaryUpload({ filePath, sizeBytes: Number(buffer?.length || 0), reason: 'PDF 文本不足、扫描件或复杂版式' });
           if (!accepted) throw typed('NECESSARY_UPLOAD_DECLINED', '用户未允许本次必要云端识别。');
         }
-        const mineru = await this.call('mineru', filePath, buffer, { ...context, probe });
-        if (qualityOk(mineru)) return mineru;
-        remoteFailure = typed('MINERU_QUALITY_FAILED', 'MinerU 结果未达到知识生成质量门。');
-      } catch (error) { remoteFailure = error; }
+        const remote = await this.call('mineru', filePath, buffer, { ...context, probe });
+        if (qualityOk(remote)) return this.sanitize(remote);
+        mineruError = typed('MINERU_QUALITY_FAILED', 'MinerU 结果未达到知识生成质量门。');
+      } catch (error) { mineruError = error; }
     }
+
     let ocr = null;
     try {
-      ocr = await this.call('localOcr', filePath, buffer, { ...context, probe, remoteFailure });
-      if (qualityOk(ocr)) return ocr;
-    } catch (error) { if (!remoteFailure) remoteFailure = error; }
+      ocr = await this.call('localOcr', filePath, buffer, { ...context, probe, mineruError });
+      if (qualityOk(ocr)) return this.sanitize(ocr);
+    } catch (error) {
+      if (!mineruError) mineruError = error;
+    }
+    // Preserve actionable parser outcomes. Converting these to an internal,
+    // non-retryable quality-gate error hides the actual remediation from users.
     if (ocr && (ocr.actionable || ['ocr_required', 'review_required', 'cancelled'].includes(ocr.status))) return ocr;
-    throw typed('DOCUMENT_QUALITY_GATE_FAILED', `自动识别失败：MinerU 与本地 OCR 均未产生可核验知识证据。${remoteFailure ? ` ${remoteFailure.message}` : ''}`);
+    throw typed('DOCUMENT_QUALITY_GATE_FAILED', `自动识别失败：MinerU 与本地 OCR 均未产生可核验知识证据。${mineruError ? ` ${mineruError.message}` : ''}`);
   }
+
+  async call(name, filePath, buffer, context) {
+    if (typeof this.adapters[name] !== 'function') throw typed('AUTO_PARSER_ADAPTER_UNAVAILABLE', `自动解析适配器不可用：${name}`);
+    return this.adapters[name](filePath, buffer, context);
+  }
+
+  requireQuality(result, code) {
+    if (!qualityOk(result)) throw typed(code, '本地确定性解析结果未达到知识生成质量门。');
+    return this.sanitize(result);
+  }
+
+  sanitize(result) { quarantineInvalidBlocks(result.parsePackage); return result; }
 }
-function removedLegacyPdfDispatcher() { throw typed('REMOVED_LEGACY_PDF_DISPATCHER', '旧 PDF 引擎顺序/PaddleOCR 生产分支已移除；请使用 AutoDocumentParser。'); }
+
+function removedLegacyPdfDispatcher() {
+  throw typed('REMOVED_LEGACY_PDF_DISPATCHER', '旧 PDF 引擎顺序/PaddleOCR 生产分支已移除；请使用 AutoDocumentParser。');
+}
+
+function typed(code, message) { const error = new Error(message); error.code = code; return error; }
+
 module.exports = { AutoDocumentParser, LOCAL_EXTENSIONS, pdfQualityProbe, qualityOk, removedLegacyPdfDispatcher };
 },
 /**

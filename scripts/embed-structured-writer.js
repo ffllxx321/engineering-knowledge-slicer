@@ -9,6 +9,7 @@ const START = '/** STRUCTURED_PHASE_MODULES_START */';
 const OLD_START = '/* STRUCTURED_PHASE_MODULES_START */';
 const END = '/* STRUCTURED_PHASE_MODULES_END */';
 const modules = [
+  ['src/content-integrity.js', 'src/content-integrity.js'],
   ['src/production-flow-contract.js', 'src/production-flow-contract.js'],
   ['src/production-state-machine.js', 'src/production-state-machine.js'],
   ['src/production-commit-service.js', 'src/production-commit-service.js'],
@@ -24,7 +25,8 @@ function factory(id, sourcePath) {
     .replace(/^'use strict';\s*/, '')
     .replace(/require\('\.\/phase1-foundation\.js'\)/g, 'require("src/phase1-foundation.js")')
     .replace(/require\('\.\/production-flow-contract\.js'\)/g, 'require("src/production-flow-contract.js")')
-    .replace(/require\('\.\/knowledge-write-port\.js'\)/g, 'require("src/knowledge-write-port.js")');
+    .replace(/require\('\.\/knowledge-write-port\.js'\)/g, 'require("src/knowledge-write-port.js")')
+    .replace(/require\('\.\/content-integrity\.js'\)/g, 'require("src/content-integrity.js")');
   return `"${id}": function(require, module, exports) {\n${source.trim()}\n},`;
 }
 const generated = `${START}\n${modules.map(([id, file]) => factory(id, file)).join('\n')}\n${END}`;

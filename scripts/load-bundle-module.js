@@ -20,6 +20,7 @@ function loadBundleModule(id, dependencies = {}) {
   new Function('require', 'module', 'exports', code.slice(bodyStart, end))(
     (name) => {
       if (Object.hasOwn(dependencies, name)) return dependencies[name];
+      if (name === 'src/content-integrity.js') return loadBundleModule(name);
       if (name === 'src/knowledge-write-port.js') return loadBundleModule(name, { crypto });
       if (name === 'src/production-flow-contract.js') return loadBundleModule(name);
       if (name === 'src/production-state-machine.js') return loadBundleModule(name, {

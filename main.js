@@ -1851,7 +1851,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
               if (Number(context?.attempt) > 1) this.operationCounters.aiRetries += 1;
               if (context?.stage === 'summary-reduce') this.operationCounters.summaryReduceRequests += 1;
               this.operationCounters.promptCharacters += String(prompt || '').length;
+              const fallbackBefore = this.settings.minimaxOutputTokenLimitFallback;
               const result = await requestMiniMaxStream({ settings: this.settings, prompt, context, signal: context?.signal || taskController.signal, onDelta: hooks && hooks.onDelta, onProgressText: hooks && hooks.onProgressText });
+              if (fallbackBefore !== this.settings.minimaxOutputTokenLimitFallback
+                && this.settings.minimaxOutputTokenLimitFallback === 8192) await this.saveSafeSettings();
               this.operationCounters.outputCharacters += typeof result === 'string' ? result.length : JSON.stringify(result || {}).length;
               return result;
             },
@@ -2018,8 +2021,10 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       if (workflow?.truncated) {
         current.truncated = true;
         current.truncated_completed = workflow.truncatedCompleted || 0;
-        new Notice(`⚠️ AI 输出超过 8192 token 上限被截断。已成功 ${current.truncated_completed} 个原子。dashboard 顶部有警告。`);
-        diag('workflow.truncated', { sourcePath: current.source_path, completed: current.truncated_completed });
+        const requestedTokenLimit = configuredMiniMaxOutputTokenLimit(this.settings);
+        new Notice(`⚠️ AI 提供商报告输出截断（本次请求上限 ${requestedTokenLimit} token）。已成功 ${current.truncated_completed} 个原子。dashboard 顶部有警告。`);
+        diag('workflow.truncated', { sourcePath: current.source_path, completed: current.truncated_completed,
+          requestedTokenLimit, providerStopReason: workflow.providerStopReason || 'reported-by-provider' });
       }
       await this.writeTaskLog(current);
       await this.saveTasks(upsertTask(await this.loadTasks(), current));
@@ -2206,9 +2211,14 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       if (context.stage === 'summary-reduce') this.operationCounters.summaryReduceRequests += 1;
       this.operationCounters.promptCharacters += String(prompt || '').length;
       try {
+        const fallbackBefore = this.settings.minimaxOutputTokenLimitFallback;
         const result = await requestMiniMaxJson({
           settings: this.settings, prompt, context, fetchImpl: obsidianRequest, signal
         });
+        if (fallbackBefore !== this.settings.minimaxOutputTokenLimitFallback
+          && this.settings.minimaxOutputTokenLimitFallback === 8192) {
+          await this.saveSafeSettings();
+        }
         this.operationCounters.outputCharacters += typeof result === 'string'
           ? result.length : JSON.stringify(result || {}).length;
         return result;
@@ -3253,7 +3263,6 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         translation_cache: translationCheckpoint?.cache || priorUniversal?.translation_cache || {},
         translation_prompt_version: 'universal-zh-v1',
         model_version: this.settings.minimaxModel || 'configured-provider',
-        translation_batch_char_budget: 3600,
         save_translation_checkpoint: (checkpoint) => this.persistArtifact(task, 'universal-translation-checkpoint', {
           schema_version: 'translation-checkpoint/2.0', status: checkpoint.missing_region_ids?.length ? 'partial' : 'complete',
           source_hash: document.source_hash, output_language: 'zh-CN', ...checkpoint
@@ -5576,6 +5585,20 @@ class SlicerSettingTab extends PluginSettingTab {
       placeholder: '请输入密钥',
       service: 'minimax'
     });
+    new Setting(containerEl)
+      .setName('MiniMax 最大输出 token')
+      .setDesc('每次请求允许的最大输出量，默认 16384；若接口明确不支持该值，会自动降至 8192 并记录诊断。')
+      .addText((text) => text
+        .setPlaceholder('16384')
+        .setValue(String(this.plugin.settings.minimaxOutputTokenLimit || 16384))
+        .onChange(async (value) => {
+          const limit = Number(value);
+          if (Number.isInteger(limit) && limit >= 1 && limit <= 65536) {
+            this.plugin.settings.minimaxOutputTokenLimit = limit;
+            this.plugin.settings.minimaxOutputTokenLimitFallback = null;
+            await this.plugin.saveSafeSettings();
+          }
+        }));
 
     containerEl.createEl('h3', { text: '自动识别文档' });
     new Setting(containerEl).setName('解析方式').setDesc('自动选择（只读）：Office/邮件/文本本地解析；PDF 先本地探测，必要时 MinerU，失败后本地 OCR。');
@@ -8942,7 +8965,7 @@ function translationCacheKey(region, options = {}) {
   ]);
 }
 
-const DEFAULT_TRANSLATION_BATCH_CHARS = 3600;
+const DEFAULT_TRANSLATION_BATCH_CHARS = 24000;
 const MIN_TRANSLATION_CHUNK_CHARS = 600;
 
 function splitTranslationText(text, maxChars) {
@@ -9024,10 +9047,10 @@ async function translateRegions(regions, options = {}) {
     });
   }
   const batchSize = Math.max(1, Math.min(20, Number(options.translation_batch_size) || 8));
-  const maxChars = Math.max(MIN_TRANSLATION_CHUNK_CHARS, Math.min(6000,
+  const maxChars = Math.max(MIN_TRANSLATION_CHUNK_CHARS, Math.min(30000,
     Number(options.translation_batch_char_budget) || DEFAULT_TRANSLATION_BATCH_CHARS));
   const uniquePending = [...new Map(pending.map((item) => [item.key, item])).values()];
-  const work = translationWorkItems(uniquePending, maxChars);
+  const work = uniquePending.map((item) => ({ ...item, text: item.region.text, request_id: item.region.region_id }));
   const completedParts = new Map();
   const batches = [];
   for (const item of work) {
@@ -9057,9 +9080,8 @@ async function translateRegions(regions, options = {}) {
       for (const row of validated) {
         const item = batch.find((candidate) => candidate.request_id === row.region_id);
         completedParts.set(item.request_id, row.translated_text);
-        const siblings = work.filter((candidate) => candidate.key === item.key);
-        if (siblings.every((candidate) => completedParts.has(candidate.request_id))) {
-          const translatedText = siblings.map((candidate) => completedParts.get(candidate.request_id)).join('\n');
+        if (!item.fragment) {
+          const translatedText = row.translated_text;
           item.region.translated_text = translatedText;
           item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
             provenance: 'configured-provider', cache_key: item.key };
@@ -9076,6 +9098,25 @@ async function translateRegions(regions, options = {}) {
         await runBatch(batch.slice(0, middle));
         await runBatch(batch.slice(middle));
         return;
+      }
+      if (error?.code === 'AI_OUTPUT_TRUNCATED' && batch.length === 1 && batch[0].text.length > MIN_TRANSLATION_CHUNK_CHARS) {
+        const item = batch[0];
+        const pieces = splitTranslationText(item.text, Math.ceil(item.text.length / 2));
+        if (pieces.length > 1) {
+          const fragments = pieces.map((text, index) => ({ ...item, text, fragment: true,
+            request_id: `${item.request_id}::recovery-${index + 1}/${pieces.length}` }));
+          for (const fragment of fragments) await runBatch([fragment]);
+          const translatedText = fragments.map((fragment) => completedParts.get(fragment.request_id)).join('\n');
+          item.region.translated_text = translatedText;
+          item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
+            provenance: 'configured-provider', cache_key: item.key };
+          cache[item.key] = { translated_text: translatedText,
+            source_language: item.region.source_language.language, version: TRANSLATION_VERSION };
+          telemetry.regions.push({ region_id: item.region.region_id,
+            source_language: item.region.source_language.language, status: 'provider-recovered-after-truncation' });
+          await saveCheckpoint();
+          return;
+        }
       }
       telemetry.failures += batch.length;
       throw Object.assign(new Error(`翻译批次失败：${error.message}`), {
@@ -10409,6 +10450,8 @@ const DEFAULT_SETTINGS = {
   minimaxApiKey: '',
   minimaxModel: 'MiniMax-M3',
   minimaxEndpoint: 'https://api.minimaxi.com/anthropic/v1/messages',
+  minimaxOutputTokenLimit: 16384,
+  minimaxOutputTokenLimitFallback: null,
   pdfExtractionOrder: 'legacy-removed',
   pdfAllowExternalUpload: false,
   localMsgAdapterEnabled: true,
@@ -10588,6 +10631,10 @@ function migrateSettings(stored = {}) {
     || migrated.minimaxEndpoint === 'https://api.minimaxi.com/v1/chat/completions') {
     migrated.minimaxEndpoint = DEFAULT_SETTINGS.minimaxEndpoint;
   }
+  const storedOutputLimit = Number(source.minimaxOutputTokenLimit);
+  migrated.minimaxOutputTokenLimit = Number.isInteger(storedOutputLimit) && storedOutputLimit >= 1 && storedOutputLimit <= 65536
+    ? storedOutputLimit : DEFAULT_SETTINGS.minimaxOutputTokenLimit;
+  migrated.minimaxOutputTokenLimitFallback = source.minimaxOutputTokenLimitFallback === 8192 ? 8192 : null;
   if (!Number(migrated.aiMaxChunks) || Number(migrated.aiMaxChunks) < 1) migrated.aiMaxChunks = DEFAULT_SETTINGS.aiMaxChunks;
   if (!Number(migrated.aiChunkSize) || Number(migrated.aiChunkSize) < 1) migrated.aiChunkSize = DEFAULT_SETTINGS.aiChunkSize;
   if (!Number(migrated.maxPointsPerRequest)) migrated.maxPointsPerRequest = DEFAULT_SETTINGS.maxPointsPerRequest;
@@ -17723,6 +17770,42 @@ function applySchemaConstants(schema, value) {
   return value;
 }
 
+function configuredMiniMaxOutputTokenLimit(settings = {}) {
+  const configured = Number(settings.minimaxOutputTokenLimit);
+  const validated = Number.isInteger(configured) && configured >= 1 && configured <= 65536 ? configured : 16384;
+  return settings.minimaxOutputTokenLimitFallback === 8192 ? 8192 : validated;
+}
+
+function isTokenLimitRejection(response, detail, field) {
+  if (![400, 422].includes(Number(response?.status))) return false;
+  const text = String(detail || '').toLowerCase();
+  const namesParameter = text.includes(String(field).toLowerCase()) || /max(?:imum)?[_ ]?(?:completion[_ ]?)?tokens?/.test(text);
+  const rejectsValue = /invalid|unsupported|not supported|unknown|unrecognized|too (?:large|high)|maximum|must be (?:less|at most)|不支持|无效|最大|上限/.test(text);
+  return namesParameter && rejectsValue;
+}
+
+function miniMaxRequestBody(settings, prompt, context, anthropicProtocol, tokenLimit, stream = false) {
+  const body = {
+    model: settings.minimaxModel || 'MiniMax-M3',
+    messages: [
+      { role: 'system', content: '你是工程知识处理引擎。严格返回 JSON，不要输出 Markdown 代码围栏。' },
+      { role: 'user', content: prompt }
+    ],
+    max_completion_tokens: tokenLimit,
+    reasoning_split: true,
+    temperature: context && context.stage === 'classification' ? 0.1 : 0.2
+  };
+  if (stream) body.stream = true;
+  if (anthropicProtocol) {
+    body.max_tokens = tokenLimit;
+    delete body.max_completion_tokens;
+    delete body.reasoning_split;
+    body.system = '你是工程知识处理引擎。只通过指定工具返回结构化结果，不要输出额外说明。';
+    body.messages = [{ role: 'user', content: prompt }];
+  }
+  return body;
+}
+
 async function requestMiniMaxJson({ settings, prompt, fetchImpl, context, signal }) {
   if (!settings || !settings.minimaxApiKey) throw new Error('MiniMax 国内版 API Key 未配置');
   const fetcher = fetchImpl || globalThis.fetch;
@@ -17736,16 +17819,9 @@ async function requestMiniMaxJson({ settings, prompt, fetchImpl, context, signal
   if (signal) signal.addEventListener('abort', abortFromCaller, { once: true });
   let response;
   try {
-    const body = {
-      model: settings.minimaxModel || 'MiniMax-M3',
-      messages: [
-        { role: 'system', content: '你是工程知识处理引擎。严格返回 JSON，不要输出 Markdown 代码围栏。' },
-        { role: 'user', content: prompt }
-      ],
-      max_completion_tokens: 2048,
-      reasoning_split: true,
-      temperature: context && context.stage === 'classification' ? 0.1 : 0.2
-    };
+    const requestedTokenLimit = configuredMiniMaxOutputTokenLimit(settings);
+    let tokenLimit = requestedTokenLimit;
+    let body = miniMaxRequestBody(settings, prompt, context, anthropicProtocol, tokenLimit);
     if (context?.schema) {
       body.tools = [{
         type: 'function',
@@ -17759,11 +17835,6 @@ async function requestMiniMaxJson({ settings, prompt, fetchImpl, context, signal
     }
     let headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.minimaxApiKey}` };
     if (anthropicProtocol) {
-      body.max_tokens = 8192;
-      delete body.max_completion_tokens;
-      delete body.reasoning_split;
-      body.system = '你是工程知识处理引擎。只通过指定工具返回结构化结果，不要输出额外说明。';
-      body.messages = [{ role: 'user', content: prompt }];
       if (context?.schema) {
         body.tools = [{
           name: 'return_structured_result',
@@ -17774,12 +17845,31 @@ async function requestMiniMaxJson({ settings, prompt, fetchImpl, context, signal
       }
       headers = { 'Content-Type': 'application/json', 'x-api-key': settings.minimaxApiKey, 'anthropic-version': '2023-06-01' };
     }
-    response = await fetchWithTransientRetry(fetcher, endpoint, {
-      method: 'POST',
-      headers,
-      signal: controller ? controller.signal : undefined,
-      body: JSON.stringify(body)
-    }, settings);
+    const tokenField = anthropicProtocol ? 'max_tokens' : 'max_completion_tokens';
+    for (let tokenAttempt = 1; tokenAttempt <= 2; tokenAttempt += 1) {
+      response = await fetchWithTransientRetry(fetcher, endpoint, {
+        method: 'POST', headers, signal: controller ? controller.signal : undefined, body: JSON.stringify(body)
+      }, settings);
+      if (response.ok || tokenLimit !== 16384 || tokenAttempt > 1) break;
+      const detail = await safeResponseText(response);
+      if (!isTokenLimitRejection(response, detail, tokenField)) {
+        response.__eksDetail = detail;
+        break;
+      }
+      tokenLimit = 8192;
+      settings.minimaxOutputTokenLimitFallback = 8192;
+      diag('minimax.outputTokenLimitFallback', {
+        endpoint, stage: context && context.stage, protocol: anthropicProtocol ? 'anthropic' : 'openai',
+        requestedTokenLimit, fallbackTokenLimit: tokenLimit, status: response.status, tokenField
+      });
+      body = miniMaxRequestBody(settings, prompt, context, anthropicProtocol, tokenLimit);
+      if (context?.schema) {
+        body.tools = anthropicProtocol
+          ? [{ name: 'return_structured_result', description: '返回严格符合输入 Schema 的工程知识处理结果。', input_schema: context.schema }]
+          : [{ type: 'function', function: { name: 'return_structured_result', description: '返回严格符合参数 Schema 的工程知识处理结果。', parameters: context.schema } }];
+        body.tool_choice = anthropicProtocol ? { type: 'tool', name: 'return_structured_result' } : 'auto';
+      }
+    }
   } catch (error) {
     if (error && error.name === 'AbortError') {
       if (signal?.aborted) throw abortError();
@@ -17798,7 +17888,7 @@ async function requestMiniMaxJson({ settings, prompt, fetchImpl, context, signal
     if (signal) signal.removeEventListener('abort', abortFromCaller);
   }
   if (!response.ok) {
-    const detail = await safeResponseText(response);
+    const detail = response.__eksDetail === undefined ? await safeResponseText(response) : response.__eksDetail;
     diag('minimax.http', {
       endpoint,
       stage: context && context.stage,
@@ -17810,7 +17900,9 @@ async function requestMiniMaxJson({ settings, prompt, fetchImpl, context, signal
   const payload = await response.json();
   if (anthropicProtocol) {
     if (payload?.stop_reason === 'max_tokens') {
-      throw outputTruncatedError('MiniMax 输出达到 8192 token 上限，结果已截断。');
+      throw outputTruncatedError(`MiniMax 输出在请求上限 ${configuredMiniMaxOutputTokenLimit(settings)} token 处停止（provider stop_reason: ${payload.stop_reason}）。`, {
+        requestedTokenLimit: configuredMiniMaxOutputTokenLimit(settings), providerStopReason: payload.stop_reason
+      });
     }
     const toolUse = (payload?.content || []).find((item) => item?.type === 'tool_use' && item?.name === 'return_structured_result');
     const text = (payload?.content || []).filter((item) => item?.type === 'text').map((item) => item.text || '').join('\n');
@@ -17820,7 +17912,9 @@ async function requestMiniMaxJson({ settings, prompt, fetchImpl, context, signal
   }
   const choice = payload && payload.choices && payload.choices[0];
   if (choice?.finish_reason === 'length' || choice?.finish_reason === 'max_output') {
-    throw outputTruncatedError('MiniMax 输出达到 2048 token 上限，结果已截断；请缩小单批知识点数量后重试。');
+    throw outputTruncatedError(`MiniMax 输出在请求上限 ${configuredMiniMaxOutputTokenLimit(settings)} token 处停止（provider finish_reason: ${choice.finish_reason}）。`, {
+      requestedTokenLimit: configuredMiniMaxOutputTokenLimit(settings), providerStopReason: choice.finish_reason
+    });
   }
   const toolCall = choice?.message?.tool_calls?.find((item) => item?.function?.name === 'return_structured_result');
   const content = toolCall?.function?.arguments || (choice && choice.message && choice.message.content);
@@ -17844,7 +17938,10 @@ async function sseJsonRequest(url, init, onDelta) {
   const response = await globalThis.fetch(url, init);
   if (!response.ok) {
     const text = await response.text().catch(() => '');
-    throw new Error(`SSE 请求失败（HTTP ${response.status}）${text ? `：${text.slice(0, 200)}` : ''}`);
+    const error = new Error(`SSE 请求失败（HTTP ${response.status}）${text ? `：${text.slice(0, 200)}` : ''}`);
+    error.status = response.status;
+    error.responseBody = text;
+    throw error;
   }
   if (!response.body || typeof response.body.getReader !== 'function') {
     throw new Error('当前环境不支持 ReadableStream，无法使用 SSE 流式');
@@ -17920,23 +18017,9 @@ async function requestMiniMaxStream({ settings, prompt, context, signal, onDelta
   if (!settings || !settings.minimaxApiKey) throw new Error('MiniMax 国内版 API Key 未配置');
   const endpoint = settings.minimaxEndpoint || 'https://api.minimaxi.com/anthropic/v1/messages';
   const anthropicProtocol = /\/anthropic\/v1\/messages\/?$/i.test(endpoint);
-  const body = {
-    model: settings.minimaxModel || 'MiniMax-M3',
-    messages: anthropicProtocol
-      ? [{ role: 'user', content: prompt }]
-      : [{ role: 'system', content: '你是工程知识处理引擎。严格返回 JSON，不要输出 Markdown 代码围栏。' },
-         { role: 'user', content: prompt }],
-    max_completion_tokens: 2048,
-    reasoning_split: true,
-    temperature: context && context.stage === 'classification' ? 0.1 : 0.2,
-    stream: true
-  };
-  if (anthropicProtocol) {
-    body.max_tokens = 8192;
-    delete body.max_completion_tokens;
-    delete body.reasoning_split;
-    body.system = '你是工程知识处理引擎。只通过指定工具返回结构化结果，不要输出额外说明。';
-  }
+  const requestedTokenLimit = configuredMiniMaxOutputTokenLimit(settings);
+  let tokenLimit = requestedTokenLimit;
+  let body = miniMaxRequestBody(settings, prompt, context, anthropicProtocol, tokenLimit, true);
   let headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.minimaxApiKey}` };
   if (context?.schema) {
     body.tools = anthropicProtocol
@@ -17953,23 +18036,49 @@ async function requestMiniMaxStream({ settings, prompt, context, signal, onDelta
   const abortFromCaller = () => controller?.abort();
   if (signal) signal.addEventListener('abort', abortFromCaller, { once: true });
   try {
-    const state = { text: '', toolInputJson: '' };
-    await sseJsonRequest(endpoint, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: controller ? controller.signal : undefined
-    }, (event) => {
-      collectSseTextDeltas(event, state);
-      if (typeof onDelta === 'function') onDelta(event, state);
-      // 透传进度文本（每 30 字符报告一次，避免 onProgress 风暴）
-      if (typeof onProgressText === 'function' && state.text.length % 30 < 2) {
-        onProgressText(state.text);
+    const tokenField = anthropicProtocol ? 'max_tokens' : 'max_completion_tokens';
+    for (let tokenAttempt = 1; tokenAttempt <= 2; tokenAttempt += 1) {
+      const state = { text: '', toolInputJson: '', providerStopReason: null };
+      try {
+        await sseJsonRequest(endpoint, {
+          method: 'POST', headers, body: JSON.stringify(body), signal: controller ? controller.signal : undefined
+        }, (event) => {
+          collectSseTextDeltas(event, state);
+          state.providerStopReason = event?.delta?.stop_reason || event?.stop_reason
+            || event?.choices?.[0]?.finish_reason || state.providerStopReason;
+          if (typeof onDelta === 'function') onDelta(event, state);
+          if (typeof onProgressText === 'function' && state.text.length % 30 < 2) onProgressText(state.text);
+        });
+      } catch (error) {
+        const responseLike = { status: error?.status };
+        if (tokenAttempt === 1 && tokenLimit === 16384
+          && isTokenLimitRejection(responseLike, error?.responseBody, tokenField)) {
+          tokenLimit = 8192;
+          settings.minimaxOutputTokenLimitFallback = 8192;
+          diag('minimax.outputTokenLimitFallback', {
+            endpoint, stage: context && context.stage, protocol: anthropicProtocol ? 'anthropic' : 'openai',
+            requestedTokenLimit, fallbackTokenLimit: tokenLimit, status: error.status, tokenField, streaming: true
+          });
+          body = miniMaxRequestBody(settings, prompt, context, anthropicProtocol, tokenLimit, true);
+          if (context?.schema) {
+            body.tools = anthropicProtocol
+              ? [{ name: 'return_structured_result', description: '返回严格符合输入 Schema 的工程知识处理结果。', input_schema: context.schema }]
+              : [{ type: 'function', function: { name: 'return_structured_result', description: '返回严格符合参数 Schema 的工程知识处理结果。', parameters: context.schema } }];
+            body.tool_choice = anthropicProtocol ? { type: 'tool', name: 'return_structured_result' } : 'auto';
+          }
+          continue;
+        }
+        throw error;
       }
-    });
-    const finalContent = state.toolInputJson || state.text;
-    if (!finalContent) throw new Error('MiniMax 流式返回内容为空');
-    return finalContent;
+      if (state.providerStopReason === 'max_tokens' || state.providerStopReason === 'length' || state.providerStopReason === 'max_output') {
+        throw outputTruncatedError(`MiniMax 流式输出在请求上限 ${tokenLimit} token 处停止（provider stop reason: ${state.providerStopReason}）。`, {
+          requestedTokenLimit: tokenLimit, providerStopReason: state.providerStopReason
+        });
+      }
+      const finalContent = state.toolInputJson || state.text;
+      if (!finalContent) throw new Error('MiniMax 流式返回内容为空');
+      return finalContent;
+    }
   } catch (error) {
     if (error && error.name === 'AbortError') {
       if (signal?.aborted) throw abortError();
@@ -17990,9 +18099,10 @@ function exactCoverage(coverage, key, expected, message) {
   return left.length === right.length && left.every((item, index) => item === right[index]) ? [] : [message];
 }
 
-function outputTruncatedError(message) {
+function outputTruncatedError(message, details = {}) {
   const error = new Error(message);
   error.code = 'AI_OUTPUT_TRUNCATED';
+  error.details = details;
   return error;
 }
 

@@ -5,17 +5,18 @@ const { translateRegions } = require('../src/universal-knowledge-pipeline.js');
 const english = (id, length) => ({ region_id: id, semantic_kind: 'fact', text: `${id.toLowerCase()} technical specification detail `.repeat(length).slice(0, length), source_language: { language: 'en', script_evidence: { han: 0, hiragana: 0, katakana: 0, latin: length } } });
 const translated = (request) => ({ translations: request.map((row) => ({ region_id: row.region_id, translated_text: `工程要求${(row.preserve_exactly || []).join(' ')}${'内容'.repeat(Math.max(2, Math.ceil(row.text.length / 3)))}` })) });
 
-async function truncationIsBoundedAndSplit() {
+async function noEagerSplitAndTruncationRecovery() {
   const regions = [english('a', 1000), english('b', 1000), english('c', 1000), english('d', 14915)];
-  const sizes = []; let truncated = false;
-  const result = await translateRegions(regions, { translation_batch_char_budget: 3600, translate_batch: async (request) => {
-    sizes.push(request.reduce((sum, row) => sum + row.text.length, 0));
+  const requests = []; let truncated = false;
+  const result = await translateRegions(regions, { translate_batch: async (request) => {
+    requests.push(request.map((row) => ({ id: row.region_id, length: row.text.length })));
     if (!truncated && request.length > 1) { truncated = true; throw Object.assign(new Error('provider output limit'), { code: 'AI_OUTPUT_TRUNCATED' }); }
     return translated(request);
   } });
   assert.strictEqual(regions.reduce((sum, row) => sum + row.text.length, 0), 17915);
-  assert(sizes.every((size) => size <= 3600), `oversized request: ${Math.max(...sizes)}`);
-  assert(truncated && result.telemetry.provider_calls > 5);
+  assert.strictEqual(requests[0].length, 4, 'normal batching must not eagerly split around 3600 characters');
+  assert(requests[0].some((row) => row.id === 'd' && row.length === 14915), 'large region must remain intact before real truncation');
+  assert(truncated && result.telemetry.provider_calls === 3, 'real truncation should trigger one bounded batch bisection');
   assert(result.regions.every((row) => row.translated_text && row.translation.provenance === 'configured-provider'));
 }
 
@@ -43,5 +44,5 @@ function stateAndDependencyGuards() {
   assert(main.includes('save_translation_checkpoint: (checkpoint) => this.persistArtifact'));
 }
 
-(async () => { await truncationIsBoundedAndSplit(); await partialCheckpointResume(); stateAndDependencyGuards(); console.log('universal translation resume regressions passed'); })()
+(async () => { await noEagerSplitAndTruncationRecovery(); await partialCheckpointResume(); stateAndDependencyGuards(); console.log('universal translation resume regressions passed'); })()
   .catch((error) => { console.error(error); process.exitCode = 1; });

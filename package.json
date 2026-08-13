@@ -17,6 +17,7 @@
     "gate:v3-obsidian": "node scripts/verify-v3-real-obsidian.js",
     "test:multilingual": "node scripts/test-multilingual-zh-output.js",
     "test:translation-resume": "node scripts/regression-universal-translation-resume.js",
+    "test:minimax-output-limit": "node scripts/regression-minimax-output-limit.js",
     "test:phase1": "node scripts/test-phase1-foundation.js",
     "test:phase2": "node scripts/test-phase2-candidate-pipeline.js",
     "test:phase3": "node scripts/test-phase3-review-gate.js",

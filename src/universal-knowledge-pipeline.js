@@ -345,7 +345,7 @@ function translationCacheKey(region, options = {}) {
   ]);
 }
 
-const DEFAULT_TRANSLATION_BATCH_CHARS = 3600;
+const DEFAULT_TRANSLATION_BATCH_CHARS = 24000;
 const MIN_TRANSLATION_CHUNK_CHARS = 600;
 
 function splitTranslationText(text, maxChars) {
@@ -427,10 +427,10 @@ async function translateRegions(regions, options = {}) {
     });
   }
   const batchSize = Math.max(1, Math.min(20, Number(options.translation_batch_size) || 8));
-  const maxChars = Math.max(MIN_TRANSLATION_CHUNK_CHARS, Math.min(6000,
+  const maxChars = Math.max(MIN_TRANSLATION_CHUNK_CHARS, Math.min(30000,
     Number(options.translation_batch_char_budget) || DEFAULT_TRANSLATION_BATCH_CHARS));
   const uniquePending = [...new Map(pending.map((item) => [item.key, item])).values()];
-  const work = translationWorkItems(uniquePending, maxChars);
+  const work = uniquePending.map((item) => ({ ...item, text: item.region.text, request_id: item.region.region_id }));
   const completedParts = new Map();
   const batches = [];
   for (const item of work) {
@@ -460,9 +460,8 @@ async function translateRegions(regions, options = {}) {
       for (const row of validated) {
         const item = batch.find((candidate) => candidate.request_id === row.region_id);
         completedParts.set(item.request_id, row.translated_text);
-        const siblings = work.filter((candidate) => candidate.key === item.key);
-        if (siblings.every((candidate) => completedParts.has(candidate.request_id))) {
-          const translatedText = siblings.map((candidate) => completedParts.get(candidate.request_id)).join('\n');
+        if (!item.fragment) {
+          const translatedText = row.translated_text;
           item.region.translated_text = translatedText;
           item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
             provenance: 'configured-provider', cache_key: item.key };
@@ -479,6 +478,25 @@ async function translateRegions(regions, options = {}) {
         await runBatch(batch.slice(0, middle));
         await runBatch(batch.slice(middle));
         return;
+      }
+      if (error?.code === 'AI_OUTPUT_TRUNCATED' && batch.length === 1 && batch[0].text.length > MIN_TRANSLATION_CHUNK_CHARS) {
+        const item = batch[0];
+        const pieces = splitTranslationText(item.text, Math.ceil(item.text.length / 2));
+        if (pieces.length > 1) {
+          const fragments = pieces.map((text, index) => ({ ...item, text, fragment: true,
+            request_id: `${item.request_id}::recovery-${index + 1}/${pieces.length}` }));
+          for (const fragment of fragments) await runBatch([fragment]);
+          const translatedText = fragments.map((fragment) => completedParts.get(fragment.request_id)).join('\n');
+          item.region.translated_text = translatedText;
+          item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
+            provenance: 'configured-provider', cache_key: item.key };
+          cache[item.key] = { translated_text: translatedText,
+            source_language: item.region.source_language.language, version: TRANSLATION_VERSION };
+          telemetry.regions.push({ region_id: item.region.region_id,
+            source_language: item.region.source_language.language, status: 'provider-recovered-after-truncation' });
+          await saveCheckpoint();
+          return;
+        }
       }
       telemetry.failures += batch.length;
       throw Object.assign(new Error(`翻译批次失败：${error.message}`), {

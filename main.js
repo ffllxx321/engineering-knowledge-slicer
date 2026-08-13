@@ -334,10 +334,11 @@ function forceFlushDiag() {
 
 // v1.1.8: 实时进度条 + 心跳
 // 1 秒一次刷新 elapsedMs / at，不写盘、不重渲染整个 dashboard，只更新进度条 DOM
-function startProgressHeartbeat(plugin, task, startedAt) {
+function startProgressHeartbeat(plugin, task, startedAt, runId) {
   return setInterval(() => {
     try {
       if (!task || !plugin) return;
+      if (task.run_id !== runId || plugin.activeTaskRuns?.get(task.task_id)?.runId !== runId) return;
       if (!shouldAcceptIncrementalProgress(task, plugin._terminalTaskIds)) return;
       task.progress = task.progress || {};
       task.progress.elapsedMs = Date.now() - startedAt;
@@ -1806,7 +1807,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         current.regeneration_mode ? '' : current.source_hash
       );
       // v1.1.8: 启动心跳，1 秒一次更新已用时 / 进度条，避免 18 分钟黑屏
-      const heartbeat = startProgressHeartbeat(this, current, startedAt);
+      const heartbeat = startProgressHeartbeat(this, current, startedAt, executionRun.runId);
       diag('heartbeat.start', { sourcePath: current.source_path, intervalMs: 1000 });
       let workflow = null;
       try {
@@ -2537,6 +2538,13 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
       inventory.push(item);
     }
+    const parsed = inventory.find((item) => item.name === 'parsed');
+    if (!parsed || !parsed.exists || parsed.validation !== 'valid') {
+      for (const item of inventory.filter((entry) => entry.name === 'universal-translation-checkpoint'
+        || entry.name === 'universal-canonical')) {
+        item.validation = 'invalid-dependency:parsed';
+      }
+    }
     return inventory.sort((left, right) => left.name.localeCompare(right.name));
   }
 
@@ -3230,7 +3238,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       blocks
     };
     const priorUniversal = await this.loadArtifact(task, 'universal-canonical');
-    const translationCheckpoint = await this.loadArtifact(task, 'universal-translation-checkpoint');
+    const loadedTranslationCheckpoint = await this.loadArtifact(task, 'universal-translation-checkpoint');
+    const translationCheckpoint = loadedTranslationCheckpoint?.schema_version === 'translation-checkpoint/2.0'
+      && loadedTranslationCheckpoint?.source_hash === document.source_hash
+      && loadedTranslationCheckpoint?.cache && typeof loadedTranslationCheckpoint.cache === 'object'
+      ? loadedTranslationCheckpoint : null;
     let universal = priorUniversal?.document?.source_hash === document.source_hash
       && Array.isArray(priorUniversal?.knowledge_units) ? priorUniversal : null;
     try {
@@ -3241,6 +3253,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         translation_cache: translationCheckpoint?.cache || priorUniversal?.translation_cache || {},
         translation_prompt_version: 'universal-zh-v1',
         model_version: this.settings.minimaxModel || 'configured-provider',
+        translation_batch_char_budget: 3600,
+        save_translation_checkpoint: (checkpoint) => this.persistArtifact(task, 'universal-translation-checkpoint', {
+          schema_version: 'translation-checkpoint/2.0', status: checkpoint.missing_region_ids?.length ? 'partial' : 'complete',
+          source_hash: document.source_hash, output_language: 'zh-CN', ...checkpoint
+        }),
         translate_batch: async (regions, contract) => {
           const prompt = [
             '把以下知识区域准确翻译为简体中文。不得翻译或改变 preserve_exactly 中的身份标识。',
@@ -3272,8 +3289,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     } catch (error) {
       if (error?.checkpoint) {
         await this.persistArtifact(task, 'universal-translation-checkpoint', {
-          schema_version: 'translation-checkpoint/1.0', status: 'retryable_failure',
-          output_language: 'zh-CN', ...error.checkpoint
+          schema_version: 'translation-checkpoint/2.0', status: 'retryable_failure',
+          source_hash: document.source_hash, output_language: 'zh-CN', ...error.checkpoint
         });
       }
       throw error;
@@ -3842,6 +3859,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     if (!task) return;
     task.status = 'queued';
     task.errors = [];
+    task.progress = null;
+    task.lease = null;
     task.updated_at = new Date().toISOString();
     await this.saveTasks(tasks);
     // processTask 开头会重读账本，确保 queued 状态已对该读取可见。
@@ -4249,6 +4268,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   }
 
   async setTaskProgress(task, message, details = {}) {
+    const activeRun = this.activeTaskRuns?.get(task?.task_id);
+    if (activeRun && task.run_id !== activeRun.runId) return false;
+    if (!shouldAcceptIncrementalProgress(task, this._terminalTaskIds)) return false;
     const now = new Date().toISOString();
     task.updated_at = now;
     const nextProgress = Object.assign({}, details, {
@@ -4261,6 +4283,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     this.sessionStats.lastMessage = message;
     await this.saveTasks(upsertTask(await this.loadTasks(), task));
     await this.refreshViews();
+    return true;
   }
 
   async recoverStaleProcessingTasks(tasks) {
@@ -8919,6 +8942,34 @@ function translationCacheKey(region, options = {}) {
   ]);
 }
 
+const DEFAULT_TRANSLATION_BATCH_CHARS = 3600;
+const MIN_TRANSLATION_CHUNK_CHARS = 600;
+
+function splitTranslationText(text, maxChars) {
+  const source = clean(text, 30000);
+  if (source.length <= maxChars) return [source];
+  const chunks = [];
+  let rest = source;
+  while (rest.length > maxChars) {
+    const window = rest.slice(0, maxChars + 1);
+    const candidates = [window.lastIndexOf('\n'), window.lastIndexOf('。'), window.lastIndexOf('. '), window.lastIndexOf('；'), window.lastIndexOf('; ')];
+    let cut = Math.max(...candidates);
+    if (cut < Math.min(MIN_TRANSLATION_CHUNK_CHARS, Math.floor(maxChars * 0.5))) cut = maxChars;
+    else cut += 1;
+    chunks.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) chunks.push(rest);
+  return chunks.filter(Boolean);
+}
+
+function translationWorkItems(pending, maxChars) {
+  return pending.flatMap((item) => splitTranslationText(item.region.text, maxChars).map((text, index, parts) => ({
+    ...item, text, part_index: index, part_count: parts.length,
+    request_id: parts.length === 1 ? item.region.region_id : `${item.region.region_id}::${index + 1}/${parts.length}`
+  })));
+}
+
 async function translateRegions(regions, options = {}) {
   const cache = options.translation_cache && typeof options.translation_cache === 'object'
     ? { ...options.translation_cache } : {};
@@ -8938,8 +8989,17 @@ async function translateRegions(regions, options = {}) {
       continue;
     }
     const key = translationCacheKey(region, options);
-    if (cache[key]?.translated_text) {
-      region.translated_text = cache[key].translated_text;
+    let cachedTranslation = null;
+    if (cache[key]?.version === TRANSLATION_VERSION && cache[key]?.source_language === language.language) {
+      try {
+        cachedTranslation = validateTranslationResult(
+          [{ region_id: region.region_id, text: region.text }],
+          [{ region_id: region.region_id, translated_text: cache[key].translated_text }]
+        )[0].translated_text;
+      } catch (_) { delete cache[key]; }
+    }
+    if (cachedTranslation) {
+      region.translated_text = cachedTranslation;
       region.translation = { status: 'translated', version: TRANSLATION_VERSION, provenance: 'cache', cache_key: key };
       telemetry.cache_hits += 1;
       telemetry.regions.push({ region_id: region.region_id, source_language: language.language, status: 'cache_hit' });
@@ -8964,11 +9024,27 @@ async function translateRegions(regions, options = {}) {
     });
   }
   const batchSize = Math.max(1, Math.min(20, Number(options.translation_batch_size) || 8));
-  for (let offset = 0; offset < pending.length; offset += batchSize) {
-    const batch = pending.slice(offset, offset + batchSize);
-    const request = batch.map(({ region }) => ({
-      region_id: region.region_id, source_language: region.source_language.language,
-      text: region.text, preserve_exactly: protectedTokens(region.text)
+  const maxChars = Math.max(MIN_TRANSLATION_CHUNK_CHARS, Math.min(6000,
+    Number(options.translation_batch_char_budget) || DEFAULT_TRANSLATION_BATCH_CHARS));
+  const uniquePending = [...new Map(pending.map((item) => [item.key, item])).values()];
+  const work = translationWorkItems(uniquePending, maxChars);
+  const completedParts = new Map();
+  const batches = [];
+  for (const item of work) {
+    const last = batches.at(-1);
+    if (!last || last.length >= batchSize || last.reduce((sum, row) => sum + row.text.length, 0) + item.text.length > maxChars) batches.push([item]);
+    else last.push(item);
+  }
+  const saveCheckpoint = async () => {
+    if (typeof options.save_translation_checkpoint === 'function') {
+      await options.save_translation_checkpoint({ cache, missing_region_ids: pending
+        .filter((item) => !cache[item.key]?.translated_text).map((item) => item.region.region_id), telemetry });
+    }
+  };
+  const runBatch = async (batch) => {
+    const request = batch.map((item) => ({
+      region_id: item.request_id, source_language: item.region.source_language.language,
+      text: item.text, preserve_exactly: protectedTokens(item.text)
     }));
     try {
       telemetry.provider_calls += 1;
@@ -8979,22 +9055,44 @@ async function translateRegions(regions, options = {}) {
       const validated = validateTranslationResult(request, response);
       telemetry.provider_tokens += Number(response?.usage?.total_tokens) || 0;
       for (const row of validated) {
-        const item = batch.find(({ region }) => region.region_id === row.region_id);
-        item.region.translated_text = row.translated_text;
-        item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
-          provenance: 'configured-provider', cache_key: item.key };
-        cache[item.key] = { translated_text: row.translated_text,
-          source_language: item.region.source_language.language, version: TRANSLATION_VERSION };
-        telemetry.regions.push({ region_id: row.region_id,
-          source_language: item.region.source_language.language, status: 'provider' });
+        const item = batch.find((candidate) => candidate.request_id === row.region_id);
+        completedParts.set(item.request_id, row.translated_text);
+        const siblings = work.filter((candidate) => candidate.key === item.key);
+        if (siblings.every((candidate) => completedParts.has(candidate.request_id))) {
+          const translatedText = siblings.map((candidate) => completedParts.get(candidate.request_id)).join('\n');
+          item.region.translated_text = translatedText;
+          item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
+            provenance: 'configured-provider', cache_key: item.key };
+          cache[item.key] = { translated_text: translatedText,
+            source_language: item.region.source_language.language, version: TRANSLATION_VERSION };
+          telemetry.regions.push({ region_id: item.region.region_id,
+            source_language: item.region.source_language.language, status: 'provider' });
+        }
       }
+      await saveCheckpoint();
     } catch (error) {
+      if (error?.code === 'AI_OUTPUT_TRUNCATED' && batch.length > 1) {
+        const middle = Math.ceil(batch.length / 2);
+        await runBatch(batch.slice(0, middle));
+        await runBatch(batch.slice(middle));
+        return;
+      }
       telemetry.failures += batch.length;
       throw Object.assign(new Error(`翻译批次失败：${error.message}`), {
         code: error.code || 'TRANSLATION_PROVIDER_FAILED', retryable: true, cause: error,
-        checkpoint: { cache, missing_region_ids: pending.slice(offset).map((item) => item.region.region_id), telemetry }
+        checkpoint: { cache, missing_region_ids: pending.filter((item) => !cache[item.key]?.translated_text)
+          .map((item) => item.region.region_id), telemetry }
       });
     }
+  }
+  for (const batch of batches) await runBatch(batch);
+  for (const item of pending.filter((candidate) => !candidate.region.translated_text && cache[candidate.key]?.translated_text)) {
+    item.region.translated_text = cache[item.key].translated_text;
+    item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
+      provenance: 'cache', cache_key: item.key };
+    telemetry.cache_hits += 1;
+    telemetry.regions.push({ region_id: item.region.region_id,
+      source_language: item.region.source_language.language, status: 'cache_hit' });
   }
   return { regions, cache, telemetry };
 }

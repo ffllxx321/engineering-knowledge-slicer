@@ -1,3 +1,4 @@
+// @ts-nocheck -- Runtime JS contracts are exercised by adversarial regressions.
 'use strict';
 
 // Fail-closed checks for text that can never be knowledge evidence.  These are

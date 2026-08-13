@@ -49,10 +49,10 @@ async function parserContracts() {
     assert.strictEqual(parsed.attempts[0].status, 'attempted'); assert.strictEqual(parsed.attempts[1].status, 'succeeded');
     assert(!('knowledge_card' in parsed.result));
   }
-  const native = source('pdf', '%PDF-1.4 BT (This is a sufficiently long native PDF text with engineering requirements, schedule, safety controls, verification evidence, and acceptance criteria for the representative fixture.) Tj ET');
-  const nativeResult = await selectAndParse(native, {});
-  assert.strictEqual(nativeResult.result.parser_provenance.selected_parser, 'pdf-native');
-  assert(nativeResult.attempts.some((a) => a.adapter === 'pdf-cloud' && a.status === 'skipped'));
+  const native = source('pdf', '%PDF-1.4 BT (This raw object operand must never be treated as decoded PDF text, even when it is long enough to resemble engineering content.) Tj ET');
+  const nativeResult = await selectAndParse(native, { ocr: { available: true, parse: async () => '真实解析器恢复的工程验收要求' } });
+  assert.strictEqual(nativeResult.result.parser_provenance.selected_parser, 'pdf-local-ocr');
+  assert(nativeResult.attempts.some((a) => a.adapter === 'pdf-native-probe' && a.status === 'skipped'));
   const scanned = source('pdf', '%PDF-1.4\n/image scanned only');
   const ocr = await selectAndParse(scanned, { ocr: { available: true, parse: async () => '扫描件 OCR 中文内容' } });
   assert.strictEqual(ocr.result.parser_provenance.selected_parser, 'pdf-local-ocr');

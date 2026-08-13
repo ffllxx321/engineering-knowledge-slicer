@@ -11,6 +11,7 @@ let bundle = fs.readFileSync(bundlePath, 'utf8');
 const modules = ids.map((name) => {
   let source = fs.readFileSync(path.join(root, 'src', 'v3', `${name}.js`), 'utf8');
   source = source.replace(/require\('\.\/contracts'\)/g, 'require("src/v3/contracts.js")')
+    .replace(/require\('\.\.\/content-integrity\.js'\)/g, 'require("src/content-integrity.js")')
     .replace(/require\('\.\/adapters'\)/g, 'require("src/v3/adapters.js")')
     .replace(/require\('\.\/orchestrator'\)/g, 'require("src/v3/orchestrator.js")')
     .replace(/require\('\.\/candidate-contract'\)/g, 'require("src/v3/candidate-contract.js")')

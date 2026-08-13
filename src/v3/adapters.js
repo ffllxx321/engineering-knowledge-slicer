@@ -3,6 +3,7 @@
 
 const zlib = require('zlib');
 const { attempt, buildParseResult } = require('./contracts');
+const { analyzeText } = require('../content-integrity.js');
 
 const LOCAL_EXTENSIONS = Object.freeze(['txt', 'md', 'docx', 'xlsx', 'pptx', 'msg', 'eml']);
 const decodeXml = (value) => String(value || '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
@@ -51,10 +52,10 @@ function parseEmail(source) {
 }
 
 function nativePdfText(bytes) {
-  const raw = bytes.toString('latin1'); const chunks = [];
-  for (const match of raw.matchAll(/\(([^()]*)\)\s*Tj/g)) chunks.push(match[1].replace(/\\([()\\])/g, '$1'));
-  for (const match of raw.matchAll(/\[(.*?)\]\s*TJ/gs)) for (const inner of match[1].matchAll(/\(([^()]*)\)/g)) chunks.push(inner[1]);
-  return chunks.join(' ').trim();
+  void bytes;
+  const error = new Error('V3_UNSAFE_PDF_RAW_TEXT_DISABLED: PDF object streams require a real parser with font/CMap decoding');
+  error.code = 'V3_UNSAFE_PDF_RAW_TEXT_DISABLED';
+  throw error;
 }
 
 function pdfQualityProbe(text, bytes) {
@@ -85,18 +86,17 @@ async function selectAndParse(source, options = {}) {
   }
   if (ext !== 'pdf') throw closedError([attempt('parser-selection', 'failed', `unsupported extension: ${ext}`, 0)], 'unsupported file');
 
-  const native = await timed('pdf-native-probe', async () => nativePdfText(source.bytes), records);
-  const probe = pdfQualityProbe(native, source.bytes);
-  if (probe.native_text_accepted) {
-    records.push(attempt('pdf-cloud', 'skipped', 'native text quality accepted', 0));
-    records.push(attempt('pdf-local-ocr', 'skipped', 'native text quality accepted', 0));
-    return { result: buildParseResult(source, native, { selected_parser: 'pdf-native', attempts: records }, { score: probe.score, valid: true, metrics: probe }), attempts: records };
-  }
+  // Regex scraping Tj/TJ operands from raw PDF bytes is not text extraction:
+  // it cannot decode compressed streams, fonts/CMaps, or distinguish image
+  // payloads.  The old working pipeline succeeded by using a document parser
+  // and OCR fallback, so keep the local probe diagnostic-only and fail closed.
+  records.push(attempt('pdf-native-probe', 'skipped', 'unsafe raw PDF object scraping disabled', 0));
+  const probe = pdfQualityProbe('', source.bytes);
   let cloudText = '';
   if (!options.cloud?.configured) records.push(attempt('pdf-cloud', 'skipped', 'no configured cloud key', 0));
   else if (!options.cloud.authorized) records.push(attempt('pdf-cloud', 'skipped', 'external upload not authorized or declined', 0));
   else {
-    try { cloudText = await timed('pdf-cloud', () => options.cloud.parse(source), records); } catch (_) { cloudText = ''; }
+    try { cloudText = await timed('pdf-cloud', async () => requireUsableText(await options.cloud.parse(source), 'cloud parser'), records); } catch (_) { cloudText = ''; }
     if (String(cloudText).trim()) {
       records.push(attempt('pdf-local-ocr', 'skipped', 'cloud parser produced valid content', 0));
       return { result: buildParseResult(source, cloudText, { selected_parser: 'pdf-cloud', attempts: records }, { score: 1, valid: true, metrics: probe }), attempts: records };
@@ -104,9 +104,20 @@ async function selectAndParse(source, options = {}) {
   }
   let ocrText = '';
   if (!options.ocr?.available) records.push(attempt('pdf-local-ocr', 'skipped', 'local OCR unavailable', 0));
-  else { try { ocrText = await timed('pdf-local-ocr', () => options.ocr.parse(source), records); } catch (_) { ocrText = ''; } }
+  else { try { ocrText = await timed('pdf-local-ocr', async () => requireUsableText(await options.ocr.parse(source), 'local OCR'), records); } catch (_) { ocrText = ''; } }
   if (!String(ocrText).trim()) throw closedError(records, 'no adapter produced valid content');
   return { result: buildParseResult(source, ocrText, { selected_parser: 'pdf-local-ocr', attempts: records }, { score: 0.75, valid: true, metrics: probe }), attempts: records };
+}
+
+function requireUsableText(value, adapter) {
+  const text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  const quality = analyzeText(text);
+  const languageCharacters = (text.match(/\p{L}|\p{N}/gu) || []).length;
+  if (!quality.ok || languageCharacters < 4) {
+    const reason = quality.reasons.length ? quality.reasons.join(',') : 'insufficient natural-language text';
+    throw new Error(`${adapter} returned unusable content: ${reason}`);
+  }
+  return text;
 }
 
 function closedError(records, summary) {
@@ -114,4 +125,4 @@ function closedError(records, summary) {
   const error = new Error(`V3_PARSE_FAILED: ${summary}. ${detail}`); error.code = 'V3_PARSE_FAILED'; error.attempts = records; return error;
 }
 
-module.exports = { LOCAL_EXTENSIONS, closedError, nativePdfText, parseEmail, parseOoxml, pdfQualityProbe, selectAndParse, zipEntries };
+module.exports = { LOCAL_EXTENSIONS, closedError, nativePdfText, parseEmail, parseOoxml, pdfQualityProbe, requireUsableText, selectAndParse, zipEntries };

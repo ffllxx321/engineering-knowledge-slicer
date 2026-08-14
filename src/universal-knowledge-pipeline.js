@@ -391,6 +391,10 @@ function translationCacheKey(region, options = {}) {
 
 const DEFAULT_TRANSLATION_BATCH_CHARS = 24000;
 const MIN_TRANSLATION_CHUNK_CHARS = 600;
+const MAX_TRANSLATION_SEMANTIC_RETRIES = 2;
+const TRANSLATION_SEMANTIC_ERROR_CODES = new Set([
+  'TRANSLATION_NOT_CHINESE', 'TRANSLATION_FIDELITY_INVALID'
+]);
 
 function splitTranslationText(text, maxChars) {
   const source = clean(text, 30000);
@@ -422,7 +426,8 @@ async function translateRegions(regions, options = {}) {
     ? { ...options.translation_cache } : {};
   const telemetry = {
     regions: [], cache_hits: 0, cache_misses: 0, provider_calls: 0,
-    provider_tokens: 0, failures: 0, fallback_count: 0
+    provider_tokens: 0, failures: 0, fallback_count: 0,
+    semantic_retries: 0, semantic_retry_failures: 0
   };
   const pending = [];
   for (const region of regions) {
@@ -494,13 +499,31 @@ async function translateRegions(regions, options = {}) {
       text: item.text, preserve_exactly: protectedTokens(item.text)
     }));
     try {
-      telemetry.provider_calls += 1;
-      const response = await options.translate_batch(request, {
-        target_language: OUTPUT_LANGUAGE, prompt_version: options.translation_prompt_version || TRANSLATION_VERSION,
-        contract: '只返回 translations；区域 ID 必须完整且无额外项；保留名称、代码、标准、数字、日期、单位、模态、条件和例外。'
-      });
-      const validated = validateTranslationResult(request, response);
-      telemetry.provider_tokens += Number(response?.usage?.total_tokens) || 0;
+      let response;
+      let validated;
+      for (let retryAttempt = 0; retryAttempt <= MAX_TRANSLATION_SEMANTIC_RETRIES; retryAttempt += 1) {
+        telemetry.provider_calls += 1;
+        const retryInstruction = retryAttempt > 0
+          ? '上一次返回未通过简体中文或忠实度校验。请逐区域修复：输出简体中文，完整保留 region_id、数字、单位、型号、条件和例外，不得返回原文、纯英文或日文。'
+          : undefined;
+        try {
+          response = await options.translate_batch(request, {
+            target_language: OUTPUT_LANGUAGE, prompt_version: options.translation_prompt_version || TRANSLATION_VERSION,
+            contract: '只返回 translations；区域 ID 必须完整且无额外项；保留名称、代码、标准、数字、日期、单位、模态、条件和例外。',
+            ...(retryAttempt > 0 ? { retry_attempt: retryAttempt, retry_instruction: retryInstruction } : {})
+          });
+          telemetry.provider_tokens += Number(response?.usage?.total_tokens) || 0;
+          validated = validateTranslationResult(request, response);
+          break;
+        } catch (error) {
+          if (!TRANSLATION_SEMANTIC_ERROR_CODES.has(error?.code)) throw error;
+          if (retryAttempt >= MAX_TRANSLATION_SEMANTIC_RETRIES) {
+            telemetry.semantic_retry_failures += 1;
+            throw error;
+          }
+          telemetry.semantic_retries += 1;
+        }
+      }
       for (const row of validated) {
         const item = batch.find((candidate) => candidate.request_id === row.region_id);
         completedParts.set(item.request_id, row.translated_text);

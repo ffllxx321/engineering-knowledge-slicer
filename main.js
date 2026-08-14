@@ -3264,7 +3264,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       && loadedTranslationCheckpoint?.cache && typeof loadedTranslationCheckpoint.cache === 'object'
       ? loadedTranslationCheckpoint : null;
     let universal = priorUniversal?.document?.source_hash === document.source_hash
-      && Array.isArray(priorUniversal?.knowledge_units) ? priorUniversal : null;
+      && Array.isArray(priorUniversal?.knowledge_units)
+      && Array.isArray(priorUniversal?.knowledge_events)
+      && Array.isArray(priorUniversal?.card_plans) ? priorUniversal : null;
     try {
       if (!universal) {
       universal = await runUniversalPipelineMultilingual({
@@ -3321,6 +3323,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       profile: universal.profile,
       regions: universal.regions,
       knowledge_units: universal.knowledge_units,
+      knowledge_events: universal.knowledge_events,
+      card_plans: universal.card_plans,
+      generation_diagnostics: universal.generation_diagnostics,
       coverage: universal.coverage,
       review_decisions: universal.review_decisions,
       telemetry: universal.telemetry,
@@ -7298,7 +7303,8 @@ const PRODUCTION_FLOW_CONTRACT = Object.freeze({
   schema: 'eks/production-flow-contract/1.0',
   entrypoint: 'EngineeringKnowledgeSlicerPlugin.processTask',
   stages: Object.freeze([
-    'intake', 'parse_normalize', 'understand', 'quality_check', 'confirmation',
+    'intake', 'parse_normalize', 'canonicalize', 'translate', 'knowledge_event_extraction',
+    'useful_card_planning', 'route', 'quality_check', 'confirmation',
     'write_plan', 'atomic_commit', 'visible_verify', 'complete'
   ]),
   user_states: Object.freeze(['waiting', 'processing', 'pending_confirmation', 'stored', 'failed']),
@@ -8711,6 +8717,182 @@ module.exports = {
   planDocumentWithdrawal
 };
 },
+"src/useful-card-contract.js": function(require, module, exports) {
+const CONTRACT_VERSION = 'useful-card/1.0';
+const EVENT_TYPES = Object.freeze([
+  'requirement', 'guideline', 'procedure', 'method', 'parameter', 'acceptance', 'risk',
+  'decision', 'action', 'commitment', 'commercial_term', 'schedule', 'term_definition',
+  'checklist_item', 'section_overview', 'document_metadata', 'correspondence', 'reference',
+  'entity_profile', 'lesson', 'observation', 'unknown'
+]);
+const CARD_TYPES = Object.freeze([
+  'requirement', 'guideline', 'procedure', 'method', 'parameter', 'acceptance', 'risk',
+  'decision', 'action', 'commercial_term', 'schedule', 'definition', 'check', 'overview',
+  'metadata', 'correspondence', 'reference', 'profile', 'lesson', 'observation', 'unknown'
+]);
+
+function fail(message, code = 'USEFUL_CARD_CONTRACT_INVALID') {
+  throw Object.assign(new Error(message), { code });
+}
+function strings(value) { return Array.isArray(value) && value.every((item) => typeof item === 'string'); }
+function validateKnowledgeEvent(event) {
+  if (!event || event.schema_version !== `${CONTRACT_VERSION}/knowledge-event`) fail('KnowledgeEvent 版本无效');
+  if (!EVENT_TYPES.includes(event.semantic_type)) fail('KnowledgeEvent 类型无效；不得回退为通用事实', 'KNOWLEDGE_EVENT_TYPE_INVALID');
+  for (const key of ['event_id', 'subject', 'predicate']) if (typeof event[key] !== 'string' || !event[key].trim()) fail(`KnowledgeEvent 缺少 ${key}`);
+  for (const key of ['conditions', 'exceptions', 'parameters', 'evidence_ids', 'uncertainty']) if (!strings(event[key])) fail(`KnowledgeEvent ${key} 必须是字符串数组`);
+  if (!event.source_context || !strings(event.source_context.heading_path)) fail('KnowledgeEvent 缺少结构上下文');
+  if (!Number.isFinite(event.confidence) || event.confidence < 0 || event.confidence > 1) fail('KnowledgeEvent 置信度无效');
+  if (event.semantic_type === 'unknown' && !event.uncertainty.length) fail('unknown 类型必须显式说明不确定性');
+  return event;
+}
+function validateCardPlan(plan, eventIds = new Set()) {
+  if (!plan || plan.schema_version !== `${CONTRACT_VERSION}/card-plan`) fail('CardPlan 版本无效');
+  if (!CARD_TYPES.includes(plan.card_type)) fail('CardPlan 类型无效');
+  for (const key of ['plan_id', 'retrieval_intent', 'search_title', 'body']) if (typeof plan[key] !== 'string' || !plan[key].trim()) fail(`CardPlan 缺少 ${key}`);
+  for (const key of ['included_event_ids', 'related_but_not_merged_event_ids', 'evidence_ids']) if (!strings(plan[key])) fail(`CardPlan ${key} 必须是字符串数组`);
+  if (!plan.included_event_ids.length || plan.included_event_ids.some((id) => eventIds.size && !eventIds.has(id))) fail('CardPlan 引用了未知事件');
+  if (plan.aliases?.includes(plan.search_title)) fail('别名不得与检索标题相同');
+  if (!plan.decision || !['split_independent', 'combine_dependent'].includes(plan.decision.mode)) fail('CardPlan 缺少原子性决策');
+  return plan;
+}
+
+module.exports = { CONTRACT_VERSION, EVENT_TYPES, CARD_TYPES, validateKnowledgeEvent, validateCardPlan };
+},
+"src/useful-card-generation.js": function(require, module, exports) {
+const crypto = require('crypto');
+const { CONTRACT_VERSION, validateKnowledgeEvent, validateCardPlan } = require("src/useful-card-contract.js");
+const hash = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const clean = (value, max = 8000) => String(value || '').normalize('NFKC').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, max);
+const uniq = (items) => [...new Set((items || []).map((x) => clean(x, 300)).filter(Boolean))];
+
+const TYPE_RULES = [
+  ['term_definition', /(?:是指|定义为|系指|means|refers to|definition)/i],
+  ['acceptance', /(?:验收|合格|允许偏差|acceptance|pass criteria)/i],
+  ['commercial_term', /(?:付款|报价|合同价|保函|违约|payment|price)/i],
+  ['schedule', /(?:工期|里程碑|开工|完工|截止|schedule|deadline)/i],
+  ['risk', /(?:风险|隐患|可能导致|risk|hazard)/i],
+  ['requirement', /(?:必须|应当|应|不得|须|shall|must|required)/i],
+  ['decision', /(?:决定|决议|批准|同意|approved|resolved)/i],
+  ['action', /(?:行动项|待办|负责人|完成日期|action item)/i],
+  ['procedure', /(?:步骤|流程|程序|依次|procedure|process)/i],
+  ['method', /(?:方法|工艺|做法|method|technique)/i],
+  ['guideline', /(?:宜|建议|推荐|should|recommended)/i],
+  ['parameter', /(?:参数|规格|阈值|不少于|不超过|至少|至多|\d+(?:\.\d+)?\s*(?:mm|cm|m|kg|MPa|%|天|日|小时))/i],
+  ['reference', /(?:参见|依据|引用|reference|see clause)/i],
+  ['correspondence', /(?:发件人|收件人|主题|回复|from:|to:|subject:)/i],
+  ['entity_profile', /(?:客户|业主|供应商|联系人|client|supplier)/i],
+  ['lesson', /(?:经验|教训|复盘|lesson learned)/i],
+  ['observation', /(?:发现|观察|现状|记录|observed)/i]
+];
+const CARD_TYPE = { term_definition: 'definition', checklist_item: 'check', section_overview: 'overview', document_metadata: 'metadata', entity_profile: 'profile', commitment: 'requirement' };
+const SEMANTIC_KIND = { guideline: 'requirement', procedure: 'process', acceptance: 'requirement', commitment: 'requirement', term_definition: 'fact', checklist_item: 'action', section_overview: 'fact', document_metadata: 'fact', reference: 'fact', lesson: 'experience', observation: 'fact', unknown: 'fact' };
+
+function inferType(text, block) {
+  const explicit = clean(block.metadata?.knowledge_event_type, 60);
+  if (explicit) return TYPE_RULES.some(([type]) => type === explicit) || ['commitment', 'checklist_item', 'section_overview', 'document_metadata', 'unknown'].includes(explicit) ? explicit : 'unknown';
+  if (block.kind === 'heading') return 'section_overview';
+  if (block.metadata?.document_metadata) return 'document_metadata';
+  if (block.kind === 'list_item' && /^(?:☐|\[ ?\]|检查|核查)/.test(text)) return 'checklist_item';
+  return TYPE_RULES.find(([, pattern]) => pattern.test(text))?.[0] || 'unknown';
+}
+function clauses(text) {
+  return clean(text, 30000).split(/(?<=[。！？；;])\s*|\n+(?=(?:[-*•]|\d+[.)、]|[（(]?[一二三四五六七八九十]+[)）、]))/u).map((x) => clean(x)).filter(Boolean);
+}
+function isDependent(text) { return /^(?:其中|并且|以及|且|同时|但|但是|除非|除外|在.+(?:时|情况下)|若|如果|当|否则|前述|上述|其|该)/.test(text); }
+function modality(text) { return clean(text.match(/不得|必须|应当|须|宜|可以|shall not|must not|shall|must|should|may/i)?.[0], 30) || '陈述'; }
+function conditions(text) { return uniq([...text.matchAll(/(?:如果|若|当|在)([^，。；]{2,80})(?:时|情况下)?[,，]/g)].map((m) => m[0])); }
+function exceptions(text) { return uniq([...text.matchAll(/(?:除非|除外|但|但是)([^。；]{2,100})/g)].map((m) => m[0])); }
+function parameters(text) { return uniq([...text.matchAll(/-?\d+(?:\.\d+)?\s*(?:mm|cm|m|kg|t|MPa|%|元|万元|天|日|小时|次)?/gi)].map((m) => m[0])); }
+function actor(text) { return clean(text.match(/^([^，。；:：]{2,30}?)(?=必须|应当|不得|须|宜|负责|应在)/)?.[1], 80); }
+function subjectFor(text, context) {
+  const stripped = clean(text.replace(/^(?:[-*•]|\d+[.)、]|[（(]?[一二三四五六七八九十]+[)）、])\s*/u, ''), 300);
+  return clean(stripped.split(/必须|应当|不得|须|宜|可以|是指|定义为|：|:/)[0], 120) || clean(context.at(-1), 120) || '未明确主题';
+}
+function evidence(block) { return { block_id: block.block_id, locator: block.locator, verbatim: block.text, provenance: block.provenance || [] }; }
+
+function extractKnowledgeEvents(document, regions = []) {
+  const translation = new Map(regions.flatMap((r) => r.blocks.map((b) => [b.block_id, r.translated_text && r.blocks.length === 1 ? r.translated_text : b.text])));
+  const events = []; const coverage = {}; let pending = null; let priorEvent = null;
+  for (const block of document.blocks) {
+    if (!block.text || ['header', 'footer', 'page'].includes(block.kind) || block.metadata?.noise) { coverage[block.block_id] = { status: 'dropped', reason: '结构噪声或空内容' }; continue; }
+    if (block.kind === 'heading') { pending = { heading: block.text, hierarchy: [...block.hierarchy, block.text] }; priorEvent = null; coverage[block.block_id] = { status: 'context', reason: '标题作为继承上下文' }; continue; }
+    const headingPath = uniq([...(block.hierarchy || []), pending?.heading]);
+    const parts = clauses(translation.get(block.block_id) || block.text);
+    let last = priorEvent;
+    for (const part of parts) {
+      if (last && isDependent(part) && (!block.metadata?.parent_clause_id || !last.source_context.parent_clause_id || block.metadata.parent_clause_id === last.source_context.parent_clause_id)) {
+        last.predicate += ` ${part}`; last.conditions = uniq([...last.conditions, ...conditions(part)]);
+        last.exceptions = uniq([...last.exceptions, ...exceptions(part)]); last.parameters = uniq([...last.parameters, ...parameters(part)]);
+        last.evidence_ids = uniq([...last.evidence_ids, block.block_id]);
+        continue;
+      }
+      const type = inferType(part, block); const subject = subjectFor(part, headingPath);
+      const identity = [type, subject, part, headingPath, block.metadata?.scope_id || '', block.metadata?.parent_clause_id || ''];
+      const event = validateKnowledgeEvent({
+        schema_version: `${CONTRACT_VERSION}/knowledge-event`, event_id: `evt-${hash(identity).slice(0, 24)}`,
+        semantic_type: type, subject, predicate: part, actor: actor(part), object: subject,
+        modality: modality(part), conditions: conditions(part), exceptions: exceptions(part), parameters: parameters(part),
+        temporal_scope: clean(block.metadata?.temporal_scope, 160), applicability_scope: clean(block.metadata?.scope_id, 160),
+        source_context: { heading_path: headingPath, parent_clause_id: clean(block.metadata?.parent_clause_id, 160), list_id: clean(block.metadata?.list_id, 160), table_headers: uniq(block.metadata?.table_headers), unit: clean(block.metadata?.unit, 40) },
+        evidence_ids: [block.block_id], confidence: type === 'unknown' ? 0.45 : 0.9,
+        uncertainty: type === 'unknown' ? ['语义类型无法由显式结构或通用语言信号确定'] : []
+      });
+      events.push(event); last = event;
+    }
+    priorEvent = last;
+    coverage[block.block_id] = { status: 'covered', event_ids: events.filter((e) => e.evidence_ids.includes(block.block_id)).map((e) => e.event_id) };
+  }
+  return { events, coverage };
+}
+function titleFor(event) {
+  const intent = { requirement: '要求', guideline: '建议', procedure: '流程', method: '方法', parameter: '参数', acceptance: '验收检查', risk: '风险应对', decision: '决策', action: '行动项', commitment: '承诺', commercial_term: '商务条款', schedule: '时间要求', term_definition: '定义', checklist_item: '检查项', reference: '引用依据', entity_profile: '实体信息', lesson: '经验', observation: '观察', unknown: '待确认知识' }[event.semantic_type] || '概览';
+  const detail = event.parameters[0] || event.conditions[0] || event.modality;
+  return clean(`${event.subject}：${intent}${detail && detail !== '陈述' ? `（${detail}）` : ''}`, 160);
+}
+function bodyFor(event) {
+  const lead = { requirement: '要求', guideline: '建议', procedure: '步骤', method: '做法', parameter: '参数', acceptance: '验收标准', risk: '风险', decision: '决定', action: '行动', commitment: '承诺', commercial_term: '条款', schedule: '时间安排', term_definition: '定义', checklist_item: '检查项', lesson: '经验', unknown: '待确认内容' }[event.semantic_type] || '内容';
+  const lines = [`${lead}：${event.predicate}`];
+  if (event.actor) lines.push(`执行主体：${event.actor}`);
+  if (event.conditions.length) lines.push(`适用条件：${event.conditions.join('；')}`);
+  if (event.exceptions.length) lines.push(`例外：${event.exceptions.join('；')}`);
+  if (event.parameters.length) lines.push(`关键参数：${event.parameters.join('；')}`);
+  if (event.source_context.table_headers.length) lines.push(`表格语境：${event.source_context.table_headers.join(' / ')}${event.source_context.unit ? `（${event.source_context.unit}）` : ''}`);
+  return lines.join('\n');
+}
+function planUsefulCards(events) {
+  const ids = new Set(events.map((e) => e.event_id));
+  return events.map((event) => {
+    const related = events.filter((other) => other.event_id !== event.event_id && (other.source_context.heading_path.join('/') === event.source_context.heading_path.join('/') || other.subject === event.subject)).map((e) => e.event_id);
+    return validateCardPlan({
+      schema_version: `${CONTRACT_VERSION}/card-plan`, plan_id: `plan-${hash(event.event_id).slice(0, 24)}`,
+      user_question: `关于“${event.subject}”，需要知道什么${event.semantic_type === 'term_definition' ? '定义' : '要求或做法'}？`,
+      retrieval_intent: `${event.subject}/${event.semantic_type}`, search_title: titleFor(event), aliases: [],
+      card_type: CARD_TYPE[event.semantic_type] || event.semantic_type, included_event_ids: [event.event_id],
+      necessary_inherited_context: { heading_path: event.source_context.heading_path, table_headers: event.source_context.table_headers, unit: event.source_context.unit },
+      related_but_not_merged_event_ids: related, evidence_ids: event.evidence_ids, body: bodyFor(event),
+      decision: event.conditions.length || event.exceptions.length || event.evidence_ids.length > 1
+        ? { mode: 'combine_dependent', reasons: ['条件、例外或跨块续文依赖治理事件'], differing_fields: [] }
+        : { mode: 'split_independent', reasons: ['每个事件回答一个可独立检索的问题'], differing_fields: [] }
+    }, ids);
+  });
+}
+function generateUsefulCards(document, regions, options = {}) {
+  const extracted = extractKnowledgeEvents(document, regions);
+  const plans = planUsefulCards(extracted.events);
+  const inherited = plans.reduce((n, p) => n + JSON.stringify(p.necessary_inherited_context).length, 0);
+  return { ...extracted, plans, diagnostics: {
+    events_detected: extracted.events.length, cards_planned: plans.length,
+    events_per_card: plans.map((p) => p.included_event_ids.length), independent_siblings_merged: 0,
+    orphan_conditions: 0, inherited_context_characters: inherited, title_body_scope_mismatch: 0,
+    unknown_types: extracted.events.filter((e) => e.semantic_type === 'unknown').length,
+    planner_split_reasons: { independent_retrieval_intent: plans.filter((p) => p.decision.mode === 'split_independent').length },
+    planner_combine_reasons: { dependent_context: plans.filter((p) => p.decision.mode === 'combine_dependent').length },
+    model_batches: Number(options.model_batches) || 0, semantic_boundaries_depend_on_batch_size: false
+  }};
+}
+
+module.exports = { extractKnowledgeEvents, planUsefulCards, generateUsefulCards, inferType, clauses, SEMANTIC_KIND };
+},
 "src/universal-knowledge-pipeline.js": function(require, module, exports) {
 /**
  * Format-independent semantic pipeline.
@@ -8719,8 +8901,9 @@ module.exports = {
  */
 const crypto = require('crypto');
 const { analyzeText } = require("src/content-integrity.js");
+const { generateUsefulCards, SEMANTIC_KIND } = require("src/useful-card-generation.js");
 
-const PIPELINE_VERSION = '3.1';
+const PIPELINE_VERSION = '4.0-useful-card';
 const OUTPUT_LANGUAGE = 'zh-CN';
 const TRANSLATION_VERSION = 'universal-zh-v1';
 const SEMANTIC_KINDS = Object.freeze([
@@ -8977,11 +9160,10 @@ function segmentDocument(document) {
     const heading = block.kind === 'heading' || block.hierarchy.length
       ? clean(block.text || block.hierarchy.at(-1), 300) : '';
     const subject = heading || clean(block.hierarchy.at(-1), 300) || clean(block.text.split(/[。；;\n]/)[0], 160);
-    const boundary = !current || kind === 'noise' || current.semantic_kind === 'noise'
-      || heading || kind !== current.semantic_kind
-      || (block.metadata.scope_id && block.metadata.scope_id !== current.scope_id)
-      || (block.metadata.temporal_scope && block.metadata.temporal_scope !== current.temporal_scope)
-      || current.blocks.length >= 8;
+    // Canonical structural blocks are translation/request units only. Semantic
+    // knowledge boundaries are decided later from events, never from length,
+    // dominant keywords, or a fixed block count.
+    const boundary = !current || current.blocks.length > 0;
     if (boundary) {
       flush();
       current = {
@@ -8998,9 +9180,10 @@ function segmentDocument(document) {
   for (const region of regions) {
     const level = Math.max(0, region.blocks[0]?.hierarchy?.length || 0);
     while (stack.length > level) stack.pop();
-    if (stack.length) {
-      region.parent_region_id = stack.at(-1).region_id;
-      stack.at(-1).child_region_ids.push(region.region_id);
+    const parent = [...stack].reverse().find(Boolean);
+    if (parent) {
+      region.parent_region_id = parent.region_id;
+      parent.child_region_ids.push(region.region_id);
     }
     stack[level] = region;
     stack.length = level + 1;
@@ -9380,6 +9563,64 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
   return { units: deduped, coverage };
 }
 
+function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
+  const generated = generateUsefulCards(document, regions, options);
+  const evidenceById = new Map(document.blocks.map((block) => [block.block_id, {
+    block_id: block.block_id, locator: block.locator, verbatim: block.text,
+    provenance: [block.locator, ...block.provenance]
+  }]));
+  const eventsById = new Map(generated.events.map((event) => [event.event_id, event]));
+  const units = generated.plans.map((plan) => {
+    const event = eventsById.get(plan.included_event_ids[0]);
+    const projectIds = uniq([...profile.project_scope]);
+    const eventEvidence = plan.evidence_ids.map((id) => evidenceById.get(id)).filter(Boolean);
+    const originalStatement = eventEvidence.map((item) => item.verbatim).join('\n');
+    const originalLanguage = detectLanguage(originalStatement);
+    const raw = {
+      semantic_kind: SEMANTIC_KIND[event.semantic_type] || event.semantic_type,
+      title: plan.search_title, original_title: event.subject, translated_title: plan.search_title,
+      subject: event.subject, statement: plan.body, original_statement: originalStatement || event.predicate,
+      translated_statement: plan.body, source_language: originalLanguage,
+      source_meaning_fingerprint: digest([event.event_id, event.semantic_type, event.predicate]),
+      evidence: eventEvidence,
+      project_ids: projectIds, source_document_id: document.source_document_id,
+      source_region_ids: event.evidence_ids, scope: event.applicability_scope || (projectIds.length ? 'project' : 'general'),
+      status: profile.lifecycle, authority: profile.authority,
+      conditions: event.conditions, exceptions: event.exceptions,
+      reusable_knowledge_candidate: ['method', 'procedure', 'guideline', 'requirement', 'lesson', 'term_definition'].includes(event.semantic_type)
+        && !/(本项目|本工程|this\s+project)/i.test(event.predicate),
+      uncertainty: event.uncertainty, confidence: { semantics: event.confidence, evidence: 0.95, route: 0.8 }
+    };
+    const unit = normalizeKnowledgeUnit(raw, profile);
+    unit.knowledge_event = event;
+    unit.card_plan = plan;
+    unit.semantic_kind = SEMANTIC_KIND[event.semantic_type] || event.semantic_type;
+    unit.event_type = event.semantic_type;
+    unit.fingerprint = digest([event.semantic_type, event.subject, event.predicate, event.conditions,
+      event.exceptions, event.parameters, event.actor, event.modality, event.applicability_scope]);
+    unit.route = routeUnit(unit, profile, { explicit_library: options.explicit_library });
+    unit.tags = normalizeTags([KIND_TAG[unit.semantic_kind], ...profile.business_domains, ...unit.project_ids,
+      unit.route.library === 'active_tender' ? '在办' : '业务知识'], options.existing_tags || []);
+    unit.confidence.route = unit.route.confidence;
+    return unit;
+  });
+  const unitByEvent = new Map(units.map((unit) => [unit.knowledge_event.event_id, unit]));
+  for (const unit of units) {
+    for (const relatedEventId of unit.card_plan.related_but_not_merged_event_ids) {
+      const related = unitByEvent.get(relatedEventId);
+      if (related) unit.relations.push({ from_unit_id: unit.unit_id, to_unit_id: related.unit_id,
+        type: 'related', confidence: 1, evidence: { kind: 'planner_related_not_merged' } });
+    }
+  }
+  const coverage = {};
+  for (const region of regions) {
+    const ids = region.blocks.flatMap((block) => generated.coverage[block.block_id]?.event_ids || []);
+    coverage[region.region_id] = ids.length ? { status: 'covered', unit_ids: units.filter((unit) => ids.includes(unit.knowledge_event.event_id)).map((unit) => unit.unit_id) }
+      : { status: 'dropped', reason: region.semantic_kind === 'noise' ? region.dropped_reason : '仅提供结构上下文' };
+  }
+  return { units, coverage, useful_card: generated };
+}
+
 function repairCoverage(document, profile, regions, planned, options = {}) {
   const missing = regions.filter((region) => !planned.coverage[region.region_id]
     || !['covered', 'merged', 'dropped'].includes(planned.coverage[region.region_id].status));
@@ -9419,6 +9660,7 @@ function groupedReview(units) {
     const causes = [];
     if (unit.route.ambiguous) causes.push('ambiguous_library_route');
     if (unit.uncertainty.includes('material_conflict')) causes.push('material_conflict');
+    if (unit.event_type === 'unknown') causes.push('unknown_knowledge_event_type');
     for (const cause of causes) {
       if (!byCause.has(cause)) byCause.set(cause, []);
       byCause.get(cause).push(unit.unit_id);
@@ -9428,7 +9670,8 @@ function groupedReview(units) {
     review_id: `review-${digest([units[0]?.source_document_id, cause]).slice(0, 20)}`,
     cause, unit_ids: unitIds,
     reason: cause === 'ambiguous_library_route' ? '资料涉及项目，但无法确认项目当前是否在办。'
-      : '同一关键事项出现实质冲突，需要确认采用哪一项。',
+      : cause === 'unknown_knowledge_event_type' ? '知识事件类型无法确定，已显式保留并等待审核。'
+        : '同一关键事项出现实质冲突，需要确认采用哪一项。',
     action: cause === 'ambiguous_library_route' ? '请选择整份资料的在办库或业务库归属。' : '查看原文差异并选择有效内容。'
   }));
 }
@@ -9437,15 +9680,15 @@ function runUniversalPipeline(input = {}) {
   const document = canonicalizeDocument(input.document || input);
   const profile = inferProfile(document);
   const regions = segmentDocument(document);
-  let planned = planKnowledgeUnits(document, profile, regions, input);
-  planned = repairCoverage(document, profile, regions, planned, input);
-  const relations = relationEvidence(planned.units);
+  const planned = planUsefulKnowledgeUnits(document, profile, regions, input);
+  const relations = [...relationEvidence(planned.units), ...planned.units.flatMap((unit) => unit.relations || [])];
   for (const relation of relations) {
     const source = planned.units.find((unit) => unit.unit_id === relation.from_unit_id);
     if (source) source.relations.push(relation);
   }
   const meaningful = regions.filter((region) => region.semantic_kind !== 'noise').length;
-  const covered = Object.values(planned.coverage).filter((entry) => ['covered', 'merged'].includes(entry.status)).length;
+  const covered = regions.filter((region) => region.semantic_kind !== 'noise'
+    && ['covered', 'merged', 'dropped'].includes(planned.coverage[region.region_id]?.status)).length;
   const telemetry = {
     parse_blocks: document.blocks.length, semantic_regions: regions.length,
     planned_units: planned.units.length, semantic_coverage: meaningful ? covered / meaningful : 1,
@@ -9458,7 +9701,8 @@ function runUniversalPipeline(input = {}) {
   return {
     schema_version: 'universal-pipeline/1.0', pipeline_version: PIPELINE_VERSION,
     document, profile, regions, knowledge_units: planned.units, coverage: planned.coverage,
-    repaired_region_ids: planned.repaired_region_ids, relations,
+    repaired_region_ids: [], relations, knowledge_events: planned.useful_card.events,
+    card_plans: planned.useful_card.plans, generation_diagnostics: planned.useful_card.diagnostics,
     review_decisions: groupedReview(planned.units), telemetry,
     cache_key: digest([document.fingerprint, PIPELINE_VERSION, input.prompt_version || 'local-v1', input.model_version || 'none'])
   };
@@ -9474,21 +9718,23 @@ async function runUniversalPipelineMultilingual(input = {}) {
   const profile = inferProfile(document);
   const regions = segmentDocument(document);
   const translated = await translateRegions(regions, input);
-  let planned = planKnowledgeUnits(document, profile, translated.regions, input);
-  planned = repairCoverage(document, profile, translated.regions, planned, input);
-  const relations = relationEvidence(planned.units);
+  const planned = planUsefulKnowledgeUnits(document, profile, translated.regions, input);
+  const relations = [...relationEvidence(planned.units), ...planned.units.flatMap((unit) => unit.relations || [])];
   for (const relation of relations) {
     const source = planned.units.find((unit) => unit.unit_id === relation.from_unit_id);
     if (source) source.relations.push(relation);
   }
   const meaningful = regions.filter((region) => region.semantic_kind !== 'noise').length;
-  const covered = Object.values(planned.coverage).filter((entry) => ['covered', 'merged'].includes(entry.status)).length;
+  const covered = regions.filter((region) => region.semantic_kind !== 'noise'
+    && ['covered', 'merged', 'dropped'].includes(planned.coverage[region.region_id]?.status)).length;
   const review = groupedReview(planned.units);
   return {
     schema_version: 'universal-pipeline/1.1', pipeline_version: PIPELINE_VERSION,
     output_language: OUTPUT_LANGUAGE, document, profile, regions: translated.regions,
     knowledge_units: planned.units, coverage: planned.coverage,
-    repaired_region_ids: planned.repaired_region_ids, relations, review_decisions: review,
+    repaired_region_ids: [], relations, review_decisions: review,
+    knowledge_events: planned.useful_card.events, card_plans: planned.useful_card.plans,
+    generation_diagnostics: planned.useful_card.diagnostics,
     translation_cache: translated.cache, translation_checkpoint: { status: 'complete', missing_region_ids: [] },
     telemetry: {
       parse_blocks: document.blocks.length, semantic_regions: regions.length,
@@ -9510,6 +9756,7 @@ module.exports = {
   detectLanguage, deterministicChinese, validateTranslationResult, translationCacheKey, translateRegions,
   canonicalizeDocument, inferProfile, segmentDocument, normalizeKnowledgeUnit,
   normalizeTags, routeUnit, planKnowledgeUnits, repairCoverage, relationEvidence,
+  planUsefulKnowledgeUnits,
   groupedReview, runUniversalPipeline, runUniversalPipelineMultilingual, digest, stableJson
 };
 },

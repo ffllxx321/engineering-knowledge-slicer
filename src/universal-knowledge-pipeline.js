@@ -7,8 +7,9 @@
  */
 const crypto = require('crypto');
 const { analyzeText } = require('./content-integrity.js');
+const { generateUsefulCards, SEMANTIC_KIND } = require('./useful-card-generation.js');
 
-const PIPELINE_VERSION = '3.1';
+const PIPELINE_VERSION = '4.0-useful-card';
 const OUTPUT_LANGUAGE = 'zh-CN';
 const TRANSLATION_VERSION = 'universal-zh-v1';
 const SEMANTIC_KINDS = Object.freeze([
@@ -265,11 +266,10 @@ function segmentDocument(document) {
     const heading = block.kind === 'heading' || block.hierarchy.length
       ? clean(block.text || block.hierarchy.at(-1), 300) : '';
     const subject = heading || clean(block.hierarchy.at(-1), 300) || clean(block.text.split(/[。；;\n]/)[0], 160);
-    const boundary = !current || kind === 'noise' || current.semantic_kind === 'noise'
-      || heading || kind !== current.semantic_kind
-      || (block.metadata.scope_id && block.metadata.scope_id !== current.scope_id)
-      || (block.metadata.temporal_scope && block.metadata.temporal_scope !== current.temporal_scope)
-      || current.blocks.length >= 8;
+    // Canonical structural blocks are translation/request units only. Semantic
+    // knowledge boundaries are decided later from events, never from length,
+    // dominant keywords, or a fixed block count.
+    const boundary = !current || current.blocks.length > 0;
     if (boundary) {
       flush();
       current = {
@@ -286,9 +286,10 @@ function segmentDocument(document) {
   for (const region of regions) {
     const level = Math.max(0, region.blocks[0]?.hierarchy?.length || 0);
     while (stack.length > level) stack.pop();
-    if (stack.length) {
-      region.parent_region_id = stack.at(-1).region_id;
-      stack.at(-1).child_region_ids.push(region.region_id);
+    const parent = [...stack].reverse().find(Boolean);
+    if (parent) {
+      region.parent_region_id = parent.region_id;
+      parent.child_region_ids.push(region.region_id);
     }
     stack[level] = region;
     stack.length = level + 1;
@@ -668,6 +669,64 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
   return { units: deduped, coverage };
 }
 
+function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
+  const generated = generateUsefulCards(document, regions, options);
+  const evidenceById = new Map(document.blocks.map((block) => [block.block_id, {
+    block_id: block.block_id, locator: block.locator, verbatim: block.text,
+    provenance: [block.locator, ...block.provenance]
+  }]));
+  const eventsById = new Map(generated.events.map((event) => [event.event_id, event]));
+  const units = generated.plans.map((plan) => {
+    const event = eventsById.get(plan.included_event_ids[0]);
+    const projectIds = uniq([...profile.project_scope]);
+    const eventEvidence = plan.evidence_ids.map((id) => evidenceById.get(id)).filter(Boolean);
+    const originalStatement = eventEvidence.map((item) => item.verbatim).join('\n');
+    const originalLanguage = detectLanguage(originalStatement);
+    const raw = {
+      semantic_kind: SEMANTIC_KIND[event.semantic_type] || event.semantic_type,
+      title: plan.search_title, original_title: event.subject, translated_title: plan.search_title,
+      subject: event.subject, statement: plan.body, original_statement: originalStatement || event.predicate,
+      translated_statement: plan.body, source_language: originalLanguage,
+      source_meaning_fingerprint: digest([event.event_id, event.semantic_type, event.predicate]),
+      evidence: eventEvidence,
+      project_ids: projectIds, source_document_id: document.source_document_id,
+      source_region_ids: event.evidence_ids, scope: event.applicability_scope || (projectIds.length ? 'project' : 'general'),
+      status: profile.lifecycle, authority: profile.authority,
+      conditions: event.conditions, exceptions: event.exceptions,
+      reusable_knowledge_candidate: ['method', 'procedure', 'guideline', 'requirement', 'lesson', 'term_definition'].includes(event.semantic_type)
+        && !/(本项目|本工程|this\s+project)/i.test(event.predicate),
+      uncertainty: event.uncertainty, confidence: { semantics: event.confidence, evidence: 0.95, route: 0.8 }
+    };
+    const unit = normalizeKnowledgeUnit(raw, profile);
+    unit.knowledge_event = event;
+    unit.card_plan = plan;
+    unit.semantic_kind = SEMANTIC_KIND[event.semantic_type] || event.semantic_type;
+    unit.event_type = event.semantic_type;
+    unit.fingerprint = digest([event.semantic_type, event.subject, event.predicate, event.conditions,
+      event.exceptions, event.parameters, event.actor, event.modality, event.applicability_scope]);
+    unit.route = routeUnit(unit, profile, { explicit_library: options.explicit_library });
+    unit.tags = normalizeTags([KIND_TAG[unit.semantic_kind], ...profile.business_domains, ...unit.project_ids,
+      unit.route.library === 'active_tender' ? '在办' : '业务知识'], options.existing_tags || []);
+    unit.confidence.route = unit.route.confidence;
+    return unit;
+  });
+  const unitByEvent = new Map(units.map((unit) => [unit.knowledge_event.event_id, unit]));
+  for (const unit of units) {
+    for (const relatedEventId of unit.card_plan.related_but_not_merged_event_ids) {
+      const related = unitByEvent.get(relatedEventId);
+      if (related) unit.relations.push({ from_unit_id: unit.unit_id, to_unit_id: related.unit_id,
+        type: 'related', confidence: 1, evidence: { kind: 'planner_related_not_merged' } });
+    }
+  }
+  const coverage = {};
+  for (const region of regions) {
+    const ids = region.blocks.flatMap((block) => generated.coverage[block.block_id]?.event_ids || []);
+    coverage[region.region_id] = ids.length ? { status: 'covered', unit_ids: units.filter((unit) => ids.includes(unit.knowledge_event.event_id)).map((unit) => unit.unit_id) }
+      : { status: 'dropped', reason: region.semantic_kind === 'noise' ? region.dropped_reason : '仅提供结构上下文' };
+  }
+  return { units, coverage, useful_card: generated };
+}
+
 function repairCoverage(document, profile, regions, planned, options = {}) {
   const missing = regions.filter((region) => !planned.coverage[region.region_id]
     || !['covered', 'merged', 'dropped'].includes(planned.coverage[region.region_id].status));
@@ -707,6 +766,7 @@ function groupedReview(units) {
     const causes = [];
     if (unit.route.ambiguous) causes.push('ambiguous_library_route');
     if (unit.uncertainty.includes('material_conflict')) causes.push('material_conflict');
+    if (unit.event_type === 'unknown') causes.push('unknown_knowledge_event_type');
     for (const cause of causes) {
       if (!byCause.has(cause)) byCause.set(cause, []);
       byCause.get(cause).push(unit.unit_id);
@@ -716,7 +776,8 @@ function groupedReview(units) {
     review_id: `review-${digest([units[0]?.source_document_id, cause]).slice(0, 20)}`,
     cause, unit_ids: unitIds,
     reason: cause === 'ambiguous_library_route' ? '资料涉及项目，但无法确认项目当前是否在办。'
-      : '同一关键事项出现实质冲突，需要确认采用哪一项。',
+      : cause === 'unknown_knowledge_event_type' ? '知识事件类型无法确定，已显式保留并等待审核。'
+        : '同一关键事项出现实质冲突，需要确认采用哪一项。',
     action: cause === 'ambiguous_library_route' ? '请选择整份资料的在办库或业务库归属。' : '查看原文差异并选择有效内容。'
   }));
 }
@@ -725,15 +786,15 @@ function runUniversalPipeline(input = {}) {
   const document = canonicalizeDocument(input.document || input);
   const profile = inferProfile(document);
   const regions = segmentDocument(document);
-  let planned = planKnowledgeUnits(document, profile, regions, input);
-  planned = repairCoverage(document, profile, regions, planned, input);
-  const relations = relationEvidence(planned.units);
+  const planned = planUsefulKnowledgeUnits(document, profile, regions, input);
+  const relations = [...relationEvidence(planned.units), ...planned.units.flatMap((unit) => unit.relations || [])];
   for (const relation of relations) {
     const source = planned.units.find((unit) => unit.unit_id === relation.from_unit_id);
     if (source) source.relations.push(relation);
   }
   const meaningful = regions.filter((region) => region.semantic_kind !== 'noise').length;
-  const covered = Object.values(planned.coverage).filter((entry) => ['covered', 'merged'].includes(entry.status)).length;
+  const covered = regions.filter((region) => region.semantic_kind !== 'noise'
+    && ['covered', 'merged', 'dropped'].includes(planned.coverage[region.region_id]?.status)).length;
   const telemetry = {
     parse_blocks: document.blocks.length, semantic_regions: regions.length,
     planned_units: planned.units.length, semantic_coverage: meaningful ? covered / meaningful : 1,
@@ -746,7 +807,8 @@ function runUniversalPipeline(input = {}) {
   return {
     schema_version: 'universal-pipeline/1.0', pipeline_version: PIPELINE_VERSION,
     document, profile, regions, knowledge_units: planned.units, coverage: planned.coverage,
-    repaired_region_ids: planned.repaired_region_ids, relations,
+    repaired_region_ids: [], relations, knowledge_events: planned.useful_card.events,
+    card_plans: planned.useful_card.plans, generation_diagnostics: planned.useful_card.diagnostics,
     review_decisions: groupedReview(planned.units), telemetry,
     cache_key: digest([document.fingerprint, PIPELINE_VERSION, input.prompt_version || 'local-v1', input.model_version || 'none'])
   };
@@ -762,21 +824,23 @@ async function runUniversalPipelineMultilingual(input = {}) {
   const profile = inferProfile(document);
   const regions = segmentDocument(document);
   const translated = await translateRegions(regions, input);
-  let planned = planKnowledgeUnits(document, profile, translated.regions, input);
-  planned = repairCoverage(document, profile, translated.regions, planned, input);
-  const relations = relationEvidence(planned.units);
+  const planned = planUsefulKnowledgeUnits(document, profile, translated.regions, input);
+  const relations = [...relationEvidence(planned.units), ...planned.units.flatMap((unit) => unit.relations || [])];
   for (const relation of relations) {
     const source = planned.units.find((unit) => unit.unit_id === relation.from_unit_id);
     if (source) source.relations.push(relation);
   }
   const meaningful = regions.filter((region) => region.semantic_kind !== 'noise').length;
-  const covered = Object.values(planned.coverage).filter((entry) => ['covered', 'merged'].includes(entry.status)).length;
+  const covered = regions.filter((region) => region.semantic_kind !== 'noise'
+    && ['covered', 'merged', 'dropped'].includes(planned.coverage[region.region_id]?.status)).length;
   const review = groupedReview(planned.units);
   return {
     schema_version: 'universal-pipeline/1.1', pipeline_version: PIPELINE_VERSION,
     output_language: OUTPUT_LANGUAGE, document, profile, regions: translated.regions,
     knowledge_units: planned.units, coverage: planned.coverage,
-    repaired_region_ids: planned.repaired_region_ids, relations, review_decisions: review,
+    repaired_region_ids: [], relations, review_decisions: review,
+    knowledge_events: planned.useful_card.events, card_plans: planned.useful_card.plans,
+    generation_diagnostics: planned.useful_card.diagnostics,
     translation_cache: translated.cache, translation_checkpoint: { status: 'complete', missing_region_ids: [] },
     telemetry: {
       parse_blocks: document.blocks.length, semantic_regions: regions.length,
@@ -798,5 +862,6 @@ module.exports = {
   detectLanguage, deterministicChinese, validateTranslationResult, translationCacheKey, translateRegions,
   canonicalizeDocument, inferProfile, segmentDocument, normalizeKnowledgeUnit,
   normalizeTags, routeUnit, planKnowledgeUnits, repairCoverage, relationEvidence,
+  planUsefulKnowledgeUnits,
   groupedReview, runUniversalPipeline, runUniversalPipelineMultilingual, digest, stableJson
 };

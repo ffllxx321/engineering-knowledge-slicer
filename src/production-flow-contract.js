@@ -4,7 +4,8 @@ const PRODUCTION_FLOW_CONTRACT = Object.freeze({
   schema: 'eks/production-flow-contract/1.0',
   entrypoint: 'EngineeringKnowledgeSlicerPlugin.processTask',
   stages: Object.freeze([
-    'intake', 'parse_normalize', 'understand', 'quality_check', 'confirmation',
+    'intake', 'parse_normalize', 'canonicalize', 'translate', 'knowledge_event_extraction',
+    'useful_card_planning', 'route', 'quality_check', 'confirmation',
     'write_plan', 'atomic_commit', 'visible_verify', 'complete'
   ]),
   user_states: Object.freeze(['waiting', 'processing', 'pending_confirmation', 'stored', 'failed']),

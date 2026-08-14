@@ -27,6 +27,12 @@ assert(!/settings\.(businessOutputPath|bidOutputPath|structuredBusinessRoot|stru
 const processTask = main.slice(main.indexOf('async _processTaskOwned('), main.indexOf('async requestMiniMaxProduction('));
 assert.strictEqual((processTask.match(/parseDocumentAutomatically\(current, buffer/g) || []).length, 1, 'processTask 必须且只能调用一次统一自动解析入口');
 assert(!processTask.includes('pdfExtractionOrder'), '生产任务不得读取旧 PDF 引擎顺序');
+assert(processTask.includes('this.runStructuredWriterPhase(current, parsePackage)'), 'processTask 必须进入统一结构化生成路径');
+assert(productionCommit.includes('runUniversalPipelineMultilingual'), '生产结构化阶段必须进入统一语义管线');
+const universalModuleStart = main.indexOf('"src/universal-knowledge-pipeline.js": function');
+const universalModule = main.slice(universalModuleStart, main.indexOf('"src/knowledge-write-port.js": function', universalModuleStart));
+assert(universalModule.includes('planUsefulKnowledgeUnits(document, profile'), '生产 bundle 必须实际调用 useful-card planner');
+assert(universalModule.includes('knowledge_events: planned.useful_card.events'), '生产产物必须携带版本化知识事件');
 assert(main.includes("const DEFAULT_ORDER = ['mineru-api'];"), '生产外部解析只能保留 MinerU');
 assert(main.includes('LEGACY_PADDLEOCR_REMOVED'), 'PaddleOCR 兼容入口必须显式拒绝生产调用');
 assert(main.includes("EKS_ENABLE_DEVELOPMENT_SHADOW === '1'"), '影子评估必须受开发环境变量隔离');

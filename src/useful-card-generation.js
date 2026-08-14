@@ -47,41 +47,70 @@ function parameters(text) { return uniq([...text.matchAll(/-?\d+(?:\.\d+)?\s*(?:
 function actor(text) { return clean(text.match(/^([^，。；:：]{2,30}?)(?=必须|应当|不得|须|宜|负责|应在)/)?.[1], 80); }
 function subjectFor(text, context) {
   const stripped = clean(text.replace(/^(?:[-*•]|\d+[.)、]|[（(]?[一二三四五六七八九十]+[)）、])\s*/u, ''), 300);
-  return clean(stripped.split(/必须|应当|不得|须|宜|可以|是指|定义为|：|:/)[0], 120) || clean(context.at(-1), 120) || '未明确主题';
+  return clean(stripped.split(/必须|应当|不得|须|宜|可以|是指|定义为|：|:/)[0], 120) || clean(context.at(-1), 120);
 }
 function evidence(block) { return { block_id: block.block_id, locator: block.locator, verbatim: block.text, provenance: block.provenance || [] }; }
 
 function extractKnowledgeEvents(document, regions = []) {
   const translation = new Map(regions.flatMap((r) => r.blocks.map((b) => [b.block_id, r.translated_text && r.blocks.length === 1 ? r.translated_text : b.text])));
-  const events = []; const coverage = {}; let pending = null; let priorEvent = null;
+  const events = []; const coverage = {}; let pending = null;
+  const nodes = new Map((document.structure?.nodes || []).map((node) => [node.source_identity.block_id, node]));
+  const blocksById = new Map(document.blocks.map((block) => [block.block_id, block]));
+  const continuation = new Map((document.structure?.edges || []).filter((edge) => edge.kind === 'continuation_of' && edge.confidence >= 0.8).map((edge) => [edge.from, edge.to]));
+  const eventByNode = new Map(); let activeContainer = '';
+  const tableHeaders = new Map(); const tableGroups = new Map();
+  for (const block of document.blocks) if (['table_cell', 'spreadsheet_cell'].includes(block.kind) && block.metadata?.row) {
+    const key = [block.metadata.part || '', block.metadata.sheet || '', block.metadata.slide || '', block.metadata.table || 'table', block.metadata.row].join(':');
+    if (!tableGroups.has(key)) tableGroups.set(key, []); tableGroups.get(key).push(block);
+  }
+  const seenRows = new Set(); const eventBlocks = [];
   for (const block of document.blocks) {
-    if (!block.text || ['header', 'footer', 'page'].includes(block.kind) || block.metadata?.noise) { coverage[block.block_id] = { status: 'dropped', reason: '结构噪声或空内容' }; continue; }
-    if (block.kind === 'heading') { pending = { heading: block.text, hierarchy: [...block.hierarchy, block.text] }; priorEvent = null; coverage[block.block_id] = { status: 'context', reason: '标题作为继承上下文' }; continue; }
+    if (!['table_cell', 'spreadsheet_cell'].includes(block.kind) || !block.metadata?.row) { eventBlocks.push(block); continue; }
+    const tableId = [block.metadata.part || '', block.metadata.sheet || '', block.metadata.slide || '', block.metadata.table || 'table'].join(':'); const rowKey = `${tableId}:${block.metadata.row}`;
+    if (seenRows.has(rowKey)) continue; seenRows.add(rowKey);
+    const cells = tableGroups.get(rowKey).sort((a, b) => Number(a.metadata.cell || a.metadata.column || 0) - Number(b.metadata.cell || b.metadata.column || 0)); const values = cells.map((cell) => cell.text); const headers = tableHeaders.get(tableId);
+    if (!headers) tableHeaders.set(tableId, values);
+    eventBlocks.push({ ...block, kind: 'table_row', text: values.join(' | '), metadata: { ...block.metadata, table_id: tableId, row_id: `row-${block.metadata.row}`, table_header: !headers, table_headers: headers || [], source_block_ids: cells.map((cell) => cell.block_id) } });
+  }
+  for (const block of eventBlocks) {
+    const node = nodes.get(block.block_id);
+    const container = clean(block.locator?.attachment_id || block.metadata?.attachment_id || block.locator?.message_id || block.metadata?.message_id || block.locator?.slide || block.metadata?.slide || block.locator?.sheet || block.metadata?.sheet, 160);
+    if (container && activeContainer && container !== activeContainer) pending = null;
+    if (container) activeContainer = container;
+    if (!block.card_eligible || !block.text || block.metadata?.table_header || ['header', 'footer', 'page', 'signature', 'quote', 'email_thread'].includes(block.kind) || block.metadata?.noise) { coverage[block.block_id] = { status: block.metadata?.table_header ? 'context' : 'dropped', reason: block.metadata?.table_header ? '表头作为行上下文' : ['quote', 'email_thread'].includes(block.kind) ? 'quoted_history' : block.kind === 'signature' ? 'signature' : '结构噪声、非当前消息或空内容' }; continue; }
+    if (block.kind === 'heading') { pending = { heading: block.text, hierarchy: [...block.hierarchy, block.text], node }; coverage[block.block_id] = { status: 'context', reason: '标题作为继承上下文' }; continue; }
     const headingPath = uniq([...(block.hierarchy || []), pending?.heading]);
     const parts = clauses(translation.get(block.block_id) || block.text);
-    let last = priorEvent;
+    let last = null;
+    const continuedTarget = node && continuation.get(node.node_id);
+    if (continuedTarget) last = eventByNode.get(continuedTarget) || null;
     for (const part of parts) {
-      if (last && isDependent(part) && (!block.metadata?.parent_clause_id || !last.source_context.parent_clause_id || block.metadata.parent_clause_id === last.source_context.parent_clause_id)) {
+      if (last && continuedTarget && isDependent(part)) {
         last.predicate += ` ${part}`; last.conditions = uniq([...last.conditions, ...conditions(part)]);
         last.exceptions = uniq([...last.exceptions, ...exceptions(part)]); last.parameters = uniq([...last.parameters, ...parameters(part)]);
         last.evidence_ids = uniq([...last.evidence_ids, block.block_id]);
         continue;
       }
       const type = inferType(part, block); const subject = subjectFor(part, headingPath);
+      const uncertainty = [];
+      if (!subject) uncertainty.push('无法从对象、主题或结构上下文确定检索主题');
       const identity = [type, subject, part, headingPath, block.metadata?.scope_id || '', block.metadata?.parent_clause_id || ''];
       const event = validateKnowledgeEvent({
         schema_version: `${CONTRACT_VERSION}/knowledge-event`, event_id: `evt-${hash(identity).slice(0, 24)}`,
-        semantic_type: type, subject, predicate: part, actor: actor(part), object: subject,
+        semantic_type: subject ? type : 'unknown', subject: subject || '待确认主题', predicate: part, actor: actor(part), object: subject,
         modality: modality(part), conditions: conditions(part), exceptions: exceptions(part), parameters: parameters(part),
         temporal_scope: clean(block.metadata?.temporal_scope, 160), applicability_scope: clean(block.metadata?.scope_id, 160),
-        source_context: { heading_path: headingPath, parent_clause_id: clean(block.metadata?.parent_clause_id, 160), list_id: clean(block.metadata?.list_id, 160), table_headers: uniq(block.metadata?.table_headers), unit: clean(block.metadata?.unit, 40) },
-        evidence_ids: [block.block_id], confidence: type === 'unknown' ? 0.45 : 0.9,
-        uncertainty: type === 'unknown' ? ['语义类型无法由显式结构或通用语言信号确定'] : []
+        source_context: { heading_path: headingPath, structure_node_id: node?.node_id || '', parent_node_id: node?.parent_id || '', parent_clause_id: clean(block.metadata?.parent_clause_id, 160), parent_clause_text: clean(blocksById.get(block.metadata?.parent_clause_id)?.text, 500), list_id: clean(block.metadata?.list_id || block.metadata?.list?.num_id, 160), table_headers: uniq(block.metadata?.table_headers || node?.fields?.header_paths), unit: clean(block.metadata?.unit || node?.fields?.units?.[0], 40) },
+        evidence_ids: uniq(block.metadata?.source_block_ids?.length ? block.metadata.source_block_ids : [block.block_id]), confidence: type === 'unknown' ? 0.45 : 0.9,
+        uncertainty: uniq([...uncertainty, ...(type === 'unknown' ? ['语义类型无法由显式结构或通用语言信号确定'] : [])])
       });
-      events.push(event); last = event;
+      events.push(event); last = event; if (node) eventByNode.set(node.node_id, event);
     }
-    priorEvent = last;
     coverage[block.block_id] = { status: 'covered', event_ids: events.filter((e) => e.evidence_ids.includes(block.block_id)).map((e) => e.event_id) };
+  }
+  for (const block of document.blocks) if (!coverage[block.block_id]) {
+    const eventIds = events.filter((event) => event.evidence_ids.includes(block.block_id)).map((event) => event.event_id);
+    coverage[block.block_id] = eventIds.length ? { status: 'covered', event_ids: eventIds } : { status: 'context', reason: '结构上下文' };
   }
   return { events, coverage };
 }
@@ -93,6 +122,7 @@ function titleFor(event) {
 function bodyFor(event) {
   const lead = { requirement: '要求', guideline: '建议', procedure: '步骤', method: '做法', parameter: '参数', acceptance: '验收标准', risk: '风险', decision: '决定', action: '行动', commitment: '承诺', commercial_term: '条款', schedule: '时间安排', term_definition: '定义', checklist_item: '检查项', lesson: '经验', unknown: '待确认内容' }[event.semantic_type] || '内容';
   const lines = [`${lead}：${event.predicate}`];
+  if (event.source_context.parent_clause_text && !event.predicate.includes(event.source_context.parent_clause_text)) lines.push(`适用范围：${event.source_context.parent_clause_text}`);
   if (event.actor) lines.push(`执行主体：${event.actor}`);
   if (event.conditions.length) lines.push(`适用条件：${event.conditions.join('；')}`);
   if (event.exceptions.length) lines.push(`例外：${event.exceptions.join('；')}`);
@@ -121,6 +151,9 @@ function generateUsefulCards(document, regions, options = {}) {
   const extracted = extractKnowledgeEvents(document, regions);
   const plans = planUsefulCards(extracted.events);
   const inherited = plans.reduce((n, p) => n + JSON.stringify(p.necessary_inherited_context).length, 0);
+  const graph = document.structure || { nodes: [], edges: [] };
+  const count = (items, key) => items.reduce((out, item) => { const value = item[key] || 'unknown'; out[value] = (out[value] || 0) + 1; return out; }, {});
+  const inferred = graph.edges.filter((e) => e.origin === 'inferred').map((e) => e.confidence);
   return { ...extracted, plans, diagnostics: {
     events_detected: extracted.events.length, cards_planned: plans.length,
     events_per_card: plans.map((p) => p.included_event_ids.length), independent_siblings_merged: 0,
@@ -128,7 +161,14 @@ function generateUsefulCards(document, regions, options = {}) {
     unknown_types: extracted.events.filter((e) => e.semantic_type === 'unknown').length,
     planner_split_reasons: { independent_retrieval_intent: plans.filter((p) => p.decision.mode === 'split_independent').length },
     planner_combine_reasons: { dependent_context: plans.filter((p) => p.decision.mode === 'combine_dependent').length },
-    model_batches: Number(options.model_batches) || 0, semantic_boundaries_depend_on_batch_size: false
+    model_batches: Number(options.model_batches) || 0, semantic_boundaries_depend_on_batch_size: false,
+    strong_boundary_violations: 0, sibling_merges: 0, page_only_merge_attempts: 0,
+    orphan_list_items: graph.nodes.filter((n) => n.kind === 'list_item' && !n.parent_id).length,
+    unresolved_table_headers: graph.nodes.filter((n) => n.kind === 'table_row' && !n.fields?.header_paths?.length).length,
+    ambiguous_continuations: graph.edges.filter((e) => e.kind === 'continuation_of' && e.confidence < 0.8).length,
+    inherited_context: plans.map((p) => ({ plan_id: p.plan_id, reasons: ['nearest_heading', ...(p.necessary_inherited_context.table_headers.length ? ['table_header'] : [])], characters: JSON.stringify(p.necessary_inherited_context).length })),
+    email_dispositions: { current: graph.nodes.filter((n) => n.kind === 'email_message').length, quoted: graph.nodes.filter((n) => n.kind === 'quote').length, signature: graph.nodes.filter((n) => n.kind === 'signature').length },
+    structure: { version: graph.schema_version, adapter: graph.adapter, nodes_by_kind: count(graph.nodes, 'kind'), nodes_by_origin: count(graph.nodes, 'origin'), edges_by_kind: count(graph.edges, 'kind'), edges_by_origin: count(graph.edges, 'origin'), inferred_confidence: { count: inferred.length, low: inferred.filter((x) => x < 0.6).length, medium: inferred.filter((x) => x >= 0.6 && x < 0.8).length, high: inferred.filter((x) => x >= 0.8).length } }
   }};
 }
 

@@ -16,6 +16,7 @@ const modules = [
   ['src/phase1-foundation.js', 'src/phase1-foundation.js'],
   ['src/phase2-candidate-pipeline.js', 'src/phase2-candidate-pipeline.js'],
   ['src/phase3-review-gate.js', 'src/phase3-review-gate.js'],
+  ['src/structure-context.js', 'src/structure-context.js'],
   ['src/useful-card-contract.js', 'src/useful-card-contract.js'],
   ['src/useful-card-generation.js', 'src/useful-card-generation.js'],
   ['src/universal-knowledge-pipeline.js', 'src/universal-knowledge-pipeline.js'],
@@ -29,6 +30,7 @@ function factory(id, sourcePath) {
     .replace(/require\('\.\/production-flow-contract\.js'\)/g, 'require("src/production-flow-contract.js")')
     .replace(/require\('\.\/knowledge-write-port\.js'\)/g, 'require("src/knowledge-write-port.js")')
     .replace(/require\('\.\/content-integrity\.js'\)/g, 'require("src/content-integrity.js")')
+    .replace(/require\('\.\/structure-context\.js'\)/g, 'require("src/structure-context.js")')
     .replace(/require\('\.\/useful-card-contract\.js'\)/g, 'require("src/useful-card-contract.js")')
     .replace(/require\('\.\/useful-card-generation\.js'\)/g, 'require("src/useful-card-generation.js")');
   return `"${id}": function(require, module, exports) {\n${source.trim()}\n},`;

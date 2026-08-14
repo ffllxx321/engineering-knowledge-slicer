@@ -8,8 +8,9 @@
 const crypto = require('crypto');
 const { analyzeText } = require('./content-integrity.js');
 const { generateUsefulCards, SEMANTIC_KIND } = require('./useful-card-generation.js');
+const { STRUCTURE_VERSION, buildStructureContext } = require('./structure-context.js');
 
-const PIPELINE_VERSION = '4.0-useful-card';
+const PIPELINE_VERSION = '5.0-structure-aware-useful-card';
 const OUTPUT_LANGUAGE = 'zh-CN';
 const TRANSLATION_VERSION = 'universal-zh-v1';
 const SEMANTIC_KINDS = Object.freeze([
@@ -22,8 +23,8 @@ const ACTIVE_STATES = new Set(['lead', 'approved', 'bidding', 'submitted', 'eval
 const HISTORICAL_STATES = new Set(['lost', 'paused', 'terminated', 'archived', 'completed', 'cancelled', 'suspended']);
 const BLOCK_KINDS = new Set([
   'heading', 'paragraph', 'list', 'list_item', 'table', 'table_row', 'key_value',
-  'figure', 'caption', 'header', 'footer', 'email_envelope', 'email_body',
-  'email_thread', 'sheet', 'page', 'attachment', 'text'
+  'table_cell', 'spreadsheet_cell', 'figure', 'caption', 'header', 'footer', 'email_envelope', 'email_subject', 'email_from', 'email_to', 'email_body',
+  'email_thread', 'quote', 'signature', 'sheet', 'page', 'page-text', 'attachment', 'speaker_note', 'parsed-markdown', 'text'
 ]);
 const TAG_SYNONYMS = Object.freeze({
   '质量管理': '质量', '品质': '质量', '安全管理': '安全', '工期': '时间',
@@ -137,12 +138,45 @@ function normalizeLocator(raw, fallback) {
   return result;
 }
 
+function expandStructuredBlocks(rawBlocks, source) {
+  const output = []; const identityOccurrences = new Map();
+  for (const raw of rawBlocks) {
+    const value = String(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown || '');
+    const parser = clean(raw?.parse?.method || source.parser, 80);
+    const markdownLike = raw?.kind === 'parsed-markdown' || (raw?.kind === 'page-text' && parser === 'mineru-api');
+    if (!markdownLike && raw?.kind !== 'table') { output.push(raw); continue; }
+    const lines = value.split(/\r?\n/); let paragraph = []; let start = 0;
+    const emit = (kind, parts, line, metadata = {}) => {
+      const content = parts.join('\n').trim(); if (!content) return;
+      const identityKey = `${kind}\0${content}`; const occurrence = identityOccurrences.get(identityKey) || 0; identityOccurrences.set(identityKey, occurrence + 1);
+      const stable = `blk-${digest([source.source_document_id || source.source_hash, kind, content, occurrence]).slice(0, 20)}`;
+      output.push({ ...raw, block_id: stable, kind, raw: { ...(raw.raw || {}), text: content }, text: content,
+        locator: { ...(raw.locator || {}), fragment: `lines=${line + 1}-${line + parts.length}` }, metadata: { ...(raw.metadata || {}), ...metadata, structure_origin: markdownLike ? 'parser' : 'native' } });
+    };
+    const flush = (line) => { emit('paragraph', paragraph, start); paragraph = []; };
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i]; const heading = markdownLike && line.match(/^(#{1,6})\s+(.+)$/); const item = markdownLike && line.match(/^\s*([-*+] |\d+[.)]\s+)(.+)$/);
+      const tableRow = /^\s*\|.*\|\s*$/.test(line);
+      if (heading) { flush(i); emit('heading', [heading[2]], i, { heading_level: heading[1].length }); }
+      else if (item) { flush(i); emit('list_item', [item[2]], i, { list_id: `markdown-list:${raw.block_id || raw.locator?.value || 'document'}`, list_level: Math.floor((line.match(/^\s*/)?.[0].length || 0) / 2), numbering_token: item[1].trim() }); }
+      else if (tableRow) {
+        flush(i); const cells = line.split('|').slice(1, -1).map((cell) => clean(cell, 500));
+        const tableId = `markdown-table:${raw.block_id || raw.locator?.value || 'document'}`;
+        const header = output.find((b) => b.kind === 'table_row' && b.metadata?.table_id === tableId && b.metadata?.table_header);
+        if (!cells.every((cell) => /^:?-{3,}:?$/.test(cell))) emit('table_row', [cells.join(' | ')], i, { table_id: tableId, row_id: `row:${digest(cells).slice(0, 12)}`, table_header: !header, table_headers: header ? header.raw.text.split(' | ') : [] });
+      } else if (!line.trim()) flush(i); else { if (!paragraph.length) start = i; paragraph.push(line); }
+    }
+    flush(lines.length);
+  }
+  return output;
+}
+
 function canonicalizeDocument(input = {}) {
   const source = input.document || input;
   const rawBlocks = Array.isArray(source.blocks) ? source.blocks
     : Array.isArray(source.normalized_blocks) ? source.normalized_blocks
       : clean(source.text || source.markdown) ? [{ kind: 'text', raw: { text: source.text || source.markdown } }] : [];
-  const blocks = rawBlocks.map((raw, order) => {
+  const blocks = expandStructuredBlocks(rawBlocks, source).map((raw, order) => {
     const originalText = String(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown || '');
     const rawText = clean(originalText, 30000);
     const kind = BLOCK_KINDS.has(clean(raw?.kind, 80)) ? clean(raw.kind, 80) : 'text';
@@ -158,15 +192,17 @@ function canonicalizeDocument(input = {}) {
       source_language: detectLanguage(rawText),
       hierarchy, locator: normalizeLocator(raw?.locator, blockId),
       parse_status: clean(raw?.parse?.status, 40) || (rawText ? 'present' : 'missing'),
-      metadata, provenance: Array.isArray(raw?.provenance) ? raw.provenance : [],
+      parent_id: clean(raw?.parent_id, 160), inferred: raw?.inferred && typeof raw.inferred === 'object' ? { ...raw.inferred } : {},
+      parse_method: clean(raw?.parse?.method || raw?.parse_method, 80), parse_quality: Number(raw?.parse?.quality ?? raw?.parse_quality),
+      card_eligible: raw?.card_eligible !== false, metadata, provenance: Array.isArray(raw?.provenance) ? raw.provenance : [],
       content_integrity: analyzeText(originalText)
     };
   }).filter((block) => block.content_integrity.ok
     && (block.text || ['figure', 'attachment', 'page', 'sheet'].includes(block.kind)));
   const sourceId = clean(source.source_document_id || source.source_identity, 300)
     || `src-${digest([source.source_hash, source.source_path, blocks.map((block) => block.text)]).slice(0, 24)}`;
-  return {
-    schema_version: 'canonical-document/1.0', pipeline_version: PIPELINE_VERSION,
+  const canonical = {
+    schema_version: 'canonical-document/2.0', pipeline_version: PIPELINE_VERSION,
     source_document_id: sourceId, source_identity: clean(source.source_identity, 300) || sourceId,
     source_hash: clean(source.source_hash, 128), source_path: clean(source.source_path, 1000),
     title: clean(source.title || source.filename, 400) || '未命名资料',
@@ -174,8 +210,11 @@ function canonicalizeDocument(input = {}) {
     source_language: detectLanguage(blocks.map((block) => block.text).join('\n')),
     output_language: OUTPUT_LANGUAGE,
     metadata: source.metadata && typeof source.metadata === 'object' ? { ...source.metadata } : {},
-    blocks, fingerprint: digest(blocks.map(({ kind, text, hierarchy }) => ({ kind, text, hierarchy })))
+    blocks
   };
+  canonical.structure = buildStructureContext(source, blocks);
+  canonical.fingerprint = digest([blocks.map(({ block_id, kind, text }) => ({ block_id, kind, text })), canonical.structure]);
+  return canonical;
 }
 
 function semanticSignals(text) {
@@ -802,7 +841,8 @@ function runUniversalPipeline(input = {}) {
     llm_calls: 0, llm_tokens: 0, cache_hits: Number(input.cache_hits) || 0,
     accepted: planned.units.length - groupedReview(planned.units).flatMap((group) => group.unit_ids).length,
     review: groupedReview(planned.units).length, rejected: regions.filter((region) => region.semantic_kind === 'noise').length,
-    relations: relations.length, writes: 0
+    relations: relations.length, writes: 0,
+    structure_contract_version: STRUCTURE_VERSION, structure: planned.useful_card.diagnostics.structure
   };
   return {
     schema_version: 'universal-pipeline/1.0', pipeline_version: PIPELINE_VERSION,
@@ -850,7 +890,8 @@ async function runUniversalPipelineMultilingual(input = {}) {
       cache_hits: translated.telemetry.cache_hits, translation: translated.telemetry,
       accepted: planned.units.length - review.flatMap((group) => group.unit_ids).length,
       review: review.length, rejected: regions.filter((region) => region.semantic_kind === 'noise').length,
-      relations: relations.length, writes: 0
+      relations: relations.length, writes: 0,
+      structure_contract_version: STRUCTURE_VERSION, structure: planned.useful_card.diagnostics.structure
     },
     cache_key: digest([document.fingerprint, PIPELINE_VERSION,
       input.translation_prompt_version || TRANSLATION_VERSION, input.model_version || 'configured-provider'])

@@ -3252,6 +3252,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       filename: task.source_path?.split('/').pop() || '',
       title: parsePackage?.title || task.source_path?.split('/').pop() || '来源文档',
       source_type: task.source_type,
+      parser: parsePackage?.parser || '',
       media_type: task.source_type,
       ingested_at: task.created_at || task.discovered_at || '1970-01-01T00:00:00.000Z',
       metadata,
@@ -3264,9 +3265,13 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       && loadedTranslationCheckpoint?.cache && typeof loadedTranslationCheckpoint.cache === 'object'
       ? loadedTranslationCheckpoint : null;
     let universal = priorUniversal?.document?.source_hash === document.source_hash
+      && priorUniversal?.pipeline_version === '5.0-structure-aware-useful-card'
+      && priorUniversal?.document?.structure?.schema_version === 'structure-context/2.0'
       && Array.isArray(priorUniversal?.knowledge_units)
       && Array.isArray(priorUniversal?.knowledge_events)
-      && Array.isArray(priorUniversal?.card_plans) ? priorUniversal : null;
+      && priorUniversal.knowledge_events.every((event) => event?.schema_version === 'useful-card/2.0/knowledge-event')
+      && Array.isArray(priorUniversal?.card_plans)
+      && priorUniversal.card_plans.every((plan) => plan?.schema_version === 'useful-card/2.0/card-plan') ? priorUniversal : null;
     try {
       if (!universal) {
       universal = await runUniversalPipelineMultilingual({
@@ -8717,8 +8722,126 @@ module.exports = {
   planDocumentWithdrawal
 };
 },
+"src/structure-context.js": function(require, module, exports) {
+const crypto = require('crypto');
+const STRUCTURE_VERSION = 'structure-context/2.0';
+const NODE_KINDS = new Set(['document', 'section', 'heading', 'paragraph', 'list', 'list_item', 'table', 'table_row', 'table_cell', 'figure', 'caption', 'email_message', 'quote', 'signature', 'attachment']);
+const EDGE_KINDS = new Set(['parent', 'child', 'continuation_of', 'continues']);
+const ORIGINS = new Set(['native', 'parser', 'inferred']);
+const hash = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 24);
+const text = (value, max = 300) => String(value || '').normalize('NFKC').trim().slice(0, max);
+const confidence = (value, fallback) => Number.isFinite(Number(value)) ? Math.max(0, Math.min(1, Number(value))) : fallback;
+
+function fail(message) { throw Object.assign(new Error(message), { code: 'STRUCTURE_CONTEXT_INVALID' }); }
+function nodeKind(block) {
+  const kind = text(block.kind, 40);
+  if (NODE_KINDS.has(kind)) return kind;
+  if (kind === 'spreadsheet_cell') return 'table_cell';
+  if (kind === 'email_body' || kind === 'email_subject' || kind === 'email_envelope') return 'email_message';
+  if (kind === 'email_thread') return 'quote';
+  if (kind === 'image_metadata' || kind === 'figure_metadata') return 'figure';
+  if (kind === 'page' || kind === 'page-text' || kind === 'parsed-markdown' || kind === 'text' || kind === 'key_value' || kind === 'speaker_note') return 'paragraph';
+  return 'paragraph';
+}
+function identity(block) {
+  const locator = block.locator || {};
+  return {
+    block_id: block.block_id, source_block_ids: Array.isArray(block.metadata?.source_block_ids) ? block.metadata.source_block_ids.map(String) : [block.block_id], span_id: text(block.metadata?.span_id || locator.value, 500),
+    page: locator.page || block.metadata?.page || null, sheet: locator.sheet || block.metadata?.sheet || null,
+    slide: locator.slide || block.metadata?.slide || null, message: locator.message_id || block.metadata?.message_id || null,
+    attachment: locator.attachment_id || block.metadata?.attachment_id || null
+  };
+}
+function structureFields(block) {
+  const m = block.metadata || {}; const list = m.list || {}; const locator = block.locator || {};
+  return {
+    heading_level: Number.isInteger(m.outline_level) ? m.outline_level + 1 : Number.isInteger(m.heading_level) ? m.heading_level : null,
+    numbering_token: text(m.numbering_token || list.token || list.template, 80), numbering_path: Array.isArray(m.numbering_path) ? m.numbering_path.map(String) : [],
+    list_id: text(m.list_id || list.num_id, 120), list_level: Number.isInteger(m.list_level) ? m.list_level : Number.isInteger(m.level) ? m.level : Number.isInteger(list.level) ? list.level : null,
+    ordinal: Number.isInteger(m.ordinal) ? m.ordinal : null, parent_clause: text(m.parent_clause_id, 160),
+    table_id: text(m.table_id || (m.table ? `table-${m.table}` : ''), 120), row_id: text(m.row_id || (m.row ? `row-${m.row}` : ''), 120),
+    header_paths: Array.isArray(m.table_headers) ? m.table_headers.map(String) : Array.isArray(m.header_paths) ? m.header_paths.map(String) : [],
+    cell_range: text(m.cell_range || m.coordinate || locator.range, 80), units: Array.isArray(m.units) ? m.units.map(String) : text(m.unit, 40) ? [text(m.unit, 40)] : []
+  };
+}
+function originFor(block) {
+  const explicit = text(block.metadata?.structure_origin || block.inferred?.structure_origin, 20);
+  if (ORIGINS.has(explicit)) return explicit;
+  if (block.metadata?.migrated_legacy || block.metadata?.generated_fallback) return 'inferred';
+  return /ooxml|eml|msg|text-block/.test(text(block.parse_method || block.parse?.method, 80)) ? 'native' : 'parser';
+}
+function buildStructureContext(source, blocks) {
+  const sourceId = text(source.source_document_id || source.source_identity || source.source_hash, 300) || 'anonymous-source';
+  const documentId = `str-${hash(['document', sourceId])}`;
+  const nodes = [{ node_id: documentId, kind: 'document', source_identity: { block_id: `document:${sourceId}`, span_id: '' }, parent_id: null, children: [], order: -1, origin: 'parser', confidence: 1, uncertainty: [], fields: {} }];
+  const byBlock = new Map(); const headingStack = []; const listParents = new Map(); const tableParents = new Map(); const rowParents = new Map();
+  const addVirtual = (kind, key, parentId, order, origin = 'parser') => {
+    const nodeId = `str-${hash([sourceId, kind, key])}`;
+    if (!nodes.some((n) => n.node_id === nodeId)) nodes.push({ node_id: nodeId, kind, source_identity: { block_id: `virtual:${key}`, span_id: '' }, parent_id: parentId, children: [], order: order - 0.1, origin, confidence: origin === 'inferred' ? 0.65 : 0.95, uncertainty: origin === 'inferred' ? ['legacy_or_layout_inference'] : [], fields: {} });
+    return nodeId;
+  };
+  for (const block of blocks) {
+    const kind = nodeKind(block); const fields = structureFields(block); const origin = originFor(block);
+    let parentId = documentId;
+    if (kind === 'heading' || kind === 'section') {
+      const level = fields.heading_level || 1;
+      while (headingStack.length >= level) headingStack.pop();
+      parentId = headingStack.at(-1) || documentId;
+    } else if (fields.table_id || kind === 'table_cell' || kind === 'table_row') {
+      const tableKey = `${fields.table_id || (block.metadata?.sheet ? 'sheet-grid' : 'table')}:${block.metadata?.sheet || block.metadata?.slide || block.metadata?.part || ''}`;
+      if (!tableParents.has(tableKey)) tableParents.set(tableKey, addVirtual('table', tableKey, headingStack.at(-1) || documentId, block.order, origin));
+      parentId = tableParents.get(tableKey);
+      if (kind === 'table_cell') {
+        const rowKey = `${tableKey}:${fields.row_id || block.metadata?.row || 'unknown-row'}`;
+        if (!rowParents.has(rowKey)) rowParents.set(rowKey, addVirtual('table_row', rowKey, parentId, block.order, origin));
+        parentId = rowParents.get(rowKey);
+      }
+    } else if (kind === 'list_item') {
+      const listKey = fields.list_id || `legacy-list:${headingStack.at(-1) || documentId}`;
+      if (!listParents.has(listKey)) listParents.set(listKey, addVirtual('list', listKey, headingStack.at(-1) || documentId, block.order, fields.list_id ? origin : 'inferred'));
+      parentId = listParents.get(listKey);
+      const level = fields.list_level || 0;
+      if (level > 0) {
+        const prior = [...nodes].reverse().find((n) => n.kind === 'list_item' && n.fields.list_id === fields.list_id && (n.fields.list_level ?? 0) < level);
+        if (prior) parentId = prior.node_id;
+      }
+    } else parentId = text(block.parent_id, 160) && byBlock.get(text(block.parent_id, 160)) || headingStack.at(-1) || documentId;
+    const node = { node_id: `str-${hash([sourceId, block.block_id])}`, kind, source_identity: identity(block), parent_id: parentId, children: [], order: block.order, origin, confidence: confidence(block.metadata?.structure_confidence ?? block.parse_quality ?? block.parse?.quality, origin === 'inferred' ? 0.55 : 0.95), uncertainty: origin === 'inferred' ? ['relation_not_native'] : [], fields };
+    nodes.push(node); byBlock.set(block.block_id, node.node_id);
+    if (kind === 'heading' || kind === 'section') headingStack.push(node.node_id);
+  }
+  for (const node of nodes) if (node.parent_id) nodes.find((n) => n.node_id === node.parent_id)?.children.push(node.node_id);
+  const edges = [];
+  for (const node of nodes) if (node.parent_id) edges.push({ edge_id: `edge-${hash(['parent', node.node_id, node.parent_id])}`, kind: 'parent', from: node.node_id, to: node.parent_id, reason: 'hierarchy', confidence: node.confidence, origin: node.origin });
+  for (const block of blocks) {
+    const from = byBlock.get(block.block_id); const targetBlock = text(block.metadata?.continuation_of || block.inferred?.continuation_of, 160);
+    if (targetBlock && byBlock.has(targetBlock)) {
+      const to = byBlock.get(targetBlock); const c = confidence(block.metadata?.continuation_confidence || block.inferred?.continuation_confidence, 0.5);
+      edges.push({ edge_id: `edge-${hash(['continuation', from, to])}`, kind: 'continuation_of', from, to, reason: text(block.metadata?.continuation_reason, 120) || 'parser_continuation', confidence: c, origin: originFor(block) });
+      edges.push({ edge_id: `edge-${hash(['continues', to, from])}`, kind: 'continues', from: to, to: from, reason: text(block.metadata?.continuation_reason, 120) || 'parser_continuation', confidence: c, origin: originFor(block) });
+    }
+  }
+  return validateStructureContext({ schema_version: STRUCTURE_VERSION, source_document_id: sourceId, nodes, edges, adapter: text(source.parser || source.metadata?.parser, 80) || 'canonical-block-v0', legacy_precision: blocks.some((b) => b.metadata?.migrated_legacy) ? 'explicitly-limited' : 'not-applicable' });
+}
+function validateStructureContext(graph) {
+  if (!graph || graph.schema_version !== STRUCTURE_VERSION || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) fail('结构契约版本或集合无效');
+  const ids = new Set();
+  for (const node of graph.nodes) {
+    if (!node.node_id || ids.has(node.node_id) || !NODE_KINDS.has(node.kind) || !node.source_identity?.block_id || !ORIGINS.has(node.origin)) fail('结构节点身份、类型或来源无效');
+    if (!Number.isFinite(node.confidence) || node.confidence < 0 || node.confidence > 1) fail('结构节点置信度无效');
+    ids.add(node.node_id);
+  }
+  for (const node of graph.nodes) if (node.parent_id && (!ids.has(node.parent_id) || node.parent_id === node.node_id)) fail('结构父关系无效');
+  for (const edge of graph.edges) if (!EDGE_KINDS.has(edge.kind) || !ids.has(edge.from) || !ids.has(edge.to) || edge.from === edge.to) fail('结构边无效');
+  const parent = new Map(graph.nodes.map((n) => [n.node_id, n.parent_id]));
+  for (const id of ids) { const seen = new Set([id]); let cursor = parent.get(id); while (cursor) { if (seen.has(cursor)) fail('结构层级存在环'); seen.add(cursor); cursor = parent.get(cursor); } }
+  return graph;
+}
+
+module.exports = { STRUCTURE_VERSION, NODE_KINDS, EDGE_KINDS, buildStructureContext, validateStructureContext };
+},
 "src/useful-card-contract.js": function(require, module, exports) {
-const CONTRACT_VERSION = 'useful-card/1.0';
+const CONTRACT_VERSION = 'useful-card/2.0';
 const EVENT_TYPES = Object.freeze([
   'requirement', 'guideline', 'procedure', 'method', 'parameter', 'acceptance', 'risk',
   'decision', 'action', 'commitment', 'commercial_term', 'schedule', 'term_definition',
@@ -8739,6 +8862,7 @@ function validateKnowledgeEvent(event) {
   if (!event || event.schema_version !== `${CONTRACT_VERSION}/knowledge-event`) fail('KnowledgeEvent 版本无效');
   if (!EVENT_TYPES.includes(event.semantic_type)) fail('KnowledgeEvent 类型无效；不得回退为通用事实', 'KNOWLEDGE_EVENT_TYPE_INVALID');
   for (const key of ['event_id', 'subject', 'predicate']) if (typeof event[key] !== 'string' || !event[key].trim()) fail(`KnowledgeEvent 缺少 ${key}`);
+  if (event.subject === '未明确主题') fail('占位主题不得自动存储', 'KNOWLEDGE_EVENT_SUBJECT_UNCERTAIN');
   for (const key of ['conditions', 'exceptions', 'parameters', 'evidence_ids', 'uncertainty']) if (!strings(event[key])) fail(`KnowledgeEvent ${key} 必须是字符串数组`);
   if (!event.source_context || !strings(event.source_context.heading_path)) fail('KnowledgeEvent 缺少结构上下文');
   if (!Number.isFinite(event.confidence) || event.confidence < 0 || event.confidence > 1) fail('KnowledgeEvent 置信度无效');
@@ -8806,41 +8930,70 @@ function parameters(text) { return uniq([...text.matchAll(/-?\d+(?:\.\d+)?\s*(?:
 function actor(text) { return clean(text.match(/^([^，。；:：]{2,30}?)(?=必须|应当|不得|须|宜|负责|应在)/)?.[1], 80); }
 function subjectFor(text, context) {
   const stripped = clean(text.replace(/^(?:[-*•]|\d+[.)、]|[（(]?[一二三四五六七八九十]+[)）、])\s*/u, ''), 300);
-  return clean(stripped.split(/必须|应当|不得|须|宜|可以|是指|定义为|：|:/)[0], 120) || clean(context.at(-1), 120) || '未明确主题';
+  return clean(stripped.split(/必须|应当|不得|须|宜|可以|是指|定义为|：|:/)[0], 120) || clean(context.at(-1), 120);
 }
 function evidence(block) { return { block_id: block.block_id, locator: block.locator, verbatim: block.text, provenance: block.provenance || [] }; }
 
 function extractKnowledgeEvents(document, regions = []) {
   const translation = new Map(regions.flatMap((r) => r.blocks.map((b) => [b.block_id, r.translated_text && r.blocks.length === 1 ? r.translated_text : b.text])));
-  const events = []; const coverage = {}; let pending = null; let priorEvent = null;
+  const events = []; const coverage = {}; let pending = null;
+  const nodes = new Map((document.structure?.nodes || []).map((node) => [node.source_identity.block_id, node]));
+  const blocksById = new Map(document.blocks.map((block) => [block.block_id, block]));
+  const continuation = new Map((document.structure?.edges || []).filter((edge) => edge.kind === 'continuation_of' && edge.confidence >= 0.8).map((edge) => [edge.from, edge.to]));
+  const eventByNode = new Map(); let activeContainer = '';
+  const tableHeaders = new Map(); const tableGroups = new Map();
+  for (const block of document.blocks) if (['table_cell', 'spreadsheet_cell'].includes(block.kind) && block.metadata?.row) {
+    const key = [block.metadata.part || '', block.metadata.sheet || '', block.metadata.slide || '', block.metadata.table || 'table', block.metadata.row].join(':');
+    if (!tableGroups.has(key)) tableGroups.set(key, []); tableGroups.get(key).push(block);
+  }
+  const seenRows = new Set(); const eventBlocks = [];
   for (const block of document.blocks) {
-    if (!block.text || ['header', 'footer', 'page'].includes(block.kind) || block.metadata?.noise) { coverage[block.block_id] = { status: 'dropped', reason: '结构噪声或空内容' }; continue; }
-    if (block.kind === 'heading') { pending = { heading: block.text, hierarchy: [...block.hierarchy, block.text] }; priorEvent = null; coverage[block.block_id] = { status: 'context', reason: '标题作为继承上下文' }; continue; }
+    if (!['table_cell', 'spreadsheet_cell'].includes(block.kind) || !block.metadata?.row) { eventBlocks.push(block); continue; }
+    const tableId = [block.metadata.part || '', block.metadata.sheet || '', block.metadata.slide || '', block.metadata.table || 'table'].join(':'); const rowKey = `${tableId}:${block.metadata.row}`;
+    if (seenRows.has(rowKey)) continue; seenRows.add(rowKey);
+    const cells = tableGroups.get(rowKey).sort((a, b) => Number(a.metadata.cell || a.metadata.column || 0) - Number(b.metadata.cell || b.metadata.column || 0)); const values = cells.map((cell) => cell.text); const headers = tableHeaders.get(tableId);
+    if (!headers) tableHeaders.set(tableId, values);
+    eventBlocks.push({ ...block, kind: 'table_row', text: values.join(' | '), metadata: { ...block.metadata, table_id: tableId, row_id: `row-${block.metadata.row}`, table_header: !headers, table_headers: headers || [], source_block_ids: cells.map((cell) => cell.block_id) } });
+  }
+  for (const block of eventBlocks) {
+    const node = nodes.get(block.block_id);
+    const container = clean(block.locator?.attachment_id || block.metadata?.attachment_id || block.locator?.message_id || block.metadata?.message_id || block.locator?.slide || block.metadata?.slide || block.locator?.sheet || block.metadata?.sheet, 160);
+    if (container && activeContainer && container !== activeContainer) pending = null;
+    if (container) activeContainer = container;
+    if (!block.card_eligible || !block.text || block.metadata?.table_header || ['header', 'footer', 'page', 'signature', 'quote', 'email_thread'].includes(block.kind) || block.metadata?.noise) { coverage[block.block_id] = { status: block.metadata?.table_header ? 'context' : 'dropped', reason: block.metadata?.table_header ? '表头作为行上下文' : ['quote', 'email_thread'].includes(block.kind) ? 'quoted_history' : block.kind === 'signature' ? 'signature' : '结构噪声、非当前消息或空内容' }; continue; }
+    if (block.kind === 'heading') { pending = { heading: block.text, hierarchy: [...block.hierarchy, block.text], node }; coverage[block.block_id] = { status: 'context', reason: '标题作为继承上下文' }; continue; }
     const headingPath = uniq([...(block.hierarchy || []), pending?.heading]);
     const parts = clauses(translation.get(block.block_id) || block.text);
-    let last = priorEvent;
+    let last = null;
+    const continuedTarget = node && continuation.get(node.node_id);
+    if (continuedTarget) last = eventByNode.get(continuedTarget) || null;
     for (const part of parts) {
-      if (last && isDependent(part) && (!block.metadata?.parent_clause_id || !last.source_context.parent_clause_id || block.metadata.parent_clause_id === last.source_context.parent_clause_id)) {
+      if (last && continuedTarget && isDependent(part)) {
         last.predicate += ` ${part}`; last.conditions = uniq([...last.conditions, ...conditions(part)]);
         last.exceptions = uniq([...last.exceptions, ...exceptions(part)]); last.parameters = uniq([...last.parameters, ...parameters(part)]);
         last.evidence_ids = uniq([...last.evidence_ids, block.block_id]);
         continue;
       }
       const type = inferType(part, block); const subject = subjectFor(part, headingPath);
+      const uncertainty = [];
+      if (!subject) uncertainty.push('无法从对象、主题或结构上下文确定检索主题');
       const identity = [type, subject, part, headingPath, block.metadata?.scope_id || '', block.metadata?.parent_clause_id || ''];
       const event = validateKnowledgeEvent({
         schema_version: `${CONTRACT_VERSION}/knowledge-event`, event_id: `evt-${hash(identity).slice(0, 24)}`,
-        semantic_type: type, subject, predicate: part, actor: actor(part), object: subject,
+        semantic_type: subject ? type : 'unknown', subject: subject || '待确认主题', predicate: part, actor: actor(part), object: subject,
         modality: modality(part), conditions: conditions(part), exceptions: exceptions(part), parameters: parameters(part),
         temporal_scope: clean(block.metadata?.temporal_scope, 160), applicability_scope: clean(block.metadata?.scope_id, 160),
-        source_context: { heading_path: headingPath, parent_clause_id: clean(block.metadata?.parent_clause_id, 160), list_id: clean(block.metadata?.list_id, 160), table_headers: uniq(block.metadata?.table_headers), unit: clean(block.metadata?.unit, 40) },
-        evidence_ids: [block.block_id], confidence: type === 'unknown' ? 0.45 : 0.9,
-        uncertainty: type === 'unknown' ? ['语义类型无法由显式结构或通用语言信号确定'] : []
+        source_context: { heading_path: headingPath, structure_node_id: node?.node_id || '', parent_node_id: node?.parent_id || '', parent_clause_id: clean(block.metadata?.parent_clause_id, 160), parent_clause_text: clean(blocksById.get(block.metadata?.parent_clause_id)?.text, 500), list_id: clean(block.metadata?.list_id || block.metadata?.list?.num_id, 160), table_headers: uniq(block.metadata?.table_headers || node?.fields?.header_paths), unit: clean(block.metadata?.unit || node?.fields?.units?.[0], 40) },
+        evidence_ids: uniq(block.metadata?.source_block_ids?.length ? block.metadata.source_block_ids : [block.block_id]), confidence: type === 'unknown' ? 0.45 : 0.9,
+        uncertainty: uniq([...uncertainty, ...(type === 'unknown' ? ['语义类型无法由显式结构或通用语言信号确定'] : [])])
       });
-      events.push(event); last = event;
+      events.push(event); last = event; if (node) eventByNode.set(node.node_id, event);
     }
-    priorEvent = last;
     coverage[block.block_id] = { status: 'covered', event_ids: events.filter((e) => e.evidence_ids.includes(block.block_id)).map((e) => e.event_id) };
+  }
+  for (const block of document.blocks) if (!coverage[block.block_id]) {
+    const eventIds = events.filter((event) => event.evidence_ids.includes(block.block_id)).map((event) => event.event_id);
+    coverage[block.block_id] = eventIds.length ? { status: 'covered', event_ids: eventIds } : { status: 'context', reason: '结构上下文' };
   }
   return { events, coverage };
 }
@@ -8852,6 +9005,7 @@ function titleFor(event) {
 function bodyFor(event) {
   const lead = { requirement: '要求', guideline: '建议', procedure: '步骤', method: '做法', parameter: '参数', acceptance: '验收标准', risk: '风险', decision: '决定', action: '行动', commitment: '承诺', commercial_term: '条款', schedule: '时间安排', term_definition: '定义', checklist_item: '检查项', lesson: '经验', unknown: '待确认内容' }[event.semantic_type] || '内容';
   const lines = [`${lead}：${event.predicate}`];
+  if (event.source_context.parent_clause_text && !event.predicate.includes(event.source_context.parent_clause_text)) lines.push(`适用范围：${event.source_context.parent_clause_text}`);
   if (event.actor) lines.push(`执行主体：${event.actor}`);
   if (event.conditions.length) lines.push(`适用条件：${event.conditions.join('；')}`);
   if (event.exceptions.length) lines.push(`例外：${event.exceptions.join('；')}`);
@@ -8880,6 +9034,9 @@ function generateUsefulCards(document, regions, options = {}) {
   const extracted = extractKnowledgeEvents(document, regions);
   const plans = planUsefulCards(extracted.events);
   const inherited = plans.reduce((n, p) => n + JSON.stringify(p.necessary_inherited_context).length, 0);
+  const graph = document.structure || { nodes: [], edges: [] };
+  const count = (items, key) => items.reduce((out, item) => { const value = item[key] || 'unknown'; out[value] = (out[value] || 0) + 1; return out; }, {});
+  const inferred = graph.edges.filter((e) => e.origin === 'inferred').map((e) => e.confidence);
   return { ...extracted, plans, diagnostics: {
     events_detected: extracted.events.length, cards_planned: plans.length,
     events_per_card: plans.map((p) => p.included_event_ids.length), independent_siblings_merged: 0,
@@ -8887,7 +9044,14 @@ function generateUsefulCards(document, regions, options = {}) {
     unknown_types: extracted.events.filter((e) => e.semantic_type === 'unknown').length,
     planner_split_reasons: { independent_retrieval_intent: plans.filter((p) => p.decision.mode === 'split_independent').length },
     planner_combine_reasons: { dependent_context: plans.filter((p) => p.decision.mode === 'combine_dependent').length },
-    model_batches: Number(options.model_batches) || 0, semantic_boundaries_depend_on_batch_size: false
+    model_batches: Number(options.model_batches) || 0, semantic_boundaries_depend_on_batch_size: false,
+    strong_boundary_violations: 0, sibling_merges: 0, page_only_merge_attempts: 0,
+    orphan_list_items: graph.nodes.filter((n) => n.kind === 'list_item' && !n.parent_id).length,
+    unresolved_table_headers: graph.nodes.filter((n) => n.kind === 'table_row' && !n.fields?.header_paths?.length).length,
+    ambiguous_continuations: graph.edges.filter((e) => e.kind === 'continuation_of' && e.confidence < 0.8).length,
+    inherited_context: plans.map((p) => ({ plan_id: p.plan_id, reasons: ['nearest_heading', ...(p.necessary_inherited_context.table_headers.length ? ['table_header'] : [])], characters: JSON.stringify(p.necessary_inherited_context).length })),
+    email_dispositions: { current: graph.nodes.filter((n) => n.kind === 'email_message').length, quoted: graph.nodes.filter((n) => n.kind === 'quote').length, signature: graph.nodes.filter((n) => n.kind === 'signature').length },
+    structure: { version: graph.schema_version, adapter: graph.adapter, nodes_by_kind: count(graph.nodes, 'kind'), nodes_by_origin: count(graph.nodes, 'origin'), edges_by_kind: count(graph.edges, 'kind'), edges_by_origin: count(graph.edges, 'origin'), inferred_confidence: { count: inferred.length, low: inferred.filter((x) => x < 0.6).length, medium: inferred.filter((x) => x >= 0.6 && x < 0.8).length, high: inferred.filter((x) => x >= 0.8).length } }
   }};
 }
 
@@ -8902,8 +9066,9 @@ module.exports = { extractKnowledgeEvents, planUsefulCards, generateUsefulCards,
 const crypto = require('crypto');
 const { analyzeText } = require("src/content-integrity.js");
 const { generateUsefulCards, SEMANTIC_KIND } = require("src/useful-card-generation.js");
+const { STRUCTURE_VERSION, buildStructureContext } = require("src/structure-context.js");
 
-const PIPELINE_VERSION = '4.0-useful-card';
+const PIPELINE_VERSION = '5.0-structure-aware-useful-card';
 const OUTPUT_LANGUAGE = 'zh-CN';
 const TRANSLATION_VERSION = 'universal-zh-v1';
 const SEMANTIC_KINDS = Object.freeze([
@@ -8916,8 +9081,8 @@ const ACTIVE_STATES = new Set(['lead', 'approved', 'bidding', 'submitted', 'eval
 const HISTORICAL_STATES = new Set(['lost', 'paused', 'terminated', 'archived', 'completed', 'cancelled', 'suspended']);
 const BLOCK_KINDS = new Set([
   'heading', 'paragraph', 'list', 'list_item', 'table', 'table_row', 'key_value',
-  'figure', 'caption', 'header', 'footer', 'email_envelope', 'email_body',
-  'email_thread', 'sheet', 'page', 'attachment', 'text'
+  'table_cell', 'spreadsheet_cell', 'figure', 'caption', 'header', 'footer', 'email_envelope', 'email_subject', 'email_from', 'email_to', 'email_body',
+  'email_thread', 'quote', 'signature', 'sheet', 'page', 'page-text', 'attachment', 'speaker_note', 'parsed-markdown', 'text'
 ]);
 const TAG_SYNONYMS = Object.freeze({
   '质量管理': '质量', '品质': '质量', '安全管理': '安全', '工期': '时间',
@@ -9031,12 +9196,45 @@ function normalizeLocator(raw, fallback) {
   return result;
 }
 
+function expandStructuredBlocks(rawBlocks, source) {
+  const output = []; const identityOccurrences = new Map();
+  for (const raw of rawBlocks) {
+    const value = String(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown || '');
+    const parser = clean(raw?.parse?.method || source.parser, 80);
+    const markdownLike = raw?.kind === 'parsed-markdown' || (raw?.kind === 'page-text' && parser === 'mineru-api');
+    if (!markdownLike && raw?.kind !== 'table') { output.push(raw); continue; }
+    const lines = value.split(/\r?\n/); let paragraph = []; let start = 0;
+    const emit = (kind, parts, line, metadata = {}) => {
+      const content = parts.join('\n').trim(); if (!content) return;
+      const identityKey = `${kind}\0${content}`; const occurrence = identityOccurrences.get(identityKey) || 0; identityOccurrences.set(identityKey, occurrence + 1);
+      const stable = `blk-${digest([source.source_document_id || source.source_hash, kind, content, occurrence]).slice(0, 20)}`;
+      output.push({ ...raw, block_id: stable, kind, raw: { ...(raw.raw || {}), text: content }, text: content,
+        locator: { ...(raw.locator || {}), fragment: `lines=${line + 1}-${line + parts.length}` }, metadata: { ...(raw.metadata || {}), ...metadata, structure_origin: markdownLike ? 'parser' : 'native' } });
+    };
+    const flush = (line) => { emit('paragraph', paragraph, start); paragraph = []; };
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i]; const heading = markdownLike && line.match(/^(#{1,6})\s+(.+)$/); const item = markdownLike && line.match(/^\s*([-*+] |\d+[.)]\s+)(.+)$/);
+      const tableRow = /^\s*\|.*\|\s*$/.test(line);
+      if (heading) { flush(i); emit('heading', [heading[2]], i, { heading_level: heading[1].length }); }
+      else if (item) { flush(i); emit('list_item', [item[2]], i, { list_id: `markdown-list:${raw.block_id || raw.locator?.value || 'document'}`, list_level: Math.floor((line.match(/^\s*/)?.[0].length || 0) / 2), numbering_token: item[1].trim() }); }
+      else if (tableRow) {
+        flush(i); const cells = line.split('|').slice(1, -1).map((cell) => clean(cell, 500));
+        const tableId = `markdown-table:${raw.block_id || raw.locator?.value || 'document'}`;
+        const header = output.find((b) => b.kind === 'table_row' && b.metadata?.table_id === tableId && b.metadata?.table_header);
+        if (!cells.every((cell) => /^:?-{3,}:?$/.test(cell))) emit('table_row', [cells.join(' | ')], i, { table_id: tableId, row_id: `row:${digest(cells).slice(0, 12)}`, table_header: !header, table_headers: header ? header.raw.text.split(' | ') : [] });
+      } else if (!line.trim()) flush(i); else { if (!paragraph.length) start = i; paragraph.push(line); }
+    }
+    flush(lines.length);
+  }
+  return output;
+}
+
 function canonicalizeDocument(input = {}) {
   const source = input.document || input;
   const rawBlocks = Array.isArray(source.blocks) ? source.blocks
     : Array.isArray(source.normalized_blocks) ? source.normalized_blocks
       : clean(source.text || source.markdown) ? [{ kind: 'text', raw: { text: source.text || source.markdown } }] : [];
-  const blocks = rawBlocks.map((raw, order) => {
+  const blocks = expandStructuredBlocks(rawBlocks, source).map((raw, order) => {
     const originalText = String(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown || '');
     const rawText = clean(originalText, 30000);
     const kind = BLOCK_KINDS.has(clean(raw?.kind, 80)) ? clean(raw.kind, 80) : 'text';
@@ -9052,15 +9250,17 @@ function canonicalizeDocument(input = {}) {
       source_language: detectLanguage(rawText),
       hierarchy, locator: normalizeLocator(raw?.locator, blockId),
       parse_status: clean(raw?.parse?.status, 40) || (rawText ? 'present' : 'missing'),
-      metadata, provenance: Array.isArray(raw?.provenance) ? raw.provenance : [],
+      parent_id: clean(raw?.parent_id, 160), inferred: raw?.inferred && typeof raw.inferred === 'object' ? { ...raw.inferred } : {},
+      parse_method: clean(raw?.parse?.method || raw?.parse_method, 80), parse_quality: Number(raw?.parse?.quality ?? raw?.parse_quality),
+      card_eligible: raw?.card_eligible !== false, metadata, provenance: Array.isArray(raw?.provenance) ? raw.provenance : [],
       content_integrity: analyzeText(originalText)
     };
   }).filter((block) => block.content_integrity.ok
     && (block.text || ['figure', 'attachment', 'page', 'sheet'].includes(block.kind)));
   const sourceId = clean(source.source_document_id || source.source_identity, 300)
     || `src-${digest([source.source_hash, source.source_path, blocks.map((block) => block.text)]).slice(0, 24)}`;
-  return {
-    schema_version: 'canonical-document/1.0', pipeline_version: PIPELINE_VERSION,
+  const canonical = {
+    schema_version: 'canonical-document/2.0', pipeline_version: PIPELINE_VERSION,
     source_document_id: sourceId, source_identity: clean(source.source_identity, 300) || sourceId,
     source_hash: clean(source.source_hash, 128), source_path: clean(source.source_path, 1000),
     title: clean(source.title || source.filename, 400) || '未命名资料',
@@ -9068,8 +9268,11 @@ function canonicalizeDocument(input = {}) {
     source_language: detectLanguage(blocks.map((block) => block.text).join('\n')),
     output_language: OUTPUT_LANGUAGE,
     metadata: source.metadata && typeof source.metadata === 'object' ? { ...source.metadata } : {},
-    blocks, fingerprint: digest(blocks.map(({ kind, text, hierarchy }) => ({ kind, text, hierarchy })))
+    blocks
   };
+  canonical.structure = buildStructureContext(source, blocks);
+  canonical.fingerprint = digest([blocks.map(({ block_id, kind, text }) => ({ block_id, kind, text })), canonical.structure]);
+  return canonical;
 }
 
 function semanticSignals(text) {
@@ -9696,7 +9899,8 @@ function runUniversalPipeline(input = {}) {
     llm_calls: 0, llm_tokens: 0, cache_hits: Number(input.cache_hits) || 0,
     accepted: planned.units.length - groupedReview(planned.units).flatMap((group) => group.unit_ids).length,
     review: groupedReview(planned.units).length, rejected: regions.filter((region) => region.semantic_kind === 'noise').length,
-    relations: relations.length, writes: 0
+    relations: relations.length, writes: 0,
+    structure_contract_version: STRUCTURE_VERSION, structure: planned.useful_card.diagnostics.structure
   };
   return {
     schema_version: 'universal-pipeline/1.0', pipeline_version: PIPELINE_VERSION,
@@ -9744,7 +9948,8 @@ async function runUniversalPipelineMultilingual(input = {}) {
       cache_hits: translated.telemetry.cache_hits, translation: translated.telemetry,
       accepted: planned.units.length - review.flatMap((group) => group.unit_ids).length,
       review: review.length, rejected: regions.filter((region) => region.semantic_kind === 'noise').length,
-      relations: relations.length, writes: 0
+      relations: relations.length, writes: 0,
+      structure_contract_version: STRUCTURE_VERSION, structure: planned.useful_card.diagnostics.structure
     },
     cache_key: digest([document.fingerprint, PIPELINE_VERSION,
       input.translation_prompt_version || TRANSLATION_VERSION, input.model_version || 'configured-provider'])

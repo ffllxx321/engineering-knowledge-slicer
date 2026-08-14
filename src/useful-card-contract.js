@@ -1,6 +1,6 @@
 'use strict';
 
-const CONTRACT_VERSION = 'useful-card/1.0';
+const CONTRACT_VERSION = 'useful-card/2.0';
 const EVENT_TYPES = Object.freeze([
   'requirement', 'guideline', 'procedure', 'method', 'parameter', 'acceptance', 'risk',
   'decision', 'action', 'commitment', 'commercial_term', 'schedule', 'term_definition',
@@ -21,6 +21,7 @@ function validateKnowledgeEvent(event) {
   if (!event || event.schema_version !== `${CONTRACT_VERSION}/knowledge-event`) fail('KnowledgeEvent 版本无效');
   if (!EVENT_TYPES.includes(event.semantic_type)) fail('KnowledgeEvent 类型无效；不得回退为通用事实', 'KNOWLEDGE_EVENT_TYPE_INVALID');
   for (const key of ['event_id', 'subject', 'predicate']) if (typeof event[key] !== 'string' || !event[key].trim()) fail(`KnowledgeEvent 缺少 ${key}`);
+  if (event.subject === '未明确主题') fail('占位主题不得自动存储', 'KNOWLEDGE_EVENT_SUBJECT_UNCERTAIN');
   for (const key of ['conditions', 'exceptions', 'parameters', 'evidence_ids', 'uncertainty']) if (!strings(event[key])) fail(`KnowledgeEvent ${key} 必须是字符串数组`);
   if (!event.source_context || !strings(event.source_context.heading_path)) fail('KnowledgeEvent 缺少结构上下文');
   if (!Number.isFinite(event.confidence) || event.confidence < 0 || event.confidence > 1) fail('KnowledgeEvent 置信度无效');

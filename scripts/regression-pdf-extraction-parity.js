@@ -4,6 +4,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const { nativePdfText, selectAndParse } = require('../src/v3/adapters.js');
+const { loadBundleModule } = require('./load-bundle-module.js');
 
 const source = (bytes) => ({ path: 'fixtures/screenshot-regression.pdf', name: 'screenshot-regression.pdf',
   extension: 'pdf', bytes: Buffer.from(bytes) });
@@ -21,6 +22,15 @@ async function rejected(promise) {
   assert.strictEqual(closed.code, 'V3_PARSE_FAILED');
   assert(closed.attempts.some((item) => item.adapter === 'pdf-native-probe' && item.status === 'skipped'));
   assert(!closed.attempts.some((item) => item.adapter === 'pdf-native-probe' && item.status === 'succeeded'));
+
+  const bundledPdf = loadBundleModule('src/pdf-text-extractor.js', {
+    'vendor/pdfjs.js': require('../node_modules/pdfjs-dist/legacy/build/pdf.js'),
+    'vendor/pdf.worker.js': require('../node_modules/pdfjs-dist/legacy/build/pdf.worker.js')
+  });
+  const { nativeChinesePdf } = require('./acceptance-real.js');
+  const valid = await bundledPdf.extractPdfText(nativeChinesePdf());
+  assert.match(valid.text, /施工验收要求/);
+  assert.match(valid.text, /VAV-50/);
 
   const restored = await selectAndParse(source(screenshotPayload), {
     cloud: { configured: true, authorized: true, parse: async () => '施工图要求：防水层厚度不得小于 1.5 mm，并按检验批验收。' },
@@ -42,8 +52,19 @@ async function rejected(promise) {
   const end = main.indexOf('\n  async getPluginFilePath', start);
   const productionPdfShortcut = main.slice(start, end);
   assert(start >= 0 && end > start, 'production PDF gate must remain inspectable');
-  assert(productionPdfShortcut.includes('PDF_REAL_TEXT_PARSER_REQUIRED'));
+  assert(productionPdfShortcut.includes('extractPdfText(buffer'),
+    'production must use the bundled cross-platform PDF.js extractor before cloud/OCR fallback');
+  assert(!productionPdfShortcut.includes('pdftotext') && !productionPdfShortcut.includes('child_process'),
+    'production PDF extraction must not depend on a system executable');
+  assert(productionPdfShortcut.includes('createParsePackage({'),
+    'native PDF text must cross the same parse-package/evidence boundary');
+  assert(productionPdfShortcut.includes('PDF_NATIVE_TEXT_UNAVAILABLE'),
+    'empty native extraction must retain a typed fallback outcome');
   assert(!productionPdfShortcut.includes('matchAll('), 'production must not scrape raw PDF Tj/TJ operands');
+  assert(main.includes('PDF_TEXT_INTEGRITY_FAILED'),
+    'the bundled extractor must reject corrupt native text before returning a parse package');
+  assert(main.includes('vendor/pdfjs.js') && main.includes('src/pdf-text-extractor.js') && main.includes('"vendor/pdf.worker.js"'),
+    'the shipped single-file plugin must embed PDF.js, its fake-worker runtime, and its adapter');
   const realGateStart = main.indexOf('async runV3RealObsidianGateProbe()');
   const realGateEnd = main.indexOf('\n  async v3GateWrite', realGateStart);
   const realGate = main.slice(realGateStart, realGateEnd);

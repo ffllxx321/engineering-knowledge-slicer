@@ -72,7 +72,7 @@ class AutoDocumentParser {
     // Preserve actionable parser outcomes. Converting these to an internal,
     // non-retryable quality-gate error hides the actual remediation from users.
     if (ocr && (ocr.actionable || ['ocr_required', 'review_required', 'cancelled'].includes(ocr.status))) return ocr;
-    throw typed('DOCUMENT_QUALITY_GATE_FAILED', `自动识别失败：MinerU 与本地 OCR 均未产生可核验知识证据。${mineruError ? ` ${mineruError.message}` : ''}`);
+    throw typed('DOCUMENT_QUALITY_GATE_FAILED', `自动识别失败：MinerU 与本地 OCR 均未产生可核验知识证据。${local?.message ? ` ${local.message}` : ''}${mineruError ? ` ${mineruError.message}` : ''}`);
   }
 
   async call(name, filePath, buffer, context) {

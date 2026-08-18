@@ -12,6 +12,76 @@ const binary = process.env.OBSIDIAN_APPIMAGE || "/tmp/Obsidian-1.12.7.AppImage";
 const shaBuffer = (b) => crypto.createHash("sha256").update(b).digest("hex");
 const shaFile = (p) => shaBuffer(fs.readFileSync(p));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const { analyzeMarkdownCard } = require('../src/content-integrity.js');
+
+class AcceptanceLifecycleError extends Error {
+  constructor(code, message, evidence = {}, cause) {
+    super(message, cause ? { cause } : undefined);
+    this.name = 'AcceptanceLifecycleError';
+    this.code = code;
+    this.evidence = evidence;
+  }
+}
+
+function deadlineMs(name, fallback) {
+  const value = Number(process.env[name] || fallback);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function childEvidence(child, extra = {}) {
+  return { pid: child?.pid || null, spawnfile: child?.spawnfile || null,
+    exit_code: child?.exitCode ?? null, signal: child?.signalCode || null, ...extra };
+}
+
+async function terminateChild(child, graceMs = deadlineMs('EKS_ACCEPTANCE_KILL_GRACE_MS', 3000)) {
+  if (!child || child.exitCode !== null || child.signalCode) return { terminated: true, forced: false };
+  const exited = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const signal = (name) => {
+    try { if (child.pid) process.kill(-child.pid, name); else child.kill(name); }
+    catch (error) { if (error.code !== 'ESRCH') throw error; }
+  };
+  signal('SIGTERM');
+  let result = await Promise.race([exited, sleep(graceMs).then(() => null)]);
+  if (result) return { terminated: true, forced: false, ...result };
+  signal('SIGKILL');
+  result = await Promise.race([exited, sleep(graceMs).then(() => null)]);
+  return { terminated: Boolean(result), forced: true, ...(result || {}) };
+}
+
+async function closeServer(server, timeoutMs = deadlineMs('EKS_ACCEPTANCE_SERVER_CLOSE_MS', 3000)) {
+  if (!server?.listening) return;
+  await Promise.race([
+    new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+    sleep(timeoutMs).then(() => { throw new AcceptanceLifecycleError('PROVIDER_CLOSE_TIMEOUT',
+      `provider server did not close within ${timeoutMs}ms`, { timeout_ms: timeoutMs }); })
+  ]);
+}
+
+function nativeChinesePdf(text = '施工验收要求：风管净距必须为 50 mm，设备型号 VAV-50。') {
+  const characters = [...text];
+  const hex = characters.map((_, index) => (index + 1).toString(16).padStart(2, '0')).join('').toUpperCase();
+  const stream = `BT /F1 16 Tf 72 760 Td <${hex}> Tj ET`;
+  const mappings = characters.map((character, index) => {
+    const source = (index + 1).toString(16).padStart(2, '0').toUpperCase();
+    const target = Buffer.from(character, 'utf16le').swap16().toString('hex').toUpperCase();
+    return `<${source}> <${target}>`;
+  }).join('\n');
+  const cmap = `/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def /CMapName /EKS def /CMapType 2 def 1 begincodespacerange <00> <FF> endcodespacerange ${characters.length} beginbfchar\n${mappings}\nendbfchar endcmap CMapName currentdict /CMap defineresource pop end end`;
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>',
+    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>',
+    `<< /Length ${Buffer.byteLength(cmap)} >>\nstream\n${cmap}\nendstream`
+  ];
+  let pdf = '%PDF-1.7\n'; const offsets = [0];
+  objects.forEach((object, index) => { offsets.push(Buffer.byteLength(pdf)); pdf += `${index + 1} 0 obj\n${object}\nendobj\n`; });
+  const xref = Buffer.byteLength(pdf); pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets.slice(1)) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer << /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(pdf);
+}
 function crc32(data) {
   let c = 0xffffffff;
   for (const b of data) {
@@ -95,9 +165,7 @@ function fixtures() {
       "ppt/slides/slide1.xml":
         '<p:sld xmlns:p="p" xmlns:a="a"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>质量要求：混凝土强度等级 C35。</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>',
     }),
-    "native.pdf": Buffer.from(
-      "%PDF-1.4\n1 0 obj<</Type/Page>>endobj\nBT (Acceptance duct clearance shall be 50 mm model VAV-50.) Tj ET\n%%EOF",
-    ),
+    "native.pdf": nativeChinesePdf(),
   };
 }
 function inputs(argv) {
@@ -173,15 +241,27 @@ async function localProvider() {
       }),
     );
   });
-  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const startupMs = deadlineMs('EKS_ACCEPTANCE_PROVIDER_START_MS', 5000);
+  await Promise.race([
+    new Promise((resolve, reject) => {
+      const onError = (error) => { server.off('listening', onListen); reject(new AcceptanceLifecycleError(
+        'PROVIDER_LISTEN_ERROR', `provider server failed to listen: ${error.message}`, {}, error)); };
+      const onListen = () => { server.off('error', onError); resolve(); };
+      server.once('error', onError); server.once('listening', onListen);
+      server.listen(0, '127.0.0.1');
+    }),
+    sleep(startupMs).then(() => { throw new AcceptanceLifecycleError('PROVIDER_START_TIMEOUT',
+      `provider server did not listen within ${startupMs}ms`, { timeout_ms: startupMs }); })
+  ]).catch(async (error) => { await closeServer(server).catch(() => {}); throw error; });
   return {
     server,
     endpoint: `http://127.0.0.1:${server.address().port}/anthropic/v1/messages`,
     stats,
   };
 }
-async function evaluate(port) {
-  const pages = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+async function evaluate(port, maximumMs) {
+  const timeoutMs = Math.max(1, Math.min(deadlineMs('EKS_ACCEPTANCE_CDP_TIMEOUT_MS', 15000), maximumMs || Infinity));
+  const pages = await (await fetch(`http://127.0.0.1:${port}/json`, { signal: AbortSignal.timeout(timeoutMs) })).json();
   const page = pages.find(
     (x) =>
       x.type === "page" &&
@@ -191,7 +271,8 @@ async function evaluate(port) {
   if (!page) return false;
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(page.webSocketDebuggerUrl),
-      timer = setTimeout(() => reject(new Error("CDP timeout")), 15000);
+      timer = setTimeout(() => { ws.close(); reject(new AcceptanceLifecycleError('CDP_TIMEOUT',
+        `CDP evaluation exceeded ${timeoutMs}ms`, { port, timeout_ms: timeoutMs })); }, timeoutMs);
     ws.onopen = () =>
       ws.send(
         JSON.stringify({
@@ -201,7 +282,7 @@ async function evaluate(port) {
             awaitPromise: true,
             returnByValue: true,
             expression:
-              '(async()=>{if(typeof app==="undefined"||!app.plugins)return false;localStorage.setItem("enable-plugin-"+app.appId,"true");let p=app.plugins.plugins["engineering-knowledge-slicer"]||await app.plugins.loadPlugin("engineering-knowledge-slicer");if(!p||typeof p.runAcceptanceRealProbe!=="function")return false;await p.runAcceptanceRealProbe();return true})()',
+              '(async()=>{if(typeof app==="undefined"||!app.plugins)return false;localStorage.setItem("enable-plugin-"+app.appId,"true");let p=app.plugins.plugins["engineering-knowledge-slicer"]||await app.plugins.loadPlugin("engineering-knowledge-slicer");if(!p||!p.settings||typeof p.runAcceptanceRealProbe!=="function")return false;await p.runAcceptanceRealProbe();return true})()',
           },
         }),
       );
@@ -210,20 +291,27 @@ async function evaluate(port) {
       if (m.id === 1) {
         clearTimeout(timer);
         ws.close();
+        if (m.result?.exceptionDetails) {
+          const detail = m.result.exceptionDetails;
+          const message = detail.exception?.description || detail.text || 'acceptance probe threw';
+          reject(new AcceptanceLifecycleError('HOST_PROBE_ERROR', message, {
+            port, line_number: detail.lineNumber ?? null, column_number: detail.columnNumber ?? null
+          }));
+          return;
+        }
         resolve(m.result?.result?.value === true);
       }
     };
-    ws.onerror = reject;
+    ws.onerror = (error) => { clearTimeout(timer); reject(error); };
   });
 }
-async function launch(vault, config, resultPath, env) {
+async function launch(vault, config, resultPath, env, options = {}) {
   try {
     fs.unlinkSync(resultPath);
   } catch {}
   const port = 21000 + Math.floor(Math.random() * 1000);
-  const child = spawn(
-    "xvfb-run",
-    [
+  const command = options.command || 'xvfb-run';
+  const args = options.args || [
       "-a",
       binary,
       "--no-sandbox",
@@ -231,8 +319,9 @@ async function launch(vault, config, resultPath, env) {
       `--remote-debugging-port=${port}`,
       `--user-data-dir=${config}`,
       `obsidian://open?path=${encodeURIComponent(vault)}`,
-    ],
-    {
+    ];
+  const startedAt = Date.now();
+  const child = spawn(command, args, {
       detached: true,
       stdio: "ignore",
       env: {
@@ -242,28 +331,43 @@ async function launch(vault, config, resultPath, env) {
         XDG_CONFIG_HOME: config,
         EKS_ACCEPTANCE_REAL: "1",
       },
-    },
-  );
-  const deadline =
-    Date.now() + Number(process.env.EKS_ACCEPTANCE_TIMEOUT_MS || 240000);
+    });
+  const timeoutMs = Number(options.timeoutMs || deadlineMs('EKS_ACCEPTANCE_TIMEOUT_MS', 240000));
+  const deadline = Date.now() + timeoutMs;
+  let spawnError;
+  let exit;
+  child.once('error', (error) => { spawnError = error; });
+  child.once('exit', (code, signal) => { exit = { code, signal }; });
   let invoked = false;
-  while (Date.now() < deadline && !fs.existsSync(resultPath)) {
-    if (!invoked)
-      try {
-        invoked = await evaluate(port);
-      } catch {}
-    await sleep(500);
-  }
+  let lastCdpError;
+  let cleanup;
   try {
-    process.kill(-child.pid, "SIGTERM");
-  } catch {
-    child.kill("SIGTERM");
+    while (Date.now() < deadline && !fs.existsSync(resultPath)) {
+      if (spawnError) throw new AcceptanceLifecycleError('HOST_SPAWN_ERROR',
+        `acceptance host failed to spawn: ${spawnError.message}`, childEvidence(child), spawnError);
+      if (exit) throw new AcceptanceLifecycleError('HOST_EARLY_EXIT',
+        `acceptance host exited before producing a result`, childEvidence(child, { ...exit, elapsed_ms: Date.now() - startedAt }));
+      if (!invoked && !options.skipEvaluate) {
+        try { invoked = await evaluate(port, deadline - Date.now()); }
+        catch (error) {
+          lastCdpError = error;
+          if (error?.code === 'HOST_PROBE_ERROR') throw error;
+        }
+      }
+      await sleep(Math.min(250, Math.max(1, deadline - Date.now())));
+    }
+    if (!fs.existsSync(resultPath)) throw new AcceptanceLifecycleError('HOST_RESULT_TIMEOUT',
+      `official Obsidian did not produce acceptance result within ${timeoutMs}ms`,
+      childEvidence(child, { timeout_ms: timeoutMs, elapsed_ms: Date.now() - startedAt,
+        cdp_invoked: invoked, last_cdp_error: lastCdpError ? String(lastCdpError.message || lastCdpError) : null }));
+    try { return JSON.parse(fs.readFileSync(resultPath, 'utf8')); }
+    catch (error) { throw new AcceptanceLifecycleError('HOST_RESULT_INVALID',
+      `acceptance result is not valid JSON: ${error.message}`, childEvidence(child, { result_path: resultPath }), error); }
+  } finally {
+    cleanup = await terminateChild(child).catch((error) => ({ terminated: false, cleanup_error: String(error.message || error) }));
+    if (!cleanup.terminated && !spawnError) throw new AcceptanceLifecycleError('HOST_CLEANUP_FAILED',
+      'acceptance host remained alive after SIGTERM and SIGKILL', childEvidence(child, cleanup));
   }
-  assert(
-    fs.existsSync(resultPath),
-    "official Obsidian did not produce acceptance result",
-  );
-  return JSON.parse(fs.readFileSync(resultPath, "utf8"));
 }
 function bucket(n) {
   return n < 1024 ? "lt_1KiB" : n < 1024 * 1024 ? "1KiB_1MiB" : "gte_1MiB";
@@ -287,7 +391,8 @@ function safeSources(tasks) {
     production_state: task.production_state,
     terminal_outcome: task.terminal_outcome,
     card_count: task.cards.length,
-    cards: task.cards.map((card) => ({ sha256: card.content_hash, size_bytes: card.bytes })),
+    cards: task.cards.map((card) => ({ sha256: card.content_hash, size_bytes: card.bytes,
+      quality_ok: card.quality_ok === true, quality_reasons: card.quality_reasons || [] })),
     counts: task.counts,
     error_codes: task.error_codes,
   }));
@@ -297,7 +402,7 @@ function externalCorpusAcceptance(tasks, suppliedCount) {
   const successful = external.filter((source) =>
     source.status === "stored" && source.production_state === "stored" &&
     source.terminal_outcome === "completed_with_output" && source.card_count > 0 &&
-    source.cards.every((card) => card.size_bytes > 0) &&
+    source.cards.every((card) => card.size_bytes > 0 && card.quality_ok === true) &&
     Number(source.counts?.verified || 0) > 0 && (source.error_codes || []).length === 0
   );
   const statusCounts = {};
@@ -307,6 +412,7 @@ function externalCorpusAcceptance(tasks, suppliedCount) {
     external_corpus_accounted: !required || external.length === suppliedCount,
     external_all_stored: !required || external.every((source) => source.status === "stored" && source.production_state === "stored" && source.terminal_outcome === "completed_with_output"),
     external_cards_nonempty: !required || external.every((source) => source.card_count > 0 && source.cards.every((card) => card.size_bytes > 0)),
+    external_cards_content_quality: !required || external.every((source) => source.cards.every((card) => card.quality_ok === true)),
     external_cards_verified: !required || external.every((source) => Number(source.counts?.verified || 0) > 0),
     external_error_free: !required || external.every((source) => (source.error_codes || []).length === 0),
   };
@@ -369,11 +475,14 @@ async function main() {
       EKS_ACCEPTANCE_MINIMAX_ENDPOINT: provider.endpoint,
     });
   } finally {
-    provider.server.close();
+    await closeServer(provider.server);
   }
-  const same =
-    JSON.stringify(first.tasks.map((t) => t.cards)) ===
-    JSON.stringify(second.tasks.map((t) => t.cards));
+  const stableCardSet = (result) => result.tasks.map((task) => ({
+    source_hash: task.source_hash,
+    cards: task.cards.map((card) => ({ path_hash: card.path_hash, content_hash: card.content_hash, bytes: card.bytes }))
+      .sort((a, b) => a.path_hash.localeCompare(b.path_hash)),
+  })).sort((a, b) => a.source_hash.localeCompare(b.source_hash));
+  const same = JSON.stringify(stableCardSet(first)) === JSON.stringify(stableCardSet(second));
   const fixtureChecks = {
     host_real: first.real_host === true,
     production_terminal: first.terminal_count === first.task_count,
@@ -384,6 +493,7 @@ async function main() {
     binary_free: first.openable_count === first.binary_free_count,
     stable_ids: first.openable_count === first.stable_id_count,
     placeholder_free: first.openable_count === first.placeholder_free_count,
+    content_quality: first.openable_count === first.content_quality_count,
     fixture_gold: first.gold?.passed === true && first.gold?.hit_count >= first.gold?.minimum_hits
       && first.gold?.fixture_sources_hit >= first.gold?.minimum_fixture_sources_hit,
     idempotent: same,
@@ -447,9 +557,24 @@ async function main() {
     `REAL ACCEPTANCE PASS tasks=${report.metrics.tasks} cards=${report.metrics.cards}`,
   );
 }
+function writeLifecycleFailureReport(error, targetRoot = root) {
+  const dir = path.join(targetRoot, 'test-artifacts'); fs.mkdirSync(dir, { recursive: true });
+  const report = { schema: 'eks/acceptance-report/1', passed: false, generated_at: new Date().toISOString(),
+    source_tree: (() => { try { return sourceTree(); } catch { return 'unknown'; } })(), checks: {},
+    failures: [error.code || 'ACCEPTANCE_UNEXPECTED_ERROR'], lifecycle_failure: {
+      type: error.name || 'Error', code: error.code || 'ACCEPTANCE_UNEXPECTED_ERROR', message: error.message,
+      evidence: error.evidence || {}, cause: error.cause ? String(error.cause.message || error.cause) : null },
+    provider: { local: 'failed', real: 'not_run' }, sources: [], metrics: { harness_fixtures: { passed: false } } };
+  fs.writeFileSync(path.join(dir, 'acceptance-real.json'), `${JSON.stringify(report, null, 2)}\n`);
+  fs.writeFileSync(path.join(dir, 'acceptance-real.md'), `# Real acceptance\n\n- Result: **FAIL**\n- Lifecycle failure: **${report.lifecycle_failure.code}**\n- Message: ${report.lifecycle_failure.message}\n`);
+  return report;
+}
 if (require.main === module)
   main().catch((e) => {
-    console.error(e);
+    writeLifecycleFailureReport(e);
+    console.error(`${e.name || 'Error'} [${e.code || 'ACCEPTANCE_UNEXPECTED_ERROR'}]: ${e.message}`);
     process.exitCode = 1;
   });
-module.exports = { binary, bucket, externalCorpusAcceptance, fixtures, inputs, launch, obsidianVersion, root, safeSources, shaFile, sourceTree };
+module.exports = { AcceptanceLifecycleError, binary, bucket, closeServer, externalCorpusAcceptance, fixtures,
+  inputs, launch, nativeChinesePdf, obsidianVersion, root, safeSources, shaFile, sourceTree,
+  terminateChild, writeLifecycleFailureReport };

@@ -762,6 +762,7 @@ function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
     const unit = normalizeKnowledgeUnit(raw, profile);
     unit.knowledge_event = event;
     unit.card_plan = plan;
+    unit.structure_context = plan.necessary_inherited_context;
     unit.semantic_kind = SEMANTIC_KIND[event.semantic_type] || event.semantic_type;
     unit.event_type = event.semantic_type;
     unit.fingerprint = digest([event.semantic_type, event.subject, event.predicate, event.conditions,
@@ -772,7 +773,8 @@ function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
     unit.confidence.route = unit.route.confidence;
     return unit;
   });
-  const unitByEvent = new Map(units.map((unit) => [unit.knowledge_event.event_id, unit]));
+  const unitByEvent = new Map();
+  for (const unit of units) for (const eventId of unit.card_plan.included_event_ids) unitByEvent.set(eventId, unit);
   for (const unit of units) {
     for (const relatedEventId of unit.card_plan.related_but_not_merged_event_ids) {
       const related = unitByEvent.get(relatedEventId);

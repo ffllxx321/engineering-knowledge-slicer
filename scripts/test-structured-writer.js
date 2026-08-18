@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const {
   stableId, emptyIndex, serializeRecord, buildPlan, commitPlan, rollbackTransaction,
-  pathSafe, hash
+  pathSafe, hash, coalesceCanonicalUnits
 } = require('../src/structured-writer.js');
 const { runPhase2CandidatePipeline } = require('../src/phase2-candidate-pipeline.js');
 const { evaluatePhase3 } = require('../src/phase3-review-gate.js');
@@ -185,6 +185,21 @@ async function realPhasePath() {
 }
 
 async function main() {
+  const semanticBase = {
+    route: { library: 'business', category: 'safety' }, semantic_kind: 'requirement', scope: 'project',
+    subject: '临边防护', title: '临边防护', tags: [], applicable_conditions: [], exceptions: [], uncertainty: []
+  };
+  const adjacent = coalesceCanonicalUnits([
+    { ...semanticBase, unit_id: 'adj-1', statement: '临边必须设置防护栏杆。', evidence: [{ locator: { scheme: 'paragraph', value: 'p10' }, verbatim: '临边必须设置防护栏杆。' }] },
+    { ...semanticBase, unit_id: 'adj-2', statement: '栏杆底部必须设置挡脚板。', evidence: [{ locator: { scheme: 'paragraph', value: 'p11' }, verbatim: '栏杆底部必须设置挡脚板。' }] }
+  ]);
+  assert.strictEqual(adjacent.length, 1, 'adjacent fragments with the same explicit topic and semantics may merge');
+  assert.strictEqual(adjacent[0].evidence.length, 2, 'semantic merge retains the complete evidence set');
+  const unrelated = coalesceCanonicalUnits([
+    { ...semanticBase, unit_id: 'apart-1', statement: '临边必须设置防护栏杆。', evidence: [{ locator: { scheme: 'paragraph', value: 'p10' }, verbatim: '临边必须设置防护栏杆。' }] },
+    { ...semanticBase, unit_id: 'apart-2', subject: '混凝土养护', title: '混凝土养护', statement: '混凝土应保湿养护。', evidence: [{ locator: { scheme: 'paragraph', value: 'p11' }, verbatim: '混凝土应保湿养护。' }] }
+  ]);
+  assert.strictEqual(unrelated.length, 2, 'semantically unrelated units never merge merely to satisfy a count');
   assert.strictEqual(pathSafe('../逃逸'), false);
   assert.strictEqual(pathSafe('/绝对'), false);
   assert.strictEqual(buildPlan({ settings: {}, document: {} }).mode, 'feature_off');
@@ -399,6 +414,41 @@ async function main() {
   assert.strictEqual(second22.verified.counts.knowledge_records, 22);
   assert.strictEqual(second22.verified.counts.knowledge_unchanged, 22);
   assert.strictEqual(new Set(second22.verified.knowledge_paths).size, 22);
+
+  const universal101 = universalResult(101);
+  universal101.knowledge_units.forEach((unit, index) => {
+    unit.evidence = [{ ...unit.evidence[0], locator: { scheme: 'paragraph', value: `p-${index}` },
+      verbatim: `第 ${index + 1} 项要求必须执行并留存记录。` }];
+  });
+  assert.throws(() => buildPlan({
+    ...input(), document: universal101.document, universalResult: universal101,
+    phase2Result: undefined, phase3Result: undefined
+  }), (error) => error.code === 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED');
+
+  const reviewed = universalResult(3);
+  reviewed.review_decisions = [{ decision_id: 'review-1', unit_ids: [reviewed.knowledge_units[2].unit_id],
+    cause: 'insufficient_evidence', action: 'manual_group' }];
+  const reviewedPlan = buildPlan({
+    ...input(), document: reviewed.document, universalResult: reviewed,
+    phase2Result: undefined, phase3Result: undefined
+  });
+  assert.strictEqual(reviewedPlan.blocked, false,
+    'quarantined review units do not block independent verified knowledge');
+  assert.strictEqual(reviewedPlan.phase3_handling_groups.length, 1);
+  assert.strictEqual(reviewedPlan.actions.filter((item) =>
+    ['business_item', 'company_knowledge'].includes(item.record_kind)).length, 2);
+
+  const duplicated = universalResult(3);
+  duplicated.knowledge_units[1].fingerprint = duplicated.knowledge_units[0].fingerprint;
+  const duplicatePlan = buildPlan({
+    ...input(), document: duplicated.document, universalResult: duplicated,
+    phase2Result: undefined, phase3Result: undefined
+  });
+  const duplicateKnowledge = duplicatePlan.actions.filter((item) =>
+    ['business_item', 'company_knowledge'].includes(item.record_kind));
+  assert.strictEqual(duplicateKnowledge.length, 2, 'stable semantic identities are coalesced before commit');
+  assert.strictEqual(new Set(duplicateKnowledge.map((item) => item.path)).size, 2,
+    'one plan never writes the same stable path twice');
 
   const noopVault = new NoopRecordVault();
   await assert.rejects(() => commitPlan({ ...plan22, mode: 'structured-write' }, {

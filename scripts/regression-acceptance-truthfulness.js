@@ -9,7 +9,7 @@ function task(overrides = {}) {
   return {
     source_origin: "external", source_hash: "a".repeat(64), source_type: "docx",
     source_size_bucket: "1KiB_1MiB", status: "stored", production_state: "stored",
-    terminal_outcome: "completed_with_output", cards: [{ content_hash: "b".repeat(64), bytes: 123 }],
+    terminal_outcome: "completed_with_output", cards: [{ content_hash: "b".repeat(64), bytes: 123, quality_ok: true, quality_reasons: [] }],
     counts: { verified: 1 }, error_codes: [], errors: [], source_path: "/secret/client-name.docx",
     source_text: "DO NOT LEAK THIS SOURCE", prompt: "DO NOT LEAK THIS PROMPT",
     provider_response: "DO NOT LEAK THIS RESPONSE", ...overrides,
@@ -24,6 +24,7 @@ for (const failed of [
   task({ status: "needs_review", production_state: "pending_confirmation", terminal_outcome: null }),
   task({ status: "unsupported", production_state: "failed", terminal_outcome: "failed" }),
   task({ cards: [] }), task({ counts: { verified: 0 } }),
+  task({ cards: [{ content_hash: "b".repeat(64), bytes: 123, quality_ok: false, quality_reasons: ["mojibake"] }] }),
 ]) assert.strictEqual(externalCorpusAcceptance([failed], 1).passed, false);
 assert.strictEqual(externalCorpusAcceptance([], 1).checks.external_corpus_accounted, false);
 assert.strictEqual(externalCorpusAcceptance([task({ source_origin: "fixture" })], 0).passed, true);

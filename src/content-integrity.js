@@ -19,6 +19,7 @@ function analyzeText(value) {
   if (!text) return { ok: false, reasons: ['empty'] };
   const controls = (text.match(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g) || []).length;
   const replacement = (text.match(/\uFFFD/g) || []).length;
+  const missingGlyphs = (text.match(/[□�]/g) || []).length;
   const mojibake = (text.match(MOJIBAKE) || []).length;
   const printable = (text.match(/[\p{L}\p{N}\p{P}\p{S}\s]/gu) || []).length;
   const letters = (text.match(/\p{L}/gu) || []).length;
@@ -26,7 +27,8 @@ function analyzeText(value) {
   if (PDF_CONTAINER.test(text)) reasons.push('pdf_or_container_bytes');
   if (controls / text.length > 0.01 || printable / text.length < 0.86
       || /(?:[A-Za-z0-9+/]{120,}={0,2}|(?:\\x[0-9a-f]{2}){8,})/i.test(text)) reasons.push('control_heavy_or_binary');
-  if (replacement >= 2 || mojibake >= 3 || (replacement + mojibake) / Math.max(1, letters) > 0.08) reasons.push('mojibake');
+  if (replacement >= 2 || missingGlyphs >= 2 || mojibake >= 3
+      || (replacement + missingGlyphs + mojibake) / Math.max(1, letters) > 0.08) reasons.push('mojibake');
   if ((contractFields >= 2 && (CONTRACT_INSTRUCTION.test(text) || /[{}[\]":]/.test(text)))
       || (contractFields >= 1 && CONTRACT_INSTRUCTION.test(text)) || PROMPT_LEAKAGE.test(text)) reasons.push('parser_or_schema_contract_leakage');
   if (META_FAILURE.some((pattern) => pattern.test(text))) reasons.push('non_content_meta_statement');
@@ -67,7 +69,10 @@ function assertKnowledgeActions(actions) {
   const failures = [];
   for (const action of actions || []) {
     if (!['business_item', 'company_knowledge'].includes(action?.record_kind)) continue;
-    const analysis = analyzeText(action.content);
+    // Writer-owned frontmatter contains contract field names such as
+    // schema_version. It is trusted structure, not model-authored knowledge.
+    const content = String(action.content || '').replace(/^---\n[\s\S]*?\n---\n?/, '');
+    const analysis = analyzeText(content);
     if (!analysis.ok) failures.push({ record_id: action.record_id, reasons: analysis.reasons });
   }
   if (failures.length) {
@@ -78,4 +83,33 @@ function assertKnowledgeActions(actions) {
   }
 }
 
-module.exports = { analyzeText, blockText, quarantineInvalidBlocks, assertKnowledgeActions };
+function topicTokens(value) {
+  const text = String(value || '').toLocaleLowerCase();
+  const words = text.match(/[a-z][a-z0-9_-]{2,}|\d+(?:\.\d+)?(?:\s*[a-z%·]+)?/gi) || [];
+  const han = (text.match(/[\p{Script=Han}]{2,}/gu) || []).flatMap((run) =>
+    Array.from({ length: Math.max(0, run.length - 1) }, (_, index) => run.slice(index, index + 2)));
+  return new Set([...words, ...han]);
+}
+
+function analyzeMarkdownCard(value) {
+  const markdown = String(value || '');
+  const body = markdown.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+  const reasons = [...analyzeText(body).reasons];
+  const evidenceSection = body.match(/## 来源证据（原文）\s*\n([\s\S]*?)(?=\n## |\n### 证据中文译文|$)/)?.[1] || '';
+  const evidence = evidenceSection.split(/\n\s*定位：[^\n]*\n?/).map((chunk) =>
+    chunk.split('\n').filter((line) => /^>/.test(line)).map((line) => line.replace(/^>\s?/, '')).join('\n').trim()).filter(Boolean);
+  const evidenceStrength = evidence.join('').match(/[\p{L}\p{N}]/gu)?.length || 0;
+  if (!evidence.length || evidenceStrength < 8) reasons.push('empty_or_weak_evidence');
+  if (body.length > 24000 || evidence.some((item) => item.length > 8000) || evidence.length > 12) reasons.push('oversized_aggregation');
+  if (evidence.length >= 3) {
+    const tokenSets = evidence.map(topicTokens);
+    const frequency = new Map();
+    for (const tokens of tokenSets) for (const token of tokens) frequency.set(token, (frequency.get(token) || 0) + 1);
+    const shared = new Set([...frequency].filter(([, count]) => count >= 2).map(([token]) => token));
+    const disconnected = tokenSets.filter((tokens) => ![...tokens].some((token) => shared.has(token))).length;
+    if (disconnected >= Math.ceil(tokenSets.length / 2)) reasons.push('incoherent_cross_topic_aggregation');
+  }
+  return { ok: reasons.length === 0, reasons: [...new Set(reasons)], evidence_count: evidence.length };
+}
+
+module.exports = { analyzeText, analyzeMarkdownCard, blockText, quarantineInvalidBlocks, assertKnowledgeActions };

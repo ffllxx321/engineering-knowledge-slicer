@@ -55,5 +55,14 @@ async function main() {
   writeReport(report);
   assert(report.passed, `provider-real acceptance failed: ${failures.join(', ')}`);
 }
-if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1; });
+if (require.main === module) main().catch((error) => {
+  writeReport({ schema: 'eks/acceptance-provider-real/1', passed: false, generated_at: new Date().toISOString(),
+    source_tree: (() => { try { return sourceTree(); } catch { return 'unknown'; } })(),
+    provider: { mode: 'provider-real', status: 'failed' }, checks: {},
+    failures: [error.code || 'ACCEPTANCE_UNEXPECTED_ERROR'], metrics: { provider_requests: 0 }, sources: [],
+    lifecycle_failure: { type: error.name || 'Error', code: error.code || 'ACCEPTANCE_UNEXPECTED_ERROR',
+      message: error.message, evidence: error.evidence || {} } });
+  console.error(`${error.name || 'Error'} [${error.code || 'ACCEPTANCE_UNEXPECTED_ERROR'}]: ${error.message}`);
+  process.exitCode = 1;
+});
 module.exports = { main, writeReport };

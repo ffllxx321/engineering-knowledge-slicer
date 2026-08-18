@@ -187,9 +187,12 @@ function serializeRecord(record) {
   frontmatter.push('---', '', `# ${record.title}`, '');
   const body = [];
   if (record.summary) body.push('## 内容', '', record.summary, '');
-  if (record.evidence?.verbatim) {
-    body.push('## 来源证据（原文）', '', `> ${clean(record.evidence.verbatim, 4000).replace(/\n/g, '\n> ')}`, '',
-      `定位：${humanLocator(record.evidence.locator || {})}`, '');
+  const evidenceList = (record.evidence_list?.length ? record.evidence_list : [record.evidence]).filter((item) => item?.verbatim);
+  if (evidenceList.length) {
+    body.push('## 来源证据（原文）', '');
+    for (const evidence of evidenceList) body.push(
+      `> ${clean(evidence.verbatim, 4000).replace(/\n/g, '\n> ')}`, '',
+      `定位：${humanLocator(evidence.locator || {})}`, '');
     if (record.evidence_translation && record.evidence_translation !== record.evidence.verbatim) {
       body.push('### 证据中文译文', '', `> ${clean(record.evidence_translation, 4000).replace(/\n/g, '\n> ')}`, '');
     }
@@ -353,15 +356,18 @@ function buildRecords(input, settings) {
       requested_relations: [{ type: 'derived_from', target_id: sourceId }]
     });
   }
-  if (records.length > settings.limits.max_records) throw new Error('结构化记录数量超过安全上限');
+  if (records.filter((record) => ['business_item', 'company_knowledge'].includes(record.record_kind)).length > settings.limits.max_records) {
+    throw Object.assign(new Error('结构化知识记录数量超过安全上限'), { code: 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED' });
+  }
   return { records, registry, route, sourceId };
 }
 
 function buildCanonicalRecords(input, settings) {
   const result = input.universalResult;
   const document = result.document || input.document || {};
-  const units = (result.knowledge_units || []).filter((unit) =>
+  const eligibleUnits = (result.knowledge_units || []).filter((unit) =>
     !(result.review_decisions || []).some((review) => review.unit_ids?.includes(unit.unit_id)));
+  const units = coalesceCanonicalUnits(eligibleUnits);
   const now = clean(input.logicalTime || document.ingested_at || '1970-01-01T00:00:00.000Z', 80);
   const sourceId = stableId('source_document', sourceIdentity(document));
   const registryMatches = (input.projectRegistry || []).filter((entry) =>
@@ -394,12 +400,20 @@ function buildCanonicalRecords(input, settings) {
     records.unshift(project);
   }
   const unitToRecord = new Map();
+  const recordsById = new Map(records.map((record) => [record.record_id, record]));
   for (const unit of units) {
     const recordKind = unit.route.library === 'business' && unit.reusable === true
       ? 'company_knowledge' : 'business_item';
     const recordId = stableId(recordKind, `${sourceId}:unit:${unit.fingerprint || unit.unit_id}`);
     unitToRecord.set(unit.unit_id, recordId);
-    records.push({
+    for (const memberId of unit.member_unit_ids || []) unitToRecord.set(memberId, recordId);
+    if (recordsById.has(recordId)) {
+      const existing = recordsById.get(recordId);
+      const evidence = [...(existing.evidence_list || []), ...(unit.evidence || [])];
+      existing.evidence_list = [...new Map(evidence.map((item) => [hash(item), item])).values()];
+      continue;
+    }
+    const record = {
       schema_version: '1.0', record_kind: recordKind, record_id: recordId,
       title: clean(unit.title, 160) || '知识单元', library: unit.route.library,
       created_at: now, updated_at: now, category: unit.route.category,
@@ -416,7 +430,9 @@ function buildCanonicalRecords(input, settings) {
       uncertainty: unit.uncertainty, owner_source_id: sourceId,
       source_document_ids: [sourceId], project_ids: project ? [project.record_id] : [],
       requested_relations: [{ type: 'derived_from', target_id: sourceId }]
-    });
+    };
+    records.push(record);
+    recordsById.set(recordId, record);
   }
   for (const relation of result.relations || []) {
     const from = records.find((record) => record.record_id === unitToRecord.get(relation.from_unit_id));
@@ -426,12 +442,80 @@ function buildCanonicalRecords(input, settings) {
     const to = records.find((record) => record.record_id === toId);
     if (to) to.requested_relations.push({ type: relation.type, target_id: from.record_id, evidence_locator: relation.evidence });
   }
-  if (records.length > settings.limits.max_records) throw new Error('结构化记录数量超过安全上限');
+  if (records.filter((record) => ['business_item', 'company_knowledge'].includes(record.record_kind)).length > settings.limits.max_records) {
+    throw Object.assign(new Error('结构化知识记录数量超过安全上限'), { code: 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED' });
+  }
   return {
     records, registry, sourceId,
     route: { library: sourceLibrary, directory_category: source.category },
     reviewDecisions: result.review_decisions || []
   };
+}
+
+function coalesceCanonicalUnits(units, options = {}) {
+  const maxChars = Math.max(1000, Number(options.max_chars) || 12000);
+  const output = [];
+  for (const unit of units) {
+    const immediate = output.at(-1);
+    const previous = immediate && semanticallyAdjacent(immediate, unit) ? immediate
+      : [...output].reverse().find((candidate) => sameStructuralTopic(candidate, unit));
+    if (!previous
+      || String(previous.statement || '').length + String(unit.statement || '').length > maxChars) {
+      output.push({ ...unit, member_unit_ids: [...(unit.member_unit_ids || [unit.unit_id])] });
+      continue;
+    }
+    const members = [...previous.member_unit_ids, ...(unit.member_unit_ids || [unit.unit_id])];
+    previous.member_unit_ids = uniq(members);
+    previous.unit_id = `coalesced-${hash(previous.member_unit_ids).slice(0, 24)}`;
+    previous.fingerprint = `coalesced:${hash(previous.member_unit_ids.map((id) => String(id)))}`;
+    previous.statement = [previous.statement, unit.statement].filter(Boolean).join('\n');
+    previous.evidence = [...new Map([...(previous.evidence || []), ...(unit.evidence || [])].map((item) => [hash(item), item])).values()];
+    previous.tags = uniq([...(previous.tags || []), ...(unit.tags || [])]);
+    previous.applicable_conditions = uniq([...(previous.applicable_conditions || []), ...(unit.applicable_conditions || [])]);
+    previous.exceptions = uniq([...(previous.exceptions || []), ...(unit.exceptions || [])]);
+    previous.uncertainty = uniq([...(previous.uncertainty || []), ...(unit.uncertainty || [])]);
+  }
+  return output;
+}
+
+function sameStructuralTopic(left, right) {
+  const a = stableJson(left?.structure_context?.heading_path || []);
+  const b = stableJson(right?.structure_context?.heading_path || []);
+  return a !== '[]' && a === b && semanticTopic(left) && semanticTopic(left) === semanticTopic(right)
+    && left.route?.library === right.route?.library
+    && left.route?.category === right.route?.category && left.semantic_kind === right.semantic_kind
+    && left.scope === right.scope;
+}
+
+function semanticTopic(unit) {
+  return clean(unit.subject || unit.title, 200).toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
+}
+
+function locatorOrdinal(unit) {
+  const value = unit.evidence?.[0]?.locator?.value ?? unit.evidence?.[0]?.locator?.paragraph
+    ?? unit.evidence?.[0]?.locator?.row ?? '';
+  const match = String(value).match(/\d+/); return match ? Number(match[0]) : null;
+}
+
+function locatorSection(unit) {
+  const locator = unit.evidence?.[0]?.locator || {};
+  const value = String(locator.value ?? '');
+  return `${locator.scheme || ''}:${value.replace(/(?:[\/#]p(?:aragraph)?=?)\d+.*$/i, '')}`;
+}
+
+function semanticallyAdjacent(left, right) {
+  if (!left?.route || !right?.route) return false;
+  if (left.route.library !== right.route.library || left.route.category !== right.route.category
+    || left.semantic_kind !== right.semantic_kind || left.scope !== right.scope) return false;
+  const a = locatorOrdinal(left); const b = locatorOrdinal(right);
+  const leftHeading = stableJson(left.structure_context?.heading_path || []);
+  const rightHeading = stableJson(right.structure_context?.heading_path || []);
+  const sameHeading = leftHeading !== '[]' && leftHeading === rightHeading;
+  const adjacent = a == null || b == null || (b >= a && b - a <= (sameHeading ? 10 : 2));
+  const sameTopic = semanticTopic(left) && semanticTopic(left) === semanticTopic(right);
+  return adjacent && sameTopic && (sameHeading || (a != null && b != null
+    && (left.evidence?.[0]?.locator?.scheme === right.evidence?.[0]?.locator?.scheme
+      || (locatorSection(left) && locatorSection(left) === locatorSection(right)))));
 }
 
 function buildPlan(input) {
@@ -550,7 +634,10 @@ function buildPlan(input) {
   const universalMode = Boolean(input.universalResult?.knowledge_units);
   const phase3HandlingGroups = universalMode ? reviewDecisions
     : [...(input.phase3Result?.handling_groups || []), ...reviewDecisions];
-  const blocked = conflicts.length > 0 || reviewGroups.length > 0 || phase3HandlingGroups.length > 0;
+  // Phase-3 decisions refer to units already excluded by buildCanonicalRecords.
+  // They remain durable review evidence, but must not block an atomic commit of
+  // the independent, verified knowledge set.
+  const blocked = conflicts.length > 0 || reviewGroups.length > 0;
   const planCore = {
     version: WRITER_VERSION, mode: settings.mode, source_document_id: sourceId,
     generator: 'structured-writer', actions, conflicts, review_groups: reviewGroups,
@@ -806,5 +893,5 @@ module.exports = {
   WRITER_VERSION, INDEX_VERSION, PLAN_LIMITS, MODES, RELATION_TYPES,
   stableJson, hash, stableId, pathSafe, normalizeSettings, sourceIdentity,
   candidateIdentity, emptyIndex, validateIndex, serializeRecord, resolveRelations,
-  buildPlan, commitPlan, rollbackTransaction, verifyCommittedRecords
+  buildPlan, commitPlan, rollbackTransaction, verifyCommittedRecords, coalesceCanonicalUnits
 };

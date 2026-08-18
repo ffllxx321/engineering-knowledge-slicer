@@ -9,6 +9,9 @@ const START = '/** STRUCTURED_PHASE_MODULES_START */';
 const OLD_START = '/* STRUCTURED_PHASE_MODULES_START */';
 const END = '/* STRUCTURED_PHASE_MODULES_END */';
 const modules = [
+  ['vendor/pdfjs.js', 'node_modules/pdfjs-dist/legacy/build/pdf.js'],
+  ['vendor/pdf.worker.js', 'node_modules/pdfjs-dist/legacy/build/pdf.worker.js'],
+  ['src/pdf-text-extractor.js', 'src/pdf-text-extractor.js'],
   ['src/content-integrity.js', 'src/content-integrity.js'],
   ['src/production-flow-contract.js', 'src/production-flow-contract.js'],
   ['src/production-state-machine.js', 'src/production-state-machine.js'],
@@ -33,7 +36,10 @@ function factory(id, sourcePath) {
     .replace(/require\('\.\/structure-context\.js'\)/g, 'require("src/structure-context.js")')
     .replace(/require\('\.\/useful-card-contract\.js'\)/g, 'require("src/useful-card-contract.js")')
     .replace(/require\('\.\/useful-card-generation\.js'\)/g, 'require("src/useful-card-generation.js")');
-  return `"${id}": function(require, module, exports) {\n${source.trim()}\n},`;
+  const bundledSource = source
+    .replace(/require\(["']\.\/pdf\.worker\.js["']\)/g, 'require("vendor/pdf.worker.js")')
+    .replace(/require\(["']\.\/content-integrity\.js["']\)/g, 'require("src/content-integrity.js")');
+  return `"${id}": function(require, module, exports) {\n${bundledSource.trim()}\n},`;
 }
 const generated = `${START}\n${modules.map(([id, file]) => factory(id, file)).join('\n')}\n${END}`;
 const current = fs.readFileSync(bundlePath, 'utf8');

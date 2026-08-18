@@ -132,17 +132,29 @@ function bodyFor(event) {
 }
 function planUsefulCards(events) {
   const ids = new Set(events.map((e) => e.event_id));
-  return events.map((event) => {
+  const groups = [];
+  for (const event of events) {
+    const previous = groups.at(-1); const blockId = event.evidence_ids[0];
+    if (previous && previous[0].semantic_type === event.semantic_type
+      && previous[0].evidence_ids[0] === blockId
+      && previous[0].subject === event.subject
+      && previous.reduce((n, item) => n + item.predicate.length, 0) + event.predicate.length <= 8000) previous.push(event);
+    else groups.push([event]);
+  }
+  return groups.map((group) => {
+    const event = group[0];
     const related = events.filter((other) => other.event_id !== event.event_id && (other.source_context.heading_path.join('/') === event.source_context.heading_path.join('/') || other.subject === event.subject)).map((e) => e.event_id);
+    const evidenceIds = uniq(group.flatMap((item) => item.evidence_ids));
     return validateCardPlan({
-      schema_version: `${CONTRACT_VERSION}/card-plan`, plan_id: `plan-${hash(event.event_id).slice(0, 24)}`,
+      schema_version: `${CONTRACT_VERSION}/card-plan`, plan_id: `plan-${hash(group.map((item) => item.event_id)).slice(0, 24)}`,
       user_question: `关于“${event.subject}”，需要知道什么${event.semantic_type === 'term_definition' ? '定义' : '要求或做法'}？`,
       retrieval_intent: `${event.subject}/${event.semantic_type}`, search_title: titleFor(event), aliases: [],
-      card_type: CARD_TYPE[event.semantic_type] || event.semantic_type, included_event_ids: [event.event_id],
+      card_type: CARD_TYPE[event.semantic_type] || event.semantic_type, included_event_ids: group.map((item) => item.event_id),
       necessary_inherited_context: { heading_path: event.source_context.heading_path, table_headers: event.source_context.table_headers, unit: event.source_context.unit },
-      related_but_not_merged_event_ids: related, evidence_ids: event.evidence_ids, body: bodyFor(event),
-      decision: event.conditions.length || event.exceptions.length || event.evidence_ids.length > 1
-        ? { mode: 'combine_dependent', reasons: ['条件、例外或跨块续文依赖治理事件'], differing_fields: [] }
+      related_but_not_merged_event_ids: related.filter((id) => !group.some((item) => item.event_id === id)), evidence_ids: evidenceIds,
+      body: group.map(bodyFor).join('\n'),
+      decision: group.length > 1 || event.conditions.length || event.exceptions.length || event.evidence_ids.length > 1
+        ? { mode: 'combine_dependent', reasons: [group.length > 1 ? '同一来源块内相邻且语义类型一致的从属条款' : '条件、例外或跨块续文依赖治理事件'], differing_fields: [] }
         : { mode: 'split_independent', reasons: ['每个事件回答一个可独立检索的问题'], differing_fields: [] }
     }, ids);
   });

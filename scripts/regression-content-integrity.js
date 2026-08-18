@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('assert');
-const { analyzeText } = require('../src/content-integrity.js');
+const { analyzeText, analyzeMarkdownCard } = require('../src/content-integrity.js');
 const { AutoDocumentParser, qualityOk } = require('../src/auto-document-parser.js');
 const { evidenceIsVerifiable } = require('../src/phase3-review-gate.js');
 const { ProductionCommitService } = require('../src/production-commit-service.js');
@@ -18,7 +18,8 @@ const corrupt = [
   '%PDF-1.7\n1 0 obj<</Type/Page/Filter/FlateDecode>>stream\x00\x01\x02xœí½ endstream endobj\nxref\nstartxref',
   'å·¥ç¨‹è¦æ± Ã¦Â©â€™ å®å¨è´¨é Ã¦Â©â€™ å®å¨è´¨é',
   '{"region_id":"reg-12","text":"...","preserve_exactly":["GB/T 50010"]} Please return JSON using the output_schema and preserve every field.',
-  'The supplied payload appears corrupted and cannot be meaningfully translated; there is no meaningful natural-language text.'
+  'The supplied payload appears corrupted and cannot be meaningfully translated; there is no meaningful natural-language text.',
+  '防水层采用 4mm 厚 SBS 改性沥青防□□材料，进场后□□复验并记录。'
 ];
 for (const text of corrupt) {
   assert.strictEqual(analyzeText(text).ok, false, text);
@@ -34,6 +35,10 @@ const multilingual = '耐震等級は ISO 3010 に従う。Seismic joint SJ-204 
 assert(analyzeText(engineering).ok);
 assert(analyzeText(multilingual).ok);
 assert(qualityOk(result(engineering)));
+assert(analyzeMarkdownCard(`---\nrecord_id: "ck-healthy123"\n---\n# 混凝土验收\n\n## 内容\n\n混凝土强度必须达到 C30。\n\n## 来源证据（原文）\n\n> 混凝土强度必须达到 C30，并留存试验报告。\n\n定位：page:1\n`).ok);
+assert(!analyzeMarkdownCard('# 损坏卡片\n\n## 内容\n\n防水层□□倷怀。\n\n## 来源证据（原文）\n\n> □□\n\n定位：page:1').ok);
+const unrelatedCard = `# 聚合卡片\n\n## 内容\n\n多个主题。\n\n## 来源证据（原文）\n\n> 混凝土强度必须达到 C30 并完成试验。\n\n定位：p1\n\n> 电梯维保人员应每月检查制动器。\n\n定位：p90\n\n> 招标保证金应在截止日前汇入账户。\n\n定位：p180\n`;
+assert(analyzeMarkdownCard(unrelatedCard).reasons.includes('incoherent_cross_topic_aggregation'));
 
 (async () => {
   const calls = [];

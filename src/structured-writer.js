@@ -158,6 +158,14 @@ function humanLocator(locator = {}) {
   ].filter(Boolean).join('，') || '来源原文';
 }
 
+function searchKeywords(record) {
+  return uniq([...(record.keywords || []), ...(record.tags || []), record.semantic_kind, record.category]);
+}
+
+function encodedLocator(locator) {
+  return Buffer.from(stableJson(locator || {}), 'utf8').toString('base64url');
+}
+
 function serializeRecord(record) {
   const check = validateRecord(record);
   if (!check.valid) throw new Error(`记录 ${record.record_id} 不符合 schema：${check.errors.join('；')}`);
@@ -169,7 +177,9 @@ function serializeRecord(record) {
     `record_kind: ${yamlScalar(record.record_kind)}`,
     `record_id: ${yamlScalar(record.record_id)}`,
     `title: ${yamlScalar(record.title)}`,
-    `aliases: ${yamlArray([record.title])}`,
+    `search_title: ${yamlScalar(record.search_title || record.title)}`,
+    `aliases: ${yamlArray([record.title, ...(record.aliases || [])])}`,
+    `keywords: ${yamlArray(searchKeywords(record))}`,
     `library: ${yamlScalar(record.library)}`,
     `created_at: ${yamlScalar(record.created_at)}`,
     `updated_at: ${yamlScalar(record.updated_at)}`
@@ -192,7 +202,8 @@ function serializeRecord(record) {
     body.push('## 来源证据（原文）', '');
     for (const evidence of evidenceList) body.push(
       `> ${clean(evidence.verbatim, 4000).replace(/\n/g, '\n> ')}`, '',
-      `定位：${humanLocator(evidence.locator || {})}`, '');
+      `定位：${humanLocator(evidence.locator || {})}`,
+      `定位数据：base64url:${encodedLocator(evidence.locator || {})}`, '');
     if (record.evidence_translation && record.evidence_translation !== record.evidence.verbatim) {
       body.push('### 证据中文译文', '', `> ${clean(record.evidence_translation, 4000).replace(/\n/g, '\n> ')}`, '');
     }
@@ -422,6 +433,8 @@ function buildCanonicalRecords(input, settings) {
       summary: clean(unit.statement, 8000), evidence: unit.evidence?.[0],
       evidence_translation: unit.source_language === 'zh' ? '' : clean(unit.translated_statement, 8000),
       evidence_list: unit.evidence, tags: unit.tags, semantic_kind: unit.semantic_kind,
+      search_title: unit.search_title || unit.title, aliases: unit.aliases || [],
+      keywords: uniq([...(unit.keywords || []), ...(unit.tags || []), unit.subject]),
       source_language: unit.source_language, output_language: unit.output_language || 'zh-CN',
       original_statement: unit.original_statement, translated_statement: unit.translated_statement,
       translation: unit.translation,

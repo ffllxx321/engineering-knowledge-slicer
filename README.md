@@ -145,6 +145,14 @@ npm run benchmark  # 仅测本地编排，不调用付费 API
 npm run dev        # 监听模式
 ```
 
+真实卡片检索评测直接读取生产 serializer 格式的 Markdown（单文件或递归目录），并要求显式、版本化的 `eks-real-card-question-set/1.0` ground truth：
+
+```bash
+npm run eval:real-cards -- ./卡片目录 ./questions-v1.json ./retrieval-report.json
+```
+
+报告仅包含 corpus 计数、聚合指标、重复项 ID、失败分类和逐问题排名/得分解释，不包含完整卡片、完整来源文档或 provider 原始响应。损坏编码、疑似二进制、空 corpus 和空/无效 ground truth 均失败关闭。问题集可参考 `scripts/fixtures/real-card-questions-v1.json`；`npm run test:retrieval` 会用真实 `serializeRecord` 生成代表性临时 corpus，验证 round-trip、检索、证据与重启一致性。
+
 烟雾测试（不需要 Obsidian，从 main.js 抽取真实模块隔离执行）：
 
 ```bash

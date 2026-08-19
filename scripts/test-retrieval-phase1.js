@@ -38,11 +38,11 @@ async function main() {
   assert.equal((await distinct.search('防火门耐火完整性')).length, 2);
 
   const falsePositiveFixture = { schema: fixture.schema, records: [fixture.records[0]], questions: [{ id: 'negative', query: '防火门', expected_ids: [] }] };
-  assert((await evaluate(new HybridRetriever(falsePositiveFixture.records), falsePositiveFixture)).failures.some((item) => item.includes('false-positive')));
+  assert((await evaluate(new HybridRetriever(falsePositiveFixture.records), falsePositiveFixture)).failures.some((item) => item.type === 'no_answer_false_positive'));
   const missingEvidenceFixture = { schema: fixture.schema, records: [{ id: 'empty', title: '空证据记录', body: '只有声明' }], questions: [{ id: 'missing', query: '空证据记录', expected_ids: ['empty'], expected_evidence: '不存在的原文' }] };
-  assert((await evaluate(new HybridRetriever(missingEvidenceFixture.records), missingEvidenceFixture)).failures.some((item) => item.includes('expected evidence')));
+  assert((await evaluate(new HybridRetriever(missingEvidenceFixture.records), missingEvidenceFixture)).failures.some((item) => item.type === 'evidence_missing'));
   const duplicateOnlyFixture = { schema: fixture.schema, records: [fixture.records[0], { ...fixture.records[0], id: 'req-fire-door-copy' }], questions: [{ id: 'duplicates', query: '防火门耐火完整性', expected_ids: ['req-fire-door', 'req-fire-door-copy'], expected_evidence: '1.50 h' }] };
-  assert((await evaluate(new HybridRetriever(duplicateOnlyFixture.records), duplicateOnlyFixture)).failures.some((item) => item.includes('duplicate-only')));
+  assert((await evaluate(new HybridRetriever(duplicateOnlyFixture.records), duplicateOnlyFixture)).failures.some((item) => item.type === 'duplicate_only'));
   console.log(JSON.stringify({ retrieval_phase1: 'ok', metrics: report.metrics }, null, 2));
 }
 

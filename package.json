@@ -34,8 +34,9 @@
     "release:verify": "npm run lint && npm run typecheck && npm test && npm run build && npm run benchmark && npm run release:obsidian && node scripts/check-release-evidence.js",
     "test:semantic": "node scripts/test-semantic-embedding.js",
     "benchmark:semantic": "node scripts/benchmark-semantic.js",
-    "test:retrieval": "node scripts/test-retrieval-phase1.js",
-    "eval:retrieval": "node scripts/test-retrieval-phase1.js"
+    "test:retrieval": "node scripts/test-retrieval-phase1.js && node scripts/test-real-card-evaluation.js",
+    "eval:retrieval": "node scripts/test-retrieval-phase1.js",
+    "eval:real-cards": "node scripts/evaluate-real-cards.js"
   },
   "keywords": [
     "obsidian",

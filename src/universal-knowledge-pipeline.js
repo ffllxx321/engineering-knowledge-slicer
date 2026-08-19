@@ -747,6 +747,7 @@ function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
     const raw = {
       semantic_kind: SEMANTIC_KIND[event.semantic_type] || event.semantic_type,
       title: plan.search_title, original_title: event.subject, translated_title: plan.search_title,
+      search_title: plan.search_title, aliases: plan.aliases || [],
       subject: event.subject, statement: plan.body, original_statement: originalStatement || event.predicate,
       translated_statement: plan.body, source_language: originalLanguage,
       source_meaning_fingerprint: digest([event.event_id, event.semantic_type, event.predicate]),
@@ -762,6 +763,8 @@ function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
     const unit = normalizeKnowledgeUnit(raw, profile);
     unit.knowledge_event = event;
     unit.card_plan = plan;
+    unit.search_title = plan.search_title;
+    unit.aliases = uniq(plan.aliases || []);
     unit.structure_context = plan.necessary_inherited_context;
     unit.semantic_kind = SEMANTIC_KIND[event.semantic_type] || event.semantic_type;
     unit.event_type = event.semantic_type;

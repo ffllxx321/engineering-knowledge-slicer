@@ -1,6 +1,8 @@
 'use strict';
 
 const crypto = require('crypto');
+const fs = require('fs');
+const pathModule = require('path');
 
 const SEARCH_SCHEMA = 'eks-search-record/1.0';
 const FIELD_WEIGHTS = Object.freeze({ title: 5, keywords: 3, evidence: 2, body: 1 });
@@ -34,8 +36,30 @@ function parseArray(value) {
   return input.replace(/^\[|\]$/g, '').split(',').map((item) => item.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
 }
 
+function assertSafeMarkdown(value, path = '') {
+  const input = Buffer.isBuffer(value) ? value : Buffer.from(String(value ?? ''), 'utf8');
+  if (!input.length) throw Object.assign(new Error(`空 Markdown 卡片：${path}`), { code: 'CARD_EMPTY' });
+  if (input.includes(0) || input.subarray(0, 4096).some((byte) => byte < 9 || (byte > 13 && byte < 32))) {
+    throw Object.assign(new Error(`疑似二进制卡片：${path}`), { code: 'CARD_BINARY_LIKE' });
+  }
+  const text = input.toString('utf8');
+  const replacementCount = (text.match(/\uFFFD/g) || []).length;
+  const mojibakeCount = (text.match(/(?:Ã.|Â.|â.|锟斤拷|烫烫烫)/g) || []).length;
+  if (replacementCount || mojibakeCount >= 2) throw Object.assign(new Error(`卡片编码损坏：${path}`), { code: 'CARD_MOJIBAKE' });
+  return text;
+}
+
+function locatorValue(value) {
+  const input = clean(value);
+  if (!input) return '';
+  if (input.startsWith('base64url:')) {
+    try { return JSON.parse(Buffer.from(input.slice(10), 'base64url').toString('utf8')); } catch (_) { return ''; }
+  }
+  try { const parsed = JSON.parse(input); return parsed && typeof parsed === 'object' ? parsed : input; } catch (_) { return input; }
+}
+
 function markdownRecord(markdown, path = '') {
-  const input = String(markdown || '');
+  const input = assertSafeMarkdown(markdown, path);
   const frontmatter = input.match(/^---\s*\n([\s\S]*?)\n---\s*(?:\n|$)/)?.[1] || '';
   const meta = {};
   for (const line of frontmatter.split('\n')) {
@@ -46,13 +70,31 @@ function markdownRecord(markdown, path = '') {
   const heading = body.match(/^#\s+(.+)$/m)?.[1];
   const evidence = [...body.matchAll(/^>\s?(.*(?:\n>\s?.*)*)/gm)].map((match) => match[1].replace(/\n>\s?/g, '\n'));
   const locators = [...body.matchAll(/^定位：(.+)$/gm)].map((match) => clean(match[1]));
+  const structuredLocators = [...body.matchAll(/^定位数据：(.+)$/gm)].map((match) => locatorValue(match[1]));
   return canonicalRecord({
     id: meta.record_id || meta.card_id, title: meta.search_title || meta.title || heading,
     search_title: meta.search_title, aliases: parseArray(meta.aliases), keywords: parseArray(meta.keywords),
-    tags: parseArray(meta.tags), body, evidence: evidence.map((text, index) => ({ text, locator: locators[index] || '' })),
+    tags: parseArray(meta.tags), body, evidence: evidence.map((text, index) => ({ text, locator: structuredLocators[index] || locators[index] || '' })),
     source_id: meta.owner_source_id || parseArray(meta.source_document_ids)[0], source_path: meta.source_path,
     semantic_kind: meta.semantic_kind || meta.record_kind, category: meta.category, library: meta.library,
     path, content_hash: meta.content_hash || meta.source_hash
+  });
+}
+
+function loadMarkdownCorpus(root, options = {}) {
+  const absolute = pathModule.resolve(root);
+  const stat = fs.statSync(absolute);
+  const files = stat.isDirectory() ? fs.readdirSync(absolute, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
+    .map((entry) => pathModule.join(entry.parentPath || entry.path, entry.name)).sort() : [absolute];
+  if (!files.length) throw Object.assign(new Error(`卡片目录不含 Markdown：${root}`), { code: 'CORPUS_EMPTY' });
+  const maxBytes = Math.max(1024, Number(options.max_bytes) || 2 * 1024 * 1024);
+  return files.map((file) => {
+    const buffer = fs.readFileSync(file);
+    if (buffer.length > maxBytes) throw Object.assign(new Error(`卡片超过安全大小：${file}`), { code: 'CARD_TOO_LARGE' });
+    const record = markdownRecord(buffer, pathModule.relative(absolute, file) || pathModule.basename(file));
+    if (!record.id || !record.title) throw Object.assign(new Error(`卡片缺少 ID 或标题：${file}`), { code: 'CARD_INVALID' });
+    return record;
   });
 }
 
@@ -166,9 +208,11 @@ class HybridRetriever {
     const scores = new Map();
     const add = (list, kind) => list.forEach((item, rank) => { const current = scores.get(item.record.id) || { record: item.record, lexical_score: 0, dense_score: 0, lexical_rank: null, dense_rank: null, fusion_score: 0, matched_terms: [] }; current[`${kind}_score`] = item.score; current[`${kind}_rank`] = rank + 1; current.fusion_score += 1 / (60 + rank + 1); if (item.matched_terms) current.matched_terms = item.matched_terms; scores.set(item.record.id, current); });
     add(lexical, 'lexical'); add(dense, 'dense');
-    return deduplicate([...scores.values()].sort((a, b) => b.fusion_score - a.fusion_score || b.lexical_score - a.lexical_score || a.record.id.localeCompare(b.record.id)))
+    const minLexicalScore = Math.max(0, Number(options.min_lexical_score) || 0);
+    return deduplicate([...scores.values()].filter((item) => item.lexical_score >= minLexicalScore)
+      .sort((a, b) => b.fusion_score - a.fusion_score || b.lexical_score - a.lexical_score || a.record.id.localeCompare(b.record.id)))
       .slice(0, limit).map((item) => ({ ...item, evidence_locators: item.record.evidence.map((e) => ({ locator: e.locator, text: e.text })) }));
   }
 }
 
-module.exports = { SEARCH_SCHEMA, FIELD_WEIGHTS, tokenize, canonicalRecord, markdownRecord, HybridRetriever, deduplicate };
+module.exports = { SEARCH_SCHEMA, FIELD_WEIGHTS, tokenize, canonicalRecord, markdownRecord, loadMarkdownCorpus, assertSafeMarkdown, HybridRetriever, deduplicate };

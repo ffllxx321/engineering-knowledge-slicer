@@ -41,3 +41,11 @@ Known limitations are explicit: OCR layout does not yet create hierarchy; MSG th
 Generation diagnostics include detected events, planned cards, events per card, accidentally merged independent siblings, orphan conditions, inherited-context size, title/body scope mismatch, unknown types, split/combine reasons, and model batches separately from semantic boundaries.
 
 Quality and review gates are a final safety net. They do not substitute for generating independently useful cards.
+
+The deterministic generation-quality gate enters before card planning and exits after the production structured writer, Markdown parser, hybrid retriever, and evaluator. It covers shared requirement context and exceptions, ordered procedures, table headers/units, bilingual aliases, overlapping pressure topics, repeated marginalia, no-answer behavior, and restart hashes:
+
+```bash
+npm run test:useful-card
+```
+
+Its sanitized corpus and expected metrics/report hash are committed in `scripts/fixtures/phase3-generation-corpus-v1.json`; runtime Markdown and source documents are not committed.

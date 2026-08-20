@@ -492,6 +492,9 @@ function coalesceCanonicalUnits(units, options = {}) {
 }
 
 function sameStructuralTopic(left, right) {
+  // useful-card/2.0 already made an explicit split/combine decision. Never
+  // undo an independent split in the writer merely because headings match.
+  if (left?.card_plan || right?.card_plan) return left?.card_plan?.plan_id === right?.card_plan?.plan_id;
   const a = stableJson(left?.structure_context?.heading_path || []);
   const b = stableJson(right?.structure_context?.heading_path || []);
   return a !== '[]' && a === b && semanticTopic(left) && semanticTopic(left) === semanticTopic(right)
@@ -517,6 +520,7 @@ function locatorSection(unit) {
 }
 
 function semanticallyAdjacent(left, right) {
+  if (left?.card_plan || right?.card_plan) return left?.card_plan?.plan_id === right?.card_plan?.plan_id;
   if (!left?.route || !right?.route) return false;
   if (left.route.library !== right.route.library || left.route.category !== right.route.category
     || left.semantic_kind !== right.semantic_kind || left.scope !== right.scope) return false;

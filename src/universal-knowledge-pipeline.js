@@ -750,10 +750,10 @@ function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
       search_title: plan.search_title, aliases: plan.aliases || [],
       subject: event.subject, statement: plan.body, original_statement: originalStatement || event.predicate,
       translated_statement: plan.body, source_language: originalLanguage,
-      source_meaning_fingerprint: digest([event.event_id, event.semantic_type, event.predicate]),
+      source_meaning_fingerprint: digest([plan.included_event_ids, plan.body]),
       evidence: eventEvidence,
       project_ids: projectIds, source_document_id: document.source_document_id,
-      source_region_ids: event.evidence_ids, scope: event.applicability_scope || (projectIds.length ? 'project' : 'general'),
+      source_region_ids: plan.evidence_ids, scope: event.applicability_scope || (projectIds.length ? 'project' : 'general'),
       status: profile.lifecycle, authority: profile.authority,
       conditions: event.conditions, exceptions: event.exceptions,
       reusable_knowledge_candidate: ['method', 'procedure', 'guideline', 'requirement', 'lesson', 'term_definition'].includes(event.semantic_type)
@@ -765,11 +765,11 @@ function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
     unit.card_plan = plan;
     unit.search_title = plan.search_title;
     unit.aliases = uniq(plan.aliases || []);
+    unit.keywords = uniq(plan.keywords || []);
     unit.structure_context = plan.necessary_inherited_context;
     unit.semantic_kind = SEMANTIC_KIND[event.semantic_type] || event.semantic_type;
     unit.event_type = event.semantic_type;
-    unit.fingerprint = digest([event.semantic_type, event.subject, event.predicate, event.conditions,
-      event.exceptions, event.parameters, event.actor, event.modality, event.applicability_scope]);
+    unit.fingerprint = digest([plan.included_event_ids, plan.search_title, plan.body, plan.evidence_ids]);
     unit.route = routeUnit(unit, profile, { explicit_library: options.explicit_library });
     unit.tags = normalizeTags([KIND_TAG[unit.semantic_kind], ...profile.business_domains, ...unit.project_ids,
       unit.route.library === 'active_tender' ? '在办' : '业务知识'], options.existing_tags || []);
@@ -788,7 +788,7 @@ function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
   const coverage = {};
   for (const region of regions) {
     const ids = region.blocks.flatMap((block) => generated.coverage[block.block_id]?.event_ids || []);
-    coverage[region.region_id] = ids.length ? { status: 'covered', unit_ids: units.filter((unit) => ids.includes(unit.knowledge_event.event_id)).map((unit) => unit.unit_id) }
+    coverage[region.region_id] = ids.length ? { status: 'covered', unit_ids: units.filter((unit) => unit.card_plan.included_event_ids.some((id) => ids.includes(id))).map((unit) => unit.unit_id) }
       : { status: 'dropped', reason: region.semantic_kind === 'noise' ? region.dropped_reason : '仅提供结构上下文' };
   }
   return { units, coverage, useful_card: generated };

@@ -43,13 +43,21 @@ function isDependent(text) { return /^(?:其中|并且|以及|且|同时|但|但
 function modality(text) { return clean(text.match(/不得|必须|应当|须|宜|可以|shall not|must not|shall|must|should|may/i)?.[0], 30) || '陈述'; }
 function conditions(text) { return uniq([...text.matchAll(/(?:如果|若|当|在)([^，。；]{2,80})(?:时|情况下)?[,，]/g)].map((m) => m[0])); }
 function exceptions(text) { return uniq([...text.matchAll(/(?:除非|除外|但|但是)([^。；]{2,100})/g)].map((m) => m[0])); }
-function parameters(text) { return uniq([...text.matchAll(/-?\d+(?:\.\d+)?\s*(?:mm|cm|m|kg|t|MPa|%|元|万元|天|日|小时|次)?/gi)].map((m) => m[0])); }
-function actor(text) { return clean(text.match(/^([^，。；:：]{2,30}?)(?=必须|应当|不得|须|宜|负责|应在)/)?.[1], 80); }
+function parameters(text) { return uniq([...text.matchAll(/-?\d+(?:\.\d+)?\s*(?:MPa|mm\/s|mm|cm|kg|万元|小时|m|t|%|元|天|日|次|°C)?/gi)].map((m) => m[0])); }
+function actor(text) { return clean(text.replace(/^(?:[-*•]|\d+[.)、]|[（(]?[一二三四五六七八九十]+[)）、])\s*/u, '').match(/^([^，。；:：]{2,30}?)(?=必须|应当|不得|须|宜|负责|应在)/)?.[1], 80); }
 function subjectFor(text, context) {
   const stripped = clean(text.replace(/^(?:[-*•]|\d+[.)、]|[（(]?[一二三四五六七八九十]+[)）、])\s*/u, ''), 300);
   return clean(stripped.split(/必须|应当|不得|须|宜|可以|是指|定义为|：|:/)[0], 120) || clean(context.at(-1), 120);
 }
 function evidence(block) { return { block_id: block.block_id, locator: block.locator, verbatim: block.text, provenance: block.provenance || [] }; }
+function definitionAliases(event) {
+  if (event.semantic_type !== 'term_definition') return [];
+  const prefix = event.predicate.split(/是指|定义为|系指|means|refers to/i)[0];
+  const parenthetical = [...prefix.matchAll(/[（(]([^）)]+)[）)]/g)].flatMap((match) => match[1].split(/[，,、/]/));
+  const abbreviation = [...prefix.matchAll(/\b[A-Z][A-Z0-9-]{1,12}\b/g)].map((match) => match[0]);
+  const english = parenthetical.filter((item) => /[A-Za-z]{3}/.test(item));
+  return uniq([...english, ...abbreviation]).filter((item) => item !== event.subject);
+}
 
 function extractKnowledgeEvents(document, regions = []) {
   const translation = new Map(regions.flatMap((r) => r.blocks.map((b) => [b.block_id, r.translated_text && r.blocks.length === 1 ? r.translated_text : b.text])));
@@ -63,6 +71,8 @@ function extractKnowledgeEvents(document, regions = []) {
     const key = [block.metadata.part || '', block.metadata.sheet || '', block.metadata.slide || '', block.metadata.table || 'table', block.metadata.row].join(':');
     if (!tableGroups.has(key)) tableGroups.set(key, []); tableGroups.get(key).push(block);
   }
+  const occurrences = new Map();
+  for (const block of document.blocks) occurrences.set(block.text, (occurrences.get(block.text) || 0) + 1);
   const seenRows = new Set(); const eventBlocks = [];
   for (const block of document.blocks) {
     if (!['table_cell', 'spreadsheet_cell'].includes(block.kind) || !block.metadata?.row) { eventBlocks.push(block); continue; }
@@ -77,7 +87,9 @@ function extractKnowledgeEvents(document, regions = []) {
     const container = clean(block.locator?.attachment_id || block.metadata?.attachment_id || block.locator?.message_id || block.metadata?.message_id || block.locator?.slide || block.metadata?.slide || block.locator?.sheet || block.metadata?.sheet, 160);
     if (container && activeContainer && container !== activeContainer) pending = null;
     if (container) activeContainer = container;
-    if (!block.card_eligible || !block.text || block.metadata?.table_header || ['header', 'footer', 'page', 'signature', 'quote', 'email_thread'].includes(block.kind) || block.metadata?.noise) { coverage[block.block_id] = { status: block.metadata?.table_header ? 'context' : 'dropped', reason: block.metadata?.table_header ? '表头作为行上下文' : ['quote', 'email_thread'].includes(block.kind) ? 'quoted_history' : block.kind === 'signature' ? 'signature' : '结构噪声、非当前消息或空内容' }; continue; }
+    const repeatedBoilerplate = occurrences.get(block.text) > 1 && (block.metadata?.repeated_marginalia === true
+      || /(?:受控副本|技术文件|confidential|controlled copy|版权所有|copyright)/i.test(block.text));
+    if (!block.card_eligible || !block.text || block.metadata?.table_header || repeatedBoilerplate || ['header', 'footer', 'page', 'signature', 'quote', 'email_thread'].includes(block.kind) || block.metadata?.noise) { coverage[block.block_id] = { status: block.metadata?.table_header ? 'context' : 'dropped', reason: block.metadata?.table_header ? '表头作为行上下文' : repeatedBoilerplate ? '重复页边栏或受控文件样板' : ['quote', 'email_thread'].includes(block.kind) ? 'quoted_history' : block.kind === 'signature' ? 'signature' : '结构噪声、非当前消息或空内容' }; continue; }
     if (block.kind === 'heading') { pending = { heading: block.text, hierarchy: [...block.hierarchy, block.text], node }; coverage[block.block_id] = { status: 'context', reason: '标题作为继承上下文' }; continue; }
     const headingPath = uniq([...(block.hierarchy || []), pending?.heading]);
     const parts = clauses(translation.get(block.block_id) || block.text);
@@ -85,13 +97,15 @@ function extractKnowledgeEvents(document, regions = []) {
     const continuedTarget = node && continuation.get(node.node_id);
     if (continuedTarget) last = eventByNode.get(continuedTarget) || null;
     for (const part of parts) {
-      if (last && continuedTarget && isDependent(part)) {
+      if (last && isDependent(part)) {
         last.predicate += ` ${part}`; last.conditions = uniq([...last.conditions, ...conditions(part)]);
         last.exceptions = uniq([...last.exceptions, ...exceptions(part)]); last.parameters = uniq([...last.parameters, ...parameters(part)]);
         last.evidence_ids = uniq([...last.evidence_ids, block.block_id]);
         continue;
       }
-      const type = inferType(part, block); const subject = subjectFor(part, headingPath);
+      const type = inferType(part, block);
+      const subject = type === 'procedure' && (block.metadata?.list_id || block.metadata?.list?.num_id)
+        ? clean(headingPath.at(-1), 120) || subjectFor(part, headingPath) : subjectFor(part, headingPath);
       const uncertainty = [];
       if (!subject) uncertainty.push('无法从对象、主题或结构上下文确定检索主题');
       const identity = [type, subject, part, headingPath, block.metadata?.scope_id || '', block.metadata?.parent_clause_id || ''];
@@ -100,7 +114,7 @@ function extractKnowledgeEvents(document, regions = []) {
         semantic_type: subject ? type : 'unknown', subject: subject || '待确认主题', predicate: part, actor: actor(part), object: subject,
         modality: modality(part), conditions: conditions(part), exceptions: exceptions(part), parameters: parameters(part),
         temporal_scope: clean(block.metadata?.temporal_scope, 160), applicability_scope: clean(block.metadata?.scope_id, 160),
-        source_context: { heading_path: headingPath, structure_node_id: node?.node_id || '', parent_node_id: node?.parent_id || '', parent_clause_id: clean(block.metadata?.parent_clause_id, 160), parent_clause_text: clean(blocksById.get(block.metadata?.parent_clause_id)?.text, 500), list_id: clean(block.metadata?.list_id || block.metadata?.list?.num_id, 160), table_headers: uniq(block.metadata?.table_headers || node?.fields?.header_paths), unit: clean(block.metadata?.unit || node?.fields?.units?.[0], 40) },
+        source_context: { heading_path: headingPath, structure_node_id: node?.node_id || '', parent_node_id: node?.parent_id || '', parent_clause_id: clean(block.metadata?.parent_clause_id, 160), parent_clause_text: clean(blocksById.get(block.metadata?.parent_clause_id)?.text, 500), list_id: clean(block.metadata?.list_id || block.metadata?.list?.num_id, 160), sequence: Number(block.metadata?.sequence) || 0, table_headers: uniq(block.metadata?.table_headers || node?.fields?.header_paths), unit: clean(block.metadata?.unit || node?.fields?.units?.[0], 40) },
         evidence_ids: uniq(block.metadata?.source_block_ids?.length ? block.metadata.source_block_ids : [block.block_id]), confidence: type === 'unknown' ? 0.45 : 0.9,
         uncertainty: uniq([...uncertainty, ...(type === 'unknown' ? ['语义类型无法由显式结构或通用语言信号确定'] : [])])
       });
@@ -135,8 +149,12 @@ function planUsefulCards(events) {
   const groups = [];
   for (const event of events) {
     const previous = groups.at(-1); const blockId = event.evidence_ids[0];
+    const sameProcedure = previous && event.semantic_type === 'procedure'
+      && previous[0].semantic_type === 'procedure' && event.source_context.list_id
+      && previous[0].source_context.list_id === event.source_context.list_id
+      && previous[0].source_context.heading_path.join('/') === event.source_context.heading_path.join('/');
     if (previous && previous[0].semantic_type === event.semantic_type
-      && previous[0].evidence_ids[0] === blockId
+      && (previous[0].evidence_ids[0] === blockId || sameProcedure)
       && previous[0].subject === event.subject
       && previous.reduce((n, item) => n + item.predicate.length, 0) + event.predicate.length <= 8000) previous.push(event);
     else groups.push([event]);
@@ -148,13 +166,14 @@ function planUsefulCards(events) {
     return validateCardPlan({
       schema_version: `${CONTRACT_VERSION}/card-plan`, plan_id: `plan-${hash(group.map((item) => item.event_id)).slice(0, 24)}`,
       user_question: `关于“${event.subject}”，需要知道什么${event.semantic_type === 'term_definition' ? '定义' : '要求或做法'}？`,
-      retrieval_intent: `${event.subject}/${event.semantic_type}`, search_title: titleFor(event), aliases: [],
+      retrieval_intent: `${event.subject}/${event.semantic_type}`, search_title: titleFor(event), aliases: definitionAliases(event),
+      keywords: uniq([event.subject, ...definitionAliases(event), ...group.flatMap((item) => item.parameters), ...event.source_context.table_headers]),
       card_type: CARD_TYPE[event.semantic_type] || event.semantic_type, included_event_ids: group.map((item) => item.event_id),
       necessary_inherited_context: { heading_path: event.source_context.heading_path, table_headers: event.source_context.table_headers, unit: event.source_context.unit },
       related_but_not_merged_event_ids: related.filter((id) => !group.some((item) => item.event_id === id)), evidence_ids: evidenceIds,
       body: group.map(bodyFor).join('\n'),
       decision: group.length > 1 || event.conditions.length || event.exceptions.length || event.evidence_ids.length > 1
-        ? { mode: 'combine_dependent', reasons: [group.length > 1 ? '同一来源块内相邻且语义类型一致的从属条款' : '条件、例外或跨块续文依赖治理事件'], differing_fields: [] }
+        ? { mode: 'combine_dependent', reasons: [group.length > 1 && event.semantic_type === 'procedure' ? '同一主题和列表中的有序步骤构成一个完整过程' : group.length > 1 ? '同一来源块内相邻且语义类型一致的从属条款' : '条件、例外或跨块续文依赖治理事件'], differing_fields: [] }
         : { mode: 'split_independent', reasons: ['每个事件回答一个可独立检索的问题'], differing_fields: [] }
     }, ids);
   });

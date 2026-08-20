@@ -1,0 +1,51 @@
+{
+  "schema": "eks/phase4-pre-generation-fixture/1",
+  "document": {
+    "source_document_id": "phase4-generic-ocr-table",
+    "source_hash": "4444444444444444444444444444444444444444444444444444444444444444",
+    "filename": "generic-engineering-scan.pdf",
+    "parser": "local-ocr:paddle",
+    "blocks": [
+      { "block_id": "hdr-1", "kind": "header", "raw": { "text": "GENERIC EQUIPMENT MANUAL" }, "locator": { "scheme": "page", "value": "p1-header", "page": 1 }, "metadata": { "marginal": true }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+      { "block_id": "page-1", "kind": "paragraph", "raw": { "text": "第 1 页" }, "locator": { "scheme": "page", "value": "p1-number", "page": 1 }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+      { "block_id": "h-1", "kind": "paragraph", "raw": { "text": "1 泵组启动要求" }, "locator": { "scheme": "page", "value": "p1-l3", "page": 1 }, "metadata": { "x": 20 }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+      { "block_id": "req-11", "kind": "paragraph", "raw": { "text": "1.1 操作员必须确认入口阀开启" }, "locator": { "scheme": "page", "value": "p1-l4", "page": 1 }, "metadata": { "x": 20 }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+      { "block_id": "req-11-wrap", "kind": "paragraph", "raw": { "text": "并且记录压力 1.O MPa。" }, "locator": { "scheme": "page", "value": "p1-l5", "page": 1 }, "metadata": { "x": 21, "continuation": true }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+      { "block_id": "req-12", "kind": "paragraph", "raw": { "text": "1.2 操作员不得在护罩松动时启动泵组。" }, "locator": { "scheme": "page", "value": "p1-l6", "page": 1 }, "metadata": { "x": 20 }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+      { "block_id": "hdr-2", "kind": "header", "raw": { "text": "GENERIC EQUIPMENT MANUAL" }, "locator": { "scheme": "page", "value": "p2-header", "page": 2 }, "metadata": { "marginal": true }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+      { "block_id": "page-2", "kind": "paragraph", "raw": { "text": "第 2 页" }, "locator": { "scheme": "page", "value": "p2-number", "page": 2 }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+      { "block_id": "h-2", "kind": "paragraph", "raw": { "text": "2 风机检修要求" }, "locator": { "scheme": "page", "value": "p2-l3", "page": 2 }, "metadata": { "x": 20 }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+      { "block_id": "req-21", "kind": "paragraph", "raw": { "text": "2.1 检修人员必须切断风机电源。" }, "locator": { "scheme": "page", "value": "p2-l4", "page": 2 }, "metadata": { "x": 20 }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+      { "block_id": "amb-a", "kind": "paragraph", "raw": { "text": "3.1 冷却水必须保持流动。" }, "locator": { "scheme": "page", "value": "p3-l1", "page": 3 }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+      { "block_id": "amb-b", "kind": "paragraph", "raw": { "text": "3.1 仓库车辆不得进入。" }, "locator": { "scheme": "page", "value": "p3-l2", "page": 3 }, "parse": { "method": "local-ocr:paddle", "quality": 0.8 } },
+
+      { "block_id": "th-a", "kind": "table_cell", "raw": { "text": "设备" }, "locator": { "scheme": "table", "value": "T1-A1", "page": 4 }, "metadata": { "table_id": "T1", "row": 1, "column": 1, "rowspan": 2, "table_header": true }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "th-b", "kind": "table_cell", "raw": { "text": "运行参数" }, "locator": { "scheme": "table", "value": "T1-B1", "page": 4 }, "metadata": { "table_id": "T1", "row": 1, "column": 2, "colspan": 2, "table_header": true }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "th-d", "kind": "table_cell", "raw": { "text": "保护限值" }, "locator": { "scheme": "table", "value": "T1-D1", "page": 4 }, "metadata": { "table_id": "T1", "row": 1, "column": 4, "colspan": 2, "table_header": true }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "th-b2", "kind": "table_cell", "raw": { "text": "压力 (MPa)" }, "locator": { "scheme": "table", "value": "T1-B2", "page": 4 }, "metadata": { "table_id": "T1", "row": 2, "column": 2, "table_header": true }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "th-c2", "kind": "table_cell", "raw": { "text": "温度 (°C)" }, "locator": { "scheme": "table", "value": "T1-C2", "page": 4 }, "metadata": { "table_id": "T1", "row": 2, "column": 3, "table_header": true }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "th-d2", "kind": "table_cell", "raw": { "text": "压力 (MPa)" }, "locator": { "scheme": "table", "value": "T1-D2", "page": 4 }, "metadata": { "table_id": "T1", "row": 2, "column": 4, "table_header": true }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "th-e2", "kind": "table_cell", "raw": { "text": "振动 (mm/s)" }, "locator": { "scheme": "table", "value": "T1-E2", "page": 4 }, "metadata": { "table_id": "T1", "row": 2, "column": 5, "table_header": true }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "r3-a", "kind": "table_cell", "raw": { "text": "循环泵 A" }, "locator": { "scheme": "table", "value": "T1-A3", "page": 4 }, "metadata": { "table_id": "T1", "row": 3, "column": 1, "rowspan": 2 }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "r3-b", "kind": "table_cell", "raw": { "text": "1.6" }, "locator": { "scheme": "table", "value": "T1-B3", "page": 4 }, "metadata": { "table_id": "T1", "row": 3, "column": 2 }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "r3-c", "kind": "table_cell", "raw": { "text": "75" }, "locator": { "scheme": "table", "value": "T1-C3", "page": 4 }, "metadata": { "table_id": "T1", "row": 3, "column": 3 }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "r3-d", "kind": "table_cell", "raw": { "text": "2.0" }, "locator": { "scheme": "table", "value": "T1-D3", "page": 4 }, "metadata": { "table_id": "T1", "row": 3, "column": 4 }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "r3-e", "kind": "table_cell", "raw": { "text": "4.5" }, "locator": { "scheme": "table", "value": "T1-E3", "page": 4 }, "metadata": { "table_id": "T1", "row": 3, "column": 5 }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "r4-b", "kind": "table_cell", "raw": { "text": "1.4" }, "locator": { "scheme": "table", "value": "T1-B4", "page": 4 }, "metadata": { "table_id": "T1", "row": 4, "column": 2 }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "r4-c", "kind": "table_cell", "raw": { "text": "70" }, "locator": { "scheme": "table", "value": "T1-C4", "page": 4 }, "metadata": { "table_id": "T1", "row": 4, "column": 3 }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "r4-d", "kind": "table_cell", "raw": { "text": "1.9" }, "locator": { "scheme": "table", "value": "T1-D4", "page": 4 }, "metadata": { "table_id": "T1", "row": 4, "column": 4 }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+      { "block_id": "r4-e", "kind": "table_cell", "raw": { "text": "4.0" }, "locator": { "scheme": "table", "value": "T1-E4", "page": 4 }, "metadata": { "table_id": "T1", "row": 4, "column": 5 }, "parse": { "method": "mineru:block_v0", "quality": 0.95 } },
+
+      { "block_id": "bad-h", "kind": "table_cell", "raw": { "text": "参数" }, "locator": { "scheme": "table", "value": "BAD-A1", "page": 5 }, "metadata": { "table_id": "BAD", "row": 1, "column": 1, "colspan": 2, "table_header": true }, "parse": { "method": "mineru:block_v0", "quality": 0.7 } },
+      { "block_id": "bad-overlap", "kind": "table_cell", "raw": { "text": "冲突" }, "locator": { "scheme": "table", "value": "BAD-B1", "page": 5 }, "metadata": { "table_id": "BAD", "row": 1, "column": 2, "table_header": true }, "parse": { "method": "mineru:block_v0", "quality": 0.7 } },
+      { "block_id": "bad-value", "kind": "table_cell", "raw": { "text": "999" }, "locator": { "scheme": "table", "value": "BAD-A2", "page": 5 }, "metadata": { "table_id": "BAD", "row": 2 }, "parse": { "method": "mineru:block_v0", "quality": 0.7 } }
+    ]
+  },
+  "questions": [
+    { "id": "ocr-start", "query": "泵组启动前入口阀和压力 1.O MPa 记录要求", "evidence": "req-11", "quote": "1.1 操作员必须确认入口阀开启" },
+    { "id": "ocr-fan", "query": "风机检修必须切断什么", "evidence": "req-21", "quote": "2.1 检修人员必须切断风机电源。" },
+    { "id": "table-operating-pressure", "query": "循环泵 A 运行参数压力是多少", "evidence": "r3-b", "quote": "1.6" },
+    { "id": "table-protection-pressure", "query": "循环泵 A 保护限值压力 2.0 MPa", "evidence": "r3-d", "quote": "2.0" },
+    { "id": "table-vibration", "query": "循环泵 A 保护限值振动是多少", "evidence": "r3-e", "quote": "4.5" }
+  ]
+}

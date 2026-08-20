@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const { analyzeText } = require('./content-integrity.js');
 const { generateUsefulCards, SEMANTIC_KIND } = require('./useful-card-generation.js');
 const { STRUCTURE_VERSION, buildStructureContext } = require('./structure-context.js');
+const { preparePreGenerationBlocks } = require('./pre-generation-structure.js');
 
 const PIPELINE_VERSION = '5.0-structure-aware-useful-card';
 const OUTPUT_LANGUAGE = 'zh-CN';
@@ -173,9 +174,11 @@ function expandStructuredBlocks(rawBlocks, source) {
 
 function canonicalizeDocument(input = {}) {
   const source = input.document || input;
-  const rawBlocks = Array.isArray(source.blocks) ? source.blocks
+  const inputBlocks = Array.isArray(source.blocks) ? source.blocks
     : Array.isArray(source.normalized_blocks) ? source.normalized_blocks
       : clean(source.text || source.markdown) ? [{ kind: 'text', raw: { text: source.text || source.markdown } }] : [];
+  const prepared = preparePreGenerationBlocks(inputBlocks, source);
+  const rawBlocks = prepared.blocks;
   const blocks = expandStructuredBlocks(rawBlocks, source).map((raw, order) => {
     const originalText = String(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown || '');
     const rawText = clean(originalText, 30000);
@@ -188,7 +191,7 @@ function canonicalizeDocument(input = {}) {
     ]);
     const blockId = clean(raw?.block_id, 160) || `blk-${digest([source.source_document_id || source.source_hash || 'source', order, rawText]).slice(0, 20)}`;
     return {
-      block_id: blockId, order, kind, text: rawText,
+      block_id: blockId, order, kind, text: rawText, raw_verbatim: originalText,
       source_language: detectLanguage(rawText),
       hierarchy, locator: normalizeLocator(raw?.locator, blockId),
       parse_status: clean(raw?.parse?.status, 40) || (rawText ? 'present' : 'missing'),
@@ -209,7 +212,7 @@ function canonicalizeDocument(input = {}) {
     media_type: clean(source.media_type || source.source_type, 120) || 'unknown',
     source_language: detectLanguage(blocks.map((block) => block.text).join('\n')),
     output_language: OUTPUT_LANGUAGE,
-    metadata: source.metadata && typeof source.metadata === 'object' ? { ...source.metadata } : {},
+    metadata: { ...(source.metadata && typeof source.metadata === 'object' ? source.metadata : {}), pre_generation_diagnostics: prepared.diagnostics },
     blocks
   };
   canonical.structure = buildStructureContext(source, blocks);
@@ -668,7 +671,7 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
       continue;
     }
     const evidence = region.blocks.filter((block) => block.text).map((block) => ({
-      block_id: block.block_id, locator: block.locator, verbatim: block.text,
+      block_id: block.block_id, locator: block.locator, verbatim: block.raw_verbatim ?? block.text,
       provenance: [block.locator, ...block.provenance]
     }));
     if (!evidence.length) {
@@ -734,7 +737,7 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
 function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
   const generated = generateUsefulCards(document, regions, options);
   const evidenceById = new Map(document.blocks.map((block) => [block.block_id, {
-    block_id: block.block_id, locator: block.locator, verbatim: block.text,
+    block_id: block.block_id, locator: block.locator, verbatim: block.raw_verbatim ?? block.text,
     provenance: [block.locator, ...block.provenance]
   }]));
   const eventsById = new Map(generated.events.map((event) => [event.event_id, event]));

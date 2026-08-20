@@ -20,6 +20,7 @@ const modules = [
   ['src/phase2-candidate-pipeline.js', 'src/phase2-candidate-pipeline.js'],
   ['src/phase3-review-gate.js', 'src/phase3-review-gate.js'],
   ['src/structure-context.js', 'src/structure-context.js'],
+  ['src/pre-generation-structure.js', 'src/pre-generation-structure.js'],
   ['src/useful-card-contract.js', 'src/useful-card-contract.js'],
   ['src/useful-card-generation.js', 'src/useful-card-generation.js'],
   ['src/universal-knowledge-pipeline.js', 'src/universal-knowledge-pipeline.js'],
@@ -34,6 +35,7 @@ function factory(id, sourcePath) {
     .replace(/require\('\.\/knowledge-write-port\.js'\)/g, 'require("src/knowledge-write-port.js")')
     .replace(/require\('\.\/content-integrity\.js'\)/g, 'require("src/content-integrity.js")')
     .replace(/require\('\.\/structure-context\.js'\)/g, 'require("src/structure-context.js")')
+    .replace(/require\('\.\/pre-generation-structure\.js'\)/g, 'require("src/pre-generation-structure.js")')
     .replace(/require\('\.\/useful-card-contract\.js'\)/g, 'require("src/useful-card-contract.js")')
     .replace(/require\('\.\/useful-card-generation\.js'\)/g, 'require("src/useful-card-generation.js")');
   const bundledSource = source

@@ -49,7 +49,7 @@ function subjectFor(text, context) {
   const stripped = clean(text.replace(/^(?:[-*•]|\d+[.)、]|[（(]?[一二三四五六七八九十]+[)）、])\s*/u, ''), 300);
   return clean(stripped.split(/必须|应当|不得|须|宜|可以|是指|定义为|：|:/)[0], 120) || clean(context.at(-1), 120);
 }
-function evidence(block) { return { block_id: block.block_id, locator: block.locator, verbatim: block.text, provenance: block.provenance || [] }; }
+function evidence(block) { return { block_id: block.block_id, locator: block.locator, verbatim: block.raw_verbatim ?? block.text, provenance: block.provenance || [] }; }
 function definitionAliases(event) {
   if (event.semantic_type !== 'term_definition') return [];
   const prefix = event.predicate.split(/是指|定义为|系指|means|refers to/i)[0];
@@ -76,6 +76,7 @@ function extractKnowledgeEvents(document, regions = []) {
   const seenRows = new Set(); const eventBlocks = [];
   for (const block of document.blocks) {
     if (!['table_cell', 'spreadsheet_cell'].includes(block.kind) || !block.metadata?.row) { eventBlocks.push(block); continue; }
+    if (block.metadata?.reconstructed_table_fact) { eventBlocks.push(block); continue; }
     const tableId = [block.metadata.part || '', block.metadata.sheet || '', block.metadata.slide || '', block.metadata.table || 'table'].join(':'); const rowKey = `${tableId}:${block.metadata.row}`;
     if (seenRows.has(rowKey)) continue; seenRows.add(rowKey);
     const cells = tableGroups.get(rowKey).sort((a, b) => Number(a.metadata.cell || a.metadata.column || 0) - Number(b.metadata.cell || b.metadata.column || 0)); const values = cells.map((cell) => cell.text); const headers = tableHeaders.get(tableId);

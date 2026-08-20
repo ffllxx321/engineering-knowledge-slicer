@@ -57,7 +57,12 @@ function buildStructureContext(source, blocks) {
     if (!nodes.some((n) => n.node_id === nodeId)) nodes.push({ node_id: nodeId, kind, source_identity: { block_id: `virtual:${key}`, span_id: '' }, parent_id: parentId, children: [], order: order - 0.1, origin, confidence: origin === 'inferred' ? 0.65 : 0.95, uncertainty: origin === 'inferred' ? ['legacy_or_layout_inference'] : [], fields: {} });
     return nodeId;
   };
+  let priorBoundary = '';
   for (const block of blocks) {
+    const boundary = [block.locator?.attachment_id || block.metadata?.attachment_id || '', block.locator?.message_id || block.metadata?.message_id || '', block.locator?.sheet || block.metadata?.sheet || '', block.locator?.slide || block.metadata?.slide || '', block.locator?.page || block.metadata?.page || ''].join('|');
+    const explicitContinuation = text(block.metadata?.continuation_of || block.inferred?.continuation_of, 160);
+    if (priorBoundary && boundary !== priorBoundary && !explicitContinuation) { headingStack.length = 0; listParents.clear(); }
+    priorBoundary = boundary;
     const kind = nodeKind(block); const fields = structureFields(block); const origin = originFor(block);
     let parentId = documentId;
     if (kind === 'heading' || kind === 'section') {
@@ -83,13 +88,13 @@ function buildStructureContext(source, blocks) {
         if (prior) parentId = prior.node_id;
       }
     } else parentId = text(block.parent_id, 160) && byBlock.get(text(block.parent_id, 160)) || headingStack.at(-1) || documentId;
-    const node = { node_id: `str-${hash([sourceId, block.block_id])}`, kind, source_identity: identity(block), parent_id: parentId, children: [], order: block.order, origin, confidence: confidence(block.metadata?.structure_confidence ?? block.parse_quality ?? block.parse?.quality, origin === 'inferred' ? 0.55 : 0.95), uncertainty: origin === 'inferred' ? ['relation_not_native'] : [], fields };
+    const node = { node_id: `str-${hash([sourceId, block.block_id])}`, kind, source_identity: identity(block), parent_id: parentId, children: [], order: block.order, origin, confidence: confidence(block.metadata?.structure_confidence ?? block.parse_quality ?? block.parse?.quality, origin === 'inferred' ? 0.55 : 0.95), uncertainty: origin === 'inferred' ? [text(block.metadata?.structure_reason, 160) || 'relation_not_native'] : [], fields };
     nodes.push(node); byBlock.set(block.block_id, node.node_id);
     if (kind === 'heading' || kind === 'section') headingStack.push(node.node_id);
   }
   for (const node of nodes) if (node.parent_id) nodes.find((n) => n.node_id === node.parent_id)?.children.push(node.node_id);
   const edges = [];
-  for (const node of nodes) if (node.parent_id) edges.push({ edge_id: `edge-${hash(['parent', node.node_id, node.parent_id])}`, kind: 'parent', from: node.node_id, to: node.parent_id, reason: 'hierarchy', confidence: node.confidence, origin: node.origin });
+  for (const node of nodes) if (node.parent_id) edges.push({ edge_id: `edge-${hash(['parent', node.node_id, node.parent_id])}`, kind: 'parent', from: node.node_id, to: node.parent_id, reason: node.uncertainty?.[0] || 'explicit_or_parser_hierarchy', confidence: node.confidence, origin: node.origin });
   for (const block of blocks) {
     const from = byBlock.get(block.block_id); const targetBlock = text(block.metadata?.continuation_of || block.inferred?.continuation_of, 160);
     if (targetBlock && byBlock.has(targetBlock)) {

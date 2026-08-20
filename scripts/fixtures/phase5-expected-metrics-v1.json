@@ -1,0 +1,14 @@
+{
+  "schema": "eks/v3/phase5-expected-metrics/1",
+  "thresholds": {
+    "current_query_recall_at_1": 1,
+    "historical_recall_at_3": 1,
+    "evidence_hit_rate": 1,
+    "conflict_peer_recall": 1,
+    "false_merge_count": 0,
+    "false_supersedes_count": 0,
+    "fabricated_relation_count": 0,
+    "locator_coverage": 1,
+    "deterministic_repeatability": 1
+  }
+}

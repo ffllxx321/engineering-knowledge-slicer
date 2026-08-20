@@ -58,6 +58,12 @@ function locatorValue(value) {
   try { const parsed = JSON.parse(input); return parsed && typeof parsed === 'object' ? parsed : input; } catch (_) { return input; }
 }
 
+function payloadValue(value) {
+  const input = clean(value);
+  if (!input.startsWith('base64url:')) return null;
+  try { const parsed = JSON.parse(Buffer.from(input.slice(10), 'base64url').toString('utf8')); return parsed && typeof parsed === 'object' ? parsed : null; } catch (_) { return null; }
+}
+
 function markdownRecord(markdown, path = '') {
   const input = assertSafeMarkdown(markdown, path);
   const frontmatter = input.match(/^---\s*\n([\s\S]*?)\n---\s*(?:\n|$)/)?.[1] || '';
@@ -71,6 +77,8 @@ function markdownRecord(markdown, path = '') {
   const evidence = [...body.matchAll(/^>\s?(.*(?:\n>\s?.*)*)/gm)].map((match) => match[1].replace(/\n>\s?/g, '\n'));
   const locators = [...body.matchAll(/^定位：(.+)$/gm)].map((match) => clean(match[1]));
   const structuredLocators = [...body.matchAll(/^定位数据：(.+)$/gm)].map((match) => locatorValue(match[1]));
+  const evolution = payloadValue(meta.evolution_payload);
+  if (evolution) return canonicalRecord({ ...evolution, id: evolution.fact_id || meta.record_id, path, content_hash: meta.content_hash || meta.source_hash });
   return canonicalRecord({
     id: meta.record_id || meta.card_id, title: meta.search_title || meta.title || heading,
     search_title: meta.search_title, aliases: parseArray(meta.aliases), keywords: parseArray(meta.keywords),
@@ -101,8 +109,9 @@ function loadMarkdownCorpus(root, options = {}) {
 function canonicalRecord(input = {}) {
   const evidenceInput = input.evidence_list || input.evidence || input.original_evidence || [];
   const evidence = (Array.isArray(evidenceInput) ? evidenceInput : [evidenceInput]).map((item) => typeof item === 'string'
-    ? { text: clean(item), locator: '' }
-    : { text: clean(item?.text || item?.verbatim || item?.original || item?.quote), locator: item?.locator || '' }).filter((item) => item.text);
+    ? { text: clean(item), raw_verbatim: item, locator: '' }
+    : { evidence_id: clean(item?.evidence_id), source_id: clean(item?.source_id), block_id: clean(item?.block_id), text: clean(item?.text ?? item?.raw_verbatim ?? item?.verbatim ?? item?.original ?? item?.quote),
+      raw_verbatim: String(item?.raw_verbatim ?? item?.verbatim ?? item?.original ?? item?.quote ?? ''), locator: item?.locator || '' }).filter((item) => item.text);
   const body = clean(input.body || input.claim || input.summary);
   const title = clean(input.search_title || input.title);
   const contentHash = clean(input.content_hash) || hash(JSON.stringify({ title, body, evidence }));
@@ -110,10 +119,30 @@ function canonicalRecord(input = {}) {
     schema: SEARCH_SCHEMA, id: clean(input.id || input.record_id || input.card_id) || `search-${contentHash.slice(0, 20)}`,
     title, search_title: clean(input.search_title || input.title), aliases: uniq(input.aliases),
     keywords: uniq([...(input.keywords || []), ...(input.tags || [])]), tags: uniq(input.tags), body,
-    evidence, source_id: clean(input.source_id || input.owner_source_id || input.source_document_ids?.[0]),
+    evidence, source_id: clean(input.source_id || input.owner_source_id || input.source_document_ids?.[0] || input.source_ids?.[0]),
     source_path: clean(input.source_path), semantic_kind: clean(input.semantic_kind || input.record_kind || input.card_type),
-    category: clean(input.category), library: clean(input.library), path: clean(input.path), content_hash: contentHash
+    category: clean(input.category), library: clean(input.library), path: clean(input.path), content_hash: contentHash,
+    source_ids: uniq(input.source_ids || (input.source_id ? [input.source_id] : [])), semantic_type: clean(input.semantic_type || input.semantic_kind),
+    subject: clean(input.subject), entity: clean(input.entity), predicate: clean(input.predicate), predicate_signature: structuredClone(input.predicate_signature || input.signature || ''),
+    parameters: structuredClone(input.parameters || {}), numbers: structuredClone(input.numbers || []), standard: clean(input.standard), clause: clean(input.clause), revision: clean(input.revision), version: clean(input.version), dates: structuredClone(input.dates || []),
+    effective_date: clean(input.effective_date), expires_date: clean(input.expires_date), scope: structuredClone(input.scope || {}), lifecycle: clean(input.lifecycle),
+    as_of: clean(input.as_of), equivalence_cluster_id: clean(input.equivalence_cluster_id), superseded_by: uniq(input.superseded_by), relations: structuredClone(input.relations || []), diagnostics: structuredClone(input.diagnostics || [])
   };
+}
+
+function queryRevision(query, records) {
+  const q = normalized(query); const revisions = [...new Set(records.map((r) => normalized(r.revision || r.version)).filter(Boolean))].sort((a, b) => b.length - a.length);
+  return revisions.find((revision) => new RegExp(`(^|[^\\p{L}\\p{N}])${revision.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^\\p{L}\\p{N}]|$)`, 'u').test(q)) || '';
+}
+
+function lifecycleAt(record, asOf) {
+  if (record.relations.some((r) => r.type === 'contradicts')) return 'conflicted';
+  if (record.superseded_by.length) return 'historical';
+  const valid = (value) => { if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false; const date = new Date(`${value}T00:00:00Z`); return Number.isFinite(date.valueOf()) && date.toISOString().slice(0, 10) === value; };
+  if ((record.effective_date && !valid(record.effective_date)) || (record.expires_date && !valid(record.expires_date))) return 'undated';
+  if (record.effective_date && record.effective_date > asOf) return 'future';
+  if (record.expires_date && record.expires_date < asOf) return 'expired';
+  return record.effective_date || record.expires_date ? 'current' : (record.lifecycle || 'undated');
 }
 
 function filterMatch(record, filters = {}) {
@@ -209,9 +238,20 @@ class HybridRetriever {
     const add = (list, kind) => list.forEach((item, rank) => { const current = scores.get(item.record.id) || { record: item.record, lexical_score: 0, dense_score: 0, lexical_rank: null, dense_rank: null, fusion_score: 0, matched_terms: [] }; current[`${kind}_score`] = item.score; current[`${kind}_rank`] = rank + 1; current.fusion_score += 1 / (60 + rank + 1); if (item.matched_terms) current.matched_terms = item.matched_terms; scores.set(item.record.id, current); });
     add(lexical, 'lexical'); add(dense, 'dense');
     const minLexicalScore = Math.max(0, Number(options.min_lexical_score) || 0);
-    return deduplicate([...scores.values()].filter((item) => item.lexical_score >= minLexicalScore)
-      .sort((a, b) => b.fusion_score - a.fusion_score || b.lexical_score - a.lexical_score || a.record.id.localeCompare(b.record.id)))
-      .slice(0, limit).map((item) => ({ ...item, evidence_locators: item.record.evidence.map((e) => ({ locator: e.locator, text: e.text })) }));
+    const asOf = clean(options.as_of || ''); const asOfDate = new Date(`${asOf}T00:00:00Z`); if (asOf && (!/^\d{4}-\d{2}-\d{2}$/.test(asOf) || !Number.isFinite(asOfDate.valueOf()) || asOfDate.toISOString().slice(0, 10) !== asOf)) throw new Error('as_of must be a valid YYYY-MM-DD');
+    const requestedRevision = queryRevision(query, this.records); const historical = options.historical === true || options.include_historical === true;
+    const lifecycleRank = { current: 5, conflicted: 5, undated: 3, future: 2, historical: 1, expired: 0 };
+    const ranked = deduplicate([...scores.values()].filter((item) => item.lexical_score >= minLexicalScore).map((item) => {
+      const lifecycle = asOf ? lifecycleAt(item.record, asOf) : (item.record.lifecycle || 'undated'); const exactRevision = requestedRevision && normalized(item.record.revision || item.record.version) === requestedRevision;
+      return { ...item, lifecycle, applicability_score: exactRevision ? 10 : historical ? 0 : (lifecycleRank[lifecycle] ?? 3), exact_revision_match: Boolean(exactRevision) };
+    }).sort((a, b) => b.applicability_score - a.applicability_score || b.fusion_score - a.fusion_score || b.lexical_score - a.lexical_score || a.record.id.localeCompare(b.record.id)));
+    const selected = ranked.slice(0, limit); const selectedIds = new Set(selected.map((item) => item.record.id));
+    const peerIds = new Set(selected.flatMap((item) => item.record.relations.filter((relation) => relation.type === 'contradicts').map((relation) => relation.target_id)));
+    for (const id of [...peerIds].sort()) if (!selectedIds.has(id)) {
+      const peerRecord = this.records.find((record) => record.id === id); const peer = ranked.find((item) => item.record.id === id) || (peerRecord ? { record: peerRecord, lifecycle: asOf ? lifecycleAt(peerRecord, asOf) : peerRecord.lifecycle, applicability_score: lifecycleRank.conflicted, exact_revision_match: false, lexical_score: 0, dense_score: 0, lexical_rank: null, dense_rank: null, fusion_score: 0, matched_terms: [], duplicate_ids: [], conflict_peer: true } : null);
+      if (peer) { selected.push(peer); selectedIds.add(id); }
+    }
+    return selected.map((item) => ({ ...item, evidence_locators: item.record.evidence.map((e) => ({ locator: e.locator, text: e.text })) }));
   }
 }
 

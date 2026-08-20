@@ -19,6 +19,7 @@ assert(/v3-phase1\/verified-output/.test(source));
 assert(/v3-phase2/.test(source) && /experimental-output\/v1/.test(source));
 assert(/v3-phase3/.test(source) && /experimental-libraries\/v1/.test(source));
 assert(/v3-phase4/.test(source) && /validated-cache/.test(source));
+assert(/eks\/v3\/evolution-graph\/1/.test(source) && /function buildEvolutionGraph/.test(source), 'Phase 5 evolution contract missing');
 assert(!/require\([^)]*(checkpoint|review|shadow|structured-writer|core\/cache|core\/workflow)/i.test(source), 'Phase 4 imports forbidden legacy module');
 assert(!/require\([^)]*(phase3-review-gate|structured-writer|production-commit-service)/i.test(source), 'Phase 3 imports forbidden legacy writer/review');
 assert.strictEqual((source.match(/class V3Phase2CandidateOrchestrator/g) || []).length, 1);

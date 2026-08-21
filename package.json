@@ -18,6 +18,7 @@
     "test:v3-phase3": "node scripts/test-v3-phase3.js",
     "test:v3-phase4": "node scripts/test-v3-phase4.js",
     "test:v3-phase5": "node scripts/test-v3-phase5.js",
+    "test:v3-phase6": "node scripts/test-v3-phase6.js && node scripts/regression-phase6-startup.js",
     "gate:v3-architecture": "node scripts/gate-v3-architecture.js",
     "gate:v3-obsidian": "node scripts/verify-v3-real-obsidian.js",
     "test:multilingual": "node scripts/test-multilingual-zh-output.js",

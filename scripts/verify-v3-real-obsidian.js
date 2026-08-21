@@ -16,7 +16,7 @@ async function evaluate(port) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(page.webSocketDebuggerUrl); const timer = setTimeout(() => reject(new Error('CDP timeout')), 15000);
     socket.onopen = () => socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { awaitPromise: true, returnByValue: true,
-      expression: '(async()=>{if(typeof app==="undefined"||!app.plugins)return false;localStorage.setItem("enable-plugin-"+app.appId,"true");let p=app.plugins.plugins["engineering-knowledge-slicer"]||await app.plugins.loadPlugin("engineering-knowledge-slicer");if(!p||typeof p.runV3RealObsidianGateProbe!=="function")return false;await p.runV3RealObsidianGateProbe();return true})()' } }));
+      expression: '(async()=>{if(typeof app==="undefined"||!app.plugins)return false;localStorage.setItem("enable-plugin-"+app.appId,"true");let p=null;for(let i=0;i<100;i++){p=app.plugins.plugins["engineering-knowledge-slicer"];if(p&&typeof p.runV3RealObsidianGateProbe==="function")break;await new Promise(r=>setTimeout(r,50))}if(!p){p=await app.plugins.loadPlugin("engineering-knowledge-slicer")}if(!p||typeof p.runV3RealObsidianGateProbe!=="function")return false;for(let i=0;i<40&&!app.vault.getAbstractFileByPath("Engineering Knowledge Slicer/v3-phase1/state/manifests/current-run.json");i++)await new Promise(r=>setTimeout(r,50));await p.runV3RealObsidianGateProbe();return true})()' } }));
     socket.onmessage = (event) => { const message = JSON.parse(event.data); if (message.id === 1) { clearTimeout(timer); socket.close(); resolve(message.result?.result?.value === true); } };
     socket.onerror = reject;
   });
@@ -34,6 +34,10 @@ async function launch(vault, config, resultPath, restartExpected) {
     await sleep(500);
   }
   try { process.kill(-child.pid, 'SIGTERM'); } catch (_) { child.kill('SIGTERM'); }
+  await Promise.race([
+    new Promise((resolve) => child.once('exit', resolve)),
+    sleep(5000).then(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch (_) { try { child.kill('SIGKILL'); } catch (_) {} } })
+  ]);
   assert(fs.existsSync(resultPath), 'official Obsidian host did not produce v3 evidence');
   const result = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
   assert.strictEqual(result.ok, true); assert.strictEqual(result.real_host, true); assert.strictEqual(result.host_api, 'Obsidian Vault');

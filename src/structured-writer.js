@@ -625,7 +625,8 @@ function buildPlan(input) {
       action, record_id: record.record_id, record_kind: record.record_kind, path: record.path,
       content, content_hash: contentHash, prior_hash: priorHash, prior_content: prior,
       owner_source_id: sourceId, source_hash: clean(input.document?.source_hash, 128),
-      source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100)
+      source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
+      record_snapshot: JSON.parse(JSON.stringify(record))
     });
   }
   if (input.archiveTransition) {
@@ -776,6 +777,7 @@ async function commitPlan(plan, options) {
     status: 'staging', steps: [], created_at: options.logicalTime || ''
   };
   manifest.previous_index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
+  manifest.required_artifacts = [];
   let indexSaved = false;
   try {
     await ensureParent(vault, manifestPath);
@@ -808,6 +810,16 @@ async function commitPlan(plan, options) {
     index.source_versions[plan.source_document_id] = { source_hash: plan.source_hash, source_version: plan.source_version };
     await options.saveIndex(index);
     indexSaved = true;
+    for (const artifact of (options.requiredArtifacts || [])) {
+      const prior = await vault.readIfExists(artifact.path);
+      const step = { action: 'required_artifact', record_id: artifact.id, record_kind: 'production_state',
+        path: artifact.path, prior_content: prior, content_hash: hash(artifact.content), status: 'started' };
+      manifest.steps.push(step); manifest.required_artifacts.push({ id: artifact.id, path: artifact.path, content_hash: step.content_hash });
+      await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+      await vault.write(artifact.path, artifact.content); step.status = 'committed';
+      if (hash(await vault.readIfExists(artifact.path)) !== step.content_hash) throw new Error(`必需生产产物最终校验失败：${artifact.id}`);
+      await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+    }
     manifest.status = 'files_committed';
     manifest.index_revision = index.revision;
     await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
@@ -815,6 +827,7 @@ async function commitPlan(plan, options) {
     const verified = await verifyCommittedRecords(plan, vault, {
       transactionId, verifiedAt: new Date().toISOString(), runId: options.runId, targetRoots
     });
+    if (typeof options.verifyRequiredArtifacts === 'function') await options.verifyRequiredArtifacts({ index, verified, manifest });
     const plannedPaths = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind)).map((item) => item.path);
     const committedPaths = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind)
       && (item.action === 'noop' || manifest.steps.some((step) => step.record_id === item.record_id && step.status === 'committed'))).map((item) => item.path);

@@ -282,7 +282,7 @@ async function evaluate(port, maximumMs) {
             awaitPromise: true,
             returnByValue: true,
             expression:
-              '(async()=>{if(typeof app==="undefined"||!app.plugins)return false;localStorage.setItem("enable-plugin-"+app.appId,"true");let p=app.plugins.plugins["engineering-knowledge-slicer"]||await app.plugins.loadPlugin("engineering-knowledge-slicer");if(!p||!p.settings||typeof p.runAcceptanceRealProbe!=="function")return false;await p.runAcceptanceRealProbe();return true})()',
+              '(async()=>{if(typeof app==="undefined"||!app.plugins)return false;localStorage.setItem("enable-plugin-"+app.appId,"true");let p=null;for(let i=0;i<100;i++){p=app.plugins.plugins["engineering-knowledge-slicer"];if(p&&p.settings&&typeof p.runAcceptanceRealProbe==="function")break;await new Promise(r=>setTimeout(r,50))}if(!p){p=await app.plugins.loadPlugin("engineering-knowledge-slicer")}if(!p||!p.settings||typeof p.runAcceptanceRealProbe!=="function")return false;await p.runAcceptanceRealProbe();return true})()',
           },
         }),
       );
@@ -464,12 +464,17 @@ async function main() {
   );
   const provider = await localProvider();
   const resultPath = path.join(vault, "EKS Acceptance/result.json");
-  let first, second;
+  let first, second; const launches = [];
   try {
     first = await launch(vault, config, resultPath, {
       EKS_ACCEPTANCE_PROVIDER_MODE: "provider-local",
       EKS_ACCEPTANCE_MINIMAX_ENDPOINT: provider.endpoint,
     });
+    launches.push(first);
+    for (let i = 1; i < 5; i += 1) launches.push(await launch(vault, config, resultPath, {
+      EKS_ACCEPTANCE_PROVIDER_MODE: "provider-local",
+      EKS_ACCEPTANCE_MINIMAX_ENDPOINT: provider.endpoint,
+    }));
     second = await launch(vault, config, resultPath, {
       EKS_ACCEPTANCE_PROVIDER_MODE: "provider-local",
       EKS_ACCEPTANCE_MINIMAX_ENDPOINT: provider.endpoint,
@@ -513,7 +518,7 @@ async function main() {
     .map(([k]) => k);
   const report = {
     schema: "eks/acceptance-report/1",
-    passed: first.ok && second.ok && !failures.length && externalAcceptance.passed,
+    passed: launches.every(item => item.ok) && second.ok && !failures.length && externalAcceptance.passed,
     generated_at: new Date().toISOString(),
     source_tree: sourceTree(),
     bundle_sha256: shaFile(path.join(root, "main.js")),
@@ -540,6 +545,8 @@ async function main() {
       cards: first.openable_count,
       checkpoint_artifacts: first.checkpoint_artifact_count,
       gold: first.gold,
+      startup: { clean_launches: launches.length, restart_reload: true,
+        duplicate_view_failures: launches.concat(second).filter(item => /existing view type/i.test(JSON.stringify(item))).length },
     },
   };
   const dir = path.join(root, "test-artifacts");

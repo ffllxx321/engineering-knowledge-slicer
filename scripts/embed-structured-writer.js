@@ -16,6 +16,8 @@ const modules = [
   ['src/production-flow-contract.js', 'src/production-flow-contract.js'],
   ['src/production-state-machine.js', 'src/production-state-machine.js'],
   ['src/production-commit-service.js', 'src/production-commit-service.js'],
+  ['src/production-evolution.js', 'src/production-evolution.js'],
+  ['src/plugin-activation.js', 'src/plugin-activation.js'],
   ['src/phase1-foundation.js', 'src/phase1-foundation.js'],
   ['src/phase2-candidate-pipeline.js', 'src/phase2-candidate-pipeline.js'],
   ['src/phase3-review-gate.js', 'src/phase3-review-gate.js'],
@@ -34,6 +36,8 @@ function factory(id, sourcePath) {
     .replace(/require\('\.\/production-flow-contract\.js'\)/g, 'require("src/production-flow-contract.js")')
     .replace(/require\('\.\/knowledge-write-port\.js'\)/g, 'require("src/knowledge-write-port.js")')
     .replace(/require\('\.\/content-integrity\.js'\)/g, 'require("src/content-integrity.js")')
+    .replace(/require\('\.\/production-evolution\.js'\)/g, 'require("src/production-evolution.js")')
+    .replace(/require\('\.\/v3\/evolution-contract\.js'\)/g, 'require("src/v3/evolution-contract.js")')
     .replace(/require\('\.\/structure-context\.js'\)/g, 'require("src/structure-context.js")')
     .replace(/require\('\.\/pre-generation-structure\.js'\)/g, 'require("src/pre-generation-structure.js")')
     .replace(/require\('\.\/useful-card-contract\.js'\)/g, 'require("src/useful-card-contract.js")')

@@ -129,6 +129,8 @@ const {
   visibleFacts: productionVisibleFacts
 } = require("src/production-state-machine.js");
 const { ProductionCommitService } = require("src/production-commit-service.js");
+const { PluginActivation } = require("src/plugin-activation.js");
+const { rebuildProductionEvolution } = require("src/production-evolution.js");
 const {
   buildPlan: buildStructuredPlan,
   commitPlan: commitStructuredPlan,
@@ -655,6 +657,9 @@ function sleepWithSignal(ms, signal) {
 const VIEW_TYPE_SLICER = 'engineering-knowledge-slicer-dashboard';
 module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
   async onload() {
+    this._eksActivation = this._eksActivation || new PluginActivation();
+    if (!this._eksActivation.begin()) return;
+    try {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, migrateSettings(await this.loadData()));
     const _secrets = loadSecretsFile();
     if (this.settings.useEnvKeys !== false) {
@@ -747,6 +752,8 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     });
     await this.semanticProcessor.load().catch((error) => diag('semantic.load', { ok: false, code: error?.code || 'SEM_STATE_READ' }));
     this.registerView(VIEW_TYPE_SLICER, (leaf) => new SlicerDashboardView(leaf, this));
+    this._eksViewRegistered = true;
+    this._eksActivation.registered();
 
     this.addRibbonIcon('layers', '工程知识切片', () => this.activateView());
     this.addCommand({ id: 'open-slicer-dashboard', name: '打开工程知识切片控制台', callback: () => this.activateView() });
@@ -763,6 +770,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     }
     this.addCommand({ id: 'run-semantic-shadow', name: '运行语义影子处理', callback: () => this.runSemanticIndex() });
     this.addCommand({ id: 'rebuild-semantic-index', name: '重建语义向量索引', callback: () => this.rebuildSemanticIndex() });
+    this.addCommand({ id: 'rebuild-production-evolution-index', name: '[管理] 预览并重建生产演化索引', callback: () => this.rebuildProductionEvolutionIndex() });
     this.addCommand({ id: 'revalidate-latest-task-local', name: '本地重新归并、校验并路由最近任务（零模型调用）', callback: () => this.revalidateLatestTaskLocal() });
     this.addCommand({
       id: 'v3-phase1-process-source-experimental',
@@ -829,6 +837,11 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
         await this.saveSafeSettings();
       }
     } catch (_) { /* 通知失败不能影响插件加载 */ }
+    } catch (error) {
+      this._eksActivation.unload(this.app.workspace, VIEW_TYPE_SLICER);
+      this._eksActivation.failed();
+      throw error;
+    }
   }
 
   async runV3Phase1Experimental() {
@@ -954,7 +967,9 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     ];
     const actions = fixtures.map(([record_id, record_kind, path, title]) => {
       const content = `---\nrecord_id: "${record_id}"\nrecord_kind: "${record_kind}"\nsource_document_ids: ["src-real-gate"]\n---\n\n# ${title}\n\n- 归属来源：src-real-gate\n`;
-      return { record_id, record_kind, path, content, content_hash: structuredContentHash(content), owner_source_id: 'src-real-gate' };
+      return { record_id, record_kind, path, content, content_hash: structuredContentHash(content), owner_source_id: 'src-real-gate',
+        record_snapshot: { record_kind, title, search_title: title, summary: title, semantic_kind: 'gate_probe',
+          evidence: { block_id: `block-${record_id}`, locator: { fixture: record_id }, verbatim: title } } };
     });
     const existed = await Promise.all(actions.map(async (action) => ({ path: action.path, content: await port.readIfExists(action.path) })));
     try {
@@ -968,7 +983,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       const service = new ProductionCommitService(port, commitStructuredPlan);
       const committed = await service.commit(plan, {
         lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
-        index: emptyStructuredIndex(), logicalTime: new Date().toISOString(), runId, taskId: 'task-real-host',
+        index: emptyStructuredIndex(), logicalTime: new Date().toISOString(), asOf: '2026-08-21', runId, taskId: 'task-real-host',
         targetRoots: { active_tender: settings.activeRoot, business: settings.businessRoot }, saveIndex: async () => {}
       });
       const task = { task_id: 'task-real-host', run_id: runId, semantic_path: 'universal', production_state: 'processing', result_counts: {} };
@@ -1274,11 +1289,25 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     // v1.6 (M-04): 卸载前 flush pending tasks，避免防抖窗口内的写丢失
     try { this.flushSaveTasksImmediate(); } catch (_) {}
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_SLICER);
+    this._eksActivation?.unload(this.app.workspace, VIEW_TYPE_SLICER);
+    this._eksViewRegistered = false;
   }
 
   async saveSettings() {
     await this.saveSafeSettings();
     this.semanticProcessor?.configure(this.settings);
+  }
+
+  async rebuildProductionEvolutionIndex() {
+    const vault = new KnowledgeWritePort(this.app.vault);
+    const indexPath = normalizeVaultPath(`${this.settings.artifactsPath}/structured-writer/id-path-index.v1.json`);
+    const raw = await vault.readIfExists(indexPath); const index = raw ? validateStructuredIndex(JSON.parse(raw)).index : emptyStructuredIndex();
+    const path = normalizeVaultPath(`${this.settings.artifactsPath}/evolution/production-index-v1.json`);
+    const asOf = new Date().toISOString().slice(0, 10);
+    const preview = await rebuildProductionEvolution(vault, index, { path, as_of: asOf, dry_run: true });
+    await rebuildProductionEvolution(vault, index, { path, as_of: asOf, dry_run: false });
+    new Notice(`生产演化索引已重建：管理记录 ${preview.preview.managed_records}，旧版未注明日期记录 ${preview.preview.legacy_undated_unrelated}`);
+    return preview.preview;
   }
 
   semanticStatePath(name) {
@@ -3605,7 +3634,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const productionCommit = new ProductionCommitService(vault, commitStructuredPlan);
     const committed = await productionCommit.commit(plan, {
       lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
-      index, logicalTime: new Date().toISOString(), runId: task.run_id, taskId: task.task_id,
+      index, logicalTime: new Date().toISOString(), asOf: new Date().toISOString().slice(0, 10), runId: task.run_id, taskId: task.task_id,
       targetRoots: { active_tender: normalizeStructuredSettings(settings).activeRoot,
         business: normalizeStructuredSettings(settings).businessRoot },
       saveIndex: async (next) => vault.write(indexPath, JSON.stringify(next, null, 2))
@@ -93356,6 +93385,7 @@ module.exports = { LABELS, assertManifest, transitionProductionState, invalidate
 const crypto = require('crypto');
 const { KnowledgeWritePort } = require("src/knowledge-write-port.js");
 const { assertKnowledgeActions } = require("src/content-integrity.js");
+const { prepareProductionEvolution, verifyProductionEvolution } = require("src/production-evolution.js");
 
 const normalized = (value) => String(value || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
 const uniqueSorted = (values) => [...new Set(values.map(normalized).filter(Boolean))].sort();
@@ -93370,7 +93400,20 @@ class ProductionCommitService {
   async commit(plan, options) {
     if (!options?.runId || !options?.taskId) throw Object.assign(new Error('生产提交必须绑定当前 run_id 和 task_id。'), { code: 'CURRENT_RUN_REQUIRED' });
     assertKnowledgeActions(plan?.actions);
-    const result = await this.commitPlan(plan, { ...options, vault: this.port });
+    const asOf = options.asOf || options.as_of;
+    if (!asOf) throw Object.assign(new Error('生产演化提交必须显式注入 as_of。'), { code: 'PRODUCTION_AS_OF_REQUIRED' });
+    const evolutionPath = `${normalized(options.stateRoot)}/evolution/production-index-v1.json`;
+    let previous = null; const previousText = await this.port.readIfExists(evolutionPath);
+    if (previousText) {
+      try { previous = JSON.parse(previousText); } catch (_) { throw Object.assign(new Error('生产演化索引损坏；必须显式重建。'), { code: 'EVOLUTION_REBUILD_REQUIRED' }); }
+      if (!verifyProductionEvolution(previous, Object.values(options.index?.records || {}))) throw Object.assign(new Error('生产演化索引绑定陈旧；必须显式重建。'), { code: 'EVOLUTION_REBUILD_REQUIRED' });
+    }
+    const evolution = prepareProductionEvolution(plan, { as_of: asOf, previous });
+    const result = await this.commitPlan(plan, { ...options, vault: this.port, requiredArtifacts: [
+      { id: 'production-evolution-index', path: evolutionPath, content: evolution.content }
+    ], verifyRequiredArtifacts: ({ index }) => {
+      if (!verifyProductionEvolution(evolution.index, Object.values(index?.records || {}))) throw Object.assign(new Error('生产演化索引与权威记录绑定校验失败。'), { code: 'EVOLUTION_BINDING_INVALID' });
+    } });
     const planned = uniqueSorted((plan.actions || []).filter((item) => ['business_item', 'company_knowledge'].includes(item.record_kind)).map((item) => item.path));
     const records = result?.verified?.knowledge_records || [];
     const committed = uniqueSorted(records.map((item) => item.final_path || item.path));
@@ -93390,16 +93433,102 @@ class ProductionCommitService {
       error.details = { planned: planned.map(hash), committed: committed.map(hash), visible_verified: visibleVerified.map(hash) };
       throw error;
     }
+    if (!verifyProductionEvolution(evolution.index, Object.values(result.index?.records || {}))) throw Object.assign(new Error('生产演化索引与权威记录绑定校验失败。'), { code: 'EVOLUTION_BINDING_INVALID' });
     return { ...result, authoritativeManifest: {
       schema: 'eks/authoritative-visible-manifest/3.0', run_id: options.runId, task_id: options.taskId,
       transaction_id: result.transactionId, created_at: new Date().toISOString(),
       target_roots: options.targetRoots,
-      path_sets: { planned, committed, visible_verified: visibleVerified }, records
+      path_sets: { planned, committed, visible_verified: visibleVerified }, records,
+      evolution: { required: true, path: evolutionPath, schema: evolution.index.schema, binding_sha256: evolution.binding, content_hash: hash(evolution.content) }
     } };
   }
 }
 
 module.exports = { ProductionCommitService };
+},
+"src/production-evolution.js": function(require, module, exports) {
+const crypto = require('crypto');
+const { buildEvolutionGraph } = require("src/v3/evolution-contract.js");
+
+const SCHEMA = 'eks/production-evolution-index/1';
+const PIPELINE = 'eks/stable-production/phase6';
+const hash = (v) => crypto.createHash('sha256').update(String(v)).digest('hex');
+const stable = (v) => JSON.stringify(v, Object.keys(v || {}).sort());
+const encode = (v) => Buffer.from(JSON.stringify(v), 'utf8').toString('base64url');
+const replaceFrontmatter = (text, key, value) => {
+  const line = `${key}: "${value}"`; const re = new RegExp(`^${key}:.*$`, 'm');
+  return re.test(text) ? text.replace(re, line) : text.replace(/^---\n/, `---\n${line}\n`);
+};
+function unitOf(action) {
+  const r = action.record_snapshot || {}; const evidence = (r.evidence_list?.length ? r.evidence_list : [r.evidence]).filter((e) => e?.verbatim);
+  if (!evidence.length) return null;
+  return { unit_id: action.record_id, title: r.title, body: r.summary, semantic_type: r.semantic_kind || r.item_type || r.record_kind,
+    subject: r.subject || r.search_title || r.title, entity: r.entity || '', predicate: r.predicate || r.summary || '',
+    predicate_signature: r.predicate_signature || r.signature || '', parameters: r.parameters || {}, numbers: r.numbers || [],
+    standard: r.standard || '', clause: r.clause || '', revision: r.revision || action.source_version || '', version: r.version || '',
+    dates: r.dates || [], effective_date: r.effective_date || '', expires_date: r.expires_date || '',
+    scope: r.scope && Object.keys(r.scope).length ? r.scope : (r.project_ids?.length ? { kind: 'project', project_ids: r.project_ids } : { kind: 'general' }),
+    replaces: r.replaces || [], evidence: evidence.map((e, i) => ({ evidence_id: e.evidence_id || `ev-${hash(`${action.owner_source_id}|${e.block_id}|${JSON.stringify(e.locator)}|${e.verbatim}`).slice(0,24)}`,
+      source_id: action.owner_source_id, block_id: String(e.block_id || `record-${action.record_id}-${i}`), locator: e.locator || {}, raw_verbatim: String(e.verbatim) })) };
+}
+function prepareProductionEvolution(plan, options = {}) {
+  const actions = (plan.actions || []).filter((a) => ['business_item','company_knowledge'].includes(a.record_kind));
+  const priorFacts = options.previous?.graph?.facts || [];
+  const priorUnits = priorFacts.map(f => ({ ...f, unit_id: f.unit_ids?.[0] || f.fact_id, semantic_type: f.semantic_type,
+    evidence: f.evidence, scope: f.scope, replaces: f.explicit_replaces || [] }));
+  const replaced = new Set(actions.map(a => a.record_id));
+  const units = [...priorUnits.filter(u => !(u.unit_ids || [u.unit_id]).some(id => replaced.has(id))), ...actions.map(unitOf).filter(Boolean)]; const documents = new Map();
+  for (const unit of units) for (const e of unit.evidence) {
+    if (!documents.has(e.source_id)) documents.set(e.source_id, { source_id: e.source_id, source_hash: actions.find(a => a.owner_source_id === e.source_id)?.source_hash || '', blocks: [] });
+    const d = documents.get(e.source_id); if (!d.blocks.some(b => b.block_id === e.block_id)) d.blocks.push({ block_id: e.block_id, locator: e.locator, raw_verbatim: e.raw_verbatim });
+  }
+  const graph = buildEvolutionGraph({ documents: [...documents.values()], units }, { as_of: options.as_of });
+  const factByUnit = new Map(graph.facts.flatMap(f => f.unit_ids.map(id => [id, f])));
+  for (const action of actions) { const fact = factByUnit.get(action.record_id); if (!fact) continue; action.content = replaceFrontmatter(action.content, 'evolution_schema', SCHEMA); action.content = replaceFrontmatter(action.content, 'evolution_payload', `base64url:${encode(fact)}`); action.content_hash = hash(action.content);
+    action.action = action.prior_hash === action.content_hash ? 'noop' : action.prior_content == null ? 'create' : 'update'; }
+  const currentRecords = actions.map(a => ({ record_id: a.record_id, path: a.path, content_hash: a.content_hash, source_id: a.owner_source_id,
+    source_hash: a.source_hash || '', evidence_hashes: (unitOf(a)?.evidence || []).map(e => hash(`${e.source_id}|${e.block_id}|${JSON.stringify(e.locator)}|${e.raw_verbatim}`)).sort() })).sort((a,b)=>a.record_id.localeCompare(b.record_id));
+  const records = [...(options.previous?.records || []).filter(r => !replaced.has(r.record_id)), ...currentRecords].sort((a,b)=>a.record_id.localeCompare(b.record_id));
+  const binding = hash(JSON.stringify({ schema: SCHEMA, pipeline: PIPELINE, records }));
+  const index = { schema: SCHEMA, pipeline: PIPELINE, as_of: options.as_of, binding_sha256: binding, records, graph };
+  return { index, content: `${JSON.stringify(index, null, 2)}\n`, binding };
+}
+function verifyProductionEvolution(index, records) {
+  if (index?.schema !== SCHEMA || index.pipeline !== PIPELINE) return false;
+  const actual = hash(JSON.stringify({ schema: SCHEMA, pipeline: PIPELINE, records: index.records }));
+  const ids = new Set(index.graph?.facts?.flatMap(f => f.unit_ids) || []);
+  return actual === index.binding_sha256 && index.records.every(r => records.some(x => x.record_id === r.record_id && x.content_hash === r.content_hash) && ids.has(r.record_id));
+}
+async function rebuildProductionEvolution(vault, idPathIndex, options = {}) {
+  const records=[]; const facts=[]; let legacy=0;
+  for (const entry of Object.values(idPathIndex?.records || {}).filter(r=>['business_item','company_knowledge'].includes(r.record_kind)).sort((a,b)=>a.record_id.localeCompare(b.record_id))) {
+    const text=await vault.readIfExists(entry.path); if(text==null) throw Object.assign(new Error(`演化重建目标缺失：${entry.record_id}`),{code:'EVOLUTION_REBUILD_TARGET_MISSING'});
+    if(entry.content_hash&&hash(text)!==entry.content_hash) throw Object.assign(new Error(`演化重建内容哈希不一致：${entry.record_id}`),{code:'EVOLUTION_REBUILD_CONTENT_MISMATCH'});
+    const encoded=String(text).match(/^evolution_payload:\s*["']?base64url:([^"'\n]+)/m)?.[1]; let fact=null;
+    if(encoded) try { fact=JSON.parse(Buffer.from(encoded,'base64url').toString('utf8')); } catch(_){ throw Object.assign(new Error(`演化 payload 损坏：${entry.record_id}`),{code:'EVOLUTION_REBUILD_PAYLOAD_INVALID'}); }
+    if(!fact){legacy+=1;fact={schema:'eks/v3/evolution-fact/1',fact_id:`legacy-${entry.record_id}`,unit_ids:[entry.record_id],title:'',body:'',semantic_type:'',subject:'',predicate:'',revision:'',version:'',effective_date:'',expires_date:'',scope:{kind:'general'},source_ids:[],evidence:[],relations:[],superseded_by:[],diagnostics:[{code:'LEGACY_UNDATED_UNRELATED'}],lifecycle:'undated'};}
+    facts.push(fact); records.push({record_id:entry.record_id,path:entry.path,content_hash:hash(text),source_id:entry.owner_source_id||'',source_hash:entry.source_hash||'',evidence_hashes:(fact.evidence||[]).map(e=>hash(`${e.source_id}|${e.block_id}|${JSON.stringify(e.locator)}|${e.raw_verbatim}`)).sort()});
+  }
+  const sorted=records.sort((a,b)=>a.record_id.localeCompare(b.record_id)); const binding=hash(JSON.stringify({schema:SCHEMA,pipeline:PIPELINE,records:sorted}));
+  const index={schema:SCHEMA,pipeline:PIPELINE,as_of:options.as_of,binding_sha256:binding,records:sorted,graph:{schema:'eks/v3/evolution-graph/1',as_of:options.as_of,facts,relations:facts.flatMap(f=>f.relations||[]),diagnostics:[]}};
+  const preview={managed_records:records.length,payload_records:records.length-legacy,legacy_undated_unrelated:legacy,path:options.path};
+  if(!options.dry_run) await vault.write(options.path,`${JSON.stringify(index,null,2)}\n`);
+  return {preview,index};
+}
+module.exports = { SCHEMA, PIPELINE, prepareProductionEvolution, verifyProductionEvolution, rebuildProductionEvolution };
+},
+"src/plugin-activation.js": function(require, module, exports) {
+class PluginActivation {
+  constructor() { this.state = 'idle'; this.viewRegistered = false; }
+  begin() { if (this.state === 'loading' || this.state === 'loaded') return false; this.state = 'loading'; return true; }
+  registered() { this.viewRegistered = true; this.state = 'loaded'; }
+  failed() { this.state = 'idle'; this.viewRegistered = false; }
+  unload(workspace, viewType) {
+    if (this.viewRegistered && typeof workspace?.unregisterView === 'function') workspace.unregisterView(viewType);
+    this.viewRegistered = false; this.state = 'idle';
+  }
+}
+module.exports = { PluginActivation };
 },
 "src/phase1-foundation.js": function(require, module, exports) {
 /**
@@ -96897,7 +97026,8 @@ function buildPlan(input) {
       action, record_id: record.record_id, record_kind: record.record_kind, path: record.path,
       content, content_hash: contentHash, prior_hash: priorHash, prior_content: prior,
       owner_source_id: sourceId, source_hash: clean(input.document?.source_hash, 128),
-      source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100)
+      source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
+      record_snapshot: JSON.parse(JSON.stringify(record))
     });
   }
   if (input.archiveTransition) {
@@ -97048,6 +97178,7 @@ async function commitPlan(plan, options) {
     status: 'staging', steps: [], created_at: options.logicalTime || ''
   };
   manifest.previous_index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
+  manifest.required_artifacts = [];
   let indexSaved = false;
   try {
     await ensureParent(vault, manifestPath);
@@ -97080,6 +97211,16 @@ async function commitPlan(plan, options) {
     index.source_versions[plan.source_document_id] = { source_hash: plan.source_hash, source_version: plan.source_version };
     await options.saveIndex(index);
     indexSaved = true;
+    for (const artifact of (options.requiredArtifacts || [])) {
+      const prior = await vault.readIfExists(artifact.path);
+      const step = { action: 'required_artifact', record_id: artifact.id, record_kind: 'production_state',
+        path: artifact.path, prior_content: prior, content_hash: hash(artifact.content), status: 'started' };
+      manifest.steps.push(step); manifest.required_artifacts.push({ id: artifact.id, path: artifact.path, content_hash: step.content_hash });
+      await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+      await vault.write(artifact.path, artifact.content); step.status = 'committed';
+      if (hash(await vault.readIfExists(artifact.path)) !== step.content_hash) throw new Error(`必需生产产物最终校验失败：${artifact.id}`);
+      await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+    }
     manifest.status = 'files_committed';
     manifest.index_revision = index.revision;
     await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
@@ -97087,6 +97228,7 @@ async function commitPlan(plan, options) {
     const verified = await verifyCommittedRecords(plan, vault, {
       transactionId, verifiedAt: new Date().toISOString(), runId: options.runId, targetRoots
     });
+    if (typeof options.verifyRequiredArtifacts === 'function') await options.verifyRequiredArtifacts({ index, verified, manifest });
     const plannedPaths = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind)).map((item) => item.path);
     const committedPaths = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind)
       && (item.action === 'noop' || manifest.steps.some((step) => step.record_id === item.record_id && step.status === 'committed'))).map((item) => item.path);

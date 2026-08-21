@@ -23,6 +23,7 @@
 - **诊断报告**：Dashboard 错误详情一键复制结构化脱敏报告（64 KiB JSON 硬上限），优先提交该报告而不是原始日志
 - **生产影子评估（v2.13）**：默认关闭；在插件内复用本地解析与已有检查点，以确定性分层队列采集脱敏质量/成本/时延指标，不写卡片、MOC、索引，也不改变任务终态。provider 请求有每次运行硬预算，设为 0 时绝不联网
 - **受控结构化写入（未发布）**：仅在高级设置显式开启。Pilot 复用真实 normalized block 和既有 AI 产物生成四类记录的 dry-run 计划，零结构化写入；Cutover 与旧卡 writer 互斥，并通过稳定 ID/路径索引、Phase 3 硬风险、事务 manifest、乐观 hash 与失败恢复后才写两库。
+- **Phase 6 生产演化（集成阶段，未发布）**：稳定提交链复用 Phase 5 合同，把版本、冲突、适用范围和证据关系写入卡片及事务必需 sidecar；详见 [Phase 6 设计与限制](docs/PHASE6_PRODUCTION_EVOLUTION.md)。旧版 Markdown 仍按未注明日期、无关系记录读取。
 - **v3 Phase 5 跨文档演进实验**：以稳定来源/块/证据身份构建版本化事实图，区分逐字重复、等价、相关、冲突与明确取代；Markdown 重载保留原文与关系，检索支持显式 `as_of` 和历史版本。设计与局限见 `docs/phase5-cross-document-evolution.md`。
 - **诊断日志**：全链路脱敏 diag 日志，默认写到 `~/.eks/logs/diag.log`，保留为本地深度排查兼容入口
 - **安全检查点与结构化错误**：阶段产物以 source/pipeline/prompt/schema 指纹校验后复用；错误提供稳定代码、可重试性和建议操作，日志递归脱敏 Header、JWT 和敏感 URL 参数

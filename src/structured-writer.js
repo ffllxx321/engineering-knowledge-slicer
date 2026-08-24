@@ -15,7 +15,13 @@ const {
 
 const WRITER_VERSION = '1.0';
 const INDEX_VERSION = '1.0';
-const PLAN_LIMITS = Object.freeze({ max_records: 250, max_actions: 600, max_links_per_record: 40 });
+const PLAN_LIMITS = Object.freeze({
+  max_records: 250, max_actions: 600, max_links_per_record: 40,
+  // Per-source ceilings are deliberately separate from the transaction knobs
+  // above. They prevent pathological/corrupt inputs without making an ordinary
+  // large document one enormous transaction.
+  max_source_records: 10000, max_source_actions: 20000
+});
 const MODES = Object.freeze(['legacy', 'structured-pilot', 'structured-write']);
 const KIND_PREFIX = Object.freeze({
   project: 'prj', source_document: 'src', business_item: 'bi', company_knowledge: 'ck'
@@ -367,9 +373,7 @@ function buildRecords(input, settings) {
       requested_relations: [{ type: 'derived_from', target_id: sourceId }]
     });
   }
-  if (records.filter((record) => ['business_item', 'company_knowledge'].includes(record.record_kind)).length > settings.limits.max_records) {
-    throw Object.assign(new Error('结构化知识记录数量超过安全上限'), { code: 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED' });
-  }
+  assertSourceRecordLimit(records, settings, sourceId);
   return { records, registry, route, sourceId };
 }
 
@@ -455,14 +459,28 @@ function buildCanonicalRecords(input, settings) {
     const to = records.find((record) => record.record_id === toId);
     if (to) to.requested_relations.push({ type: relation.type, target_id: from.record_id, evidence_locator: relation.evidence });
   }
-  if (records.filter((record) => ['business_item', 'company_knowledge'].includes(record.record_kind)).length > settings.limits.max_records) {
-    throw Object.assign(new Error('结构化知识记录数量超过安全上限'), { code: 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED' });
-  }
+  assertSourceRecordLimit(records, settings, sourceId);
   return {
     records, registry, sourceId,
     route: { library: sourceLibrary, directory_category: source.category },
     reviewDecisions: result.review_decisions || []
   };
+}
+
+function assertSourceRecordLimit(records, settings, sourceId) {
+  const knowledgeRecords = records.filter((record) => KNOWLEDGE_RECORD_KINDS.has(record.record_kind)).length;
+  if (knowledgeRecords <= PLAN_LIMITS.max_source_records) return;
+  const partitionSize = settings.limits.max_records;
+  const partitionCount = Math.ceil(knowledgeRecords / partitionSize);
+  const error = new Error(`单来源结构化记录 ${knowledgeRecords} 条，超过全局安全上限 ${PLAN_LIMITS.max_source_records} 条。`);
+  error.code = 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED';
+  error.details = {
+    actual_records: knowledgeRecords, global_safe_limit: PLAN_LIMITS.max_source_records,
+    transaction_record_limit: partitionSize, required_partitions: partitionCount,
+    source_document_id: sourceId,
+    recovery: '保留 canonical 与 translation checkpoint；检查异常重复单元后从 structured writer 重试。'
+  };
+  throw error;
 }
 
 function coalesceCanonicalUnits(units, options = {}) {
@@ -646,7 +664,13 @@ function buildPlan(input) {
       }
     }
   }
-  if (actions.length > settings.limits.max_actions) throw new Error('写入计划超过安全上限');
+  if (actions.length > PLAN_LIMITS.max_source_actions) {
+    const error = new Error(`单来源写入动作 ${actions.length} 个，超过全局安全上限 ${PLAN_LIMITS.max_source_actions} 个。`);
+    error.code = 'STRUCTURED_ACTION_LIMIT_EXCEEDED';
+    error.details = { actual_actions: actions.length, global_safe_limit: PLAN_LIMITS.max_source_actions,
+      transaction_action_limit: settings.limits.max_actions, source_document_id: sourceId };
+    throw error;
+  }
   const counts = {};
   for (const action of actions) counts[action.action] = (counts[action.action] || 0) + 1;
   const universalMode = Boolean(input.universalResult?.knowledge_units);
@@ -663,11 +687,53 @@ function buildPlan(input) {
     source_hash: clean(input.document?.source_hash, 128),
     source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
     index_revision: Number(index.revision || 0), blocked,
-    writes_performed: 0
+    writes_performed: 0,
+    transaction_limits: { max_records: settings.limits.max_records, max_actions: settings.limits.max_actions }
   };
   planCore.plan_id = `plan-${hash({ ...planCore, actions: actions.map(({ prior_content, ...item }) => item) }).slice(0, 24)}`;
   planCore.summary = `新建 ${counts.create || 0}，更新 ${counts.update || 0}，不变 ${counts.noop || 0}，移动 ${counts.move || 0}，需要处理 ${conflicts.length + reviewGroups.length + planCore.phase3_handling_groups.length}。`;
   return planCore;
+}
+
+function partitionPlan(plan) {
+  if (!plan?.actions || plan.mode === 'feature_off') return [plan];
+  const maxRecords = Math.max(1, Number(plan.transaction_limits?.max_records) || 100);
+  const maxActions = Math.max(1, Number(plan.transaction_limits?.max_actions) || 300);
+  const support = plan.actions.filter((action) => !KNOWLEDGE_RECORD_KINDS.has(action.record_kind));
+  const knowledge = plan.actions.filter((action) => KNOWLEDGE_RECORD_KINDS.has(action.record_kind));
+  if (support.length > maxActions) {
+    const error = new Error(`来源支撑记录 ${support.length} 个，无法放入上限 ${maxActions} 的有界事务。`);
+    error.code = 'STRUCTURED_PARTITION_UNSAFE';
+    error.details = { actual_support_actions: support.length, transaction_action_limit: maxActions,
+      actual_records: knowledge.length, recovery: '保留已有检查点，调整单事务 action 上限后重试。' };
+    throw error;
+  }
+  const partitions = [];
+  let offset = 0;
+  while (offset < knowledge.length || (!partitions.length && support.length)) {
+    const prefix = partitions.length ? [] : support;
+    const capacity = Math.min(maxRecords, maxActions - prefix.length);
+    if (knowledge.length > offset && capacity < 1) {
+      const error = new Error(`事务 action 上限 ${maxActions} 无法同时容纳来源支撑记录和知识记录。`);
+      error.code = 'STRUCTURED_PARTITION_UNSAFE';
+      error.details = { actual_support_actions: support.length, transaction_action_limit: maxActions,
+        actual_records: knowledge.length, recovery: '保留已有检查点，调整单事务 action 上限后重试。' };
+      throw error;
+    }
+    const actions = [...prefix, ...knowledge.slice(offset, offset + capacity)];
+    offset += Math.max(0, actions.length - prefix.length);
+    partitions.push(actions);
+  }
+  const total = partitions.length;
+  return partitions.map((actions, index) => {
+    const partition = { ...plan, actions, partition: { schema_version: 'structured-partition/1.0',
+      index: index + 1, total, knowledge_offset: index === 0 ? 0 : partitions.slice(0, index)
+        .reduce((sum, rows) => sum + rows.filter((a) => KNOWLEDGE_RECORD_KINDS.has(a.record_kind)).length, 0),
+      knowledge_count: actions.filter((a) => KNOWLEDGE_RECORD_KINDS.has(a.record_kind)).length } };
+    partition.plan_id = `plan-${hash({ parent_plan_id: plan.plan_id, partition: partition.partition,
+      actions: actions.map(({ prior_content, ...item }) => item) }).slice(0, 24)}`;
+    return partition;
+  });
 }
 
 async function ensureParent(vault, path) {
@@ -923,5 +989,5 @@ module.exports = {
   WRITER_VERSION, INDEX_VERSION, PLAN_LIMITS, MODES, RELATION_TYPES,
   stableJson, hash, stableId, pathSafe, normalizeSettings, sourceIdentity,
   candidateIdentity, emptyIndex, validateIndex, serializeRecord, resolveRelations,
-  buildPlan, commitPlan, rollbackTransaction, verifyCommittedRecords, coalesceCanonicalUnits
+  buildPlan, partitionPlan, commitPlan, rollbackTransaction, verifyCommittedRecords, coalesceCanonicalUnits
 };

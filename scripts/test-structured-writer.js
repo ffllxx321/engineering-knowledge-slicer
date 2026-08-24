@@ -4,7 +4,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const {
-  stableId, emptyIndex, serializeRecord, buildPlan, commitPlan, rollbackTransaction,
+  stableId, emptyIndex, serializeRecord, buildPlan, partitionPlan, commitPlan, rollbackTransaction,
   pathSafe, hash, coalesceCanonicalUnits
 } = require('../src/structured-writer.js');
 const { runPhase2CandidatePipeline } = require('../src/phase2-candidate-pipeline.js');
@@ -420,10 +420,57 @@ async function main() {
     unit.evidence = [{ ...unit.evidence[0], locator: { scheme: 'paragraph', value: `p-${index}` },
       verbatim: `第 ${index + 1} 项要求必须执行并留存记录。` }];
   });
-  assert.throws(() => buildPlan({
+  const preliminary101 = buildPlan({ ...input(), document: universal101.document, universalResult: universal101,
+    phase2Result: undefined, phase3Result: undefined });
+  const orderedKnowledge101 = preliminary101.actions.filter((item) =>
+    ['business_item', 'company_knowledge'].includes(item.record_kind));
+  const unitForTitle = (title) => universal101.knowledge_units.find((unit) => unit.title === title);
+  universal101.relations = [{ type: 'related',
+    from_unit_id: unitForTitle(orderedKnowledge101[0].record_snapshot.title).unit_id,
+    to_unit_id: unitForTitle(orderedKnowledge101[100].record_snapshot.title).unit_id,
+    evidence: { scheme: 'paragraph', value: 'p-0' } }];
+  const plan101 = buildPlan({
     ...input(), document: universal101.document, universalResult: universal101,
     phase2Result: undefined, phase3Result: undefined
-  }), (error) => error.code === 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED');
+  });
+  const partitions101 = partitionPlan({ ...plan101, mode: 'structured-write' });
+  assert.strictEqual(partitions101.length, 2, '101 knowledge records use two bounded transactions');
+  assert(partitions101.every((part) => part.actions.filter((action) =>
+    ['business_item', 'company_knowledge'].includes(action.record_kind)).length <= 100));
+  const relatedAction = partitions101.flatMap((part) => part.actions).find((action) =>
+    action.record_snapshot?.relations?.some((relation) => relation.type === 'related'));
+  const relatedTarget = relatedAction?.record_snapshot?.relations?.find((relation) => relation.type === 'related');
+  assert(relatedAction?.content.includes(relatedTarget?.target_id),
+    'cross-partition relationships retain stable target IDs');
+  const vault101 = new MemoryVault();
+  let index101 = emptyIndex();
+  const first101 = await commitPlan(partitions101[0], { vault: vault101, lock: lock(), stateRoot: '状态',
+    index: index101, logicalTime: TIME, runId: 'run-101-p1', saveIndex: async (next) => { index101 = next; } });
+  assert.strictEqual(first101.verified.counts.knowledge_records, 100);
+  const failingSecond = new MemoryVault(Object.fromEntries(vault101.files), 5);
+  await assert.rejects(() => commitPlan(partitions101[1], { vault: failingSecond, lock: lock(), stateRoot: '状态',
+    index: index101, logicalTime: TIME, runId: 'run-101-p2-fail', saveIndex: async () => {} }),
+  (error) => Boolean(error.transactionManifest));
+  for (const action of partitions101[0].actions.filter((item) => item.action !== 'noop')) {
+    assert.strictEqual(failingSecond.files.get(action.path), action.content,
+      'a failed later partition does not roll back an earlier committed partition');
+  }
+  const resumedVault = new MemoryVault(Object.fromEntries(failingSecond.files));
+  const second101 = await commitPlan(partitions101[1], { vault: resumedVault, lock: lock(), stateRoot: '状态',
+    index: index101, logicalTime: TIME, runId: 'run-101-p2-retry', saveIndex: async (next) => { index101 = next; } });
+  assert.strictEqual(second101.verified.counts.knowledge_records, 1);
+  const knowledgeActions101 = partitions101.flatMap((part) => part.actions)
+    .filter((item) => ['business_item', 'company_knowledge'].includes(item.record_kind));
+  assert.strictEqual(knowledgeActions101.length, 101);
+  assert(knowledgeActions101.every((action) => action.record_snapshot.evidence_list.length === 1
+    && action.content.includes(action.record_snapshot.evidence_list[0].verbatim)),
+  'partitioning retains every knowledge record and its evidence');
+  assert.throws(() => buildPlan({
+    ...input(), document: universalResult(10001).document, universalResult: universalResult(10001),
+    phase2Result: undefined, phase3Result: undefined
+  }), (error) => error.code === 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED'
+    && error.details.actual_records === 10001 && error.details.required_partitions === 101,
+  'the independent global ceiling still rejects runaway input with recovery detail');
 
   const reviewed = universalResult(3);
   reviewed.review_decisions = [{ decision_id: 'review-1', unit_ids: [reviewed.knowledge_units[2].unit_id],

@@ -10,6 +10,14 @@ v2.20 建立唯一的结构化生产路径：
 
 旧 artifact 仍可读取，但在进入新路径、恢复、缓存命中和迁移边界都会规范为统一知识单元；旧 schema 不再决定新知识的切分和路由。
 
+## 大文档的有界分区写入
+
+`structuredMaxRecords` 现在表示单个结构化事务最多包含的知识记录数，不再是单来源的可处理总量。writer 先完成 canonical unit coalescing、稳定 ID/path 和全部关系解析，再按稳定记录顺序分区。每个分区同时受 `structuredMaxRecords` 和 `structuredMaxActions` 约束；不截断、不抽样，证据、`source_id`、record ID、path 和跨分区关系均使用完整计划中的稳定值。
+
+每个分区都使用原有的事务 manifest、回滚、ID/path index 和 Phase 5/6 evolution sidecar 验证。`structured-write-checkpoint/1.0` 在每次成功提交后记录已完成分区；中途失败时，当前分区回滚，已验证分区保留，重试依据权威 index 变为 noop 或继续提交。最终 `structured-transaction/2.0` 列出全部分区事务和知识路径。
+
+独立的全局防失控上限仍保留（当前单来源 10,000 条知识记录、20,000 个计划动作）。只有超过该上限或支撑记录无法放入任一有界事务时才拒绝；错误 details 包含实际计数、上限、需要的分区数和恢复建议。
+
 ### v2.20.1 生产边界修正
 
 `structured-pilot` 和 `structured-write` 不加载或执行旧卡片 workflow，也不调用 Phase 2 候选管线或 Phase 3 审核门。writer 的完整生产输入固定为 canonical document、universal result、项目登记表、ID→路径索引、现有文件与设置。旧 Phase 2/3 实现仅用于显式 legacy、旧 artifact 迁移/读取、回滚和兼容测试。

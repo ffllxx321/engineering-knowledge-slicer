@@ -133,6 +133,7 @@ const { PluginActivation } = require("src/plugin-activation.js");
 const { rebuildProductionEvolution } = require("src/production-evolution.js");
 const {
   buildPlan: buildStructuredPlan,
+  partitionPlan: partitionStructuredPlan,
   commitPlan: commitStructuredPlan,
   rollbackTransaction: rollbackStructuredTransaction,
   hash: structuredContentHash,
@@ -3424,7 +3425,7 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       }
     };
     const rawIndex = await readJson(indexPath, emptyStructuredIndex(), 'index');
-    const { index, discarded: discardedIndexEntries = [] } = validateStructuredIndex(rawIndex);
+    let { index, discarded: discardedIndexEntries = [] } = validateStructuredIndex(rawIndex);
     if (discardedIndexEntries.length) {
       diag('structuredWriter.indexEntriesDiscarded', {
         count: discardedIndexEntries.length,
@@ -3632,18 +3633,74 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     const obsidianVault = this.app.vault;
     const vault = new KnowledgeWritePort(obsidianVault);
     const productionCommit = new ProductionCommitService(vault, commitStructuredPlan);
-    const committed = await productionCommit.commit(plan, {
-      lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
-      index, logicalTime: new Date().toISOString(), asOf: new Date().toISOString().slice(0, 10), runId: task.run_id, taskId: task.task_id,
-      targetRoots: { active_tender: normalizeStructuredSettings(settings).activeRoot,
+    const partitions = partitionStructuredPlan(plan);
+    const completed = [];
+    let committed = null;
+    for (const partition of partitions) {
+      committed = await productionCommit.commit(partition, {
+        lock: this.structuredWriterLock, stateRoot: this.settings.artifactsPath,
+        index, logicalTime: new Date().toISOString(), asOf: new Date().toISOString().slice(0, 10), runId: task.run_id, taskId: task.task_id,
+        targetRoots: { active_tender: normalizeStructuredSettings(settings).activeRoot,
+          business: normalizeStructuredSettings(settings).businessRoot },
+        saveIndex: async (next) => vault.write(indexPath, JSON.stringify(next, null, 2))
+      });
+      index = committed.index;
+      completed.push({ partition: partition.partition, transaction_id: committed.transactionId,
+        manifest_path: committed.manifestPath, index_revision: committed.index.revision,
+        verified_counts: committed.verified.counts, knowledge_paths: committed.verified.knowledge_paths });
+      await this.persistArtifact(task, 'structured-write-checkpoint', {
+        schema_version: 'structured-write-checkpoint/1.0', source_hash: task.source_hash,
+        parent_plan_id: plan.plan_id, completed_partitions: completed, partition_count: partitions.length,
+        status: completed.length === partitions.length ? 'complete' : 'partial'
+      });
+    }
+    // Earlier transaction objects are intentionally not retained in the durable
+    // checkpoint, so assemble the current-run authority from the complete plan
+    // and the now-authoritative index/files after all partitions committed.
+    const allVerifiedRecords = [];
+    for (const action of plan.actions) {
+      const content = await vault.readIfExists(action.path);
+      const indexed = index.records?.[action.record_id];
+      if (content === null || !indexed || structuredContentHash(content) !== indexed.content_hash) {
+        const error = new Error(`分区提交后全量记录校验失败：${action.record_id}`);
+        error.code = 'STRUCTURED_PARTITION_FINAL_VERIFICATION_FAILED';
+        throw error;
+      }
+      allVerifiedRecords.push({ record_id: action.record_id, record_kind: action.record_kind,
+        final_path: action.path, path: action.path, content_hash: indexed.content_hash,
+        run_id: task.run_id, target_library: action.path.startsWith(`${normalizeStructuredSettings(settings).activeRoot}/`)
+          ? 'active_tender' : 'business',
+        vault_file_type: 'markdown', source_association: action.owner_source_id || '',
+        transaction_id: completed.find((item) => item.knowledge_paths.includes(action.path))?.transaction_id
+          || completed[0]?.transaction_id || committed.transactionId,
+        state: 'visible_verified', knowledge_record: ['business_item', 'company_knowledge'].includes(action.record_kind) });
+    }
+    const allKnowledgeRecords = allVerifiedRecords.filter((item) => item.knowledge_record);
+    committed.verified = { ...committed.verified, records: allVerifiedRecords,
+      knowledge_records: allKnowledgeRecords, knowledge_paths: allKnowledgeRecords.map((item) => item.path),
+      counts: { ...committed.verified.counts,
+        source_records: allVerifiedRecords.filter((item) => item.record_kind === 'source_document').length,
+        project_records: allVerifiedRecords.filter((item) => item.record_kind === 'project').length,
+        knowledge_records: allKnowledgeRecords.length,
+        knowledge_created: plan.actions.filter((item) => item.action === 'create' && ['business_item', 'company_knowledge'].includes(item.record_kind)).length,
+        knowledge_updated: plan.actions.filter((item) => item.action.includes('update') && ['business_item', 'company_knowledge'].includes(item.record_kind)).length,
+        knowledge_unchanged: plan.actions.filter((item) => item.action === 'noop' && ['business_item', 'company_knowledge'].includes(item.record_kind)).length } };
+    const allPaths = allKnowledgeRecords.map((item) => item.path).sort();
+    committed.authoritativeManifest = { schema: 'eks/authoritative-visible-manifest/3.0',
+      run_id: task.run_id, task_id: task.task_id, parent_plan_id: plan.plan_id,
+      transaction_id: committed.transactionId,
+      transaction_ids: completed.map((item) => item.transaction_id),
+      target_roots: { active_tender: normalizeStructuredSettings(settings).activeRoot,
         business: normalizeStructuredSettings(settings).businessRoot },
-      saveIndex: async (next) => vault.write(indexPath, JSON.stringify(next, null, 2))
-    });
+      path_sets: { planned: allPaths, committed: allPaths, visible_verified: allPaths }, records: allKnowledgeRecords,
+      evolution: committed.authoritativeManifest?.evolution };
     await this.persistArtifact(task, 'structured-transaction', {
       transaction_id: committed.transactionId, manifest_path: committed.manifestPath,
       index_revision: committed.index.revision,
       verified_counts: committed.verified.counts,
-      knowledge_paths: committed.verified.knowledge_paths
+      knowledge_paths: allKnowledgeRecords.map((item) => item.path),
+      schema_version: 'structured-transaction/2.0', parent_plan_id: plan.plan_id,
+      partition_count: partitions.length, transactions: completed
     });
     task.structured_transaction_id = committed.transactionId;
     return { mode, plan, transaction: committed, universalResult: universal };
@@ -96416,7 +96473,13 @@ const {
 
 const WRITER_VERSION = '1.0';
 const INDEX_VERSION = '1.0';
-const PLAN_LIMITS = Object.freeze({ max_records: 250, max_actions: 600, max_links_per_record: 40 });
+const PLAN_LIMITS = Object.freeze({
+  max_records: 250, max_actions: 600, max_links_per_record: 40,
+  // Per-source ceilings are deliberately separate from the transaction knobs
+  // above. They prevent pathological/corrupt inputs without making an ordinary
+  // large document one enormous transaction.
+  max_source_records: 10000, max_source_actions: 20000
+});
 const MODES = Object.freeze(['legacy', 'structured-pilot', 'structured-write']);
 const KIND_PREFIX = Object.freeze({
   project: 'prj', source_document: 'src', business_item: 'bi', company_knowledge: 'ck'
@@ -96768,9 +96831,7 @@ function buildRecords(input, settings) {
       requested_relations: [{ type: 'derived_from', target_id: sourceId }]
     });
   }
-  if (records.filter((record) => ['business_item', 'company_knowledge'].includes(record.record_kind)).length > settings.limits.max_records) {
-    throw Object.assign(new Error('结构化知识记录数量超过安全上限'), { code: 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED' });
-  }
+  assertSourceRecordLimit(records, settings, sourceId);
   return { records, registry, route, sourceId };
 }
 
@@ -96856,14 +96917,28 @@ function buildCanonicalRecords(input, settings) {
     const to = records.find((record) => record.record_id === toId);
     if (to) to.requested_relations.push({ type: relation.type, target_id: from.record_id, evidence_locator: relation.evidence });
   }
-  if (records.filter((record) => ['business_item', 'company_knowledge'].includes(record.record_kind)).length > settings.limits.max_records) {
-    throw Object.assign(new Error('结构化知识记录数量超过安全上限'), { code: 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED' });
-  }
+  assertSourceRecordLimit(records, settings, sourceId);
   return {
     records, registry, sourceId,
     route: { library: sourceLibrary, directory_category: source.category },
     reviewDecisions: result.review_decisions || []
   };
+}
+
+function assertSourceRecordLimit(records, settings, sourceId) {
+  const knowledgeRecords = records.filter((record) => KNOWLEDGE_RECORD_KINDS.has(record.record_kind)).length;
+  if (knowledgeRecords <= PLAN_LIMITS.max_source_records) return;
+  const partitionSize = settings.limits.max_records;
+  const partitionCount = Math.ceil(knowledgeRecords / partitionSize);
+  const error = new Error(`单来源结构化记录 ${knowledgeRecords} 条，超过全局安全上限 ${PLAN_LIMITS.max_source_records} 条。`);
+  error.code = 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED';
+  error.details = {
+    actual_records: knowledgeRecords, global_safe_limit: PLAN_LIMITS.max_source_records,
+    transaction_record_limit: partitionSize, required_partitions: partitionCount,
+    source_document_id: sourceId,
+    recovery: '保留 canonical 与 translation checkpoint；检查异常重复单元后从 structured writer 重试。'
+  };
+  throw error;
 }
 
 function coalesceCanonicalUnits(units, options = {}) {
@@ -97047,7 +97122,13 @@ function buildPlan(input) {
       }
     }
   }
-  if (actions.length > settings.limits.max_actions) throw new Error('写入计划超过安全上限');
+  if (actions.length > PLAN_LIMITS.max_source_actions) {
+    const error = new Error(`单来源写入动作 ${actions.length} 个，超过全局安全上限 ${PLAN_LIMITS.max_source_actions} 个。`);
+    error.code = 'STRUCTURED_ACTION_LIMIT_EXCEEDED';
+    error.details = { actual_actions: actions.length, global_safe_limit: PLAN_LIMITS.max_source_actions,
+      transaction_action_limit: settings.limits.max_actions, source_document_id: sourceId };
+    throw error;
+  }
   const counts = {};
   for (const action of actions) counts[action.action] = (counts[action.action] || 0) + 1;
   const universalMode = Boolean(input.universalResult?.knowledge_units);
@@ -97064,11 +97145,53 @@ function buildPlan(input) {
     source_hash: clean(input.document?.source_hash, 128),
     source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
     index_revision: Number(index.revision || 0), blocked,
-    writes_performed: 0
+    writes_performed: 0,
+    transaction_limits: { max_records: settings.limits.max_records, max_actions: settings.limits.max_actions }
   };
   planCore.plan_id = `plan-${hash({ ...planCore, actions: actions.map(({ prior_content, ...item }) => item) }).slice(0, 24)}`;
   planCore.summary = `新建 ${counts.create || 0}，更新 ${counts.update || 0}，不变 ${counts.noop || 0}，移动 ${counts.move || 0}，需要处理 ${conflicts.length + reviewGroups.length + planCore.phase3_handling_groups.length}。`;
   return planCore;
+}
+
+function partitionPlan(plan) {
+  if (!plan?.actions || plan.mode === 'feature_off') return [plan];
+  const maxRecords = Math.max(1, Number(plan.transaction_limits?.max_records) || 100);
+  const maxActions = Math.max(1, Number(plan.transaction_limits?.max_actions) || 300);
+  const support = plan.actions.filter((action) => !KNOWLEDGE_RECORD_KINDS.has(action.record_kind));
+  const knowledge = plan.actions.filter((action) => KNOWLEDGE_RECORD_KINDS.has(action.record_kind));
+  if (support.length > maxActions) {
+    const error = new Error(`来源支撑记录 ${support.length} 个，无法放入上限 ${maxActions} 的有界事务。`);
+    error.code = 'STRUCTURED_PARTITION_UNSAFE';
+    error.details = { actual_support_actions: support.length, transaction_action_limit: maxActions,
+      actual_records: knowledge.length, recovery: '保留已有检查点，调整单事务 action 上限后重试。' };
+    throw error;
+  }
+  const partitions = [];
+  let offset = 0;
+  while (offset < knowledge.length || (!partitions.length && support.length)) {
+    const prefix = partitions.length ? [] : support;
+    const capacity = Math.min(maxRecords, maxActions - prefix.length);
+    if (knowledge.length > offset && capacity < 1) {
+      const error = new Error(`事务 action 上限 ${maxActions} 无法同时容纳来源支撑记录和知识记录。`);
+      error.code = 'STRUCTURED_PARTITION_UNSAFE';
+      error.details = { actual_support_actions: support.length, transaction_action_limit: maxActions,
+        actual_records: knowledge.length, recovery: '保留已有检查点，调整单事务 action 上限后重试。' };
+      throw error;
+    }
+    const actions = [...prefix, ...knowledge.slice(offset, offset + capacity)];
+    offset += Math.max(0, actions.length - prefix.length);
+    partitions.push(actions);
+  }
+  const total = partitions.length;
+  return partitions.map((actions, index) => {
+    const partition = { ...plan, actions, partition: { schema_version: 'structured-partition/1.0',
+      index: index + 1, total, knowledge_offset: index === 0 ? 0 : partitions.slice(0, index)
+        .reduce((sum, rows) => sum + rows.filter((a) => KNOWLEDGE_RECORD_KINDS.has(a.record_kind)).length, 0),
+      knowledge_count: actions.filter((a) => KNOWLEDGE_RECORD_KINDS.has(a.record_kind)).length } };
+    partition.plan_id = `plan-${hash({ parent_plan_id: plan.plan_id, partition: partition.partition,
+      actions: actions.map(({ prior_content, ...item }) => item) }).slice(0, 24)}`;
+    return partition;
+  });
 }
 
 async function ensureParent(vault, path) {
@@ -97324,7 +97447,7 @@ module.exports = {
   WRITER_VERSION, INDEX_VERSION, PLAN_LIMITS, MODES, RELATION_TYPES,
   stableJson, hash, stableId, pathSafe, normalizeSettings, sourceIdentity,
   candidateIdentity, emptyIndex, validateIndex, serializeRecord, resolveRelations,
-  buildPlan, commitPlan, rollbackTransaction, verifyCommittedRecords, coalesceCanonicalUnits
+  buildPlan, partitionPlan, commitPlan, rollbackTransaction, verifyCommittedRecords, coalesceCanonicalUnits
 };
 },
 /* STRUCTURED_PHASE_MODULES_END */
@@ -106079,7 +106202,8 @@ function classifyFailure(input = {}) {
   if (code === 'COMPONENT_CONFIG_INVALID') return result(code, 'component_config', false, '组件配置无效', '内置兼容回退不会替换已存在但无效的自定义内容；修正 folder-map、Schema 或 Prompt 后重试，已有解析产物会复用。');
   if (code === 'VAULT_PATH_INVALID') return result(code, 'path_contract', false, '插件路径契约无效', '修复或移除包含主机绝对路径的旧索引/状态记录后重试；已有解析与统一知识产物会复用。');
   if (code === 'STRUCTURED_WRITE_NOT_PERSISTED') return result(code, 'structured_state', true, '未写入任何知识卡片', '写入结果未能由 Obsidian 打开，事务和索引已安全回滚；请保留源文件并重试。');
-  if (code === 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED') return result(code, 'structured_state', false, '知识记录数量超过安全上限', '拆分来源文档或提高结构化知识记录上限后重试；现有解析与语义检查点会保留。');
+  if (code === 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED') return result(code, 'structured_state', false, '单来源知识记录超过全局防失控上限', '现有 canonical 与翻译检查点已保留；检查异常重复单元后从 structured writer 重试。');
+  if (code === 'STRUCTURED_PARTITION_UNSAFE') return result(code, 'structured_state', false, '无法安全划分有界写入事务', '保留已有检查点，根据错误中的实际记录数和分区信息调整单事务上限后重试。');
   if (code === 'STRUCTURED_INDEX_CORRUPT') return result(code, 'structured_state', false, '结构化索引已损坏', '修复索引 JSON 后重试；插件不会覆盖原文件，解析与统一知识检查点会复用。');
   if (code === 'PROJECT_REGISTRY_CORRUPT' || code === 'PROJECT_REGISTRY_INVALID') return result(code, 'structured_state', false, '项目登记表损坏或格式无效', '修复项目登记表 JSON/数组格式后重试；插件不会覆盖原文件，已有检查点会复用。');
   if (code === 'TASK_LEDGER_CORRUPT') return result(code, 'task_ledger', false, '任务账本损坏或无法读取', '修复 tasks.json 或从滚动备份恢复；插件不会清空或覆盖损坏账本。');

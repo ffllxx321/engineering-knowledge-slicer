@@ -22,6 +22,7 @@ function loadBundleModule(id, dependencies = {}) {
       if (Object.hasOwn(dependencies, name)) return dependencies[name];
       if (name === 'crypto') return crypto;
       if (name === 'src/content-integrity.js') return loadBundleModule(name);
+      if (name === 'src/semantic-text.js') return loadBundleModule(name, { crypto });
       if (name === 'src/phase1-foundation.js') return loadBundleModule(name, { crypto });
       if (name === 'src/knowledge-write-port.js') return loadBundleModule(name, { crypto });
       if (name === 'src/v3/contracts.js') return loadBundleModule(name, { crypto });

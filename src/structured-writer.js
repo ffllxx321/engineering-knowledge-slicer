@@ -6,6 +6,7 @@
  * commitPlan/rollbackTransaction and guarded by an injected adapter.
  */
 const crypto = require('crypto');
+const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts } = require('./semantic-text.js');
 const {
   ACTIVE_TENDER_CATEGORIES,
   BUSINESS_CATEGORIES,
@@ -163,6 +164,7 @@ function relationLink(relation) {
 }
 
 function humanLocator(locator = {}) {
+  if (Array.isArray(locator.locators)) return combinedHumanLocators(locator.locators);
   return [
     locator.page !== undefined ? `第 ${locator.page} 页` : '',
     locator.sheet ? `工作表“${clean(String(locator.sheet), 120)}”` : '',
@@ -172,6 +174,33 @@ function humanLocator(locator = {}) {
     locator.heading_path ? `章节 ${Array.isArray(locator.heading_path) ? locator.heading_path.join(' / ') : locator.heading_path}` : '',
     !locator.page && !locator.sheet && !locator.range && locator.value ? clean(String(locator.value), 160) : ''
   ].filter(Boolean).join('，') || '来源原文';
+}
+
+function combinedHumanLocators(locators = []) {
+  const unique = [...new Map(locators.map((item) => [stableJson(item || {}), item || {}])).values()];
+  const pages = [...new Set(unique.map((item) => Number(item.page)).filter(Number.isFinite))].sort((a, b) => a - b);
+  const rest = unique.filter((item) => !Number.isFinite(Number(item.page))).map(humanLocator);
+  return [...(pages.length ? [`第 ${pages.join('、')} 页`] : []), ...new Set(rest)].join('，') || '来源原文';
+}
+
+function mergeEvidence(items = []) {
+  const groups = new Map();
+  for (const item of items.filter(Boolean)) {
+    const key = semanticTextSignature(item.verbatim || '');
+    if (!normalizeSemanticText(item.verbatim) || !groups.has(key)) groups.set(key, { ...item,
+      provenance: [...(item.provenance || [])], locators: [item.locator || {}, ...(item.locators || [])] });
+    else {
+      const target = groups.get(key);
+      target.provenance.push(...(item.provenance || []));
+      target.locators.push(item.locator || {}, ...(item.locators || []));
+      for (const id of [item.block_id, ...(item.block_ids || [])].filter(Boolean)) {
+        target.block_ids = uniq([...(target.block_ids || []), target.block_id, id]);
+      }
+    }
+  }
+  return [...groups.values()].map((item) => ({ ...item,
+    provenance: [...new Map(item.provenance.map((value) => [stableJson(value), value])).values()],
+    locators: [...new Map(item.locators.map((value) => [stableJson(value), value])).values()] }));
 }
 
 function searchKeywords(record) {
@@ -228,13 +257,13 @@ function serializeRecord(record) {
   frontmatter.push('---', '', `# ${record.title}`, '');
   const body = [];
   if (record.summary) body.push('## 内容', '', readableSummary(record.summary), '');
-  const evidenceList = (record.evidence_list?.length ? record.evidence_list : [record.evidence]).filter((item) => item?.verbatim);
+  const evidenceList = mergeEvidence(record.evidence_list?.length ? record.evidence_list : [record.evidence]);
   if (evidenceList.length) {
     body.push('## 来源', '');
     const sourceRelation = relations.find((relation) => relation.type === 'derived_from');
     if (sourceRelation) body.push(`- 来源文件：${relationLink(sourceRelation)}`);
     for (const evidence of evidenceList) body.push(
-      `- 原文位置：${humanLocator(evidence.locator || {})}`, '',
+      `- 原文位置：${combinedHumanLocators(evidence.locators || [evidence.locator || {}])}`, '',
       '### 原文摘录', '',
       `> ${displayEvidence(evidence.verbatim).replace(/\n/g, '\n> ')}`, '');
     if (record.evidence_translation && record.evidence_translation !== record.evidence.verbatim) {
@@ -249,7 +278,7 @@ function serializeRecord(record) {
     ...record.unresolved_relations.map((item) =>
       `- ${item.type || 'related'}：${item.source_candidate || '未命名'}（${item.reason}；定位 ${stableJson(item.evidence_locator || {})}）`), '');
   body.push('<details>', '<summary>技术追溯</summary>', '', `- 记录编号：${record.record_id}`);
-  for (const evidence of evidenceList) body.push(`- 定位数据：base64url:${encodedLocator(evidence.locator || {})}`);
+  for (const evidence of evidenceList) for (const locator of evidence.locators || [evidence.locator || {}]) body.push(`- 定位数据：base64url:${encodedLocator(locator)}`);
   if (record.source_hash) body.push(`- 来源哈希：${record.source_hash}`);
   body.push('', '</details>');
   return `${frontmatter.concat(body).join('\n')}\n`;
@@ -517,7 +546,23 @@ function assertSourceRecordLimit(records, settings, sourceId) {
 function coalesceCanonicalUnits(units, options = {}) {
   const maxChars = Math.max(1000, Number(options.max_chars) || 12000);
   const output = [];
-  for (const unit of units) {
+  for (const rawUnit of units) {
+    const unit = { ...rawUnit, statement: dedupeSemanticTexts(String(rawUnit.statement || '').split(/\n+/)).join('\n'),
+      evidence: mergeEvidence(rawUnit.evidence || []) };
+    const semanticFingerprint = `semantic:${hash([unit.semantic_kind, normalizeSemanticText(unit.subject || unit.title),
+      normalizeSemanticText(unit.statement), unit.scope || '', unit.route?.library || '', unit.route?.category || '',
+      [...(unit.project_ids || [])].sort()])}`;
+    const exact = output.find((candidate) => candidate.semantic_kind === unit.semantic_kind
+      && normalizeSemanticText(candidate.subject || candidate.title) === normalizeSemanticText(unit.subject || unit.title)
+      && semanticTextSignature(candidate.statement) === semanticTextSignature(unit.statement)
+      && candidate.scope === unit.scope && candidate.route?.library === unit.route?.library
+      && candidate.route?.category === unit.route?.category);
+    if (exact) {
+      exact.member_unit_ids = uniq([...(exact.member_unit_ids || [exact.unit_id]), ...(unit.member_unit_ids || [unit.unit_id])]);
+      exact.evidence = mergeEvidence([...(exact.evidence || []), ...(unit.evidence || [])]);
+      exact.fingerprint = semanticFingerprint;
+      continue;
+    }
     const immediate = output.at(-1);
     const previous = immediate && semanticallyAdjacent(immediate, unit) ? immediate
       : [...output].reverse().find((candidate) => sameStructuralTopic(candidate, unit));
@@ -530,8 +575,8 @@ function coalesceCanonicalUnits(units, options = {}) {
     previous.member_unit_ids = uniq(members);
     previous.unit_id = `coalesced-${hash(previous.member_unit_ids).slice(0, 24)}`;
     previous.fingerprint = `coalesced:${hash(previous.member_unit_ids.map((id) => String(id)))}`;
-    previous.statement = [previous.statement, unit.statement].filter(Boolean).join('\n');
-    previous.evidence = [...new Map([...(previous.evidence || []), ...(unit.evidence || [])].map((item) => [hash(item), item])).values()];
+    previous.statement = dedupeSemanticTexts([previous.statement, unit.statement]).join('\n');
+    previous.evidence = mergeEvidence([...(previous.evidence || []), ...(unit.evidence || [])]);
     previous.tags = uniq([...(previous.tags || []), ...(unit.tags || [])]);
     previous.applicable_conditions = uniq([...(previous.applicable_conditions || []), ...(unit.applicable_conditions || [])]);
     previous.exceptions = uniq([...(previous.exceptions || []), ...(unit.exceptions || [])]);

@@ -6,6 +6,7 @@
  * content, order, provenance and structural hints.
  */
 const crypto = require('crypto');
+const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts } = require('./semantic-text.js');
 const { analyzeText } = require('./content-integrity.js');
 const { generateUsefulCards, SEMANTIC_KIND } = require('./useful-card-generation.js');
 const { STRUCTURE_VERSION, buildStructureContext } = require('./structure-context.js');
@@ -633,9 +634,11 @@ function normalizeKnowledgeUnit(raw, context = {}) {
   const originalStatement = clean(raw.original_statement || raw.statement || raw.summary || raw.content || raw.title, 8000);
   const sourceId = clean(raw.source_document_id || context.source_document_id, 300);
   const projectIds = uniq(raw.project_ids || (raw.project_id ? [raw.project_id] : context.project_ids || []));
-  const fingerprint = digest({ kind, source_meaning: clean(raw.source_meaning_fingerprint, 128)
-      || originalStatement.toLocaleLowerCase().replace(/\s+/g, ''), projectIds,
-    evidence: evidence.map((item) => [item.block_id, item.locator]) });
+  const semanticIdentity = {
+    kind, subject: normalizeSemanticText(raw.subject || raw.title),
+    statement: normalizeSemanticText(originalStatement || statement), projectIds, scope: clean(raw.scope, 120)
+  };
+  const fingerprint = digest(semanticIdentity);
   return {
     schema_version: 'knowledge-unit/1.0', unit_id: clean(raw.unit_id || raw.candidate_id || raw.card_id, 300) || `ku-${fingerprint.slice(0, 24)}`,
     fingerprint, title: clean(raw.translated_title || raw.title, 180) || clean(statement.split(/[。；;\n]/)[0], 120) || '知识单元',
@@ -702,11 +705,12 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
     if (previous && previous.semantic_kind === unit.semantic_kind && previous.subject === unit.subject
       && previous.scope === unit.scope && previous.status === unit.status
       && previous.statement.length + unit.statement.length < 10000) {
-      previous.statement += `\n${unit.statement}`;
+      previous.statement = dedupeSemanticTexts([previous.statement, unit.statement]).join('\n');
       previous.evidence.push(...unit.evidence);
       previous.source_region_ids.push(region.region_id);
       previous.structured_facts = extractFacts(previous.statement);
-      previous.fingerprint = digest([previous.semantic_kind, previous.statement, previous.project_ids]);
+      previous.fingerprint = digest({ kind: previous.semantic_kind, subject: normalizeSemanticText(previous.subject),
+        statement: normalizeSemanticText(previous.statement), projectIds: previous.project_ids, scope: previous.scope });
       coverage[region.region_id] = { status: 'merged', unit_id: previous.unit_id, reason: '相邻且主题、范围、责任和语义类型兼容' };
     } else {
       units.push(unit);
@@ -715,7 +719,10 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
   }
   const deduped = [];
   for (const unit of units) {
-    const duplicate = deduped.find((item) => item.fingerprint === unit.fingerprint);
+    const duplicate = deduped.find((item) => item.fingerprint === unit.fingerprint
+      || (item.semantic_kind === unit.semantic_kind && normalizeSemanticText(item.subject) === normalizeSemanticText(unit.subject)
+        && semanticTextSignature(item.statement) === semanticTextSignature(unit.statement)
+        && stableJson(item.project_ids || []) === stableJson(unit.project_ids || []) && item.scope === unit.scope));
     if (duplicate) {
       duplicate.evidence.push(...unit.evidence);
       duplicate.source_region_ids.push(...unit.source_region_ids);

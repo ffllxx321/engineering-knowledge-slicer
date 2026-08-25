@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const { CONTRACT_VERSION, validateKnowledgeEvent, validateCardPlan } = require('./useful-card-contract.js');
+const { normalizeSemanticText, dedupeSemanticTexts } = require('./semantic-text.js');
 const hash = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clean = (value, max = 8000) => String(value || '').normalize('NFKC').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, max);
 const uniq = (items) => [...new Set((items || []).map((x) => clean(x, 300)).filter(Boolean))];
@@ -133,7 +134,13 @@ function extractKnowledgeEvents(document, regions = []) {
 }
 function displayTitleFor(event) {
   const intent = { requirement: '要求', guideline: '建议', procedure: '流程', method: '方法', parameter: '参数', acceptance: '验收检查', risk: '风险应对', decision: '决策', action: '行动项', commitment: '承诺', commercial_term: '商务条款', schedule: '时间要求', term_definition: '定义', checklist_item: '检查项', reference: '引用依据', entity_profile: '实体信息', lesson: '经验', observation: '观察', unknown: '待确认知识' }[event.semantic_type] || '概览';
-  return clean(`${stripListMarker(event.subject)}${intent}`, 80).replace(/[：:]|(?:要求){2,}$/g, '要求');
+  const rawSubject = stripListMarker(event.subject);
+  const sentenceLike = rawSubject.length > 36 || /^(?:如果|若|当|在.+(?:时|情况下)|除非)/.test(rawSubject)
+    || /[，,；;。！？!?]/.test(rawSubject);
+  const subject = sentenceLike
+    ? clean(event.source_context?.heading_path?.at(-1), 48) || clean(rawSubject.split(/[，,；;。]/)[0], 32)
+    : rawSubject;
+  return clean(`${subject || '相关内容'}${intent}`, 80).replace(/[：:]|(?:要求){2,}$/g, '要求');
 }
 function searchTitleFor(event) {
   const predicate = stripListMarker(event.predicate).replace(/[。；;]+$/g, '');
@@ -153,9 +160,24 @@ function bodyFor(event) {
   return lines.join('\n');
 }
 function planUsefulCards(events) {
-  const ids = new Set(events.map((e) => e.event_id));
-  const groups = [];
+  const semanticEvents = [];
+  const bySemanticIdentity = new Map();
   for (const event of events) {
+    const key = [event.semantic_type, normalizeSemanticText(event.subject), normalizeSemanticText(event.predicate)].join('|');
+    const existing = bySemanticIdentity.get(key);
+    if (existing) {
+      existing.evidence_ids = uniq([...existing.evidence_ids, ...event.evidence_ids]);
+      existing.conditions = uniq([...existing.conditions, ...event.conditions]);
+      existing.exceptions = uniq([...existing.exceptions, ...event.exceptions]);
+      existing.parameters = uniq([...existing.parameters, ...event.parameters]);
+      continue;
+    }
+    const copy = { ...event, evidence_ids: [...event.evidence_ids] };
+    bySemanticIdentity.set(key, copy); semanticEvents.push(copy);
+  }
+  const ids = new Set(semanticEvents.map((e) => e.event_id));
+  const groups = [];
+  for (const event of semanticEvents) {
     const previous = groups.at(-1); const blockId = event.evidence_ids[0];
     const sameProcedure = previous && event.semantic_type === 'procedure'
       && previous[0].semantic_type === 'procedure' && event.source_context.list_id
@@ -169,7 +191,7 @@ function planUsefulCards(events) {
   }
   return groups.map((group) => {
     const event = group[0];
-    const related = events.filter((other) => other.event_id !== event.event_id && (other.source_context.heading_path.join('/') === event.source_context.heading_path.join('/') || other.subject === event.subject)).map((e) => e.event_id);
+    const related = semanticEvents.filter((other) => other.event_id !== event.event_id && (other.source_context.heading_path.join('/') === event.source_context.heading_path.join('/') || other.subject === event.subject)).map((e) => e.event_id);
     const evidenceIds = uniq(group.flatMap((item) => item.evidence_ids));
     return validateCardPlan({
       schema_version: `${CONTRACT_VERSION}/card-plan`, plan_id: `plan-${hash(group.map((item) => item.event_id)).slice(0, 24)}`,
@@ -179,7 +201,7 @@ function planUsefulCards(events) {
       card_type: CARD_TYPE[event.semantic_type] || event.semantic_type, included_event_ids: group.map((item) => item.event_id),
       necessary_inherited_context: { heading_path: event.source_context.heading_path, table_headers: event.source_context.table_headers, unit: event.source_context.unit },
       related_but_not_merged_event_ids: related.filter((id) => !group.some((item) => item.event_id === id)), evidence_ids: evidenceIds,
-      body: group.map(bodyFor).join('\n'),
+      body: dedupeSemanticTexts(group.flatMap((item) => bodyFor(item).split('\n'))).join('\n'),
       decision: group.length > 1 || event.conditions.length || event.exceptions.length || event.evidence_ids.length > 1
         ? { mode: 'combine_dependent', reasons: [group.length > 1 && event.semantic_type === 'procedure' ? '同一主题和列表中的有序步骤构成一个完整过程' : group.length > 1 ? '同一来源块内相邻且语义类型一致的从属条款' : '条件、例外或跨块续文依赖治理事件'], differing_fields: [] }
         : { mode: 'split_independent', reasons: ['每个事件回答一个可独立检索的问题'], differing_fields: [] }

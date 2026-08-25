@@ -1211,3 +1211,6 @@ v1.1.8 给出三件东西：
 - 结构化事务回滚覆盖待审核、零输出和中断任务；回滚同步任务结果、输出路径与终态，启动放弃不再删除带已提交事务的任务。
 - 生产设置统一升级为 `structured-write`，Pilot 与 legacy 仅能通过显式非生产环境门禁启用。
 - structured 结果与统计统一以验证后的知识记录、输出路径和事务为准，旧 `written_card_ids` 不再混入 universal 计数。
+# Unreleased
+
+- Deduplicate exact cross-page semantic statements while retaining and combining every evidence locator in generated knowledge cards.

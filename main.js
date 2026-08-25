@@ -95157,9 +95157,50 @@ function validateCardPlan(plan, eventIds = new Set()) {
 
 module.exports = { CONTRACT_VERSION, EVENT_TYPES, CARD_TYPES, validateKnowledgeEvent, validateCardPlan };
 },
+"src/semantic-text.js": function(require, module, exports) {
+const crypto = require('crypto');
+
+// Exact, deliberately conservative semantic normalization. NFKC removes width
+// and compatibility formatting differences; only presentation punctuation is
+// discarded. Numbers, letters, units, negation, operators and technical symbols
+// remain part of the signature.
+const LIST_PREFIX = /^(?:\s*(?:[-*•●▪■□☐✓✔]+|[（(]?\d+[)）.、]|[（(]?[一二三四五六七八九十百]+[)）、.])\s*)+/u;
+const PRESENTATION_PUNCTUATION = /[\s,，.。;；!?！？、'"“”‘’`´…]/gu;
+
+function normalizeSemanticText(value) {
+  return String(value ?? '')
+    .normalize('NFKC')
+    .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g, '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(LIST_PREFIX, '').trim())
+    .filter(Boolean)
+    .join(' ')
+    .toLocaleLowerCase()
+    .replace(PRESENTATION_PUNCTUATION, '');
+}
+
+function semanticTextSignature(value) {
+  return crypto.createHash('sha256').update(normalizeSemanticText(value)).digest('hex');
+}
+
+function dedupeSemanticTexts(values) {
+  const seen = new Set();
+  const output = [];
+  for (const value of values || []) {
+    const signature = semanticTextSignature(value);
+    if (!normalizeSemanticText(value) || seen.has(signature)) continue;
+    seen.add(signature);
+    output.push(value);
+  }
+  return output;
+}
+
+module.exports = { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts };
+},
 "src/useful-card-generation.js": function(require, module, exports) {
 const crypto = require('crypto');
 const { CONTRACT_VERSION, validateKnowledgeEvent, validateCardPlan } = require("src/useful-card-contract.js");
+const { normalizeSemanticText, dedupeSemanticTexts } = require("src/semantic-text.js");
 const hash = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clean = (value, max = 8000) => String(value || '').normalize('NFKC').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, max);
 const uniq = (items) => [...new Set((items || []).map((x) => clean(x, 300)).filter(Boolean))];
@@ -95291,7 +95332,13 @@ function extractKnowledgeEvents(document, regions = []) {
 }
 function displayTitleFor(event) {
   const intent = { requirement: '要求', guideline: '建议', procedure: '流程', method: '方法', parameter: '参数', acceptance: '验收检查', risk: '风险应对', decision: '决策', action: '行动项', commitment: '承诺', commercial_term: '商务条款', schedule: '时间要求', term_definition: '定义', checklist_item: '检查项', reference: '引用依据', entity_profile: '实体信息', lesson: '经验', observation: '观察', unknown: '待确认知识' }[event.semantic_type] || '概览';
-  return clean(`${stripListMarker(event.subject)}${intent}`, 80).replace(/[：:]|(?:要求){2,}$/g, '要求');
+  const rawSubject = stripListMarker(event.subject);
+  const sentenceLike = rawSubject.length > 36 || /^(?:如果|若|当|在.+(?:时|情况下)|除非)/.test(rawSubject)
+    || /[，,；;。！？!?]/.test(rawSubject);
+  const subject = sentenceLike
+    ? clean(event.source_context?.heading_path?.at(-1), 48) || clean(rawSubject.split(/[，,；;。]/)[0], 32)
+    : rawSubject;
+  return clean(`${subject || '相关内容'}${intent}`, 80).replace(/[：:]|(?:要求){2,}$/g, '要求');
 }
 function searchTitleFor(event) {
   const predicate = stripListMarker(event.predicate).replace(/[。；;]+$/g, '');
@@ -95311,9 +95358,24 @@ function bodyFor(event) {
   return lines.join('\n');
 }
 function planUsefulCards(events) {
-  const ids = new Set(events.map((e) => e.event_id));
-  const groups = [];
+  const semanticEvents = [];
+  const bySemanticIdentity = new Map();
   for (const event of events) {
+    const key = [event.semantic_type, normalizeSemanticText(event.subject), normalizeSemanticText(event.predicate)].join('|');
+    const existing = bySemanticIdentity.get(key);
+    if (existing) {
+      existing.evidence_ids = uniq([...existing.evidence_ids, ...event.evidence_ids]);
+      existing.conditions = uniq([...existing.conditions, ...event.conditions]);
+      existing.exceptions = uniq([...existing.exceptions, ...event.exceptions]);
+      existing.parameters = uniq([...existing.parameters, ...event.parameters]);
+      continue;
+    }
+    const copy = { ...event, evidence_ids: [...event.evidence_ids] };
+    bySemanticIdentity.set(key, copy); semanticEvents.push(copy);
+  }
+  const ids = new Set(semanticEvents.map((e) => e.event_id));
+  const groups = [];
+  for (const event of semanticEvents) {
     const previous = groups.at(-1); const blockId = event.evidence_ids[0];
     const sameProcedure = previous && event.semantic_type === 'procedure'
       && previous[0].semantic_type === 'procedure' && event.source_context.list_id
@@ -95327,7 +95389,7 @@ function planUsefulCards(events) {
   }
   return groups.map((group) => {
     const event = group[0];
-    const related = events.filter((other) => other.event_id !== event.event_id && (other.source_context.heading_path.join('/') === event.source_context.heading_path.join('/') || other.subject === event.subject)).map((e) => e.event_id);
+    const related = semanticEvents.filter((other) => other.event_id !== event.event_id && (other.source_context.heading_path.join('/') === event.source_context.heading_path.join('/') || other.subject === event.subject)).map((e) => e.event_id);
     const evidenceIds = uniq(group.flatMap((item) => item.evidence_ids));
     return validateCardPlan({
       schema_version: `${CONTRACT_VERSION}/card-plan`, plan_id: `plan-${hash(group.map((item) => item.event_id)).slice(0, 24)}`,
@@ -95337,7 +95399,7 @@ function planUsefulCards(events) {
       card_type: CARD_TYPE[event.semantic_type] || event.semantic_type, included_event_ids: group.map((item) => item.event_id),
       necessary_inherited_context: { heading_path: event.source_context.heading_path, table_headers: event.source_context.table_headers, unit: event.source_context.unit },
       related_but_not_merged_event_ids: related.filter((id) => !group.some((item) => item.event_id === id)), evidence_ids: evidenceIds,
-      body: group.map(bodyFor).join('\n'),
+      body: dedupeSemanticTexts(group.flatMap((item) => bodyFor(item).split('\n'))).join('\n'),
       decision: group.length > 1 || event.conditions.length || event.exceptions.length || event.evidence_ids.length > 1
         ? { mode: 'combine_dependent', reasons: [group.length > 1 && event.semantic_type === 'procedure' ? '同一主题和列表中的有序步骤构成一个完整过程' : group.length > 1 ? '同一来源块内相邻且语义类型一致的从属条款' : '条件、例外或跨块续文依赖治理事件'], differing_fields: [] }
         : { mode: 'split_independent', reasons: ['每个事件回答一个可独立检索的问题'], differing_fields: [] }
@@ -95378,6 +95440,7 @@ module.exports = { extractKnowledgeEvents, planUsefulCards, generateUsefulCards,
  * content, order, provenance and structural hints.
  */
 const crypto = require('crypto');
+const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts } = require("src/semantic-text.js");
 const { analyzeText } = require("src/content-integrity.js");
 const { generateUsefulCards, SEMANTIC_KIND } = require("src/useful-card-generation.js");
 const { STRUCTURE_VERSION, buildStructureContext } = require("src/structure-context.js");
@@ -96005,9 +96068,11 @@ function normalizeKnowledgeUnit(raw, context = {}) {
   const originalStatement = clean(raw.original_statement || raw.statement || raw.summary || raw.content || raw.title, 8000);
   const sourceId = clean(raw.source_document_id || context.source_document_id, 300);
   const projectIds = uniq(raw.project_ids || (raw.project_id ? [raw.project_id] : context.project_ids || []));
-  const fingerprint = digest({ kind, source_meaning: clean(raw.source_meaning_fingerprint, 128)
-      || originalStatement.toLocaleLowerCase().replace(/\s+/g, ''), projectIds,
-    evidence: evidence.map((item) => [item.block_id, item.locator]) });
+  const semanticIdentity = {
+    kind, subject: normalizeSemanticText(raw.subject || raw.title),
+    statement: normalizeSemanticText(originalStatement || statement), projectIds, scope: clean(raw.scope, 120)
+  };
+  const fingerprint = digest(semanticIdentity);
   return {
     schema_version: 'knowledge-unit/1.0', unit_id: clean(raw.unit_id || raw.candidate_id || raw.card_id, 300) || `ku-${fingerprint.slice(0, 24)}`,
     fingerprint, title: clean(raw.translated_title || raw.title, 180) || clean(statement.split(/[。；;\n]/)[0], 120) || '知识单元',
@@ -96074,11 +96139,12 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
     if (previous && previous.semantic_kind === unit.semantic_kind && previous.subject === unit.subject
       && previous.scope === unit.scope && previous.status === unit.status
       && previous.statement.length + unit.statement.length < 10000) {
-      previous.statement += `\n${unit.statement}`;
+      previous.statement = dedupeSemanticTexts([previous.statement, unit.statement]).join('\n');
       previous.evidence.push(...unit.evidence);
       previous.source_region_ids.push(region.region_id);
       previous.structured_facts = extractFacts(previous.statement);
-      previous.fingerprint = digest([previous.semantic_kind, previous.statement, previous.project_ids]);
+      previous.fingerprint = digest({ kind: previous.semantic_kind, subject: normalizeSemanticText(previous.subject),
+        statement: normalizeSemanticText(previous.statement), projectIds: previous.project_ids, scope: previous.scope });
       coverage[region.region_id] = { status: 'merged', unit_id: previous.unit_id, reason: '相邻且主题、范围、责任和语义类型兼容' };
     } else {
       units.push(unit);
@@ -96087,7 +96153,10 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
   }
   const deduped = [];
   for (const unit of units) {
-    const duplicate = deduped.find((item) => item.fingerprint === unit.fingerprint);
+    const duplicate = deduped.find((item) => item.fingerprint === unit.fingerprint
+      || (item.semantic_kind === unit.semantic_kind && normalizeSemanticText(item.subject) === normalizeSemanticText(unit.subject)
+        && semanticTextSignature(item.statement) === semanticTextSignature(unit.statement)
+        && stableJson(item.project_ids || []) === stableJson(unit.project_ids || []) && item.scope === unit.scope));
     if (duplicate) {
       duplicate.evidence.push(...unit.evidence);
       duplicate.source_region_ids.push(...unit.source_region_ids);
@@ -96494,6 +96563,7 @@ module.exports = {
  * commitPlan/rollbackTransaction and guarded by an injected adapter.
  */
 const crypto = require('crypto');
+const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts } = require("src/semantic-text.js");
 const {
   ACTIVE_TENDER_CATEGORIES,
   BUSINESS_CATEGORIES,
@@ -96651,6 +96721,7 @@ function relationLink(relation) {
 }
 
 function humanLocator(locator = {}) {
+  if (Array.isArray(locator.locators)) return combinedHumanLocators(locator.locators);
   return [
     locator.page !== undefined ? `第 ${locator.page} 页` : '',
     locator.sheet ? `工作表“${clean(String(locator.sheet), 120)}”` : '',
@@ -96660,6 +96731,33 @@ function humanLocator(locator = {}) {
     locator.heading_path ? `章节 ${Array.isArray(locator.heading_path) ? locator.heading_path.join(' / ') : locator.heading_path}` : '',
     !locator.page && !locator.sheet && !locator.range && locator.value ? clean(String(locator.value), 160) : ''
   ].filter(Boolean).join('，') || '来源原文';
+}
+
+function combinedHumanLocators(locators = []) {
+  const unique = [...new Map(locators.map((item) => [stableJson(item || {}), item || {}])).values()];
+  const pages = [...new Set(unique.map((item) => Number(item.page)).filter(Number.isFinite))].sort((a, b) => a - b);
+  const rest = unique.filter((item) => !Number.isFinite(Number(item.page))).map(humanLocator);
+  return [...(pages.length ? [`第 ${pages.join('、')} 页`] : []), ...new Set(rest)].join('，') || '来源原文';
+}
+
+function mergeEvidence(items = []) {
+  const groups = new Map();
+  for (const item of items.filter(Boolean)) {
+    const key = semanticTextSignature(item.verbatim || '');
+    if (!normalizeSemanticText(item.verbatim) || !groups.has(key)) groups.set(key, { ...item,
+      provenance: [...(item.provenance || [])], locators: [item.locator || {}, ...(item.locators || [])] });
+    else {
+      const target = groups.get(key);
+      target.provenance.push(...(item.provenance || []));
+      target.locators.push(item.locator || {}, ...(item.locators || []));
+      for (const id of [item.block_id, ...(item.block_ids || [])].filter(Boolean)) {
+        target.block_ids = uniq([...(target.block_ids || []), target.block_id, id]);
+      }
+    }
+  }
+  return [...groups.values()].map((item) => ({ ...item,
+    provenance: [...new Map(item.provenance.map((value) => [stableJson(value), value])).values()],
+    locators: [...new Map(item.locators.map((value) => [stableJson(value), value])).values()] }));
 }
 
 function searchKeywords(record) {
@@ -96716,13 +96814,13 @@ function serializeRecord(record) {
   frontmatter.push('---', '', `# ${record.title}`, '');
   const body = [];
   if (record.summary) body.push('## 内容', '', readableSummary(record.summary), '');
-  const evidenceList = (record.evidence_list?.length ? record.evidence_list : [record.evidence]).filter((item) => item?.verbatim);
+  const evidenceList = mergeEvidence(record.evidence_list?.length ? record.evidence_list : [record.evidence]);
   if (evidenceList.length) {
     body.push('## 来源', '');
     const sourceRelation = relations.find((relation) => relation.type === 'derived_from');
     if (sourceRelation) body.push(`- 来源文件：${relationLink(sourceRelation)}`);
     for (const evidence of evidenceList) body.push(
-      `- 原文位置：${humanLocator(evidence.locator || {})}`, '',
+      `- 原文位置：${combinedHumanLocators(evidence.locators || [evidence.locator || {}])}`, '',
       '### 原文摘录', '',
       `> ${displayEvidence(evidence.verbatim).replace(/\n/g, '\n> ')}`, '');
     if (record.evidence_translation && record.evidence_translation !== record.evidence.verbatim) {
@@ -96737,7 +96835,7 @@ function serializeRecord(record) {
     ...record.unresolved_relations.map((item) =>
       `- ${item.type || 'related'}：${item.source_candidate || '未命名'}（${item.reason}；定位 ${stableJson(item.evidence_locator || {})}）`), '');
   body.push('<details>', '<summary>技术追溯</summary>', '', `- 记录编号：${record.record_id}`);
-  for (const evidence of evidenceList) body.push(`- 定位数据：base64url:${encodedLocator(evidence.locator || {})}`);
+  for (const evidence of evidenceList) for (const locator of evidence.locators || [evidence.locator || {}]) body.push(`- 定位数据：base64url:${encodedLocator(locator)}`);
   if (record.source_hash) body.push(`- 来源哈希：${record.source_hash}`);
   body.push('', '</details>');
   return `${frontmatter.concat(body).join('\n')}\n`;
@@ -97005,7 +97103,23 @@ function assertSourceRecordLimit(records, settings, sourceId) {
 function coalesceCanonicalUnits(units, options = {}) {
   const maxChars = Math.max(1000, Number(options.max_chars) || 12000);
   const output = [];
-  for (const unit of units) {
+  for (const rawUnit of units) {
+    const unit = { ...rawUnit, statement: dedupeSemanticTexts(String(rawUnit.statement || '').split(/\n+/)).join('\n'),
+      evidence: mergeEvidence(rawUnit.evidence || []) };
+    const semanticFingerprint = `semantic:${hash([unit.semantic_kind, normalizeSemanticText(unit.subject || unit.title),
+      normalizeSemanticText(unit.statement), unit.scope || '', unit.route?.library || '', unit.route?.category || '',
+      [...(unit.project_ids || [])].sort()])}`;
+    const exact = output.find((candidate) => candidate.semantic_kind === unit.semantic_kind
+      && normalizeSemanticText(candidate.subject || candidate.title) === normalizeSemanticText(unit.subject || unit.title)
+      && semanticTextSignature(candidate.statement) === semanticTextSignature(unit.statement)
+      && candidate.scope === unit.scope && candidate.route?.library === unit.route?.library
+      && candidate.route?.category === unit.route?.category);
+    if (exact) {
+      exact.member_unit_ids = uniq([...(exact.member_unit_ids || [exact.unit_id]), ...(unit.member_unit_ids || [unit.unit_id])]);
+      exact.evidence = mergeEvidence([...(exact.evidence || []), ...(unit.evidence || [])]);
+      exact.fingerprint = semanticFingerprint;
+      continue;
+    }
     const immediate = output.at(-1);
     const previous = immediate && semanticallyAdjacent(immediate, unit) ? immediate
       : [...output].reverse().find((candidate) => sameStructuralTopic(candidate, unit));
@@ -97018,8 +97132,8 @@ function coalesceCanonicalUnits(units, options = {}) {
     previous.member_unit_ids = uniq(members);
     previous.unit_id = `coalesced-${hash(previous.member_unit_ids).slice(0, 24)}`;
     previous.fingerprint = `coalesced:${hash(previous.member_unit_ids.map((id) => String(id)))}`;
-    previous.statement = [previous.statement, unit.statement].filter(Boolean).join('\n');
-    previous.evidence = [...new Map([...(previous.evidence || []), ...(unit.evidence || [])].map((item) => [hash(item), item])).values()];
+    previous.statement = dedupeSemanticTexts([previous.statement, unit.statement]).join('\n');
+    previous.evidence = mergeEvidence([...(previous.evidence || []), ...(unit.evidence || [])]);
     previous.tags = uniq([...(previous.tags || []), ...(unit.tags || [])]);
     previous.applicable_conditions = uniq([...(previous.applicable_conditions || []), ...(unit.applicable_conditions || [])]);
     previous.exceptions = uniq([...(previous.exceptions || []), ...(unit.exceptions || [])]);

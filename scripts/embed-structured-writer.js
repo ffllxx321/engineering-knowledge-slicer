@@ -24,6 +24,7 @@ const modules = [
   ['src/structure-context.js', 'src/structure-context.js'],
   ['src/pre-generation-structure.js', 'src/pre-generation-structure.js'],
   ['src/useful-card-contract.js', 'src/useful-card-contract.js'],
+  ['src/semantic-text.js', 'src/semantic-text.js'],
   ['src/useful-card-generation.js', 'src/useful-card-generation.js'],
   ['src/universal-knowledge-pipeline.js', 'src/universal-knowledge-pipeline.js'],
   ['src/knowledge-write-port.js', 'src/knowledge-write-port.js'],
@@ -42,7 +43,9 @@ function factory(id, sourcePath) {
     .replace(/require\('\.\/pre-generation-structure\.js'\)/g, 'require("src/pre-generation-structure.js")')
     .replace(/require\('\.\/useful-card-contract\.js'\)/g, 'require("src/useful-card-contract.js")')
     .replace(/require\('\.\/useful-card-generation\.js'\)/g, 'require("src/useful-card-generation.js")');
-  const bundledSource = source
+  const normalizedSource = source
+    .replace(/require\('\.\/semantic-text\.js'\)/g, 'require("src/semantic-text.js")');
+  const bundledSource = normalizedSource
     .replace(/require\(["']\.\/pdf\.worker\.js["']\)/g, 'require("vendor/pdf.worker.js")')
     .replace(/require\(["']\.\/content-integrity\.js["']\)/g, 'require("src/content-integrity.js")');
   return `"${id}": function(require, module, exports) {\n${bundledSource.trim()}\n},`;

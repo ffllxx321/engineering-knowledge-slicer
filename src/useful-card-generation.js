@@ -2,7 +2,7 @@
 
 const crypto = require('crypto');
 const { CONTRACT_VERSION, validateKnowledgeEvent, validateCardPlan } = require('./useful-card-contract.js');
-const { normalizeSemanticText, dedupeSemanticTexts } = require('./semantic-text.js');
+const { normalizeSemanticText, dedupeSemanticTexts, distinctSemanticTexts, semanticContains } = require('./semantic-text.js');
 const hash = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clean = (value, max = 8000) => String(value || '').normalize('NFKC').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, max);
 const uniq = (items) => [...new Set((items || []).map((x) => clean(x, 300)).filter(Boolean))];
@@ -62,6 +62,24 @@ function definitionAliases(event) {
   return uniq([...english, ...abbreviation]).filter((item) => item !== event.subject);
 }
 
+function tableFactBlocks(block) {
+  if (block.kind !== 'table_row' || block.metadata?.table_header || block.metadata?.reconstructed_table_fact) return [block];
+  const values = clean(block.text, 30000).split(/\s*\|\s*/).map((value) => clean(value));
+  const headers = (block.metadata?.table_headers || []).map((header) => clean(header));
+  if (values.length < 2 || headers.length !== values.length) return [block];
+  const rowSubject = values[0];
+  return values.slice(1).map((value, index) => {
+    const header = headers[index + 1];
+    const unit = clean((header.match(/[（(]([^）)]+)[）)]\s*$/) || [])[1] || block.metadata?.unit, 40);
+    const column = clean(header.replace(/[（(][^）)]+[）)]\s*$/, ''), 120);
+    const valueHasUnit = unit && new RegExp(`${unit.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[。；;,，])`, 'iu').test(value);
+    const valueWithUnit = unit && !valueHasUnit ? `${value} ${unit}` : value;
+    return { ...block, block_id: `${block.block_id}:column-${index + 1}`, text: `${rowSubject} ${column}${valueWithUnit}`,
+      metadata: { ...block.metadata, table_headers: [headers[0], header], unit, table_row_subject: rowSubject,
+        table_column: column, source_block_ids: block.metadata?.source_block_ids || [block.block_id] } };
+  });
+}
+
 function extractKnowledgeEvents(document, regions = []) {
   const translation = new Map(regions.flatMap((r) => r.blocks.map((b) => [b.block_id, r.translated_text && r.blocks.length === 1 ? r.translated_text : b.text])));
   const events = []; const coverage = {}; let pending = null;
@@ -86,7 +104,7 @@ function extractKnowledgeEvents(document, regions = []) {
     if (!headers) tableHeaders.set(tableId, values);
     eventBlocks.push({ ...block, kind: 'table_row', text: values.join(' | '), metadata: { ...block.metadata, table_id: tableId, row_id: `row-${block.metadata.row}`, table_header: !headers, table_headers: headers || [], source_block_ids: cells.map((cell) => cell.block_id) } });
   }
-  for (const block of eventBlocks) {
+  for (const block of eventBlocks.flatMap(tableFactBlocks)) {
     const node = nodes.get(block.block_id);
     const container = clean(block.locator?.attachment_id || block.metadata?.attachment_id || block.locator?.message_id || block.metadata?.message_id || block.locator?.slide || block.metadata?.slide || block.locator?.sheet || block.metadata?.sheet, 160);
     if (container && activeContainer && container !== activeContainer) pending = null;
@@ -108,8 +126,9 @@ function extractKnowledgeEvents(document, regions = []) {
         continue;
       }
       const type = inferType(part, block);
-      const subject = type === 'procedure' && (block.metadata?.list_id || block.metadata?.list?.num_id)
-        ? clean(headingPath.at(-1), 120) || subjectFor(part, headingPath) : subjectFor(part, headingPath);
+      const tableSubject = clean(`${block.metadata?.table_row_subject || ''}${block.metadata?.table_column || ''}`, 120);
+      const subject = tableSubject || (type === 'procedure' && (block.metadata?.list_id || block.metadata?.list?.num_id)
+        ? clean(headingPath.at(-1), 120) || subjectFor(part, headingPath) : subjectFor(part, headingPath));
       const uncertainty = [];
       if (!subject) uncertainty.push('无法从对象、主题或结构上下文确定检索主题');
       const identity = [type, subject, part, headingPath, block.metadata?.scope_id || '', block.metadata?.parent_clause_id || ''];
@@ -135,6 +154,11 @@ function extractKnowledgeEvents(document, regions = []) {
 function displayTitleFor(event) {
   const intent = { requirement: '要求', guideline: '建议', procedure: '流程', method: '方法', parameter: '参数', acceptance: '验收检查', risk: '风险应对', decision: '决策', action: '行动项', commitment: '承诺', commercial_term: '商务条款', schedule: '时间要求', term_definition: '定义', checklist_item: '检查项', reference: '引用依据', entity_profile: '实体信息', lesson: '经验', observation: '观察', unknown: '待确认知识' }[event.semantic_type] || '概览';
   const rawSubject = stripListMarker(event.subject);
+  if (event.source_context?.table_headers?.length > 1) {
+    const readable = clean(rawSubject.replace(/[（(][^）)]+[）)]/g, '').replace(/参数(?=\s*\/)/gu, '').replace(/\s*\/\s*/g, ' '), 80)
+      .replace(/(?<=\p{Script=Han})\s+(?=\p{Script=Han})/gu, '');
+    return clean(`${readable}${readable.endsWith(intent) ? '' : intent}`, 80);
+  }
   const sentenceLike = rawSubject.length > 36 || /^(?:如果|若|当|在.+(?:时|情况下)|除非)/.test(rawSubject)
     || /[，,；;。！？!?]/.test(rawSubject);
   const subject = sentenceLike
@@ -145,18 +169,29 @@ function displayTitleFor(event) {
 function searchTitleFor(event) {
   const predicate = stripListMarker(event.predicate).replace(/[。；;]+$/g, '');
   const subject = stripListMarker(event.subject);
-  const complete = predicate.includes(subject) ? predicate : `${subject}：${predicate}`;
-  return clean(complete.length <= 160 ? complete : `${displayTitleFor(event)}：${predicate.slice(0, 100)}`, 160);
+  const complete = semanticContains(predicate, subject) ? predicate : `${subject}：${predicate}`;
+  const title = displayTitleFor(event);
+  const candidate = clean(complete.length <= 160 ? complete : `${title}：${predicate.slice(0, 100)}`, 160);
+  return normalizeSemanticText(candidate) === normalizeSemanticText(title)
+    ? clean(`${title} ${event.parameters[0] || event.source_context?.table_headers?.at(-1) || event.semantic_type}`, 160) : candidate;
 }
 function bodyFor(event) {
   const lead = { requirement: '要求', guideline: '建议', procedure: '步骤', method: '做法', parameter: '参数', acceptance: '验收标准', risk: '风险', decision: '决定', action: '行动', commitment: '承诺', commercial_term: '条款', schedule: '时间安排', term_definition: '定义', checklist_item: '检查项', lesson: '经验', unknown: '待确认内容' }[event.semantic_type] || '内容';
-  const lines = [`${lead}：${stripListMarker(event.predicate)}`];
-  if (event.source_context.parent_clause_text && !event.predicate.includes(event.source_context.parent_clause_text)) lines.push(`适用范围：${event.source_context.parent_clause_text}`);
-  if (event.actor) lines.push(`执行主体：${event.actor}`);
-  if (event.conditions.length) lines.push(`适用条件：${event.conditions.join('；')}`);
-  if (event.exceptions.length) lines.push(`例外：${event.exceptions.join('；')}`);
-  if (event.parameters.length) lines.push(`关键参数：${event.parameters.join('；')}`);
-  if (event.source_context.table_headers.length) lines.push(`表格语境：${event.source_context.table_headers.join(' / ')}${event.source_context.unit ? `（${event.source_context.unit}）` : ''}`);
+  const predicate = stripListMarker(event.predicate).replace(new RegExp(`^${lead}[：:]`), '');
+  const lines = [`${lead}：${predicate}`];
+  const add = (label, values) => { const fresh = distinctSemanticTexts(values, lines).filter((value) => !lines.some((line) => semanticContains(line, value))); if (fresh.length) lines.push(`${label}：${fresh.join('；')}`); };
+  add('适用范围', [event.source_context.parent_clause_text]);
+  add('执行主体', [event.actor]);
+  add('适用条件', event.conditions);
+  add('例外', event.exceptions);
+  add('关键参数', event.parameters);
+  if (event.source_context.table_headers.length) {
+    const tableContext = event.source_context.table_headers.join(' / ');
+    const unitSuffix = event.source_context.unit && !normalizeSemanticText(tableContext).includes(normalizeSemanticText(event.source_context.unit))
+      ? `（${event.source_context.unit}）` : '';
+    if (!/[。！？；;]$/u.test(lines.at(-1))) lines[lines.length - 1] += '。';
+    lines.push(`表格语境：${tableContext}${unitSuffix}`);
+  }
   return lines.join('\n');
 }
 function planUsefulCards(events) {
@@ -184,7 +219,7 @@ function planUsefulCards(events) {
       && previous[0].source_context.list_id === event.source_context.list_id
       && previous[0].source_context.heading_path.join('/') === event.source_context.heading_path.join('/');
     if (previous && previous[0].semantic_type === event.semantic_type
-      && (previous[0].evidence_ids[0] === blockId || sameProcedure)
+      && sameProcedure
       && previous[0].subject === event.subject
       && previous.reduce((n, item) => n + item.predicate.length, 0) + event.predicate.length <= 8000) previous.push(event);
     else groups.push([event]);
@@ -196,7 +231,7 @@ function planUsefulCards(events) {
     return validateCardPlan({
       schema_version: `${CONTRACT_VERSION}/card-plan`, plan_id: `plan-${hash(group.map((item) => item.event_id)).slice(0, 24)}`,
       user_question: `关于“${event.subject}”，需要知道什么${event.semantic_type === 'term_definition' ? '定义' : '要求或做法'}？`,
-      retrieval_intent: `${event.subject}/${event.semantic_type}`, title: displayTitleFor(event), search_title: searchTitleFor(event), aliases: definitionAliases(event).filter((item) => ![displayTitleFor(event), searchTitleFor(event)].includes(item)),
+      retrieval_intent: `${event.subject}/${event.semantic_type}`, title: displayTitleFor(event), search_title: searchTitleFor(event), aliases: distinctSemanticTexts(definitionAliases(event), [displayTitleFor(event), searchTitleFor(event)]),
       keywords: uniq([event.subject, ...definitionAliases(event), ...group.flatMap((item) => item.parameters), ...event.source_context.table_headers]),
       card_type: CARD_TYPE[event.semantic_type] || event.semantic_type, included_event_ids: group.map((item) => item.event_id),
       necessary_inherited_context: { heading_path: event.source_context.heading_path, table_headers: event.source_context.table_headers, unit: event.source_context.unit },

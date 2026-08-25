@@ -55,7 +55,7 @@
     "no_answer_false_positive_rate": 0,
     "deterministic_repeatability": 1,
     "boilerplate_cards": 0,
-    "report_sha256": "b606a69a38afb5859aa7aa682bedbe550aa6c0777e8179f1e878affd03bf449b",
+    "report_sha256": "ef525a2a1144f2e6af85629e690d5f676342b9a5429126a692ddcabf2b1a1dba",
     "pre_change_failures": [
       "ordered_procedure_split_into_three_cards",
       "exception_split_from_governing_requirement",

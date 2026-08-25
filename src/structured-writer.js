@@ -6,7 +6,7 @@
  * commitPlan/rollbackTransaction and guarded by an injected adapter.
  */
 const crypto = require('crypto');
-const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts } = require('./semantic-text.js');
+const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts, distinctSemanticTexts } = require('./semantic-text.js');
 const {
   ACTIVE_TENDER_CATEGORIES,
   BUSINESS_CATEGORIES,
@@ -543,11 +543,25 @@ function assertSourceRecordLimit(records, settings, sourceId) {
   throw error;
 }
 
+function normalizeCanonicalPresentation(rawUnit) {
+  const title = clean(rawUnit.title, 160).replace(/^(?:标题|名称)[：:]\s*/, '').replace(/([要求方法流程参数定义])(?:要求|方法|流程|参数|定义)$/u, '$1') || '知识单元';
+  const statement = dedupeSemanticTexts(String(rawUnit.statement || '').split(/\n+/)
+    .map((line) => clean(line).replace(/^(?:标题|名称)[：:]\s*/, ''))).join('\n');
+  let searchTitle = clean(rawUnit.search_title || title, 240);
+  if (normalizeSemanticText(searchTitle) === normalizeSemanticText(title)) {
+    const retrieval = distinctSemanticTexts([rawUnit.subject, ...(rawUnit.keywords || [])], [title])[0];
+    if (retrieval) searchTitle = `${title} ${retrieval}`;
+  }
+  return { ...rawUnit, title, search_title: searchTitle,
+    aliases: distinctSemanticTexts(rawUnit.aliases || [], [title, searchTitle]), statement };
+}
+
 function coalesceCanonicalUnits(units, options = {}) {
   const maxChars = Math.max(1000, Number(options.max_chars) || 12000);
   const output = [];
   for (const rawUnit of units) {
-    const unit = { ...rawUnit, statement: dedupeSemanticTexts(String(rawUnit.statement || '').split(/\n+/)).join('\n'),
+    const presented = normalizeCanonicalPresentation(rawUnit);
+    const unit = { ...presented, statement: dedupeSemanticTexts(String(presented.statement || '').split(/\n+/)).join('\n'),
       evidence: mergeEvidence(rawUnit.evidence || []) };
     const semanticFingerprint = `semantic:${hash([unit.semantic_kind, normalizeSemanticText(unit.subject || unit.title),
       normalizeSemanticText(unit.statement), unit.scope || '', unit.route?.library || '', unit.route?.category || '',
@@ -563,9 +577,8 @@ function coalesceCanonicalUnits(units, options = {}) {
       exact.fingerprint = semanticFingerprint;
       continue;
     }
-    const immediate = output.at(-1);
-    const previous = immediate && semanticallyAdjacent(immediate, unit) ? immediate
-      : [...output].reverse().find((candidate) => sameStructuralTopic(candidate, unit));
+    const previous = unit.card_plan?.plan_id
+      ? output.find((candidate) => candidate.card_plan?.plan_id === unit.card_plan.plan_id) : null;
     if (!previous
       || String(previous.statement || '').length + String(unit.statement || '').length > maxChars) {
       output.push({ ...unit, member_unit_ids: [...(unit.member_unit_ids || [unit.unit_id])] });
@@ -1080,5 +1093,5 @@ module.exports = {
   WRITER_VERSION, INDEX_VERSION, PLAN_LIMITS, MODES, RELATION_TYPES,
   stableJson, hash, stableId, pathSafe, normalizeSettings, sourceIdentity,
   candidateIdentity, emptyIndex, validateIndex, serializeRecord, resolveRelations,
-  buildPlan, partitionPlan, commitPlan, rollbackTransaction, verifyCommittedRecords, coalesceCanonicalUnits
+  buildPlan, partitionPlan, commitPlan, rollbackTransaction, verifyCommittedRecords, coalesceCanonicalUnits, normalizeCanonicalPresentation
 };

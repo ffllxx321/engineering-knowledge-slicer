@@ -193,8 +193,8 @@ async function main() {
     { ...semanticBase, unit_id: 'adj-1', statement: '临边必须设置防护栏杆。', evidence: [{ locator: { scheme: 'paragraph', value: 'p10' }, verbatim: '临边必须设置防护栏杆。' }] },
     { ...semanticBase, unit_id: 'adj-2', statement: '栏杆底部必须设置挡脚板。', evidence: [{ locator: { scheme: 'paragraph', value: 'p11' }, verbatim: '栏杆底部必须设置挡脚板。' }] }
   ]);
-  assert.strictEqual(adjacent.length, 1, 'adjacent fragments with the same explicit topic and semantics may merge');
-  assert.strictEqual(adjacent[0].evidence.length, 2, 'semantic merge retains the complete evidence set');
+  assert.strictEqual(adjacent.length, 2, 'adjacent independent requirements remain separate without an explicit card plan');
+  assert(adjacent.every((unit) => unit.evidence.length === 1), 'separate requirements retain their own evidence');
   const unrelated = coalesceCanonicalUnits([
     { ...semanticBase, unit_id: 'apart-1', statement: '临边必须设置防护栏杆。', evidence: [{ locator: { scheme: 'paragraph', value: 'p10' }, verbatim: '临边必须设置防护栏杆。' }] },
     { ...semanticBase, unit_id: 'apart-2', subject: '混凝土养护', title: '混凝土养护', statement: '混凝土应保湿养护。', evidence: [{ locator: { scheme: 'paragraph', value: 'p11' }, verbatim: '混凝土应保湿养护。' }] }

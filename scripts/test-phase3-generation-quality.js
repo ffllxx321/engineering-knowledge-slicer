@@ -37,8 +37,10 @@ async function main() {
   assert(procedure && procedure.included_event_ids.length === 3, 'ordered procedure must be one coherent card');
   assert(procedure.body.indexOf('打开入口阀') < procedure.body.indexOf('确认旋向') && procedure.body.indexOf('确认旋向') < procedure.body.indexOf('开启出口阀'));
   assert(!procedure.body.includes('仓库通道'));
-  const table = first.result.card_plans.find((card) => card.evidence_ids.includes('table-a'));
-  assert(table && /轴承温度 \(°C\).*振动速度 \(mm\/s\)/s.test(table.body), 'table headers and units must survive');
+  const table = first.result.card_plans.filter((card) => card.evidence_ids.includes('table-a'));
+  assert.strictEqual(table.length, 2, 'each table parameter column must produce one atomic card');
+  assert(table.some((card) => /送风机 A.*轴承温度.*80 °C/s.test(`${card.search_title}\n${card.body}`)), 'temperature header, row subject, unit, and value must survive');
+  assert(table.some((card) => /送风机 A.*振动速度.*4\.5 mm\/s/s.test(`${card.search_title}\n${card.body}`)), 'vibration header, row subject, unit, and value must survive');
   const definition = first.records.find((record) => record.evidence.some((e) => e.locator?.value === '5.1'));
   assert(definition.aliases.includes('Variable Frequency Drive') && definition.aliases.includes('VFD'));
   const pressurePlans = first.result.card_plans.filter((card) => card.evidence_ids.includes('water-pressure') || card.evidence_ids.includes('air-pressure'));

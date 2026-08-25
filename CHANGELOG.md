@@ -1,5 +1,11 @@
 # 工程知识切片 变更记录
 
+## Unreleased — bounded useful-card presentation and atomization
+
+- Production useful-card planning now keeps independent clauses separate, preserves ordered procedures and governing conditions, and emits one atomic fact per table value column with its row subject, header, unit, and value.
+- Display/search/alias and reused-canonical presentation cleanup uses exact semantic normalization, without fuzzy merging or review-threshold changes; the cross-page exact dedup behavior from `1f5c141` remains covered.
+- Added a sanitized ten-case offline corpus and an explicit pre-change failure inventory covering structure, retrieval, Markdown, locator, collision, determinism, and checkpoint reuse seams.
+
 ## v2.20.13 — 2026-08-04 缓存维护入口恢复
 
 - 在普通设置页和命令面板恢复明确的“清空缓存”入口，不需要开启高级或开发者影子控件。

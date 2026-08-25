@@ -37,4 +37,21 @@ function dedupeSemanticTexts(values) {
   return output;
 }
 
-module.exports = { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts };
+function distinctSemanticTexts(values, against = []) {
+  const blocked = new Set((against || []).map(normalizeSemanticText).filter(Boolean));
+  const output = [];
+  for (const value of values || []) {
+    const normalized = normalizeSemanticText(value);
+    if (!normalized || blocked.has(normalized)) continue;
+    blocked.add(normalized);
+    output.push(value);
+  }
+  return output;
+}
+
+function semanticContains(container, value) {
+  const outer = normalizeSemanticText(container); const inner = normalizeSemanticText(value);
+  return Boolean(outer && inner && outer.includes(inner));
+}
+
+module.exports = { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts, distinctSemanticTexts, semanticContains };

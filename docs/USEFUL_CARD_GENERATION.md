@@ -51,3 +51,5 @@ npm run test:useful-card
 ```
 
 Its sanitized corpus and expected metrics/report hash are committed in `scripts/fixtures/phase3-generation-corpus-v1.json`; runtime Markdown and source documents are not committed.
+
+The bounded production audit corpus is `scripts/test-useful-card-bounded-optimization.js`. Its ten named cases are deliberately offline and sanitized. It asserts atomic table-column facts, exact normalized presentation collisions, independent-clause non-merges, dependent procedure/condition retention, Markdown/frontmatter/filename validity, locators, retrieval terms, deterministic reruns, and legacy canonical/checkpoint reuse. Exact semantic identity remains conservative: number, unit, negation, scope, and table column are never discarded or fuzzily matched.

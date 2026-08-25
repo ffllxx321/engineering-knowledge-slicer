@@ -37,6 +37,20 @@ async function main() {
   const distinct = new HybridRetriever([fixture.records[0], { ...fixture.records[0], id: 'different-evidence', evidence: [{ text: '乙级防火门耐火完整性不得低于1.00 h。', locator: { page: 13 } }] }]);
   assert.equal((await distinct.search('防火门耐火完整性')).length, 2);
 
+  const materiallyDifferent = new HybridRetriever([
+    { id: 'weak', title: 'pump parameters', body: 'pressure', evidence: [{ text: 'pressure', locator: { value: 'z-locator' } }, { text: 'note', locator: { value: 'a-locator' } }] },
+    { id: 'strong', title: 'pump parameters', body: 'critical pressure', keywords: ['critical pressure'], evidence: [{ text: 'pressure', locator: { value: 'y-locator' } }] }
+  ]);
+  const materialRanking = materiallyDifferent.lexical('pump critical pressure');
+  assert(materialRanking[0].score > 4 && materialRanking[0].score < 4.6 && materialRanking[1].score > 1.7 && materialRanking[1].score < 2,
+    'counterexample retains the reviewed approximately 4.0 versus 1.9 BM25 scores');
+  assert.equal(materialRanking[0].record.id, 'strong', 'materially better BM25 wins regardless of locator order');
+  const reorderedEvidence = new HybridRetriever([
+    { id: 'weak', title: 'pump parameters', body: 'pressure', evidence: [{ text: 'note', locator: { value: 'a-locator' } }, { text: 'pressure', locator: { value: 'z-locator' } }] },
+    { id: 'strong', title: 'pump parameters', body: 'critical pressure', keywords: ['critical pressure'], evidence: [{ text: 'pressure', locator: { value: 'y-locator' } }] }
+  ]).lexical('pump critical pressure');
+  assert.deepEqual(reorderedEvidence.map((item) => item.record.id), materialRanking.map((item) => item.record.id), 'source tie-break is independent of evidence array order');
+
   const falsePositiveFixture = { schema: fixture.schema, records: [fixture.records[0]], questions: [{ id: 'negative', query: '防火门', expected_ids: [] }] };
   assert((await evaluate(new HybridRetriever(falsePositiveFixture.records), falsePositiveFixture)).failures.some((item) => item.type === 'no_answer_false_positive'));
   const missingEvidenceFixture = { schema: fixture.schema, records: [{ id: 'empty', title: '空证据记录', body: '只有声明' }], questions: [{ id: 'missing', query: '空证据记录', expected_ids: ['empty'], expected_evidence: '不存在的原文' }] };

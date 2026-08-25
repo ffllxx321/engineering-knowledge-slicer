@@ -164,6 +164,17 @@ function evidenceKey(record) {
   return normalized(record.evidence.map((item) => `${typeof item.locator === 'string' ? item.locator : JSON.stringify(item.locator)}:${item.text}`).join('|'));
 }
 
+function sourcePosition(record) {
+  const locators = record.evidence.map((item) => typeof item.locator === 'string'
+    ? clean(item.locator) : clean(item.locator?.value || JSON.stringify(item.locator || {}))).filter(Boolean).sort();
+  return locators.length ? locators.join('\u0000') : `~${record.id}`;
+}
+
+function scoresAreNearTie(left, right) {
+  const difference = Math.abs(left - right);
+  return difference <= Math.max(0.1, Math.max(Math.abs(left), Math.abs(right)) * 0.05);
+}
+
 function similarity(left, right) {
   const a = new Set(tokenize(`${left.title} ${left.body}`)); const b = new Set(tokenize(`${right.title} ${right.body}`));
   const intersection = [...a].filter((token) => b.has(token)).length;
@@ -190,9 +201,9 @@ class HybridRetriever {
   }
 
   _prepareLexical() {
-    this.docs = this.records.map((record) => {
+    this.docs = this.records.map((record, sourceOrder) => {
       const fields = { title: tokenize(`${record.title} ${record.search_title}`), keywords: tokenize([...record.aliases, ...record.keywords, ...record.tags].join(' ')), evidence: tokenize(record.evidence.map((item) => item.text).join(' ')), body: tokenize(record.body) };
-      const terms = new Set(Object.values(fields).flat()); return { record, fields, terms };
+      const terms = new Set(Object.values(fields).flat()); return { record, fields, terms, sourceOrder };
     });
     this.df = new Map();
     for (const doc of this.docs) for (const term of doc.terms) this.df.set(term, (this.df.get(term) || 0) + 1);
@@ -213,8 +224,20 @@ class HybridRetriever {
           matched[term] = (matched[term] || 0) + contribution;
         }
       }
-      return { record: doc.record, score, matched_terms: Object.keys(matched).sort() };
-    }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id));
+      const titleTerms = new Set(doc.fields.title); const queryTerms = [...new Set(terms)];
+      const title_scope_matches = queryTerms.filter((term) => titleTerms.has(term)).length;
+      return { record: doc.record, score, matched_terms: Object.keys(matched).sort(), title_scope_matches, source_order: doc.sourceOrder };
+    }).filter((item) => item.score > 0).sort((a, b) => {
+      const scoreDifference = b.score - a.score;
+      if (!scoresAreNearTie(a.score, b.score)) return scoreDifference;
+      const scopeDifference = b.title_scope_matches - a.title_scope_matches;
+      if (scopeDifference) return scopeDifference;
+      if (normalized(a.record.title) === normalized(b.record.title)) {
+        return sourcePosition(a.record).localeCompare(sourcePosition(b.record)) || scoreDifference
+          || a.record.id.localeCompare(b.record.id);
+      }
+      return scoreDifference || a.record.id.localeCompare(b.record.id);
+    });
   }
 
   async _vectors() {

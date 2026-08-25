@@ -3,7 +3,7 @@
 const crypto = require('crypto');
 const { KnowledgeWritePort } = require('./knowledge-write-port.js');
 const { assertKnowledgeActions } = require('./content-integrity.js');
-const { prepareProductionEvolution, verifyProductionEvolution } = require('./production-evolution.js');
+const { prepareProductionEvolution, verifyProductionEvolution, rebuildProductionEvolution } = require('./production-evolution.js');
 
 const normalized = (value) => String(value || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
 const uniqueSorted = (values) => [...new Set(values.map(normalized).filter(Boolean))].sort();
@@ -23,8 +23,15 @@ class ProductionCommitService {
     const evolutionPath = `${normalized(options.stateRoot)}/evolution/production-index-v1.json`;
     let previous = null; const previousText = await this.port.readIfExists(evolutionPath);
     if (previousText) {
-      try { previous = JSON.parse(previousText); } catch (_) { throw Object.assign(new Error('生产演化索引损坏；必须显式重建。'), { code: 'EVOLUTION_REBUILD_REQUIRED' }); }
-      if (!verifyProductionEvolution(previous, Object.values(options.index?.records || {}))) throw Object.assign(new Error('生产演化索引绑定陈旧；必须显式重建。'), { code: 'EVOLUTION_REBUILD_REQUIRED' });
+      try { previous = JSON.parse(previousText); } catch (_) { previous = null; }
+    }
+    const authoritativeRecords = Object.values(options.index?.records || {});
+    const hasExistingKnowledge = authoritativeRecords.some((record) => ['business_item', 'company_knowledge'].includes(record.record_kind));
+    if (hasExistingKnowledge && !verifyProductionEvolution(previous, authoritativeRecords)) {
+      const rebuilt = await rebuildProductionEvolution(this.port, options.index, {
+        as_of: asOf, path: evolutionPath, dry_run: true
+      });
+      previous = rebuilt.index;
     }
     const evolution = prepareProductionEvolution(plan, { as_of: asOf, previous });
     const result = await this.commitPlan(plan, { ...options, vault: this.port, requiredArtifacts: [

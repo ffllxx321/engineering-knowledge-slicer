@@ -30,12 +30,16 @@ function prepareProductionEvolution(plan, options = {}) {
   const priorUnits = priorFacts.map(f => ({ ...f, unit_id: f.unit_ids?.[0] || f.fact_id, semantic_type: f.semantic_type,
     evidence: f.evidence, scope: f.scope, replaces: f.explicit_replaces || [] }));
   const replaced = new Set(actions.map(a => a.record_id));
-  const units = [...priorUnits.filter(u => !(u.unit_ids || [u.unit_id]).some(id => replaced.has(id))), ...actions.map(unitOf).filter(Boolean)]; const documents = new Map();
+  const retainedPrior = priorUnits.filter(u => !(u.unit_ids || [u.unit_id]).some(id => replaced.has(id)));
+  const legacyFacts = retainedPrior.filter((unit) => !(unit.evidence || []).length);
+  const units = [...retainedPrior.filter((unit) => (unit.evidence || []).length), ...actions.map(unitOf).filter(Boolean)]; const documents = new Map();
   for (const unit of units) for (const e of unit.evidence) {
     if (!documents.has(e.source_id)) documents.set(e.source_id, { source_id: e.source_id, source_hash: actions.find(a => a.owner_source_id === e.source_id)?.source_hash || '', blocks: [] });
     const d = documents.get(e.source_id); if (!d.blocks.some(b => b.block_id === e.block_id)) d.blocks.push({ block_id: e.block_id, locator: e.locator, raw_verbatim: e.raw_verbatim });
   }
   const graph = buildEvolutionGraph({ documents: [...documents.values()], units }, { as_of: options.as_of });
+  graph.facts = [...graph.facts, ...legacyFacts].sort((a, b) => a.fact_id.localeCompare(b.fact_id));
+  graph.relations = [...graph.relations, ...legacyFacts.flatMap((fact) => fact.relations || [])];
   const factByUnit = new Map(graph.facts.flatMap(f => f.unit_ids.map(id => [id, f])));
   for (const action of actions) { const fact = factByUnit.get(action.record_id); if (!fact) continue; action.content = replaceFrontmatter(action.content, 'evolution_schema', SCHEMA); action.content = replaceFrontmatter(action.content, 'evolution_payload', `base64url:${encode(fact)}`); action.content_hash = hash(action.content);
     action.action = action.from_path
@@ -52,7 +56,12 @@ function verifyProductionEvolution(index, records) {
   if (index?.schema !== SCHEMA || index.pipeline !== PIPELINE) return false;
   const actual = hash(JSON.stringify({ schema: SCHEMA, pipeline: PIPELINE, records: index.records }));
   const ids = new Set(index.graph?.facts?.flatMap(f => f.unit_ids) || []);
-  return actual === index.binding_sha256 && index.records.every(r => records.some(x => x.record_id === r.record_id && x.content_hash === r.content_hash) && ids.has(r.record_id));
+  const authoritative = records.some((record) => record.record_kind)
+    ? records.filter((record) => ['business_item', 'company_knowledge'].includes(record.record_kind)) : records;
+  const indexedIds = new Set(index.records.map((record) => record.record_id));
+  return actual === index.binding_sha256
+    && index.records.every(r => authoritative.some(x => x.record_id === r.record_id && x.content_hash === r.content_hash) && ids.has(r.record_id))
+    && authoritative.every((record) => indexedIds.has(record.record_id));
 }
 async function rebuildProductionEvolution(vault, idPathIndex, options = {}) {
   const records=[]; const facts=[]; let legacy=0;

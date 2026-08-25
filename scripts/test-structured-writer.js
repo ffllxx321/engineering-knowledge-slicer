@@ -212,7 +212,8 @@ async function main() {
   assert.deepStrictEqual(plan.counts, { create: 2 });
   assert(plan.summary.includes('新建 2'));
   assert(plan.actions.every((item) => item.path.startsWith('06-知识库/业务库/')));
-  assert(plan.actions.some((item) => item.content.includes('[[src-')));
+  assert(plan.actions.some((item) => item.content.includes('|报价单.docx]]')));
+  assert(plan.actions.every((item) => !item.path.split('/').at(-1).startsWith(`${item.record_id}.md`)));
 
   const idsByKind = Object.fromEntries(plan.actions.map((item) => [item.record_kind, item.record_id]));
   const renamed = buildPlan({ ...base, document: document({ title: '改名后的报价单', filename: '改名.docx' }) });
@@ -237,7 +238,8 @@ async function main() {
   const occupied = buildPlan({
     ...base, existingFiles: { [occupiedPath]: '---\nrecord_id: \"other-id\"\n---\n' }
   });
-  assert(occupied.conflicts.some((item) => item.cause === 'path_occupied_by_different_id'));
+  assert.strictEqual(occupied.blocked, false);
+  assert(occupied.actions.some((item) => /（2）\.md$/.test(item.path)), '同名占用应稳定使用可读序号消歧');
 
   const dirty = { ...files, [occupiedPath]: `${files[occupiedPath]}\n用户修改` };
   const optimistic = buildPlan({ ...base, index, existingFiles: dirty });
@@ -288,8 +290,8 @@ async function main() {
   });
   assert(archived.actions.every((item) => item.from_path?.startsWith('06-知识库/招投标库/P-001/')));
   assert(archived.actions.every((item) => item.path.startsWith('06-知识库/业务库/complete_historical_projects/')));
-  assert(archived.actions.some((item) => item.content.includes('[[src-')),
-    'stable basename links survive archive moves');
+  assert(archived.actions.some((item) => item.content.includes('complete_historical_projects') && item.content.includes('|报价单.docx]]')),
+    '关系链接应在归档事务中改写 target_path 并保留人类标题');
 
   const ambiguous = buildPlan({
     ...base, document: activeDoc,
@@ -440,8 +442,8 @@ async function main() {
   const relatedAction = partitions101.flatMap((part) => part.actions).find((action) =>
     action.record_snapshot?.relations?.some((relation) => relation.type === 'related'));
   const relatedTarget = relatedAction?.record_snapshot?.relations?.find((relation) => relation.type === 'related');
-  assert(relatedAction?.content.includes(relatedTarget?.target_id),
-    'cross-partition relationships retain stable target IDs');
+  assert(relatedAction?.content.includes(`[[${relatedTarget?.target_path}|${relatedTarget?.target_title}]]`),
+    'cross-partition relationships retain resolved target paths and human titles');
   const vault101 = new MemoryVault();
   let index101 = emptyIndex();
   const first101 = await commitPlan(partitions101[0], { vault: vault101, lock: lock(), stateRoot: '状态',

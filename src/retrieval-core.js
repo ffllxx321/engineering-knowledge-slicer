@@ -76,11 +76,11 @@ function markdownRecord(markdown, path = '') {
   const heading = body.match(/^#\s+(.+)$/m)?.[1];
   const evidence = [...body.matchAll(/^>\s?(.*(?:\n>\s?.*)*)/gm)].map((match) => match[1].replace(/\n>\s?/g, '\n'));
   const locators = [...body.matchAll(/^定位：(.+)$/gm)].map((match) => clean(match[1]));
-  const structuredLocators = [...body.matchAll(/^定位数据：(.+)$/gm)].map((match) => locatorValue(match[1]));
+  const structuredLocators = [...body.matchAll(/^(?:-\s+)?定位数据：(.+)$/gm)].map((match) => locatorValue(match[1]));
   const evolution = payloadValue(meta.evolution_payload);
   if (evolution) return canonicalRecord({ ...evolution, id: evolution.fact_id || meta.record_id, path, content_hash: meta.content_hash || meta.source_hash });
   return canonicalRecord({
-    id: meta.record_id || meta.card_id, title: meta.search_title || meta.title || heading,
+    id: meta.record_id || meta.card_id, title: meta.title || heading || meta.search_title,
     search_title: meta.search_title, aliases: parseArray(meta.aliases), keywords: parseArray(meta.keywords),
     tags: parseArray(meta.tags), body, evidence: evidence.map((text, index) => ({ text, locator: structuredLocators[index] || locators[index] || '' })),
     source_id: meta.owner_source_id || parseArray(meta.source_document_ids)[0], source_path: meta.source_path,
@@ -113,11 +113,11 @@ function canonicalRecord(input = {}) {
     : { evidence_id: clean(item?.evidence_id), source_id: clean(item?.source_id), block_id: clean(item?.block_id), text: clean(item?.text ?? item?.raw_verbatim ?? item?.verbatim ?? item?.original ?? item?.quote),
       raw_verbatim: String(item?.raw_verbatim ?? item?.verbatim ?? item?.original ?? item?.quote ?? ''), locator: item?.locator || '' }).filter((item) => item.text);
   const body = clean(input.body || input.claim || input.summary);
-  const title = clean(input.search_title || input.title);
+  const title = clean(input.title || input.search_title);
   const contentHash = clean(input.content_hash) || hash(JSON.stringify({ title, body, evidence }));
   return {
     schema: SEARCH_SCHEMA, id: clean(input.id || input.record_id || input.card_id) || `search-${contentHash.slice(0, 20)}`,
-    title, search_title: clean(input.search_title || input.title), aliases: uniq(input.aliases),
+    title, search_title: clean(input.search_title || input.title), aliases: uniq(input.aliases).filter((item) => item !== title && item !== clean(input.search_title || input.title)),
     keywords: uniq([...(input.keywords || []), ...(input.tags || [])]), tags: uniq(input.tags), body,
     evidence, source_id: clean(input.source_id || input.owner_source_id || input.source_document_ids?.[0] || input.source_ids?.[0]),
     source_path: clean(input.source_path), semantic_kind: clean(input.semantic_kind || input.record_kind || input.card_type),

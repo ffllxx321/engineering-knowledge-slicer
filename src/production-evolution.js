@@ -38,7 +38,9 @@ function prepareProductionEvolution(plan, options = {}) {
   const graph = buildEvolutionGraph({ documents: [...documents.values()], units }, { as_of: options.as_of });
   const factByUnit = new Map(graph.facts.flatMap(f => f.unit_ids.map(id => [id, f])));
   for (const action of actions) { const fact = factByUnit.get(action.record_id); if (!fact) continue; action.content = replaceFrontmatter(action.content, 'evolution_schema', SCHEMA); action.content = replaceFrontmatter(action.content, 'evolution_payload', `base64url:${encode(fact)}`); action.content_hash = hash(action.content);
-    action.action = action.prior_hash === action.content_hash ? 'noop' : action.prior_content == null ? 'create' : 'update'; }
+    action.action = action.from_path
+      ? (action.prior_hash === action.content_hash ? 'move' : 'update_and_move')
+      : action.prior_hash === action.content_hash ? 'noop' : action.prior_content == null ? 'create' : 'update'; }
   const currentRecords = actions.map(a => ({ record_id: a.record_id, path: a.path, content_hash: a.content_hash, source_id: a.owner_source_id,
     source_hash: a.source_hash || '', evidence_hashes: (unitOf(a)?.evidence || []).map(e => hash(`${e.source_id}|${e.block_id}|${JSON.stringify(e.locator)}|${e.raw_verbatim}`)).sort() })).sort((a,b)=>a.record_id.localeCompare(b.record_id));
   const records = [...(options.previous?.records || []).filter(r => !replaced.has(r.record_id)), ...currentRecords].sort((a,b)=>a.record_id.localeCompare(b.record_id));

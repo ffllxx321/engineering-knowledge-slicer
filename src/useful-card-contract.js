@@ -31,10 +31,10 @@ function validateKnowledgeEvent(event) {
 function validateCardPlan(plan, eventIds = new Set()) {
   if (!plan || plan.schema_version !== `${CONTRACT_VERSION}/card-plan`) fail('CardPlan 版本无效');
   if (!CARD_TYPES.includes(plan.card_type)) fail('CardPlan 类型无效');
-  for (const key of ['plan_id', 'retrieval_intent', 'search_title', 'body']) if (typeof plan[key] !== 'string' || !plan[key].trim()) fail(`CardPlan 缺少 ${key}`);
+  for (const key of ['plan_id', 'retrieval_intent', 'title', 'search_title', 'body']) if (typeof plan[key] !== 'string' || !plan[key].trim()) fail(`CardPlan 缺少 ${key}`);
   for (const key of ['included_event_ids', 'related_but_not_merged_event_ids', 'evidence_ids']) if (!strings(plan[key])) fail(`CardPlan ${key} 必须是字符串数组`);
   if (!plan.included_event_ids.length || plan.included_event_ids.some((id) => eventIds.size && !eventIds.has(id))) fail('CardPlan 引用了未知事件');
-  if (plan.aliases?.includes(plan.search_title)) fail('别名不得与检索标题相同');
+  if (plan.aliases?.some((item) => item === plan.search_title || item === plan.title)) fail('别名不得与展示标题或检索标题相同');
   if (!plan.decision || !['split_independent', 'combine_dependent'].includes(plan.decision.mode)) fail('CardPlan 缺少原子性决策');
   return plan;
 }

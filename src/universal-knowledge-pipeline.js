@@ -749,7 +749,7 @@ function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
     const originalLanguage = detectLanguage(originalStatement);
     const raw = {
       semantic_kind: SEMANTIC_KIND[event.semantic_type] || event.semantic_type,
-      title: plan.search_title, original_title: event.subject, translated_title: plan.search_title,
+      title: plan.title, original_title: event.subject, translated_title: plan.title,
       search_title: plan.search_title, aliases: plan.aliases || [],
       subject: event.subject, statement: plan.body, original_statement: originalStatement || event.predicate,
       translated_statement: plan.body, source_language: originalLanguage,

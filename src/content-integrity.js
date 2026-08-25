@@ -95,9 +95,9 @@ function analyzeMarkdownCard(value) {
   const markdown = String(value || '');
   const body = markdown.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
   const reasons = [...analyzeText(body).reasons];
-  const evidenceSection = body.match(/## 来源证据（原文）\s*\n([\s\S]*?)(?=\n## |\n### 证据中文译文|$)/)?.[1] || '';
-  const evidence = evidenceSection.split(/\n\s*定位：[^\n]*\n?/).map((chunk) =>
-    chunk.split('\n').filter((line) => /^>/.test(line)).map((line) => line.replace(/^>\s?/, '')).join('\n').trim()).filter(Boolean);
+  const evidenceSection = body.match(/## (?:来源证据（原文）|来源)\s*\n([\s\S]*?)(?=\n## |$)/)?.[1] || '';
+  const evidence = [...evidenceSection.matchAll(/^>\s?(.*(?:\n>\s?.*)*)/gm)]
+    .map((match) => match[1].replace(/\n>\s?/g, '\n').trim()).filter(Boolean);
   const evidenceStrength = evidence.join('').match(/[\p{L}\p{N}]/gu)?.length || 0;
   if (!evidence.length || evidenceStrength < 8) reasons.push('empty_or_weak_evidence');
   if (body.length > 24000 || evidence.some((item) => item.length > 8000) || evidence.length > 12) reasons.push('oversized_aggregation');

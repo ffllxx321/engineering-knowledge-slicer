@@ -12,7 +12,7 @@ const TYPE_RULES = [
   ['commercial_term', /(?:付款|报价|合同价|保函|违约|payment|price)/i],
   ['schedule', /(?:工期|里程碑|开工|完工|截止|schedule|deadline)/i],
   ['risk', /(?:风险|隐患|可能导致|risk|hazard)/i],
-  ['requirement', /(?:必须|应当|应|不得|须|shall|must|required)/i],
+  ['requirement', /(?:必须|应当|(?<!不)应|不得|须|shall|must|required)/i],
   ['decision', /(?:决定|决议|批准|同意|approved|resolved)/i],
   ['action', /(?:行动项|待办|负责人|完成日期|action item)/i],
   ['procedure', /(?:步骤|流程|程序|依次|procedure|process)/i],
@@ -40,14 +40,16 @@ function clauses(text) {
   return clean(text, 30000).split(/(?<=[。！？；;])\s*|\n+(?=(?:[-*•]|\d+[.)、]|[（(]?[一二三四五六七八九十]+[)）、]))/u).map((x) => clean(x)).filter(Boolean);
 }
 function isDependent(text) { return /^(?:其中|并且|以及|且|同时|但|但是|除非|除外|在.+(?:时|情况下)|若|如果|当|否则|前述|上述|其|该)/.test(text); }
-function modality(text) { return clean(text.match(/不得|必须|应当|须|宜|可以|shall not|must not|shall|must|should|may/i)?.[0], 30) || '陈述'; }
+const LIST_MARKER = /^(?:[-*•]\s*|[（(]\s*\d+\s*[)）]\s*|\d+\s*[.)、]\s*|[（(]?[一二三四五六七八九十]+[)）、]\s*)/u;
+function stripListMarker(text) { return clean(String(text || '').replace(LIST_MARKER, '')); }
+function modality(text) { return clean(text.match(/不得|不宜|必须|应当|须|宜|可以|shall not|must not|shall|must|should|may/i)?.[0], 30) || '陈述'; }
 function conditions(text) { return uniq([...text.matchAll(/(?:如果|若|当|在)([^，。；]{2,80})(?:时|情况下)?[,，]/g)].map((m) => m[0])); }
 function exceptions(text) { return uniq([...text.matchAll(/(?:除非|除外|但|但是)([^。；]{2,100})/g)].map((m) => m[0])); }
-function parameters(text) { return uniq([...text.matchAll(/-?\d+(?:\.\d+)?\s*(?:MPa|mm\/s|mm|cm|kg|万元|小时|m|t|%|元|天|日|次|°C)?/gi)].map((m) => m[0])); }
-function actor(text) { return clean(text.replace(/^(?:[-*•]|\d+[.)、]|[（(]?[一二三四五六七八九十]+[)）、])\s*/u, '').match(/^([^，。；:：]{2,30}?)(?=必须|应当|不得|须|宜|负责|应在)/)?.[1], 80); }
+function parameters(text) { return uniq([...stripListMarker(text).matchAll(/-?\d+(?:\.\d+)?\s*(?:MPa|mm\/s|mm|cm|kg|万元|小时|m|t|%|元|天|日|次|°C)/gi)].map((m) => m[0])); }
+function actor(text) { return clean(stripListMarker(text).match(/^([^，。；:：]{2,30}?)(?=必须|应当|不得|须|负责|应在)/)?.[1], 80); }
 function subjectFor(text, context) {
-  const stripped = clean(text.replace(/^(?:[-*•]|\d+[.)、]|[（(]?[一二三四五六七八九十]+[)）、])\s*/u, ''), 300);
-  return clean(stripped.split(/必须|应当|不得|须|宜|可以|是指|定义为|：|:/)[0], 120) || clean(context.at(-1), 120);
+  const stripped = stripListMarker(text).slice(0, 300);
+  return clean(stripped.split(/必须|应当|不得|不宜|须|宜|可以|是指|定义为|：|:/)[0], 120) || clean(context.at(-1), 120);
 }
 function evidence(block) { return { block_id: block.block_id, locator: block.locator, verbatim: block.raw_verbatim ?? block.text, provenance: block.provenance || [] }; }
 function definitionAliases(event) {
@@ -129,14 +131,19 @@ function extractKnowledgeEvents(document, regions = []) {
   }
   return { events, coverage };
 }
-function titleFor(event) {
+function displayTitleFor(event) {
   const intent = { requirement: '要求', guideline: '建议', procedure: '流程', method: '方法', parameter: '参数', acceptance: '验收检查', risk: '风险应对', decision: '决策', action: '行动项', commitment: '承诺', commercial_term: '商务条款', schedule: '时间要求', term_definition: '定义', checklist_item: '检查项', reference: '引用依据', entity_profile: '实体信息', lesson: '经验', observation: '观察', unknown: '待确认知识' }[event.semantic_type] || '概览';
-  const detail = event.parameters[0] || event.conditions[0] || event.modality;
-  return clean(`${event.subject}：${intent}${detail && detail !== '陈述' ? `（${detail}）` : ''}`, 160);
+  return clean(`${stripListMarker(event.subject)}${intent}`, 80).replace(/[：:]|(?:要求){2,}$/g, '要求');
+}
+function searchTitleFor(event) {
+  const predicate = stripListMarker(event.predicate).replace(/[。；;]+$/g, '');
+  const subject = stripListMarker(event.subject);
+  const complete = predicate.includes(subject) ? predicate : `${subject}：${predicate}`;
+  return clean(complete.length <= 160 ? complete : `${displayTitleFor(event)}：${predicate.slice(0, 100)}`, 160);
 }
 function bodyFor(event) {
   const lead = { requirement: '要求', guideline: '建议', procedure: '步骤', method: '做法', parameter: '参数', acceptance: '验收标准', risk: '风险', decision: '决定', action: '行动', commitment: '承诺', commercial_term: '条款', schedule: '时间安排', term_definition: '定义', checklist_item: '检查项', lesson: '经验', unknown: '待确认内容' }[event.semantic_type] || '内容';
-  const lines = [`${lead}：${event.predicate}`];
+  const lines = [`${lead}：${stripListMarker(event.predicate)}`];
   if (event.source_context.parent_clause_text && !event.predicate.includes(event.source_context.parent_clause_text)) lines.push(`适用范围：${event.source_context.parent_clause_text}`);
   if (event.actor) lines.push(`执行主体：${event.actor}`);
   if (event.conditions.length) lines.push(`适用条件：${event.conditions.join('；')}`);
@@ -167,7 +174,7 @@ function planUsefulCards(events) {
     return validateCardPlan({
       schema_version: `${CONTRACT_VERSION}/card-plan`, plan_id: `plan-${hash(group.map((item) => item.event_id)).slice(0, 24)}`,
       user_question: `关于“${event.subject}”，需要知道什么${event.semantic_type === 'term_definition' ? '定义' : '要求或做法'}？`,
-      retrieval_intent: `${event.subject}/${event.semantic_type}`, search_title: titleFor(event), aliases: definitionAliases(event),
+      retrieval_intent: `${event.subject}/${event.semantic_type}`, title: displayTitleFor(event), search_title: searchTitleFor(event), aliases: definitionAliases(event).filter((item) => ![displayTitleFor(event), searchTitleFor(event)].includes(item)),
       keywords: uniq([event.subject, ...definitionAliases(event), ...group.flatMap((item) => item.parameters), ...event.source_context.table_headers]),
       card_type: CARD_TYPE[event.semantic_type] || event.semantic_type, included_event_ids: group.map((item) => item.event_id),
       necessary_inherited_context: { heading_path: event.source_context.heading_path, table_headers: event.source_context.table_headers, unit: event.source_context.unit },

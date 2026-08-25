@@ -116,13 +116,13 @@ function testWriterEndToEndIdempotenceArchiveAndMarkdown() {
   const second = buildPlan(writerInput(result, index, existing));
   assert(second.actions.every((action) => action.action === 'noop'));
   const item = first.actions.find((action) => action.record_kind === 'business_item');
-  assert(item.content.includes('## 来源证据'));
+  assert(item.content.includes('## 来源') && item.content.includes('### 原文摘录'));
   assert(!item.content.includes('{"scheme"'));
   const archived = buildPlan(writerInput(result, index, existing, {
     from: 'terminated', archive_outcome: 'terminated', archive_decided_at: '2026-07-31'
   }));
   assert(archived.actions.some((action) => action.path.startsWith('06-知识库/业务库/complete_historical_projects/')));
-  assert(archived.actions.every((action) => existing[action.from_path] === undefined || action.record_id.includes(action.path.split('/').at(-1).replace('.md', ''))));
+  assert(archived.actions.every((action) => existing[action.from_path] === undefined || !action.path.split('/').at(-1).includes(action.record_id)));
 }
 
 function testLegacyMigrationNoiseLongDenseAndCost() {

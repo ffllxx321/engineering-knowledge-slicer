@@ -62,6 +62,13 @@ const pathSafe = (value) => {
 const joinPath = (...parts) => parts.map((part) => String(part || '').replace(/^\/+|\/+$/g, ''))
   .filter(Boolean).join('/');
 
+function chinaTime(value) {
+  const instant = new Date(String(value || ''));
+  if (!Number.isFinite(instant.valueOf())) throw Object.assign(new Error('结构化写入时间无效；必须是可解析的 ISO 8601 instant'), { code: 'STRUCTURED_TIME_INVALID' });
+  const shifted = new Date(instant.valueOf() + 8 * 60 * 60 * 1000);
+  return `${shifted.toISOString().slice(0, -1)}+08:00`;
+}
+
 function normalizeSettings(settings = {}) {
   const mode = MODES.includes(settings.structuredWriterMode) ? settings.structuredWriterMode : 'legacy';
   const enabled = settings.controlledWriterEnabled === true;
@@ -89,6 +96,11 @@ function sourceIdentity(document) {
   const initialHash = clean(document.initial_source_hash || document.source_hash, 128);
   if (initialHash) return `initial-hash:${initialHash}`;
   throw new Error('来源缺少稳定身份；不能用可变标题或路径生成 ID');
+}
+
+function sourceFilename(document) {
+  const fromPath = clean(document.source_path, 800).replace(/\\/g, '/').split('/').at(-1);
+  return clean(fromPath || document.filename || document.title || '来源文档', 300);
 }
 
 function projectIdentity(entry) {
@@ -147,9 +159,7 @@ function yamlArray(values) {
 }
 
 function relationLink(relation) {
-  // Generated filenames are globally unique stable IDs. Basename links survive
-  // archive moves without rewriting user-facing titles or depending on aliases.
-  return `[[${relation.target_id}|${relation.target_title || relation.target_id}]]`;
+  return `[[${relation.target_path}|${relation.target_title}]]`;
 }
 
 function humanLocator(locator = {}) {
@@ -172,6 +182,19 @@ function encodedLocator(locator) {
   return Buffer.from(stableJson(locator || {}), 'utf8').toString('base64url');
 }
 
+function displayEvidence(value) {
+  return clean(value, 12000)
+    .replace(/\s*(?=(?:[（(]\d+[)）]|\d+[.、])\s*)/g, '\n')
+    .replace(/\s*(?=(?:第[一二三四五六七八九十\d]+[章节条]|[一二三四五六七八九十]+、))/g, '\n')
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function readableSummary(value) {
+  const formatted = clean(value, 12000).replace(/([。；;])(?=(?:要求|建议|步骤|做法|执行主体|适用条件|例外|关键参数|表格语境)[:：])/g, '$1\n');
+  return formatted.split(/\n+/).map((line) => line.trim()).filter(Boolean)
+    .map((line) => `- ${line.replace(/^([^：:]{1,20})[:：]\s*/, '**$1：** ')}`).join('\n');
+}
+
 function serializeRecord(record) {
   const check = validateRecord(record);
   if (!check.valid) throw new Error(`记录 ${record.record_id} 不符合 schema：${check.errors.join('；')}`);
@@ -184,7 +207,7 @@ function serializeRecord(record) {
     `record_id: ${yamlScalar(record.record_id)}`,
     `title: ${yamlScalar(record.title)}`,
     `search_title: ${yamlScalar(record.search_title || record.title)}`,
-    `aliases: ${yamlArray([record.title, ...(record.aliases || [])])}`,
+    `aliases: ${yamlArray((record.aliases || []).filter((item) => item !== record.title && item !== (record.search_title || record.title)))}`,
     `keywords: ${yamlArray(searchKeywords(record))}`,
     `library: ${yamlScalar(record.library)}`,
     `created_at: ${yamlScalar(record.created_at)}`,
@@ -195,6 +218,8 @@ function serializeRecord(record) {
   }
   if (record.semantic_kind) frontmatter.push(`semantic_kind: ${yamlScalar(record.semantic_kind)}`);
   if (record.source_language) frontmatter.push(`source_language: ${yamlScalar(record.source_language)}`);
+  if (record.source_file) frontmatter.push(`source_file: ${yamlScalar(record.source_file)}`);
+  if (record.source_document_names?.length) frontmatter.push(`source_document_names: ${yamlArray(record.source_document_names)}`);
   frontmatter.push(`output_language: ${yamlScalar(record.output_language || 'zh-CN')}`);
   if (record.tags?.length) frontmatter.push(`tags: ${yamlArray(record.tags)}`);
   for (const key of ['project_ids', 'source_document_ids', 'business_item_ids', 'company_knowledge_ids']) {
@@ -202,26 +227,31 @@ function serializeRecord(record) {
   }
   frontmatter.push('---', '', `# ${record.title}`, '');
   const body = [];
-  if (record.summary) body.push('## 内容', '', record.summary, '');
+  if (record.summary) body.push('## 内容', '', readableSummary(record.summary), '');
   const evidenceList = (record.evidence_list?.length ? record.evidence_list : [record.evidence]).filter((item) => item?.verbatim);
   if (evidenceList.length) {
-    body.push('## 来源证据（原文）', '');
+    body.push('## 来源', '');
+    const sourceRelation = relations.find((relation) => relation.type === 'derived_from');
+    if (sourceRelation) body.push(`- 来源文件：${relationLink(sourceRelation)}`);
     for (const evidence of evidenceList) body.push(
-      `> ${clean(evidence.verbatim, 4000).replace(/\n/g, '\n> ')}`, '',
-      `定位：${humanLocator(evidence.locator || {})}`,
-      `定位数据：base64url:${encodedLocator(evidence.locator || {})}`, '');
+      `- 原文位置：${humanLocator(evidence.locator || {})}`, '',
+      '### 原文摘录', '',
+      `> ${displayEvidence(evidence.verbatim).replace(/\n/g, '\n> ')}`, '');
     if (record.evidence_translation && record.evidence_translation !== record.evidence.verbatim) {
       body.push('### 证据中文译文', '', `> ${clean(record.evidence_translation, 4000).replace(/\n/g, '\n> ')}`, '');
     }
   }
-  if (relations.length) body.push('## 关系', '', ...relations.map((relation) =>
+  const visibleRelations = evidenceList.length
+    ? relations.filter((relation) => relation.type !== 'derived_from') : relations;
+  if (visibleRelations.length) body.push('## 关系', '', ...visibleRelations.map((relation) =>
     `- ${relation.type}：${relationLink(relation)}`), '');
   if (record.unresolved_relations?.length) body.push('## 待处理关系', '',
     ...record.unresolved_relations.map((item) =>
       `- ${item.type || 'related'}：${item.source_candidate || '未命名'}（${item.reason}；定位 ${stableJson(item.evidence_locator || {})}）`), '');
-  body.push('## 追溯', '', `- 记录编号：${record.record_id}`);
-  if (record.owner_source_id) body.push(`- 归属来源：${record.owner_source_id}`);
+  body.push('<details>', '<summary>技术追溯</summary>', '', `- 记录编号：${record.record_id}`);
+  for (const evidence of evidenceList) body.push(`- 定位数据：base64url:${encodedLocator(evidence.locator || {})}`);
   if (record.source_hash) body.push(`- 来源哈希：${record.source_hash}`);
+  body.push('', '</details>');
   return `${frontmatter.concat(body).join('\n')}\n`;
 }
 
@@ -232,9 +262,9 @@ function routeRecord(record, route, registryEntry, settings) {
   if (record.library === 'active_tender') {
     if (!registryEntry) throw new Error('在办库记录缺少唯一项目登记');
     return joinPath(settings.activeRoot, safeSegment(registryEntry.project_id), category,
-      KIND_FOLDER[record.record_kind], `${record.record_id}.md`);
+      KIND_FOLDER[record.record_kind], `${safeSegment(record.title)}.md`);
   }
-  return joinPath(settings.businessRoot, category, KIND_FOLDER[record.record_kind], `${record.record_id}.md`);
+  return joinPath(settings.businessRoot, category, KIND_FOLDER[record.record_kind], `${safeSegment(record.title)}.md`);
 }
 
 function resolveRelations(records, index, limits) {
@@ -304,12 +334,12 @@ function buildRecords(input, settings) {
   const registryMatches = (input.projectRegistry || []).filter((entry) => entry.project_id === route.project_id);
   if (route.project_id && registryMatches.length !== 1) throw new Error('项目路由不是登记表中的唯一精确匹配');
   const registry = registryMatches[0];
-  const now = clean(input.logicalTime || document.ingested_at || '1970-01-01T00:00:00.000Z', 80);
+  const now = chinaTime(input.logicalTime || document.ingested_at || '1970-01-01T00:00:00.000Z');
   const sourceId = stableId('source_document', sourceIdentity(document));
   const sourceHash = clean(document.source_hash, 128);
   const source = {
     schema_version: '1.0', record_kind: 'source_document', record_id: sourceId,
-    title: clean(document.title || document.filename || '来源文档', 300),
+    title: sourceFilename(document),
     library: route.library, created_at: now, updated_at: now,
     source_path: clean(document.source_path, 800), source_hash: sourceHash,
     source_version: clean(document.source_version || document.metadata?.version_label, 100),
@@ -383,7 +413,7 @@ function buildCanonicalRecords(input, settings) {
   const eligibleUnits = (result.knowledge_units || []).filter((unit) =>
     !(result.review_decisions || []).some((review) => review.unit_ids?.includes(unit.unit_id)));
   const units = coalesceCanonicalUnits(eligibleUnits);
-  const now = clean(input.logicalTime || document.ingested_at || '1970-01-01T00:00:00.000Z', 80);
+  const now = chinaTime(input.logicalTime || document.ingested_at || '1970-01-01T00:00:00.000Z');
   const sourceId = stableId('source_document', sourceIdentity(document));
   const registryMatches = (input.projectRegistry || []).filter((entry) =>
     units.some((unit) => unit.project_ids?.includes(entry.project_id)));
@@ -394,7 +424,7 @@ function buildCanonicalRecords(input, settings) {
   const sourceLibrary = units.some((unit) => unit.route?.library === 'active_tender') ? 'active_tender' : 'business';
   const source = {
     schema_version: '1.0', record_kind: 'source_document', record_id: sourceId,
-    title: clean(document.title || '来源文档', 300), library: sourceLibrary,
+    title: sourceFilename(document), library: sourceLibrary,
     created_at: now, updated_at: now, source_path: clean(document.source_path, 800),
     source_hash: clean(document.source_hash, 128), media_type: clean(document.media_type, 100),
     owner_source_id: sourceId, summary: `统一语义管线来源记录；共形成 ${units.length} 个知识单元。`,
@@ -445,6 +475,7 @@ function buildCanonicalRecords(input, settings) {
       conditions: unit.applicable_conditions, exceptions: unit.exceptions,
       structured_facts: unit.structured_facts, confidence: unit.confidence,
       uncertainty: unit.uncertainty, owner_source_id: sourceId,
+      source_file: source.title, source_document_names: [source.title],
       source_document_ids: [sourceId], project_ids: project ? [project.record_id] : [],
       requested_relations: [{ type: 'derived_from', target_id: sourceId }]
     };
@@ -605,12 +636,23 @@ function buildPlan(input) {
       summary: '新建 0，更新 0，不变 0，移动 0，需要处理 1。'
     };
   }
-  for (const record of records) {
-    record.path = routeRecord(record, { ...route, directory_category: record.category || route.directory_category }, registry, settings);
+  const reserved = new Map(Object.keys(input.existingFiles || {}).map((path) => [path, frontmatterValue(input.existingFiles[path], 'record_id')]));
+  const allocated = new Map();
+  for (const record of records.sort((a, b) => a.record_id.localeCompare(b.record_id))) {
+    const desired = routeRecord(record, { ...route, directory_category: record.category || route.directory_category }, registry, settings);
     const existingIndex = index.records?.[record.record_id];
-    if (existingIndex && existingIndex.path !== record.path && input.archiveTransition !== true) {
-      record.path = existingIndex.path; // rename/title changes never move identity
+    const oldPath = existingIndex?.path;
+    const managedTechnical = oldPath && oldPath.split('/').at(-1) === `${record.record_id}.md`
+      && input.existingFiles?.[oldPath] !== undefined && Boolean(existingIndex.content_hash);
+    let candidate = existingIndex && !managedTechnical && input.archiveTransition !== true ? oldPath : desired;
+    const ext = '.md'; const stem = candidate.slice(0, -ext.length);
+    let ordinal = 1;
+    while ((allocated.has(candidate) && allocated.get(candidate) !== record.record_id)
+      || (reserved.has(candidate) && reserved.get(candidate) !== record.record_id && candidate !== oldPath)) {
+      ordinal += 1; candidate = `${stem}（${ordinal}）${ext}`;
     }
+    record.path = candidate; allocated.set(candidate, record.record_id);
+    if (managedTechnical && oldPath !== candidate) record.migrate_from_path = oldPath;
   }
   const reviewGroups = resolveRelations(records, index, settings.limits);
   const byPath = input.existingFiles || {};
@@ -618,10 +660,6 @@ function buildPlan(input) {
   for (const record of records.sort((a, b) => a.record_id.localeCompare(b.record_id))) {
     const indexed = index.records?.[record.record_id];
     const occupied = byPath[record.path];
-    if (indexed && indexed.path !== record.path && byPath[indexed.path] !== undefined) {
-      conflicts.push({ cause: 'same_id_multiple_paths', record_id: record.record_id, paths: uniq([indexed.path, record.path]) });
-      continue;
-    }
     if (occupied !== undefined) {
       const occupiedId = clean((occupied.match(/^record_id:\s*["']?([^"'\n]+)/m) || [])[1], 300);
       if (occupiedId && occupiedId !== record.record_id) {
@@ -631,16 +669,19 @@ function buildPlan(input) {
     }
     const content = serializeRecord(record);
     const contentHash = hash(content);
-    const prior = byPath[record.path];
+    const fromPath = record.migrate_from_path;
+    const prior = fromPath ? byPath[fromPath] : byPath[record.path];
     const priorHash = prior === undefined ? null : hash(prior);
     const indexedHash = indexed?.content_hash || null;
     if (prior !== undefined && indexedHash && priorHash !== indexedHash) {
       conflicts.push({ cause: 'optimistic_hash_mismatch', record_id: record.record_id, path: record.path, expected: indexedHash, actual: priorHash });
       continue;
     }
-    const action = priorHash === contentHash ? 'noop' : prior === undefined ? 'create' : 'update';
+    const action = fromPath ? (priorHash === contentHash ? 'move' : 'update_and_move')
+      : priorHash === contentHash ? 'noop' : prior === undefined ? 'create' : 'update';
     actions.push({
       action, record_id: record.record_id, record_kind: record.record_kind, path: record.path,
+      ...(fromPath ? { from_path: fromPath } : {}),
       content, content_hash: contentHash, prior_hash: priorHash, prior_content: prior,
       owner_source_id: sourceId, source_hash: clean(input.document?.source_hash, 128),
       source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
@@ -661,6 +702,11 @@ function buildPlan(input) {
           action.from_path = action.path;
         }
         action.path = to;
+      }
+      const movedLinks = new Map(actions.filter((action) => action.from_path).map((action) => [action.from_path, action.path]));
+      for (const action of actions) {
+        for (const [from, to] of movedLinks) action.content = action.content.split(`[[${from}|`).join(`[[${to}|`);
+        action.content_hash = hash(action.content);
       }
     }
   }

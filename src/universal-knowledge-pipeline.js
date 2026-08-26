@@ -10,7 +10,8 @@ const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts } = re
 const { analyzeText } = require('./content-integrity.js');
 const { generateUsefulCards, SEMANTIC_KIND } = require('./useful-card-generation.js');
 const { STRUCTURE_VERSION, buildStructureContext } = require('./structure-context.js');
-const { preparePreGenerationBlocks } = require('./pre-generation-structure.js');
+const { PRE_GENERATION_SEMANTIC_CONTRACT_VERSION, PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT,
+  preparePreGenerationBlocks } = require('./pre-generation-structure.js');
 
 const PIPELINE_VERSION = '5.0-structure-aware-useful-card';
 const OUTPUT_LANGUAGE = 'zh-CN';
@@ -132,7 +133,7 @@ function deterministicChinese(text) {
 function normalizeLocator(raw, fallback) {
   const locator = raw && typeof raw === 'object' ? raw : {};
   const result = {};
-  for (const key of ['scheme', 'value', 'page', 'sheet', 'range', 'row', 'column', 'message_id', 'attachment_id', 'heading_path']) {
+  for (const key of ['scheme', 'value', 'fragment', 'page', 'sheet', 'range', 'row', 'column', 'message_id', 'attachment_id', 'heading_path']) {
     if (locator[key] !== undefined && locator[key] !== null && String(locator[key]).trim()) result[key] = locator[key];
   }
   if (!result.scheme) result.scheme = 'block';
@@ -207,6 +208,10 @@ function canonicalizeDocument(input = {}) {
     || `src-${digest([source.source_hash, source.source_path, blocks.map((block) => block.text)]).slice(0, 24)}`;
   const canonical = {
     schema_version: 'canonical-document/2.0', pipeline_version: PIPELINE_VERSION,
+    pre_generation_semantic_contract: {
+      version: PRE_GENERATION_SEMANTIC_CONTRACT_VERSION,
+      fingerprint: PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT
+    },
     source_document_id: sourceId, source_identity: clean(source.source_identity, 300) || sourceId,
     source_hash: clean(source.source_hash, 128), source_path: clean(source.source_path, 1000),
     title: clean(source.title || source.filename, 400) || '未命名资料',
@@ -219,6 +224,27 @@ function canonicalizeDocument(input = {}) {
   canonical.structure = buildStructureContext(source, blocks);
   canonical.fingerprint = digest([blocks.map(({ block_id, kind, text }) => ({ block_id, kind, text })), canonical.structure]);
   return canonical;
+}
+
+function isReusableUniversalArtifact(artifact, sourceHash) {
+  return artifact?.document?.source_hash === sourceHash
+    && artifact?.pipeline_version === PIPELINE_VERSION
+    && artifact?.document?.pre_generation_semantic_contract?.version === PRE_GENERATION_SEMANTIC_CONTRACT_VERSION
+    && artifact?.document?.pre_generation_semantic_contract?.fingerprint === PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT
+    && artifact?.document?.structure?.schema_version === STRUCTURE_VERSION
+    && Array.isArray(artifact?.knowledge_units)
+    && Array.isArray(artifact?.knowledge_events)
+    && artifact.knowledge_events.every((event) => event?.schema_version === 'useful-card/2.0/knowledge-event')
+    && Array.isArray(artifact?.card_plans)
+    && artifact.card_plans.every((plan) => plan?.schema_version === 'useful-card/2.0/card-plan');
+}
+
+function reusableTranslationCache(checkpoint, priorArtifact, sourceHash) {
+  if (checkpoint?.schema_version === 'translation-checkpoint/2.0'
+    && checkpoint?.source_hash === sourceHash && checkpoint?.cache && typeof checkpoint.cache === 'object') return checkpoint.cache;
+  if (priorArtifact?.document?.source_hash === sourceHash
+    && priorArtifact?.translation_cache && typeof priorArtifact.translation_cache === 'object') return priorArtifact.translation_cache;
+  return {};
 }
 
 function semanticSignals(text) {
@@ -942,5 +968,6 @@ module.exports = {
   canonicalizeDocument, inferProfile, segmentDocument, normalizeKnowledgeUnit,
   normalizeTags, routeUnit, planKnowledgeUnits, repairCoverage, relationEvidence,
   planUsefulKnowledgeUnits,
-  groupedReview, runUniversalPipeline, runUniversalPipelineMultilingual, digest, stableJson
+  groupedReview, runUniversalPipeline, runUniversalPipelineMultilingual, isReusableUniversalArtifact,
+  reusableTranslationCache, digest, stableJson
 };

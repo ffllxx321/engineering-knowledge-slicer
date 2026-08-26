@@ -2,6 +2,8 @@
 
 ## Unreleased — bounded useful-card presentation and atomization
 
+- Added an explicit pre-generation semantic contract fingerprint to canonical artifacts and production reuse. Pre-contract artifacts from `737d6e0` are rejected without invalidating parsed/OCR or safe translation checkpoints; refreshed universal structure/events/plans are reused on retry.
+- Extended conservative inline normative enumeration recovery across Chinese obligation, prohibition, guidance and permission modalities, with contextual English permission and epistemic `may` counterexamples. Negation-bearing predicates, inherited scope and exact trimmed source spans now survive Markdown reload.
 - Production useful-card planning now keeps independent clauses separate, preserves ordered procedures and governing conditions, and emits one atomic fact per table value column with its row subject, header, unit, and value.
 - Display/search/alias and reused-canonical presentation cleanup uses exact semantic normalization, without fuzzy merging or review-threshold changes; the cross-page exact dedup behavior from `1f5c141` remains covered.
 - Added a sanitized ten-case offline corpus and an explicit pre-change failure inventory covering structure, retrieval, Markdown, locator, collision, determinism, and checkpoint reuse seams.
@@ -1220,3 +1222,4 @@ v1.1.8 给出三件东西：
 # Unreleased
 
 - Deduplicate exact cross-page semantic statements while retaining and combining every evidence locator in generated knowledge cards.
+- Recover conservative inline Arabic/Chinese requirement enumerations before canonical planning, preserving governing scope, independent sibling cards, verbatim evidence, and exact deterministic character-span locators.

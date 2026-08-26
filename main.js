@@ -114,7 +114,7 @@ const {
   SemanticPostProcessor,
   semanticSettingsSnapshot
 } = require("src/core/semantic-embedding.js");
-const { runUniversalPipelineMultilingual } = require("src/universal-knowledge-pipeline.js");
+const { runUniversalPipelineMultilingual, isReusableUniversalArtifact, reusableTranslationCache } = require("src/universal-knowledge-pipeline.js");
 const {
   KnowledgeWritePort,
   applyVerifiedFacts,
@@ -3471,20 +3471,13 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
       && loadedTranslationCheckpoint?.source_hash === document.source_hash
       && loadedTranslationCheckpoint?.cache && typeof loadedTranslationCheckpoint.cache === 'object'
       ? loadedTranslationCheckpoint : null;
-    let universal = priorUniversal?.document?.source_hash === document.source_hash
-      && priorUniversal?.pipeline_version === '5.0-structure-aware-useful-card'
-      && priorUniversal?.document?.structure?.schema_version === 'structure-context/2.0'
-      && Array.isArray(priorUniversal?.knowledge_units)
-      && Array.isArray(priorUniversal?.knowledge_events)
-      && priorUniversal.knowledge_events.every((event) => event?.schema_version === 'useful-card/2.0/knowledge-event')
-      && Array.isArray(priorUniversal?.card_plans)
-      && priorUniversal.card_plans.every((plan) => plan?.schema_version === 'useful-card/2.0/card-plan') ? priorUniversal : null;
+    let universal = isReusableUniversalArtifact(priorUniversal, document.source_hash) ? priorUniversal : null;
     try {
       if (!universal) {
       universal = await runUniversalPipelineMultilingual({
         document,
         existing_tags: [],
-        translation_cache: translationCheckpoint?.cache || priorUniversal?.translation_cache || {},
+        translation_cache: reusableTranslationCache(translationCheckpoint, priorUniversal, document.source_hash),
         translation_prompt_version: 'universal-zh-v1',
         model_version: this.settings.minimaxModel || 'configured-provider',
         save_translation_checkpoint: (checkpoint) => this.persistArtifact(task, 'universal-translation-checkpoint', {
@@ -95001,6 +94994,84 @@ const requirement = (value) => /必须|应当|不得|须|应在|shall|must|requi
 const terminal = (value) => /[。！？；;.!?:：]$/.test(norm(value));
 const container = (block) => norm(block.metadata?.container_id || block.metadata?.section_id || block.locator?.container || '');
 const page = (block) => block.locator?.page ?? block.metadata?.page ?? null;
+const PRE_GENERATION_SEMANTIC_CONTRACT_VERSION = 'pre-generation-semantics/2.0';
+const PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT = hash({
+  version: PRE_GENERATION_SEMANTIC_CONTRACT_VERSION,
+  inline_enumeration: 'explicit-markers+normative-context+exact-trimmed-spans-v2',
+  ocr_structure: 'numbering+marginalia+continuation-v1',
+  complex_tables: 'coordinate-span-header-path-v1'
+});
+const INLINE_MARKER = /(?:[（(]\s*(\d{1,3}|[一二三四五六七八九十]{1,3})\s*[)）]|(?<![\d.])(\d{1,3})[、.]|([一二三四五六七八九十]{1,3})、)\s*/gu;
+const GOVERNING_PREAMBLE = /(?:下列|如下|以下|分别|包括|要求|规定|规则|事项|许可|可选|可执行|rules?|requirements?(?:\s+apply)?|permissions?|options?|shall\s+apply|must\s+meet|permitted|allowed)\s*[:：]?\s*$/iu;
+const ZH_STRONG_NORMATIVE = /(?:严禁|禁止|不得|不应当|不应|不宜|必须|应当|(?<!不)应|须|宜)/u;
+const ZH_PERMISSION = /(?:可以|允许)/u;
+const EN_STRONG_NORMATIVE = /\b(?:shall(?:\s+not)?|must(?:\s+not)?|is\s+required\s+to|are\s+required\s+to|is\s+prohibited|are\s+prohibited|should(?:\s+not)?)\b/i;
+const EN_PERMISSION = /\b(?:may|is\s+permitted\s+to|are\s+permitted\s+to|is\s+allowed\s+to|are\s+allowed\s+to)\b/i;
+
+function trimmedSlice(value, start, end) {
+  let exactStart = start; let exactEnd = end;
+  while (exactStart < exactEnd && /\s/u.test(value[exactStart])) exactStart += 1;
+  while (exactEnd > exactStart && /\s/u.test(value[exactEnd - 1])) exactEnd -= 1;
+  return { start: exactStart, end: exactEnd, text: value.slice(exactStart, exactEnd) };
+}
+
+function normativeItem(body, normativeGoverning) {
+  if (ZH_STRONG_NORMATIVE.test(body) || EN_STRONG_NORMATIVE.test(body)) return true;
+  if ((ZH_PERMISSION.test(body) || EN_PERMISSION.test(body)) && !normativeGoverning) return false;
+  if (ZH_PERMISSION.test(body)) return !/(?:结果|现象|数据|证据|研究|分析).{0,12}(?:可以|允许)(?:表明|说明|意味着|导致|包括)/u.test(body);
+  if (!EN_PERMISSION.test(body)) return false;
+  // Bare epistemic/explanatory "may" normally governs a state or consequence.
+  // Permission requires an actor-like subject followed by may + an action verb.
+  return /^(?:the\s+)?[\p{L}][\p{L}\p{N}_ -]{0,48}\s+may\s+(?!be\b|have\b|indicate\b|mean\b|cause\b|result\b|occur\b|vary\b|include\b)[a-z][a-z-]*\b/iu.test(body)
+    || /\b(?:is|are)\s+(?:permitted|allowed)\s+to\s+[a-z]/i.test(body);
+}
+
+function expandInlineEnumerations(rawBlocks) {
+  const output = []; let expanded = 0;
+  for (const block of rawBlocks) {
+    const original = String(block.raw?.text ?? block.text ?? '');
+    if (!['paragraph', 'text', 'page-text', 'parsed-markdown'].includes(block.kind) || /\n/.test(original) || block.metadata?.table_id) {
+      output.push(block); continue;
+    }
+    const matches = [...original.matchAll(INLINE_MARKER)].filter((match) => {
+      const prior = match.index ? original[match.index - 1] : '';
+      const next = original[match.index + match[0].length] || '';
+      return (!prior || /[\s:：;；。！？]/u.test(prior)) && !/^\d/u.test(next);
+    });
+    if (matches.length < 2) { output.push(block); continue; }
+    const items = matches.map((match, index) => ({
+      match, start: match.index, bodyStart: match.index + match[0].length,
+      end: matches[index + 1]?.index ?? original.length
+    }));
+    const preambleSpan = trimmedSlice(original, 0, matches[0].index);
+    const preamble = preambleSpan.text;
+    const normativeGoverning = Boolean(preamble) && GOVERNING_PREAMBLE.test(preamble);
+    const governing = !preamble || /[：:]\s*$/.test(preamble) || normativeGoverning;
+    if (!governing || items.some((item) => !normativeItem(trimmedSlice(original, item.bodyStart, item.end).text, normativeGoverning))) {
+      output.push(block); continue;
+    }
+    const sourceId = String(block.block_id || hash([block.locator, original]));
+    const parentId = preamble ? `${sourceId}:inline-preamble` : '';
+    if (preamble) output.push({ ...block, block_id: parentId, kind: 'paragraph', raw: { ...(block.raw || {}), text: preamble }, text: preamble,
+      card_eligible: false, locator: { ...(block.locator || {}), fragment: `chars=${preambleSpan.start}-${preambleSpan.end}` },
+      metadata: { ...(block.metadata || {}), inline_enumeration_preamble: true, original_source_block_id: sourceId, structure_origin: 'inferred', structure_confidence: 0.96, structure_reason: 'governing_preamble_before_explicit_inline_enumeration' } });
+    items.forEach((item, index) => {
+      const itemSpan = trimmedSlice(original, item.start, item.end);
+      const bodySpan = trimmedSlice(original, item.bodyStart, item.end);
+      const rawItem = itemSpan.text;
+      const body = bodySpan.text;
+      const marker = item.match[0].trim();
+      output.push({ ...block, block_id: `${sourceId}:inline-item-${index + 1}`, kind: 'list_item', raw: { ...(block.raw || {}), text: rawItem }, text: rawItem,
+        locator: { ...(block.locator || {}), fragment: `chars=${itemSpan.start}-${itemSpan.end}` },
+        metadata: { ...(block.metadata || {}), inline_enumeration: true, numbering_token: marker, list_id: `inline-list:${sourceId}`, list_level: 0,
+          ordinal: index + 1, parent_clause_id: parentId, parent_clause_text: preamble, original_source_block_id: sourceId,
+          structure_origin: 'inferred', structure_confidence: 0.96, structure_reason: 'multiple_explicit_inline_markers_with_requirement_bodies' },
+        inferred: { ...(block.inferred || {}), original_body: body } });
+    });
+    expanded += 1;
+  }
+  return { blocks: output, diagnostics: { paragraphs_expanded: expanded, derived_list_items: output.filter((block) => block.metadata?.inline_enumeration).length } };
+}
 
 function recoverOcrStructure(rawBlocks, source = {}) {
   const blocks = rawBlocks.map((block) => ({ ...block, metadata: { ...(block.metadata || {}) }, inferred: { ...(block.inferred || {}) } }));
@@ -95109,11 +95180,14 @@ function reconstructComplexTables(rawBlocks) {
 }
 
 function preparePreGenerationBlocks(rawBlocks, source) {
-  const ocr = recoverOcrStructure(rawBlocks, source); const tables = reconstructComplexTables(ocr.blocks);
-  return { blocks: tables.blocks, diagnostics: { ocr: ocr.diagnostics, tables: tables.diagnostics } };
+  const inline = expandInlineEnumerations(rawBlocks); const ocr = recoverOcrStructure(inline.blocks, source); const tables = reconstructComplexTables(ocr.blocks);
+  return { blocks: tables.blocks, diagnostics: { inline_enumerations: inline.diagnostics, ocr: ocr.diagnostics, tables: tables.diagnostics } };
 }
 
-module.exports = { recoverOcrStructure, reconstructComplexTables, preparePreGenerationBlocks };
+module.exports = {
+  PRE_GENERATION_SEMANTIC_CONTRACT_VERSION, PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT,
+  expandInlineEnumerations, recoverOcrStructure, reconstructComplexTables, preparePreGenerationBlocks
+};
 },
 "src/useful-card-contract.js": function(require, module, exports) {
 const CONTRACT_VERSION = 'useful-card/2.0';
@@ -95228,7 +95302,7 @@ const TYPE_RULES = [
   ['commercial_term', /(?:付款|报价|合同价|保函|违约|payment|price)/i],
   ['schedule', /(?:工期|里程碑|开工|完工|截止|schedule|deadline)/i],
   ['risk', /(?:风险|隐患|可能导致|risk|hazard)/i],
-  ['requirement', /(?:必须|应当|(?<!不)应|不得|须|shall|must|required)/i],
+  ['requirement', /(?:严禁|禁止|不得|不应当|不应|必须|应当|(?<!不)应|须|可以|允许|shall|must|required|prohibited|permitted|allowed)/i],
   ['decision', /(?:决定|决议|批准|同意|approved|resolved)/i],
   ['action', /(?:行动项|待办|负责人|完成日期|action item)/i],
   ['procedure', /(?:步骤|流程|程序|依次|procedure|process)/i],
@@ -95250,6 +95324,9 @@ function inferType(text, block) {
   if (block.kind === 'heading') return 'section_overview';
   if (block.metadata?.document_metadata) return 'document_metadata';
   if (block.kind === 'list_item' && /^(?:☐|\[ ?\]|检查|核查)/.test(text)) return 'checklist_item';
+  if (block.metadata?.inline_enumeration && block.metadata?.parent_clause_text
+    && /\bmay\b/i.test(text)
+    && /(?:要求|规定|规则|许可|可选|requirements?|rules?|permissions?|options?)/iu.test(block.metadata.parent_clause_text)) return 'requirement';
   return TYPE_RULES.find(([, pattern]) => pattern.test(text))?.[0] || 'unknown';
 }
 function clauses(text) {
@@ -95258,7 +95335,7 @@ function clauses(text) {
 function isDependent(text) { return /^(?:其中|并且|以及|且|同时|但|但是|除非|除外|在.+(?:时|情况下)|若|如果|当|否则|前述|上述|其|该)/.test(text); }
 const LIST_MARKER = /^(?:[-*•]\s*|[（(]\s*\d+\s*[)）]\s*|\d+\s*[.)、]\s*|[（(]?[一二三四五六七八九十]+[)）、]\s*)/u;
 function stripListMarker(text) { return clean(String(text || '').replace(LIST_MARKER, '')); }
-function modality(text) { return clean(text.match(/不得|不宜|必须|应当|须|宜|可以|shall not|must not|shall|must|should|may/i)?.[0], 30) || '陈述'; }
+function modality(text) { return clean(text.match(/严禁|禁止|不得|不应当|不应|不宜|必须|应当|(?<!不)应|须|允许|可以|宜|shall not|must not|shall|must|prohibited|should not|should|permitted|allowed|may/i)?.[0], 30) || '陈述'; }
 function conditions(text) { return uniq([...text.matchAll(/(?:如果|若|当|在)([^，。；]{2,80})(?:时|情况下)?[,，]/g)].map((m) => m[0])); }
 function exceptions(text) { return uniq([...text.matchAll(/(?:除非|除外|但|但是)([^。；]{2,100})/g)].map((m) => m[0])); }
 function parameters(text) { return uniq([...stripListMarker(text).matchAll(/-?\d+(?:\.\d+)?\s*(?:MPa|mm\/s|mm|cm|kg|万元|小时|m|t|%|元|天|日|次|°C)/gi)].map((m) => m[0])); }
@@ -95496,7 +95573,8 @@ const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts } = re
 const { analyzeText } = require("src/content-integrity.js");
 const { generateUsefulCards, SEMANTIC_KIND } = require("src/useful-card-generation.js");
 const { STRUCTURE_VERSION, buildStructureContext } = require("src/structure-context.js");
-const { preparePreGenerationBlocks } = require("src/pre-generation-structure.js");
+const { PRE_GENERATION_SEMANTIC_CONTRACT_VERSION, PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT,
+  preparePreGenerationBlocks } = require("src/pre-generation-structure.js");
 
 const PIPELINE_VERSION = '5.0-structure-aware-useful-card';
 const OUTPUT_LANGUAGE = 'zh-CN';
@@ -95618,7 +95696,7 @@ function deterministicChinese(text) {
 function normalizeLocator(raw, fallback) {
   const locator = raw && typeof raw === 'object' ? raw : {};
   const result = {};
-  for (const key of ['scheme', 'value', 'page', 'sheet', 'range', 'row', 'column', 'message_id', 'attachment_id', 'heading_path']) {
+  for (const key of ['scheme', 'value', 'fragment', 'page', 'sheet', 'range', 'row', 'column', 'message_id', 'attachment_id', 'heading_path']) {
     if (locator[key] !== undefined && locator[key] !== null && String(locator[key]).trim()) result[key] = locator[key];
   }
   if (!result.scheme) result.scheme = 'block';
@@ -95693,6 +95771,10 @@ function canonicalizeDocument(input = {}) {
     || `src-${digest([source.source_hash, source.source_path, blocks.map((block) => block.text)]).slice(0, 24)}`;
   const canonical = {
     schema_version: 'canonical-document/2.0', pipeline_version: PIPELINE_VERSION,
+    pre_generation_semantic_contract: {
+      version: PRE_GENERATION_SEMANTIC_CONTRACT_VERSION,
+      fingerprint: PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT
+    },
     source_document_id: sourceId, source_identity: clean(source.source_identity, 300) || sourceId,
     source_hash: clean(source.source_hash, 128), source_path: clean(source.source_path, 1000),
     title: clean(source.title || source.filename, 400) || '未命名资料',
@@ -95705,6 +95787,27 @@ function canonicalizeDocument(input = {}) {
   canonical.structure = buildStructureContext(source, blocks);
   canonical.fingerprint = digest([blocks.map(({ block_id, kind, text }) => ({ block_id, kind, text })), canonical.structure]);
   return canonical;
+}
+
+function isReusableUniversalArtifact(artifact, sourceHash) {
+  return artifact?.document?.source_hash === sourceHash
+    && artifact?.pipeline_version === PIPELINE_VERSION
+    && artifact?.document?.pre_generation_semantic_contract?.version === PRE_GENERATION_SEMANTIC_CONTRACT_VERSION
+    && artifact?.document?.pre_generation_semantic_contract?.fingerprint === PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT
+    && artifact?.document?.structure?.schema_version === STRUCTURE_VERSION
+    && Array.isArray(artifact?.knowledge_units)
+    && Array.isArray(artifact?.knowledge_events)
+    && artifact.knowledge_events.every((event) => event?.schema_version === 'useful-card/2.0/knowledge-event')
+    && Array.isArray(artifact?.card_plans)
+    && artifact.card_plans.every((plan) => plan?.schema_version === 'useful-card/2.0/card-plan');
+}
+
+function reusableTranslationCache(checkpoint, priorArtifact, sourceHash) {
+  if (checkpoint?.schema_version === 'translation-checkpoint/2.0'
+    && checkpoint?.source_hash === sourceHash && checkpoint?.cache && typeof checkpoint.cache === 'object') return checkpoint.cache;
+  if (priorArtifact?.document?.source_hash === sourceHash
+    && priorArtifact?.translation_cache && typeof priorArtifact.translation_cache === 'object') return priorArtifact.translation_cache;
+  return {};
 }
 
 function semanticSignals(text) {
@@ -96428,7 +96531,8 @@ module.exports = {
   canonicalizeDocument, inferProfile, segmentDocument, normalizeKnowledgeUnit,
   normalizeTags, routeUnit, planKnowledgeUnits, repairCoverage, relationEvidence,
   planUsefulKnowledgeUnits,
-  groupedReview, runUniversalPipeline, runUniversalPipelineMultilingual, digest, stableJson
+  groupedReview, runUniversalPipeline, runUniversalPipelineMultilingual, isReusableUniversalArtifact,
+  reusableTranslationCache, digest, stableJson
 };
 },
 "src/knowledge-write-port.js": function(require, module, exports) {
@@ -96821,7 +96925,7 @@ function encodedLocator(locator) {
 }
 
 function displayEvidence(value) {
-  return clean(value, 12000)
+  return String(value ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim().slice(0, 12000)
     .replace(/\s*(?=(?:[（(]\d+[)）]|\d+[.、])\s*)/g, '\n')
     .replace(/\s*(?=(?:第[一二三四五六七八九十\d]+[章节条]|[一二三四五六七八九十]+、))/g, '\n')
     .replace(/\n{3,}/g, '\n\n').trim();

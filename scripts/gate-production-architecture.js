@@ -29,14 +29,20 @@ assert.strictEqual((processTask.match(/parseDocumentAutomatically\(current, buff
 assert(!processTask.includes('pdfExtractionOrder'), '生产任务不得读取旧 PDF 引擎顺序');
 assert(processTask.includes('this.runStructuredWriterPhase(current, parsePackage)'), 'processTask 必须进入统一结构化生成路径');
 assert(productionCommit.includes('runUniversalPipelineMultilingual'), '生产结构化阶段必须进入统一语义管线');
-assert(productionCommit.includes("priorUniversal?.pipeline_version === '5.0-structure-aware-useful-card'"), '旧 universal/useful-card 缓存必须失效');
-assert(productionCommit.includes("priorUniversal?.document?.structure?.schema_version === 'structure-context/2.0'"), '生产缓存必须携带结构契约');
+assert(productionCommit.includes('isReusableUniversalArtifact(priorUniversal, document.source_hash)'),
+  '生产 universal 缓存必须通过集中复用谓词');
+assert(productionCommit.includes('reusableTranslationCache(translationCheckpoint, priorUniversal, document.source_hash)'),
+  '旧 universal 中的 translation cache 仅能在来源 hash 一致时复用');
 const universalModuleStart = main.indexOf('"src/universal-knowledge-pipeline.js": function');
 const universalModule = main.slice(universalModuleStart, main.indexOf('"src/knowledge-write-port.js": function', universalModuleStart));
 assert(universalModule.includes('planUsefulKnowledgeUnits(document, profile'), '生产 bundle 必须实际调用 useful-card planner');
 assert(universalModule.includes('knowledge_events: planned.useful_card.events'), '生产产物必须携带版本化知识事件');
 assert(universalModule.includes('buildStructureContext(source, blocks)'), '生产 canonicalizeDocument 必须构建结构上下文');
 assert(universalModule.includes('generateUsefulCards(document, regions'), '生产 planner 必须消费携带结构的 canonical document');
+assert(universalModule.includes("artifact?.pipeline_version === PIPELINE_VERSION"), '旧 universal/useful-card 缓存必须失效');
+assert(universalModule.includes("artifact?.document?.structure?.schema_version === STRUCTURE_VERSION"), '生产缓存必须携带结构契约');
+assert(universalModule.includes('pre_generation_semantic_contract?.fingerprint === PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT'),
+  '生产缓存必须携带预生成语义指纹');
 assert(main.includes("const DEFAULT_ORDER = ['mineru-api'];"), '生产外部解析只能保留 MinerU');
 assert(main.includes('LEGACY_PADDLEOCR_REMOVED'), 'PaddleOCR 兼容入口必须显式拒绝生产调用');
 assert(main.includes("EKS_ENABLE_DEVELOPMENT_SHADOW === '1'"), '影子评估必须受开发环境变量隔离');

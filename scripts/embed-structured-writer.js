@@ -63,6 +63,27 @@ if (presentStart) {
   assert(offset >= 0, '找不到结构化模块插入锚点');
   expected = `${current.slice(0, offset)}${generated}\n${current.slice(offset)}`;
 }
+const oldImport = 'const { runUniversalPipelineMultilingual } = require("src/universal-knowledge-pipeline.js");';
+const priorImport = 'const { runUniversalPipelineMultilingual, isReusableUniversalArtifact } = require("src/universal-knowledge-pipeline.js");';
+const newImport = 'const { runUniversalPipelineMultilingual, isReusableUniversalArtifact, reusableTranslationCache } = require("src/universal-knowledge-pipeline.js");';
+if (expected.includes(oldImport)) expected = expected.replace(oldImport, newImport);
+if (expected.includes(priorImport)) expected = expected.replace(priorImport, newImport);
+const oldPredicate = `let universal = priorUniversal?.document?.source_hash === document.source_hash
+      && priorUniversal?.pipeline_version === '5.0-structure-aware-useful-card'
+      && priorUniversal?.document?.structure?.schema_version === 'structure-context/2.0'
+      && Array.isArray(priorUniversal?.knowledge_units)
+      && Array.isArray(priorUniversal?.knowledge_events)
+      && priorUniversal.knowledge_events.every((event) => event?.schema_version === 'useful-card/2.0/knowledge-event')
+      && Array.isArray(priorUniversal?.card_plans)
+      && priorUniversal.card_plans.every((plan) => plan?.schema_version === 'useful-card/2.0/card-plan') ? priorUniversal : null;`;
+const newPredicate = 'let universal = isReusableUniversalArtifact(priorUniversal, document.source_hash) ? priorUniversal : null;';
+if (expected.includes(oldPredicate)) expected = expected.replace(oldPredicate, newPredicate);
+const oldTranslationCache = 'translation_cache: translationCheckpoint?.cache || priorUniversal?.translation_cache || {},';
+const newTranslationCache = 'translation_cache: reusableTranslationCache(translationCheckpoint, priorUniversal, document.source_hash),';
+if (expected.includes(oldTranslationCache)) expected = expected.replace(oldTranslationCache, newTranslationCache);
+assert(expected.includes(newImport), '找不到 universal pipeline 运行时导入锚点');
+assert(expected.includes(newPredicate), '找不到 universal canonical 复用谓词锚点');
+assert(expected.includes(newTranslationCache), '找不到安全 translation cache 复用锚点');
 if (process.argv.includes('--check')) {
   assert.strictEqual(current, expected, 'main.js 内嵌结构化模块与 src 源文件不同步');
   console.log('structured phase embed: synchronized');

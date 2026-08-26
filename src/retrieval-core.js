@@ -82,7 +82,7 @@ function markdownRecord(markdown, path = '') {
   return canonicalRecord({
     id: meta.record_id || meta.card_id, title: meta.title || heading || meta.search_title,
     search_title: meta.search_title, aliases: parseArray(meta.aliases), keywords: parseArray(meta.keywords),
-    tags: parseArray(meta.tags), body, evidence: evidence.map((text, index) => ({ text, locator: structuredLocators[index] || locators[index] || '' })),
+    tags: parseArray(meta.tags), body, evidence: evidence.map((text, index) => ({ text, raw_verbatim: text, locator: structuredLocators[index] || locators[index] || '' })),
     source_id: meta.owner_source_id || parseArray(meta.source_document_ids)[0], source_path: meta.source_path,
     semantic_kind: meta.semantic_kind || meta.record_kind, category: meta.category, library: meta.library,
     path, content_hash: meta.content_hash || meta.source_hash

@@ -266,18 +266,45 @@ async function main() {
       metadata: parsed.metadata,
       blocks: parsed.blocks
     } });
-  const artifacts = { parsed, 'universal-canonical': canonical };
+  const preContractCanonical = structuredClone(canonical);
+  delete preContractCanonical.document.pre_generation_semantic_contract;
+  preContractCanonical.translation_cache = { safe_translation_checkpoint_entry: { translated_text: '安全复用' } };
+  const wrongSourceLegacy = structuredClone(preContractCanonical);
+  wrongSourceLegacy.document.source_hash = 'b'.repeat(64);
+  wrongSourceLegacy.translation_cache = { unsafe_cross_source_entry: { translated_text: '禁止复用' } };
+  const wrongSourceArtifacts = { parsed, 'universal-canonical': wrongSourceLegacy };
+  const wrongSourceCounters = { artifactLoads: {}, progress: [], parser: 0, upload: 0, provider: 0 };
+  const wrongSourcePlugin = createPlugin(PluginClass, vaultHarness, task, wrongSourceArtifacts, wrongSourceCounters);
+  const wrongSourceRegenerated = await PluginClass.prototype.runStructuredWriterPhase.call(wrongSourcePlugin, task, parsed);
+  assert.notStrictEqual(wrongSourceRegenerated.universalResult, wrongSourceLegacy,
+    'wrong-source legacy universal canonical must be regenerated');
+  assert.strictEqual(wrongSourceRegenerated.universalResult.translation_cache.unsafe_cross_source_entry, undefined,
+    'wrong-source legacy universal translation cache must never be reused');
+  assert.deepStrictEqual(wrongSourceRegenerated.universalResult.translation_cache, {},
+    'Chinese wrong-source regeneration must start with an empty translation cache');
+  assert.strictEqual(wrongSourceCounters.provider, 0,
+    'wrong-source regeneration must not invent provider work for Chinese regions');
+
+  const artifacts = { parsed, 'universal-canonical': preContractCanonical };
   const counters = { artifactLoads: {}, progress: [], parser: 0, upload: 0, provider: 0 };
   const plugin = createPlugin(PluginClass, vaultHarness, task, artifacts, counters);
 
+  const regenerated = await PluginClass.prototype.runStructuredWriterPhase.call(plugin, task, parsed);
+  assert.notStrictEqual(regenerated.universalResult, preContractCanonical,
+    'pre-contract universal canonical from 737d6e0 must be regenerated');
+  assert.deepStrictEqual(regenerated.universalResult.translation_cache.safe_translation_checkpoint_entry,
+    preContractCanonical.translation_cache.safe_translation_checkpoint_entry,
+    'safe translation cache survives selective universal regeneration');
+  assert.strictEqual(counters.provider, 0, 'selective regeneration must not invent provider work for Chinese regions');
+  const refreshedCanonical = artifacts['universal-canonical'];
   const direct = await PluginClass.prototype.runStructuredWriterPhase.call(plugin, task, parsed);
   assert.strictEqual(direct.mode, 'structured-write');
   assert(direct.plan && direct.plan.actions.length > 0, 'actual bundled writer must produce a plan');
   assert(direct.transaction, 'actual bundled writer must commit its plan');
   assert.strictEqual(direct.transaction.verified.counts.knowledge_records, 1);
   assert.strictEqual(direct.transaction.verified.knowledge_paths.length, 1);
-  assert.strictEqual(direct.universalResult, canonical, 'the valid universal checkpoint must be reused');
-  assert.strictEqual(counters.artifactLoads['universal-canonical'], 1);
+  assert.strictEqual(direct.universalResult, refreshedCanonical, 'the refreshed valid universal checkpoint must be reused on retry');
+  assert.strictEqual(counters.artifactLoads['universal-canonical'], 2);
   assert.strictEqual(plugin.operationCounters.apiRequests, 0);
   assert(!JSON.stringify(direct.plan).includes(hostRoot), 'poisoned host paths must not enter the plan');
   const persistedIndex = JSON.parse(vaultHarness.files.get(indexPath));

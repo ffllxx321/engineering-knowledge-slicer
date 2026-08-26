@@ -212,7 +212,7 @@ function encodedLocator(locator) {
 }
 
 function displayEvidence(value) {
-  return clean(value, 12000)
+  return String(value ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim().slice(0, 12000)
     .replace(/\s*(?=(?:[（(]\d+[)）]|\d+[.、])\s*)/g, '\n')
     .replace(/\s*(?=(?:第[一二三四五六七八九十\d]+[章节条]|[一二三四五六七八九十]+、))/g, '\n')
     .replace(/\n{3,}/g, '\n\n').trim();

@@ -1,0 +1,24 @@
+{
+  "schema": "eks/inline-enumeration-generation-fixture/1",
+  "document": {
+    "source_document_id": "inline-enumeration-generic",
+    "source_hash": "6666666666666666666666666666666666666666666666666666666666666666",
+    "filename": "sanitized-requirements.txt",
+    "parser": "local-text",
+    "blocks": [
+      { "block_id": "scope-parenthetical", "kind": "paragraph", "raw": { "text": "室内泵组应符合下列要求：（1）操作员必须检查接地；（2）操作员必须记录绝缘电阻，但经批准的测试区域除外。" }, "locator": { "scheme": "line", "value": "10", "page": 1 }, "parse": { "method": "local-text-blocks", "quality": 1 } },
+      { "block_id": "scope-chinese", "kind": "paragraph", "raw": { "text": "室外阀组要求如下：一、维护人员必须关闭上游阀门；二、维护人员必须挂牌，并且记录关闭时间。" }, "locator": { "scheme": "line", "value": "20", "page": 1 }, "parse": { "method": "local-text-blocks", "quality": 1 } },
+      { "block_id": "scope-arabic", "kind": "paragraph", "raw": { "text": "启动检查要求：1. 操作员必须确认护罩锁定，如果锁扣松动，应先加固；2. 操作员不得旁路联锁。" }, "locator": { "scheme": "line", "value": "30", "page": 2 }, "parse": { "method": "local-text-blocks", "quality": 1 } },
+      { "block_id": "numeric-prose", "kind": "paragraph", "raw": { "text": "设计压力为 1.6 MPa，试验压力为 2.4 MPa。" }, "locator": { "scheme": "line", "value": "40", "page": 2 }, "parse": { "method": "local-text-blocks", "quality": 1 } },
+      { "block_id": "clause-references", "kind": "paragraph", "raw": { "text": "操作员必须同时参见 1.2 和 2.3 条，不得遗漏联锁记录。" }, "locator": { "scheme": "line", "value": "50", "page": 2 }, "parse": { "method": "local-text-blocks", "quality": 1 } },
+      { "block_id": "native-a", "kind": "list_item", "raw": { "text": "施工方必须保留校验记录。" }, "locator": { "scheme": "line", "value": "60", "page": 3 }, "metadata": { "list_id": "native", "ordinal": 1 }, "parse": { "method": "local-text-blocks", "quality": 1 } },
+      { "block_id": "native-b", "kind": "list_item", "raw": { "text": "施工方不得删除原始读数。" }, "locator": { "scheme": "line", "value": "61", "page": 3 }, "metadata": { "list_id": "native", "ordinal": 2 }, "parse": { "method": "local-text-blocks", "quality": 1 } }
+    ]
+  },
+  "questions": [
+    { "id": "grounding", "query": "室内泵组由谁检查接地", "quote": "（1）操作员必须检查接地；" },
+    { "id": "exception", "query": "室内泵组绝缘电阻记录有什么例外", "quote": "（2）操作员必须记录绝缘电阻，但经批准的测试区域除外。" },
+    { "id": "upstream-valve", "query": "室外阀组维护时必须关闭什么", "quote": "一、维护人员必须关闭上游阀门；" },
+    { "id": "interlock", "query": "启动检查是否允许旁路联锁", "quote": "2. 操作员不得旁路联锁。" }
+  ]
+}

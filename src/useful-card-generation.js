@@ -13,7 +13,7 @@ const TYPE_RULES = [
   ['commercial_term', /(?:付款|报价|合同价|保函|违约|payment|price)/i],
   ['schedule', /(?:工期|里程碑|开工|完工|截止|schedule|deadline)/i],
   ['risk', /(?:风险|隐患|可能导致|risk|hazard)/i],
-  ['requirement', /(?:必须|应当|(?<!不)应|不得|须|shall|must|required)/i],
+  ['requirement', /(?:严禁|禁止|不得|不应当|不应|必须|应当|(?<!不)应|须|可以|允许|shall|must|required|prohibited|permitted|allowed)/i],
   ['decision', /(?:决定|决议|批准|同意|approved|resolved)/i],
   ['action', /(?:行动项|待办|负责人|完成日期|action item)/i],
   ['procedure', /(?:步骤|流程|程序|依次|procedure|process)/i],
@@ -35,6 +35,9 @@ function inferType(text, block) {
   if (block.kind === 'heading') return 'section_overview';
   if (block.metadata?.document_metadata) return 'document_metadata';
   if (block.kind === 'list_item' && /^(?:☐|\[ ?\]|检查|核查)/.test(text)) return 'checklist_item';
+  if (block.metadata?.inline_enumeration && block.metadata?.parent_clause_text
+    && /\bmay\b/i.test(text)
+    && /(?:要求|规定|规则|许可|可选|requirements?|rules?|permissions?|options?)/iu.test(block.metadata.parent_clause_text)) return 'requirement';
   return TYPE_RULES.find(([, pattern]) => pattern.test(text))?.[0] || 'unknown';
 }
 function clauses(text) {
@@ -43,7 +46,7 @@ function clauses(text) {
 function isDependent(text) { return /^(?:其中|并且|以及|且|同时|但|但是|除非|除外|在.+(?:时|情况下)|若|如果|当|否则|前述|上述|其|该)/.test(text); }
 const LIST_MARKER = /^(?:[-*•]\s*|[（(]\s*\d+\s*[)）]\s*|\d+\s*[.)、]\s*|[（(]?[一二三四五六七八九十]+[)）、]\s*)/u;
 function stripListMarker(text) { return clean(String(text || '').replace(LIST_MARKER, '')); }
-function modality(text) { return clean(text.match(/不得|不宜|必须|应当|须|宜|可以|shall not|must not|shall|must|should|may/i)?.[0], 30) || '陈述'; }
+function modality(text) { return clean(text.match(/严禁|禁止|不得|不应当|不应|不宜|必须|应当|(?<!不)应|须|允许|可以|宜|shall not|must not|shall|must|prohibited|should not|should|permitted|allowed|may/i)?.[0], 30) || '陈述'; }
 function conditions(text) { return uniq([...text.matchAll(/(?:如果|若|当|在)([^，。；]{2,80})(?:时|情况下)?[,，]/g)].map((m) => m[0])); }
 function exceptions(text) { return uniq([...text.matchAll(/(?:除非|除外|但|但是)([^。；]{2,100})/g)].map((m) => m[0])); }
 function parameters(text) { return uniq([...stripListMarker(text).matchAll(/-?\d+(?:\.\d+)?\s*(?:MPa|mm\/s|mm|cm|kg|万元|小时|m|t|%|元|天|日|次|°C)/gi)].map((m) => m[0])); }

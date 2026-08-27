@@ -6,7 +6,7 @@
  * commitPlan/rollbackTransaction and guarded by an injected adapter.
  */
 const crypto = require('crypto');
-const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts, distinctSemanticTexts } = require('./semantic-text.js');
+const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts, distinctSemanticTexts, cleanTitleBoundary } = require('./semantic-text.js');
 const {
   ACTIVE_TENDER_CATEGORIES,
   BUSINESS_CATEGORIES,
@@ -225,6 +225,9 @@ function readableSummary(value) {
 }
 
 function serializeRecord(record) {
+  record.title = cleanTitleBoundary(record.title, 160) || '知识单元';
+  record.search_title = cleanTitleBoundary(record.search_title || record.title, 240) || record.title;
+  record.aliases = distinctSemanticTexts((record.aliases || []).map((item) => cleanTitleBoundary(item, 160)), [record.title, record.search_title]);
   const check = validateRecord(record);
   if (!check.valid) throw new Error(`记录 ${record.record_id} 不符合 schema：${check.errors.join('；')}`);
   const relations = (record.relations || []).slice().sort((a, b) =>
@@ -544,10 +547,10 @@ function assertSourceRecordLimit(records, settings, sourceId) {
 }
 
 function normalizeCanonicalPresentation(rawUnit) {
-  const title = clean(rawUnit.title, 160).replace(/^(?:标题|名称)[：:]\s*/, '').replace(/([要求方法流程参数定义])(?:要求|方法|流程|参数|定义)$/u, '$1') || '知识单元';
+  const title = cleanTitleBoundary(clean(rawUnit.title, 160).replace(/^(?:标题|名称)[：:]\s*/, '').replace(/([要求方法流程参数定义])(?:要求|方法|流程|参数|定义)$/u, '$1'), 160) || '知识单元';
   const statement = dedupeSemanticTexts(String(rawUnit.statement || '').split(/\n+/)
     .map((line) => clean(line).replace(/^(?:标题|名称)[：:]\s*/, ''))).join('\n');
-  let searchTitle = clean(rawUnit.search_title || title, 240);
+  let searchTitle = cleanTitleBoundary(rawUnit.search_title || title, 240);
   if (normalizeSemanticText(searchTitle) === normalizeSemanticText(title)) {
     const retrieval = distinctSemanticTexts([rawUnit.subject, ...(rawUnit.keywords || [])], [title])[0];
     if (retrieval) searchTitle = `${title} ${retrieval}`;
@@ -702,7 +705,7 @@ function buildPlan(input) {
     const oldPath = existingIndex?.path;
     const managedTechnical = oldPath && oldPath.split('/').at(-1) === `${record.record_id}.md`
       && input.existingFiles?.[oldPath] !== undefined && Boolean(existingIndex.content_hash);
-    let candidate = existingIndex && !managedTechnical && input.archiveTransition !== true ? oldPath : desired;
+    let candidate = desired;
     const ext = '.md'; const stem = candidate.slice(0, -ext.length);
     let ordinal = 1;
     while ((allocated.has(candidate) && allocated.get(candidate) !== record.record_id)
@@ -710,7 +713,7 @@ function buildPlan(input) {
       ordinal += 1; candidate = `${stem}（${ordinal}）${ext}`;
     }
     record.path = candidate; allocated.set(candidate, record.record_id);
-    if (managedTechnical && oldPath !== candidate) record.migrate_from_path = oldPath;
+    if (oldPath && oldPath !== candidate && input.archiveTransition !== true) record.migrate_from_path = oldPath;
   }
   const reviewGroups = resolveRelations(records, index, settings.limits);
   const byPath = input.existingFiles || {};

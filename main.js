@@ -95240,6 +95240,21 @@ const crypto = require('crypto');
 // remain part of the signature.
 const LIST_PREFIX = /^(?:\s*(?:[-*•●▪■□☐✓✔]+|[（(]?\d+[)）.、]|[（(]?[一二三四五六七八九十百]+[)）、.])\s*)+/u;
 const PRESENTATION_PUNCTUATION = /[\s,，.。;；!?！？、'"“”‘’`´…]/gu;
+const MARKDOWN_BOUNDARY_PREFIX = /^(?:\s*(?:#{1,6}\s*|>\s*|[-+*•●▪■□☐✓✔]+\s*|\[[ xX]\]\s*|[（(]?\d+[)）.、]\s*|[（(]?[一二三四五六七八九十百]+[)）、.]\s*))+/u;
+const BOUNDARY_PUNCTUATION = /^[\s\p{P}\p{S}]+|[\s\p{P}\p{S}]+$/gu;
+
+function cleanTitleBoundary(value, max = 160) {
+  let output = String(value ?? '').normalize('NFKC')
+    .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g, '')
+    .replace(/\r?\n+/g, ' ').trim();
+  // A heading may itself contain a list/task prefix, so peel layers until the
+  // boundary is ordinary prose. Internal punctuation and engineering symbols
+  // are deliberately retained.
+  let previous;
+  do { previous = output; output = output.replace(MARKDOWN_BOUNDARY_PREFIX, '').replace(BOUNDARY_PUNCTUATION, '').trim(); }
+  while (output && output !== previous);
+  return output.slice(0, max).replace(BOUNDARY_PUNCTUATION, '').trim();
+}
 
 function normalizeSemanticText(value) {
   return String(value ?? '')
@@ -95286,12 +95301,12 @@ function semanticContains(container, value) {
   return Boolean(outer && inner && outer.includes(inner));
 }
 
-module.exports = { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts, distinctSemanticTexts, semanticContains };
+module.exports = { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts, distinctSemanticTexts, semanticContains, cleanTitleBoundary };
 },
 "src/useful-card-generation.js": function(require, module, exports) {
 const crypto = require('crypto');
 const { CONTRACT_VERSION, validateKnowledgeEvent, validateCardPlan } = require("src/useful-card-contract.js");
-const { normalizeSemanticText, dedupeSemanticTexts, distinctSemanticTexts, semanticContains } = require("src/semantic-text.js");
+const { normalizeSemanticText, dedupeSemanticTexts, distinctSemanticTexts, semanticContains, cleanTitleBoundary } = require("src/semantic-text.js");
 const hash = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clean = (value, max = 8000) => String(value || '').normalize('NFKC').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, max);
 const uniq = (items) => [...new Set((items || []).map((x) => clean(x, 300)).filter(Boolean))];
@@ -95334,7 +95349,10 @@ function clauses(text) {
 }
 function isDependent(text) { return /^(?:其中|并且|以及|且|同时|但|但是|除非|除外|在.+(?:时|情况下)|若|如果|当|否则|前述|上述|其|该)/.test(text); }
 const LIST_MARKER = /^(?:[-*•]\s*|[（(]\s*\d+\s*[)）]\s*|\d+\s*[.)、]\s*|[（(]?[一二三四五六七八九十]+[)）、]\s*)/u;
-function stripListMarker(text) { return clean(String(text || '').replace(LIST_MARKER, '')); }
+function stripListMarker(text) {
+  return clean(String(text || '').replace(LIST_MARKER, '')
+    .replace(/^(?:\s*(?:#{1,6}\s*|>\s*|[-+*•●▪■□☐✓✔]+\s*|\[[ xX]\]\s*))+/u, ''));
+}
 function modality(text) { return clean(text.match(/严禁|禁止|不得|不应当|不应|不宜|必须|应当|(?<!不)应|须|允许|可以|宜|shall not|must not|shall|must|prohibited|should not|should|permitted|allowed|may/i)?.[0], 30) || '陈述'; }
 function conditions(text) { return uniq([...text.matchAll(/(?:如果|若|当|在)([^，。；]{2,80})(?:时|情况下)?[,，]/g)].map((m) => m[0])); }
 function exceptions(text) { return uniq([...text.matchAll(/(?:除非|除外|但|但是)([^。；]{2,100})/g)].map((m) => m[0])); }
@@ -95449,21 +95467,36 @@ function displayTitleFor(event) {
   if (event.source_context?.table_headers?.length > 1) {
     const readable = clean(rawSubject.replace(/[（(][^）)]+[）)]/g, '').replace(/参数(?=\s*\/)/gu, '').replace(/\s*\/\s*/g, ' '), 80)
       .replace(/(?<=\p{Script=Han})\s+(?=\p{Script=Han})/gu, '');
-    return clean(`${readable}${readable.endsWith(intent) ? '' : intent}`, 80);
+    return cleanTitleBoundary(`${readable}${readable.endsWith(intent) ? '' : intent}`, 80);
   }
-  const sentenceLike = rawSubject.length > 36 || /^(?:如果|若|当|在.+(?:时|情况下)|除非)/.test(rawSubject)
-    || /[，,；;。！？!?]/.test(rawSubject);
-  const subject = sentenceLike
-    ? clean(event.source_context?.heading_path?.at(-1), 48) || clean(rawSubject.split(/[，,；;。]/)[0], 32)
-    : rawSubject;
-  return clean(`${subject || '相关内容'}${intent}`, 80).replace(/[：:]|(?:要求){2,}$/g, '要求');
+  const predicate = stripListMarker(event.predicate).replace(/[。；;]+$/g, '');
+  const withoutConditionLead = predicate
+    .replace(/^(?:如果|若|当)\s*([^，,]{2,36})(?:时|情况下)?[,，]\s*/u, '$1时 ')
+    .replace(/^在[^，,]{2,40}(?:时|情况下)[,，]\s*/u, '')
+    .replace(/^除非[^，,]{2,60}[,，]\s*/u, '');
+  const declarative = withoutConditionLead
+    .replace(/^(?:其中|同时|并且|以及|且)\s*/u, '')
+    .replace(/(?:严禁|禁止|不得|不应当|不应|不宜|必须|应当|(?<!不)应|须|允许|可以|宜|shall not|must not|shall|must|required|prohibited|should not|should|permitted|allowed|may)/iu, ' ')
+    .replace(/[：:]/g, ' ').replace(/\s+/g, ' ').trim()
+    .replace(/^(?:(?:工程验收|施工验收|合同)要求\s*)+/u, '')
+    .replace(/\s+before\s+\d{4}(?:[-/.]\d{1,2}){0,2}.*$/iu, '');
+  let core = cleanTitleBoundary(declarative, 56);
+  const atomicLead = cleanTitleBoundary(core.split(/[，,；;。！？!?]/)[0], 40);
+  if (atomicLead.length >= 4) core = atomicLead;
+  core = core.replace(/(?<=\p{Script=Han})\s+(?=\p{Script=Han})/gu, '');
+  if (!core || normalizeSemanticText(core) === normalizeSemanticText(intent)) core = rawSubject;
+  const negative = /(?:严禁|禁止|不得|不应当|不应|shall not|must not|prohibited)/iu.test(predicate);
+  const suffix = negative ? '禁用要求' : intent;
+  if (suffix === '验收检查' && /验收$/u.test(core)) core += '检查';
+  else if (!new RegExp(`${suffix}$|要求$|流程$|方法$|参数$|定义$|检查项$`, 'u').test(core)) core += suffix;
+  return cleanTitleBoundary(core.replace(/(?:要求){2,}$/u, '要求'), 80) || '相关知识';
 }
 function searchTitleFor(event) {
   const predicate = stripListMarker(event.predicate).replace(/[。；;]+$/g, '');
   const subject = stripListMarker(event.subject);
   const complete = semanticContains(predicate, subject) ? predicate : `${subject}：${predicate}`;
   const title = displayTitleFor(event);
-  const candidate = clean(complete.length <= 160 ? complete : `${title}：${predicate.slice(0, 100)}`, 160);
+  const candidate = cleanTitleBoundary(complete.length <= 160 ? complete : `${title}：${predicate.slice(0, 100)}`, 160);
   return normalizeSemanticText(candidate) === normalizeSemanticText(title)
     ? clean(`${title} ${event.parameters[0] || event.source_context?.table_headers?.at(-1) || event.semantic_type}`, 160) : candidate;
 }
@@ -96719,7 +96752,7 @@ module.exports = {
  * commitPlan/rollbackTransaction and guarded by an injected adapter.
  */
 const crypto = require('crypto');
-const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts, distinctSemanticTexts } = require("src/semantic-text.js");
+const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts, distinctSemanticTexts, cleanTitleBoundary } = require("src/semantic-text.js");
 const {
   ACTIVE_TENDER_CATEGORIES,
   BUSINESS_CATEGORIES,
@@ -96938,6 +96971,9 @@ function readableSummary(value) {
 }
 
 function serializeRecord(record) {
+  record.title = cleanTitleBoundary(record.title, 160) || '知识单元';
+  record.search_title = cleanTitleBoundary(record.search_title || record.title, 240) || record.title;
+  record.aliases = distinctSemanticTexts((record.aliases || []).map((item) => cleanTitleBoundary(item, 160)), [record.title, record.search_title]);
   const check = validateRecord(record);
   if (!check.valid) throw new Error(`记录 ${record.record_id} 不符合 schema：${check.errors.join('；')}`);
   const relations = (record.relations || []).slice().sort((a, b) =>
@@ -97257,10 +97293,10 @@ function assertSourceRecordLimit(records, settings, sourceId) {
 }
 
 function normalizeCanonicalPresentation(rawUnit) {
-  const title = clean(rawUnit.title, 160).replace(/^(?:标题|名称)[：:]\s*/, '').replace(/([要求方法流程参数定义])(?:要求|方法|流程|参数|定义)$/u, '$1') || '知识单元';
+  const title = cleanTitleBoundary(clean(rawUnit.title, 160).replace(/^(?:标题|名称)[：:]\s*/, '').replace(/([要求方法流程参数定义])(?:要求|方法|流程|参数|定义)$/u, '$1'), 160) || '知识单元';
   const statement = dedupeSemanticTexts(String(rawUnit.statement || '').split(/\n+/)
     .map((line) => clean(line).replace(/^(?:标题|名称)[：:]\s*/, ''))).join('\n');
-  let searchTitle = clean(rawUnit.search_title || title, 240);
+  let searchTitle = cleanTitleBoundary(rawUnit.search_title || title, 240);
   if (normalizeSemanticText(searchTitle) === normalizeSemanticText(title)) {
     const retrieval = distinctSemanticTexts([rawUnit.subject, ...(rawUnit.keywords || [])], [title])[0];
     if (retrieval) searchTitle = `${title} ${retrieval}`;
@@ -97415,7 +97451,7 @@ function buildPlan(input) {
     const oldPath = existingIndex?.path;
     const managedTechnical = oldPath && oldPath.split('/').at(-1) === `${record.record_id}.md`
       && input.existingFiles?.[oldPath] !== undefined && Boolean(existingIndex.content_hash);
-    let candidate = existingIndex && !managedTechnical && input.archiveTransition !== true ? oldPath : desired;
+    let candidate = desired;
     const ext = '.md'; const stem = candidate.slice(0, -ext.length);
     let ordinal = 1;
     while ((allocated.has(candidate) && allocated.get(candidate) !== record.record_id)
@@ -97423,7 +97459,7 @@ function buildPlan(input) {
       ordinal += 1; candidate = `${stem}（${ordinal}）${ext}`;
     }
     record.path = candidate; allocated.set(candidate, record.record_id);
-    if (managedTechnical && oldPath !== candidate) record.migrate_from_path = oldPath;
+    if (oldPath && oldPath !== candidate && input.archiveTransition !== true) record.migrate_from_path = oldPath;
   }
   const reviewGroups = resolveRelations(records, index, settings.limits);
   const byPath = input.existingFiles || {};

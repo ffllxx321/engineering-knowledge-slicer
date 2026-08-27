@@ -70,7 +70,7 @@ assert.deepStrictEqual(english.map((event) => [event.semantic_type, event.modali
 assert(!result.document.blocks.some((item) => item.block_id.startsWith('epistemic-may:inline-')));
 
 const plans = result.card_plans;
-assert(plans.some((plan) => plan.title === '作业人员不应拆除护罩要求'
+assert(plans.some((plan) => plan.title === '作业人员拆除护罩禁用要求'
   && plan.body === '要求：作业人员不应拆除护罩;\n适用范围：安全规则:'));
 assert(plans.some((plan) => plan.body === '要求：The owner may approve an extension.\n适用范围：The following requirements apply:'));
 assert(plans.some((plan) => plan.search_title === '主管可以批准停机'));
@@ -88,16 +88,16 @@ for (const evidence of records.flatMap((record) => record.evidence).filter((item
   assert.strictEqual(original.slice(start, end), evidence.raw_verbatim);
   assert.strictEqual(evidence.raw_verbatim, canonical.raw_verbatim);
 }
-assert(records.some((record) => record.title === '主管要求' && record.body.includes('主管可以批准停机')));
+assert(records.some((record) => record.title === '主管批准停机要求' && record.body.includes('主管可以批准停机')));
 const retriever = new HybridRetriever(records);
 Promise.all([
   retriever.search('谁可以批准停机', { limit: 3 }),
   retriever.search('业主是否允许承包人延期', { limit: 3 }),
   retriever.search('操作员不得送电', { limit: 3 })
 ]).then(([approval, extension, energize]) => {
-  assert(approval.some((hit) => hit.record.title === '主管要求' && hit.record.evidence.some((item) => item.raw_verbatim === '5、主管可以批准停机；')));
-  assert(extension.some((hit) => hit.record.title === '业主允许承包人延期要求' && hit.record.body.includes('安全规则')));
-  assert(energize.some((hit) => hit.record.title === '操作员要求'
+  assert(approval.some((hit) => hit.record.title === '主管批准停机要求' && hit.record.evidence.some((item) => item.raw_verbatim === '5、主管可以批准停机；')));
+  assert(extension.some((hit) => hit.record.title === '业主承包人延期要求' && hit.record.body.includes('安全规则')));
+  assert(energize.some((hit) => hit.record.title === '操作员送电禁用要求'
     && hit.record.search_title === '操作员不得送电'
     && hit.record.evidence.some((item) => item.raw_verbatim === '(2)操作员不得送电；')));
   console.log('pre-generation final-review regression: contract reuse, modalities, exact spans, Markdown reload, natural facts, and counterexamples passed');

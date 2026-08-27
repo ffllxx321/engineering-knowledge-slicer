@@ -8,6 +8,21 @@ const crypto = require('crypto');
 // remain part of the signature.
 const LIST_PREFIX = /^(?:\s*(?:[-*•●▪■□☐✓✔]+|[（(]?\d+[)）.、]|[（(]?[一二三四五六七八九十百]+[)）、.])\s*)+/u;
 const PRESENTATION_PUNCTUATION = /[\s,，.。;；!?！？、'"“”‘’`´…]/gu;
+const MARKDOWN_BOUNDARY_PREFIX = /^(?:\s*(?:#{1,6}\s*|>\s*|[-+*•●▪■□☐✓✔]+\s*|\[[ xX]\]\s*|[（(]?\d+[)）.、]\s*|[（(]?[一二三四五六七八九十百]+[)）、.]\s*))+/u;
+const BOUNDARY_PUNCTUATION = /^[\s\p{P}\p{S}]+|[\s\p{P}\p{S}]+$/gu;
+
+function cleanTitleBoundary(value, max = 160) {
+  let output = String(value ?? '').normalize('NFKC')
+    .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g, '')
+    .replace(/\r?\n+/g, ' ').trim();
+  // A heading may itself contain a list/task prefix, so peel layers until the
+  // boundary is ordinary prose. Internal punctuation and engineering symbols
+  // are deliberately retained.
+  let previous;
+  do { previous = output; output = output.replace(MARKDOWN_BOUNDARY_PREFIX, '').replace(BOUNDARY_PUNCTUATION, '').trim(); }
+  while (output && output !== previous);
+  return output.slice(0, max).replace(BOUNDARY_PUNCTUATION, '').trim();
+}
 
 function normalizeSemanticText(value) {
   return String(value ?? '')
@@ -54,4 +69,4 @@ function semanticContains(container, value) {
   return Boolean(outer && inner && outer.includes(inner));
 }
 
-module.exports = { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts, distinctSemanticTexts, semanticContains };
+module.exports = { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts, distinctSemanticTexts, semanticContains, cleanTitleBoundary };

@@ -13,6 +13,7 @@ const shaBuffer = (b) => crypto.createHash("sha256").update(b).digest("hex");
 const shaFile = (p) => shaBuffer(fs.readFileSync(p));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const { analyzeMarkdownCard } = require('../src/content-integrity.js');
+const { auditVault } = require('./audit-real-obsidian-cards.js');
 
 class AcceptanceLifecycleError extends Error {
   constructor(code, message, evidence = {}, cause) {
@@ -512,7 +513,8 @@ async function main() {
     minimax_contract: provider.stats.contracts > 0,
   };
   const externalAcceptance = externalCorpusAcceptance(first.tasks, corpus.length);
-  const checks = { ...fixtureChecks, ...externalAcceptance.checks };
+  const postAudit = auditVault(vault);
+  const checks = { ...fixtureChecks, ...externalAcceptance.checks, real_obsidian_card_post_audit: postAudit.passed };
   const failures = Object.entries(checks)
     .filter(([, v]) => !v)
     .map(([k]) => k);
@@ -533,6 +535,7 @@ async function main() {
       metrics: provider.stats,
     },
     corpus,
+    real_obsidian_card_post_audit: postAudit,
     sources: safeSources(first.tasks),
     checks,
     failures,

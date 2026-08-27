@@ -33,6 +33,10 @@ function verifyStructure(run) {
   assert.strictEqual(run.result.document.blocks.filter((block) => block.block_id.startsWith('native-')).length, 2);
   const inlinePlans = run.result.card_plans.filter((card) => card.evidence_ids.some((id) => id.includes(':inline-item-')));
   assert.strictEqual(inlinePlans.length, 6, 'each explicit sibling requirement remains independently retrievable');
+  assert.strictEqual(new Set(inlinePlans.map((card) => normalizeSemanticText(card.title))).size, 6,
+    'sibling inline clauses have meaningfully distinct canonical titles');
+  assert(inlinePlans.every((card) => !/^(?:#|[-*•]|\d+[.)、]|[（(]\d+[)）])/.test(card.title)),
+    'canonical titles have no Markdown/list boundary markers');
   assert(inlinePlans.every((card) => /适用范围：/.test(card.body)));
   const exception = inlinePlans.find((card) => /绝缘电阻/.test(card.body));
   assert(exception && /除外/.test(exception.body) && !/检查接地/.test(exception.body));
@@ -60,9 +64,9 @@ async function main() {
   assert.strictEqual(restartReport.report_sha256, report.report_sha256);
   const hashes = { markdown: digest(first.markdown), plans: digest(first.result.card_plans), retrieval: report.report_sha256 };
   assert.deepStrictEqual(hashes, {
-    markdown: 'd12bf9cf5e2bb0327d870acfe216a1d4efc1dbd03d2c470b212bafcd7d7f64ce',
-    plans: '58a8155d27143582bb1784bf9537ff1dbb3a8974010692d0e9fbbe774296f3b6',
-    retrieval: '1e3ddc44e9960285df9db1f440e88c46abcea77b6c89e806ede33d5c66481fa5'
+    markdown: '7871ee9c6fd51fc834ef446b84d3deb0de6b6d1619216e32cfb46d964836ef06',
+    plans: '84b60abb7291eb8742a55ccef912b0fcfef1bdbbf8cbdae45bef832c9f660075',
+    retrieval: '88e447d9bffba0c6f7ced9ee5b552ae1ad9545ee8978ee42c3da14640c61b0f0'
   });
   console.log(JSON.stringify({ cards: first.records.length, inline_cards: 6, metrics: report.metrics, hashes }, null, 2));
 }

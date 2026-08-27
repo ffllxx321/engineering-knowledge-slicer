@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('assert');
+const path = require('path');
 const { runUniversalPipeline } = require('../src/universal-knowledge-pipeline.js');
 const { buildPlan, emptyIndex, coalesceCanonicalUnits } = require('../src/structured-writer.js');
 const { normalizeSemanticText } = require('../src/semantic-text.js');
@@ -22,6 +23,8 @@ const document = { source_identity: 'bounded-audit-v1', source_document_id: 'bou
     block('already-unitized-table-row', '风机 C | 75°C | 3.5mm/s', 'table_row', { table_headers: ['设备', '轴承温度 (°C)', '振动速度 (mm/s)'] }, ['风机参数']),
     block('alias', '变频驱动器（Variable Frequency Drive，VFD）是指调节电机转速的装置。', 'paragraph', {}, ['术语']),
     block('condition-exception', '如果液位低于下限，操作员必须停止水泵；但消防模式除外。', 'paragraph', {}, ['水泵保护'])
+    ,block('markdown-heading', '# - [ ] 安全/检查:*?', 'heading')
+    ,block('heading-child', '- [ ] 检查员必须复核防护网固定。', 'list_item', {}, ['# - [ ] 安全/检查:*?'])
   ] };
 const settings = { controlledWriterEnabled: true, structuredWriterMode: 'structured-write', knowledgeTenderRoot: '知识/项目', knowledgeBusinessRoot: '知识/业务', artifactsPath: '状态' };
 
@@ -65,6 +68,9 @@ const governed = byEvidence('condition-exception')[0]; assert.strictEqual(byEvid
 assert(/如果液位低于下限/.test(governed.body) && /消防模式除外/.test(governed.body));
 assert.strictEqual((governed.body.match(/如果液位低于下限/g) || []).length, 1, 'condition is not repeated');
 assert.strictEqual((governed.body.match(/消防模式除外/g) || []).length, 1, 'exception is not repeated');
+const headingChild = byEvidence('heading-child')[0];
+assert(headingChild && !/^(?:#|[-*•]|\[[ xX]\])/.test(headingChild.title), 'Markdown/list/task boundaries never enter canonical title');
+assert(!headingChild.title.includes('安全/检查'), 'section heading is inherited context, not the child canonical title');
 
 assert(first.cards.length > 0); for (const action of first.cards) {
   assert(action.path.endsWith('.md') && !/[<>:"|?*]/.test(action.path.split('/').at(-1)));
@@ -86,4 +92,12 @@ const repeated = produce(); assert.deepStrictEqual(repeated.cards.map((a) => [a.
 const restartIndex = emptyIndex(); for (const action of first.plan.actions) restartIndex.records[action.record_id] = { record_id: action.record_id, record_kind: action.record_kind, path: action.path, content_hash: action.content_hash, owner_source_id: action.owner_source_id };
 const restart = produce(Object.fromEntries(first.plan.actions.filter((a) => a.content).map((a) => [a.path, a.content])), restartIndex);
 assert(restart.plan.actions.filter((action) => ['business_item', 'company_knowledge'].includes(action.record_kind)).every((action) => action.action === 'noop'), 'restart/cache reuse does not rewrite canonical cards');
+const renamedResult = structuredClone(first.result); const renamedUnit = renamedResult.knowledge_units.find((unit) => unit.card_plan?.evidence_ids.includes('heading-child'));
+renamedUnit.title = '# - [ ] 防护网/固定:*?复核'; renamedUnit.search_title = '检查员如何复核防护网固定'; renamedUnit.aliases = ['防护网固定复核', '检查员如何复核防护网固定'];
+const renamedPlan = buildPlan({ settings, document, universalResult: renamedResult, projectRegistry: [], index: restartIndex,
+  existingFiles: Object.fromEntries(first.plan.actions.map((action) => [action.path, action.content])), logicalTime: '2026-08-25T00:00:00.000Z' });
+const renamedAction = renamedPlan.actions.find((action) => /防护网/.test(action.record_snapshot?.title || ''));
+assert(renamedAction && renamedAction.from_path && /move/.test(renamedAction.action), 'canonical title update safely renames the indexed file on rerun');
+assert(!/[<>:"|?*#]/.test(path.basename(renamedAction.path)) && !path.basename(renamedAction.path).startsWith('-'), 'renamed path is boundary and filename safe');
+assert(!renamedAction.content.includes('aliases: ["检查员如何复核防护网固定"'), 'aliases do not duplicate search_title');
 console.log('bounded useful-card ten-case production audit: ok');

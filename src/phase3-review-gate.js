@@ -6,6 +6,7 @@
  */
 
 const crypto = require('crypto');
+const { analyzeText } = require('./content-integrity.js');
 
 const PHASE3_SCHEMA_VERSION = '3.0';
 const PHASE3_SETTINGS_DEFAULTS = Object.freeze({
@@ -46,7 +47,7 @@ function evidenceIsVerifiable(candidate) {
   const blockId = text(evidence.block_id || candidate.block_id, 300);
   const locator = object(evidence.locator) &&
     text(evidence.locator.scheme, 80) && text(evidence.locator.value, 500);
-  return Boolean(quote && blockId && locator);
+  return Boolean(quote && blockId && locator && analyzeText(quote).ok);
 }
 
 function conflictSignature(candidate) {

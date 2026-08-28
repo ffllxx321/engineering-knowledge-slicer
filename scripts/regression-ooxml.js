@@ -4,6 +4,7 @@ const assert = require('assert');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const { loadBundleModule } = require('./load-bundle-module');
+const { canonicalizeDocument, runUniversalPipeline } = require('../src/universal-knowledge-pipeline.js');
 
 function zip(entries, overrides = {}) {
   const locals = [], central = []; let offset = 0;
@@ -95,6 +96,11 @@ assert.equal(formula.metadata.formula, '2+3'); assert.equal(formula.metadata.cac
 assert(xlsx.blocks.some(b => b.metadata.coordinate === 'A3' && b.metadata.merge.role === 'inherited' && b.metadata.inherited_header === '设备'));
 assert(xlsx.blocks.some(b => b.kind === 'image_metadata' && b.metadata.target === 'xl/media/image1.png'));
 assert.equal(xlsx.metadata.ooxml_metrics.locator_coverage, 1);
+const xlsxCanonical = canonicalizeDocument({ source_document_id: 'xlsx-fixture', source_hash: xlsx.blocks[0].source_hash, parser: 'xlsx-ooxml-local', blocks: xlsx.blocks });
+assert.equal(xlsxCanonical.structure.schema_version, 'structure-context/2.0');
+assert(xlsxCanonical.structure.nodes.some(node => node.kind === 'table_cell' && node.fields.cell_range === 'A2'));
+const xlsxUseful = runUniversalPipeline({ document: { source_document_id: 'xlsx-fixture', source_hash: xlsx.blocks[0].source_hash, parser: 'xlsx-ooxml-local', blocks: xlsx.blocks } });
+assert(xlsxUseful.knowledge_events.some(event => event.evidence_ids.length === 2 && event.source_context.table_headers.includes('设备')));
 
 const pptx = ooxml.parseOoxml(pptxFixture(), 'pptx');
 assert.equal(pptx.status, 'ok');
@@ -110,6 +116,9 @@ assert.equal(pptx.metadata.slides[1].hidden, true);
 assert.equal(pptx.metadata.slides[0].transition, 'fast');
 assert.equal(pptx.metadata.slides[0].has_timing, true);
 assert.equal(pptx.metadata.ooxml_metrics.locator_coverage, 1);
+const pptxCanonical = canonicalizeDocument({ source_document_id: 'pptx-fixture', source_hash: pptx.blocks[0].source_hash, parser: 'pptx-ooxml-local', blocks: pptx.blocks });
+assert(pptxCanonical.structure.nodes.some(node => node.kind === 'heading' && node.source_identity.slide === 1));
+assert(pptxCanonical.structure.nodes.some(node => node.kind === 'list_item' && node.fields.list_level === 1));
 
 assert.equal(ooxml.parseOoxml(zip({ '[Content_Types].xml': contentTypes, 'word/document.xml': '<w:document/>' }), 'docx').status, 'review_required');
 assert.equal(ooxml.parseOoxml(zip({ '../evil': 'x', '[Content_Types].xml': contentTypes }), 'docx').code, 'OOXML_PATH_TRAVERSAL');

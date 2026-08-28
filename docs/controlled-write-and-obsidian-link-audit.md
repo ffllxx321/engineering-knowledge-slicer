@@ -45,9 +45,9 @@ Phase 1 只定义 `Project`、`SourceDocument`、`BusinessItem`、`CompanyKnowle
 
 ## C. Wikilink/backlink 的结构化用法
 
-每条记录使用不可变 `record_id`，规范文件名建议为
-`<record_kind>--<record_id>.md`，标题放在 frontmatter 的 `title`/`aliases`，避免改名造成
-身份漂移。关系同时保存类型化 ID 字段和可点击 wikilink，例如：
+每条记录使用不可变 `record_id` 作为内部身份、去重键和事务键。Markdown 文件名使用安全化的人类 `title`，来源记录使用原文件名；同名使用稳定的“（2）”序号消歧。关系按 `target_path` 链接、按 `target_title` 显示。只有 basename 精确为 `<record_id>.md` 且索引/哈希均证明由插件管理的旧技术路径，才会在现有可回滚事务内迁移；用户自定义路径保持不动。
+
+frontmatter 中保留 `record_id`、来源 ID 和演化 payload；主要阅读流仅显示原文件名、人类定位和分行原文。hash、base64 locator 等放入折叠的“技术追溯”。业务时间统一按同一 instant 格式化为 `Asia/Shanghai` ISO 8601 `+08:00`。关系同时保存类型化 ID 字段和可点击 wikilink，例如：
 
 ```yaml
 record_kind: business_item
@@ -57,7 +57,8 @@ source_document_ids: [src-…]
 relations:
   - type: derived_from
     target_id: src-…
-    target: "[[source_document--src-…|招标文件]]"
+    target_path: "06-知识库/业务库/…/来源/招标文件.pdf.md"
+    target_title: "招标文件.pdf"
 ```
 
 `Project` 汇总其 `SourceDocument`、`BusinessItem` 和经批准的

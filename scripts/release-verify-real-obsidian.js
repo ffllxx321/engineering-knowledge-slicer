@@ -8,6 +8,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
+const { auditVault } = require('./audit-real-obsidian-cards.js');
 
 const root = path.join(__dirname, '..');
 const binary = process.env.OBSIDIAN_APPIMAGE || '/tmp/Obsidian-1.12.7.AppImage';
@@ -103,12 +104,14 @@ async function main() {
   const first = await launch(vault, config, resultPath);
   const second = await launch(vault, config, resultPath);
   assert.deepStrictEqual(second.visible_openable, first.visible_openable, 'restart changed visible record set');
+  const postAudit = auditVault(vault);
+  assert(postAudit.passed, `real Obsidian card audit failed: ${JSON.stringify(postAudit.failures)}`);
   const evidence = {
     schema: 'eks/real-obsidian-release-evidence/1.0', passed: true,
     generated_at: new Date().toISOString(), commit: require('child_process').execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
     bundle_sha256: sha(path.join(root, 'main.js')), obsidian_appimage_sha256: sha(binary),
     obsidian_version: first.obsidian_version, plugin_version: require(path.join(root, 'manifest.json')).version,
-    first_launch: first, restart: second
+    first_launch: first, restart: second, real_obsidian_card_post_audit: postAudit
   };
   const evidenceDir = path.join(root, 'test-artifacts');
   fs.mkdirSync(evidenceDir, { recursive: true });

@@ -1,0 +1,40 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const root = path.join(__dirname, '..');
+const bundlePath = path.join(root, 'main.js');
+const ids = ['contracts', 'adapters', 'orchestrator', 'candidate-contract', 'candidate-orchestrator', 'write-contract', 'write-orchestrator', 'phase4-contract', 'phase4-orchestrator', 'evolution-contract', 'index'];
+const begin = '/* V3_CORE_MODULES_BEGIN */';
+const end = '/* V3_CORE_MODULES_END */';
+let bundle = fs.readFileSync(bundlePath, 'utf8');
+const modules = ids.map((name) => {
+  let source = fs.readFileSync(path.join(root, 'src', 'v3', `${name}.js`), 'utf8');
+  source = source.replace(/require\('\.\/contracts'\)/g, 'require("src/v3/contracts.js")')
+    .replace(/require\('\.\.\/content-integrity\.js'\)/g, 'require("src/content-integrity.js")')
+    .replace(/require\('\.\/adapters'\)/g, 'require("src/v3/adapters.js")')
+    .replace(/require\('\.\/orchestrator'\)/g, 'require("src/v3/orchestrator.js")')
+    .replace(/require\('\.\/candidate-contract'\)/g, 'require("src/v3/candidate-contract.js")')
+    .replace(/require\('\.\/candidate-orchestrator'\)/g, 'require("src/v3/candidate-orchestrator.js")')
+    .replace(/require\('\.\/write-contract'\)/g, 'require("src/v3/write-contract.js")')
+    .replace(/require\('\.\/write-orchestrator'\)/g, 'require("src/v3/write-orchestrator.js")');
+  source = source.replace(/require\('\.\/phase4-contract'\)/g, 'require("src/v3/phase4-contract.js")')
+    .replace(/require\('\.\/phase4-orchestrator'\)/g, 'require("src/v3/phase4-orchestrator.js")')
+    .replace(/require\('\.\/evolution-contract'\)/g, 'require("src/v3/evolution-contract.js")');
+  if (name === 'index') source = source.replace(/require\('\.\/contracts'\)/g, 'require("src/v3/contracts.js")');
+  return `"src/v3/${name}.js": function(require, module, exports) {\n${source}\n}`;
+}).join(',\n');
+const block = `${begin}\n${modules}\n${end}`;
+if (bundle.includes(begin)) {
+  const start = bundle.indexOf(begin); const finish = bundle.indexOf(end, start);
+  if (finish < 0) throw new Error('v3 module end marker not found');
+  bundle = `${bundle.slice(0, start)}${block}${bundle.slice(finish + end.length)}`;
+}
+else {
+  const anchor = '\n}\n};\nconst __cache = {};';
+  const index = bundle.lastIndexOf(anchor);
+  if (index < 0) throw new Error('bundle module-table anchor not found');
+  bundle = `${bundle.slice(0, index)}\n},\n${block}${bundle.slice(index + 2)}`;
+}
+fs.writeFileSync(bundlePath, bundle);
+console.log('v3 core embedded in main.js');

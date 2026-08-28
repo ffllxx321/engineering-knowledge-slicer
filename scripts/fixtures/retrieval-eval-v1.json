@@ -1,0 +1,23 @@
+{
+  "schema": "eks-retrieval-eval/1.0",
+  "records": [
+    {"id":"req-fire-door","title":"防火门验收要求","keywords":["耐火完整性","验收"],"body":"防火门安装后应检查闭门器与启闭状态。","evidence":[{"text":"甲级防火门耐火完整性不得低于1.50 h。","locator":{"page":12}}],"semantic_kind":"requirement","category":"消防","library":"business","path":"消防/req-fire-door.md"},
+    {"id":"dist-fire-drill","title":"消防演练安排","keywords":["防火","演练"],"body":"项目部每季度组织消防演练并记录参与人员。","evidence":[{"text":"消防演练每季度一次。","locator":{"page":3}}],"semantic_kind":"schedule","category":"消防","library":"project"},
+    {"id":"param-anchor","title":"锚栓拉拔参数","keywords":["锚栓","拉拔试验"],"body":"后置锚栓应进行现场拉拔试验。","evidence":[{"text":"单个锚栓抗拉承载力设计值为12.5 kN。","locator":{"sheet":"参数表","row":8}}],"semantic_kind":"parameter","category":"结构","library":"business"},
+    {"id":"proc-pressure","title":"管道压力试验步骤","aliases":["hydrostatic test procedure"],"keywords":["稳压","泄漏检查"],"body":"先隔离设备并注水排气，再缓慢升压，稳压后检查接口，最后泄压排水。","evidence":[{"text":"升至1.0 MPa后稳压30 min，所有接口不得渗漏。","locator":{"heading_path":["调试","压力试验"]}}],"semantic_kind":"procedure","category":"机电","library":"business"},
+    {"id":"def-bim-lod","title":"LOD 300 定义","aliases":["Level of Development 300"],"keywords":["BIM","模型深度"],"body":"LOD 300 表示构件的数量、尺寸、形状、位置和方向可从模型中测量。","evidence":[{"text":"At LOD 300, element quantity, size, shape, location, and orientation can be measured directly from the model.","locator":{"section":"4.3"}}],"semantic_kind":"definition","category":"数字化","library":"business"},
+    {"id":"table-coating","title":"外墙涂层性能表","keywords":["真石漆","耐候年限"],"body":"材料性能参数来自饰面材料表。","evidence":[{"text":"真石漆 | 使用部位：外墙 | 耐候年限：≥10年","locator":{"sheet":"饰面材料表","range":"A6:C6"}}],"semantic_kind":"parameter","category":"材料","library":"business"},
+    {"id":"dist-coating","title":"外墙涂层送样流程","keywords":["真石漆","外墙"],"body":"真石漆样板由供应商送审，确认颜色后封样。","evidence":[{"text":"外墙真石漆须先送样确认颜色。","locator":{"page":7}}],"semantic_kind":"procedure","category":"材料","library":"project"},
+    {"id":"req-cable","title":"电缆敷设弯曲半径要求","keywords":["电缆","弯曲半径"],"body":"敷设过程中不得损伤绝缘层。","evidence":[{"text":"多芯控制电缆的最小允许弯曲半径为电缆外径的10倍。","locator":{"page":21}}],"semantic_kind":"requirement","category":"电气","library":"business"}
+  ],
+  "questions": [
+    {"id":"zh-requirement","query":"甲级防火门耐火完整性要求是多少","expected_ids":["req-fire-door"],"expected_evidence":"1.50 h"},
+    {"id":"numeric-parameter","query":"锚栓设计抗拉承载力 12.5 kN","expected_ids":["param-anchor"],"expected_evidence":"12.5 kN"},
+    {"id":"procedure","query":"管道水压试验如何升压稳压检查","expected_ids":["proc-pressure"],"expected_evidence":"稳压30 min"},
+    {"id":"definition-en","query":"What does Level of Development 300 mean in BIM?","expected_ids":["def-bim-lod"],"expected_evidence":"At LOD 300"},
+    {"id":"table-record","query":"外墙真石漆耐候年限","expected_ids":["table-coating"],"expected_evidence":"≥10年"},
+    {"id":"metadata-filter","query":"外墙真石漆","filters":{"semantic_kind":"parameter","library":"business"},"expected_ids":["table-coating"],"expected_evidence":"饰面材料表"},
+    {"id":"cable-rule","query":"控制电缆最小弯曲半径","expected_ids":["req-cable"],"expected_evidence":"外径的10倍"},
+    {"id":"false-positive","query":"量子芯片低温校准频率","expected_ids":[]}
+  ]
+}

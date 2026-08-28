@@ -1,5 +1,7 @@
 'use strict';
 
+const { analyzeText, blockText, quarantineInvalidBlocks } = require('./content-integrity.js');
+
 const LOCAL_EXTENSIONS = new Set(['docx', 'xlsx', 'pptx', 'msg', 'eml', 'txt', 'md']);
 
 function extensionOf(filePath) {
@@ -21,8 +23,14 @@ function pdfQualityProbe(buffer) {
 function qualityOk(result) {
   if (!result || result.status !== 'ok' || !result.parsePackage) return false;
   const markdown = String(result.parsePackage.markdown || result.text || '').trim();
-  const eligible = (result.parsePackage.blocks || []).filter((block) => block?.card_eligible !== false && String(block?.raw?.text || '').trim());
-  return markdown.length >= 20 && eligible.length > 0 && result.parsePackage.quality?.corruptRatio <= 0.02;
+  const eligible = (result.parsePackage.blocks || []).filter((block) => block?.card_eligible !== false
+    && analyzeText(blockText(block)).ok);
+  const quality = result.parsePackage.quality || {};
+  const directRatio = quality.corruptRatio == null ? NaN : Number(quality.corruptRatio);
+  const nestedRatio = quality.components?.corrupt_ratio == null ? NaN : Number(quality.components.corrupt_ratio);
+  const corruptRatio = Number.isFinite(directRatio) ? directRatio : nestedRatio;
+  return markdown.length >= 20 && eligible.length > 0
+    && quality.readable !== false && Number.isFinite(corruptRatio) && corruptRatio <= 0.02;
 }
 
 class AutoDocumentParser {
@@ -34,31 +42,37 @@ class AutoDocumentParser {
     if (ext !== 'pdf') throw typed('AUTO_PARSER_UNSUPPORTED', `自动识别暂不支持：${ext || 'unknown'}`);
 
     const probe = (this.adapters.probePdf || pdfQualityProbe)(buffer, context);
-    if (probe.reliableLocal) {
-      const local = await this.call('localPdf', filePath, buffer, { ...context, probe });
-      if (qualityOk(local)) return local;
-    }
+    // The probe is deliberately conservative and cannot see text stored in
+    // compressed/content streams. Always give the deterministic local reader
+    // one bounded attempt; the parse-package quality gate remains authoritative.
+    const local = await this.call('localPdf', filePath, buffer, { ...context, probe });
+    if (qualityOk(local)) return this.sanitize(local);
 
     let mineruError = null;
-    if (context.mineruConfigured === true && context.allowNecessaryCloud === true) {
+    const canRequestCloudConsent = typeof context.confirmNecessaryUpload === 'function';
+    if (context.mineruConfigured === true && (context.allowNecessaryCloud === true || canRequestCloudConsent)) {
       try {
-        if (typeof context.confirmNecessaryUpload === 'function') {
+        if (context.allowNecessaryCloud !== true && canRequestCloudConsent) {
           const accepted = await context.confirmNecessaryUpload({ filePath, sizeBytes: Number(buffer?.length || 0), reason: 'PDF 文本不足、扫描件或复杂版式' });
           if (!accepted) throw typed('NECESSARY_UPLOAD_DECLINED', '用户未允许本次必要云端识别。');
         }
         const remote = await this.call('mineru', filePath, buffer, { ...context, probe });
-        if (qualityOk(remote)) return remote;
+        if (qualityOk(remote)) return this.sanitize(remote);
         mineruError = typed('MINERU_QUALITY_FAILED', 'MinerU 结果未达到知识生成质量门。');
       } catch (error) { mineruError = error; }
     }
 
+    let ocr = null;
     try {
-      const ocr = await this.call('localOcr', filePath, buffer, { ...context, probe, mineruError });
-      if (qualityOk(ocr)) return ocr;
+      ocr = await this.call('localOcr', filePath, buffer, { ...context, probe, mineruError });
+      if (qualityOk(ocr)) return this.sanitize(ocr);
     } catch (error) {
       if (!mineruError) mineruError = error;
     }
-    throw typed('DOCUMENT_QUALITY_GATE_FAILED', `自动识别失败：MinerU 与本地 OCR 均未产生可核验知识证据。${mineruError ? ` ${mineruError.message}` : ''}`);
+    // Preserve actionable parser outcomes. Converting these to an internal,
+    // non-retryable quality-gate error hides the actual remediation from users.
+    if (ocr && (ocr.actionable || ['ocr_required', 'review_required', 'cancelled'].includes(ocr.status))) return ocr;
+    throw typed('DOCUMENT_QUALITY_GATE_FAILED', `自动识别失败：MinerU 与本地 OCR 均未产生可核验知识证据。${local?.message ? ` ${local.message}` : ''}${mineruError ? ` ${mineruError.message}` : ''}`);
   }
 
   async call(name, filePath, buffer, context) {
@@ -68,8 +82,10 @@ class AutoDocumentParser {
 
   requireQuality(result, code) {
     if (!qualityOk(result)) throw typed(code, '本地确定性解析结果未达到知识生成质量门。');
-    return result;
+    return this.sanitize(result);
   }
+
+  sanitize(result) { quarantineInvalidBlocks(result.parsePackage); return result; }
 }
 
 function removedLegacyPdfDispatcher() {

@@ -1,0 +1,33 @@
+name: Real Obsidian acceptance
+on: [push, pull_request]
+jobs:
+  provider-local:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - name: Install host dependencies
+        run: sudo apt-get update && sudo apt-get install -y xvfb libfuse2
+      - name: Download official Obsidian
+        run: curl -fL https://github.com/obsidianmd/obsidian-releases/releases/download/v1.12.7/Obsidian-1.12.7.AppImage -o /tmp/Obsidian-1.12.7.AppImage && chmod +x /tmp/Obsidian-1.12.7.AppImage
+      - run: npm run acceptance:real
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: acceptance-provider-local, path: test-artifacts/acceptance-real.* }
+  provider-real:
+    runs-on: ubuntu-latest
+    env:
+      EKS_ACCEPTANCE_MINIMAX_API_KEY: ${{ secrets.EKS_ACCEPTANCE_MINIMAX_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: sudo apt-get update && sudo apt-get install -y xvfb libfuse2
+      - run: curl -fL https://github.com/obsidianmd/obsidian-releases/releases/download/v1.12.7/Obsidian-1.12.7.AppImage -o /tmp/Obsidian-1.12.7.AppImage && chmod +x /tmp/Obsidian-1.12.7.AppImage
+      - run: npm run acceptance:provider-real
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: acceptance-provider-real, path: test-artifacts/acceptance-provider-real.* }

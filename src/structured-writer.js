@@ -6,6 +6,7 @@
  * commitPlan/rollbackTransaction and guarded by an injected adapter.
  */
 const crypto = require('crypto');
+const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts, distinctSemanticTexts, cleanTitleBoundary } = require('./semantic-text.js');
 const {
   ACTIVE_TENDER_CATEGORIES,
   BUSINESS_CATEGORIES,
@@ -15,7 +16,13 @@ const {
 
 const WRITER_VERSION = '1.0';
 const INDEX_VERSION = '1.0';
-const PLAN_LIMITS = Object.freeze({ max_records: 250, max_actions: 600, max_links_per_record: 40 });
+const PLAN_LIMITS = Object.freeze({
+  max_records: 250, max_actions: 600, max_links_per_record: 40,
+  // Per-source ceilings are deliberately separate from the transaction knobs
+  // above. They prevent pathological/corrupt inputs without making an ordinary
+  // large document one enormous transaction.
+  max_source_records: 10000, max_source_actions: 20000
+});
 const MODES = Object.freeze(['legacy', 'structured-pilot', 'structured-write']);
 const KIND_PREFIX = Object.freeze({
   project: 'prj', source_document: 'src', business_item: 'bi', company_knowledge: 'ck'
@@ -56,6 +63,13 @@ const pathSafe = (value) => {
 const joinPath = (...parts) => parts.map((part) => String(part || '').replace(/^\/+|\/+$/g, ''))
   .filter(Boolean).join('/');
 
+function chinaTime(value) {
+  const instant = new Date(String(value || ''));
+  if (!Number.isFinite(instant.valueOf())) throw Object.assign(new Error('结构化写入时间无效；必须是可解析的 ISO 8601 instant'), { code: 'STRUCTURED_TIME_INVALID' });
+  const shifted = new Date(instant.valueOf() + 8 * 60 * 60 * 1000);
+  return `${shifted.toISOString().slice(0, -1)}+08:00`;
+}
+
 function normalizeSettings(settings = {}) {
   const mode = MODES.includes(settings.structuredWriterMode) ? settings.structuredWriterMode : 'legacy';
   const enabled = settings.controlledWriterEnabled === true;
@@ -83,6 +97,11 @@ function sourceIdentity(document) {
   const initialHash = clean(document.initial_source_hash || document.source_hash, 128);
   if (initialHash) return `initial-hash:${initialHash}`;
   throw new Error('来源缺少稳定身份；不能用可变标题或路径生成 ID');
+}
+
+function sourceFilename(document) {
+  const fromPath = clean(document.source_path, 800).replace(/\\/g, '/').split('/').at(-1);
+  return clean(fromPath || document.filename || document.title || '来源文档', 300);
 }
 
 function projectIdentity(entry) {
@@ -141,12 +160,11 @@ function yamlArray(values) {
 }
 
 function relationLink(relation) {
-  // Generated filenames are globally unique stable IDs. Basename links survive
-  // archive moves without rewriting user-facing titles or depending on aliases.
-  return `[[${relation.target_id}|${relation.target_title || relation.target_id}]]`;
+  return `[[${relation.target_path}|${relation.target_title}]]`;
 }
 
 function humanLocator(locator = {}) {
+  if (Array.isArray(locator.locators)) return combinedHumanLocators(locator.locators);
   return [
     locator.page !== undefined ? `第 ${locator.page} 页` : '',
     locator.sheet ? `工作表“${clean(String(locator.sheet), 120)}”` : '',
@@ -158,7 +176,58 @@ function humanLocator(locator = {}) {
   ].filter(Boolean).join('，') || '来源原文';
 }
 
+function combinedHumanLocators(locators = []) {
+  const unique = [...new Map(locators.map((item) => [stableJson(item || {}), item || {}])).values()];
+  const pages = [...new Set(unique.map((item) => Number(item.page)).filter(Number.isFinite))].sort((a, b) => a - b);
+  const rest = unique.filter((item) => !Number.isFinite(Number(item.page))).map(humanLocator);
+  return [...(pages.length ? [`第 ${pages.join('、')} 页`] : []), ...new Set(rest)].join('，') || '来源原文';
+}
+
+function mergeEvidence(items = []) {
+  const groups = new Map();
+  for (const item of items.filter(Boolean)) {
+    const key = semanticTextSignature(item.verbatim || '');
+    if (!normalizeSemanticText(item.verbatim) || !groups.has(key)) groups.set(key, { ...item,
+      provenance: [...(item.provenance || [])], locators: [item.locator || {}, ...(item.locators || [])] });
+    else {
+      const target = groups.get(key);
+      target.provenance.push(...(item.provenance || []));
+      target.locators.push(item.locator || {}, ...(item.locators || []));
+      for (const id of [item.block_id, ...(item.block_ids || [])].filter(Boolean)) {
+        target.block_ids = uniq([...(target.block_ids || []), target.block_id, id]);
+      }
+    }
+  }
+  return [...groups.values()].map((item) => ({ ...item,
+    provenance: [...new Map(item.provenance.map((value) => [stableJson(value), value])).values()],
+    locators: [...new Map(item.locators.map((value) => [stableJson(value), value])).values()] }));
+}
+
+function searchKeywords(record) {
+  return uniq([...(record.keywords || []), ...(record.tags || []), record.semantic_kind, record.category]);
+}
+
+function encodedLocator(locator) {
+  return Buffer.from(stableJson(locator || {}), 'utf8').toString('base64url');
+}
+
+function displayEvidence(value) {
+  return String(value ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim().slice(0, 12000)
+    .replace(/\s*(?=(?:[（(]\d+[)）]|\d+[.、])\s*)/g, '\n')
+    .replace(/\s*(?=(?:第[一二三四五六七八九十\d]+[章节条]|[一二三四五六七八九十]+、))/g, '\n')
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function readableSummary(value) {
+  const formatted = clean(value, 12000).replace(/([。；;])(?=(?:要求|建议|步骤|做法|执行主体|适用条件|例外|关键参数|表格语境)[:：])/g, '$1\n');
+  return formatted.split(/\n+/).map((line) => line.trim()).filter(Boolean)
+    .map((line) => `- ${line.replace(/^([^：:]{1,20})[:：]\s*/, '**$1：** ')}`).join('\n');
+}
+
 function serializeRecord(record) {
+  record.title = cleanTitleBoundary(record.title, 160) || '知识单元';
+  record.search_title = cleanTitleBoundary(record.search_title || record.title, 240) || record.title;
+  record.aliases = distinctSemanticTexts((record.aliases || []).map((item) => cleanTitleBoundary(item, 160)), [record.title, record.search_title]);
   const check = validateRecord(record);
   if (!check.valid) throw new Error(`记录 ${record.record_id} 不符合 schema：${check.errors.join('；')}`);
   const relations = (record.relations || []).slice().sort((a, b) =>
@@ -169,7 +238,9 @@ function serializeRecord(record) {
     `record_kind: ${yamlScalar(record.record_kind)}`,
     `record_id: ${yamlScalar(record.record_id)}`,
     `title: ${yamlScalar(record.title)}`,
-    `aliases: ${yamlArray([record.title])}`,
+    `search_title: ${yamlScalar(record.search_title || record.title)}`,
+    `aliases: ${yamlArray((record.aliases || []).filter((item) => item !== record.title && item !== (record.search_title || record.title)))}`,
+    `keywords: ${yamlArray(searchKeywords(record))}`,
     `library: ${yamlScalar(record.library)}`,
     `created_at: ${yamlScalar(record.created_at)}`,
     `updated_at: ${yamlScalar(record.updated_at)}`
@@ -179,6 +250,8 @@ function serializeRecord(record) {
   }
   if (record.semantic_kind) frontmatter.push(`semantic_kind: ${yamlScalar(record.semantic_kind)}`);
   if (record.source_language) frontmatter.push(`source_language: ${yamlScalar(record.source_language)}`);
+  if (record.source_file) frontmatter.push(`source_file: ${yamlScalar(record.source_file)}`);
+  if (record.source_document_names?.length) frontmatter.push(`source_document_names: ${yamlArray(record.source_document_names)}`);
   frontmatter.push(`output_language: ${yamlScalar(record.output_language || 'zh-CN')}`);
   if (record.tags?.length) frontmatter.push(`tags: ${yamlArray(record.tags)}`);
   for (const key of ['project_ids', 'source_document_ids', 'business_item_ids', 'company_knowledge_ids']) {
@@ -186,22 +259,31 @@ function serializeRecord(record) {
   }
   frontmatter.push('---', '', `# ${record.title}`, '');
   const body = [];
-  if (record.summary) body.push('## 内容', '', record.summary, '');
-  if (record.evidence?.verbatim) {
-    body.push('## 来源证据（原文）', '', `> ${clean(record.evidence.verbatim, 4000).replace(/\n/g, '\n> ')}`, '',
-      `定位：${humanLocator(record.evidence.locator || {})}`, '');
+  if (record.summary) body.push('## 内容', '', readableSummary(record.summary), '');
+  const evidenceList = mergeEvidence(record.evidence_list?.length ? record.evidence_list : [record.evidence]);
+  if (evidenceList.length) {
+    body.push('## 来源', '');
+    const sourceRelation = relations.find((relation) => relation.type === 'derived_from');
+    if (sourceRelation) body.push(`- 来源文件：${relationLink(sourceRelation)}`);
+    for (const evidence of evidenceList) body.push(
+      `- 原文位置：${combinedHumanLocators(evidence.locators || [evidence.locator || {}])}`, '',
+      '### 原文摘录', '',
+      `> ${displayEvidence(evidence.verbatim).replace(/\n/g, '\n> ')}`, '');
     if (record.evidence_translation && record.evidence_translation !== record.evidence.verbatim) {
       body.push('### 证据中文译文', '', `> ${clean(record.evidence_translation, 4000).replace(/\n/g, '\n> ')}`, '');
     }
   }
-  if (relations.length) body.push('## 关系', '', ...relations.map((relation) =>
+  const visibleRelations = evidenceList.length
+    ? relations.filter((relation) => relation.type !== 'derived_from') : relations;
+  if (visibleRelations.length) body.push('## 关系', '', ...visibleRelations.map((relation) =>
     `- ${relation.type}：${relationLink(relation)}`), '');
   if (record.unresolved_relations?.length) body.push('## 待处理关系', '',
     ...record.unresolved_relations.map((item) =>
       `- ${item.type || 'related'}：${item.source_candidate || '未命名'}（${item.reason}；定位 ${stableJson(item.evidence_locator || {})}）`), '');
-  body.push('## 追溯', '', `- 记录编号：${record.record_id}`);
-  if (record.owner_source_id) body.push(`- 归属来源：${record.owner_source_id}`);
+  body.push('<details>', '<summary>技术追溯</summary>', '', `- 记录编号：${record.record_id}`);
+  for (const evidence of evidenceList) for (const locator of evidence.locators || [evidence.locator || {}]) body.push(`- 定位数据：base64url:${encodedLocator(locator)}`);
   if (record.source_hash) body.push(`- 来源哈希：${record.source_hash}`);
+  body.push('', '</details>');
   return `${frontmatter.concat(body).join('\n')}\n`;
 }
 
@@ -212,9 +294,9 @@ function routeRecord(record, route, registryEntry, settings) {
   if (record.library === 'active_tender') {
     if (!registryEntry) throw new Error('在办库记录缺少唯一项目登记');
     return joinPath(settings.activeRoot, safeSegment(registryEntry.project_id), category,
-      KIND_FOLDER[record.record_kind], `${record.record_id}.md`);
+      KIND_FOLDER[record.record_kind], `${safeSegment(record.title)}.md`);
   }
-  return joinPath(settings.businessRoot, category, KIND_FOLDER[record.record_kind], `${record.record_id}.md`);
+  return joinPath(settings.businessRoot, category, KIND_FOLDER[record.record_kind], `${safeSegment(record.title)}.md`);
 }
 
 function resolveRelations(records, index, limits) {
@@ -284,12 +366,12 @@ function buildRecords(input, settings) {
   const registryMatches = (input.projectRegistry || []).filter((entry) => entry.project_id === route.project_id);
   if (route.project_id && registryMatches.length !== 1) throw new Error('项目路由不是登记表中的唯一精确匹配');
   const registry = registryMatches[0];
-  const now = clean(input.logicalTime || document.ingested_at || '1970-01-01T00:00:00.000Z', 80);
+  const now = chinaTime(input.logicalTime || document.ingested_at || '1970-01-01T00:00:00.000Z');
   const sourceId = stableId('source_document', sourceIdentity(document));
   const sourceHash = clean(document.source_hash, 128);
   const source = {
     schema_version: '1.0', record_kind: 'source_document', record_id: sourceId,
-    title: clean(document.title || document.filename || '来源文档', 300),
+    title: sourceFilename(document),
     library: route.library, created_at: now, updated_at: now,
     source_path: clean(document.source_path, 800), source_hash: sourceHash,
     source_version: clean(document.source_version || document.metadata?.version_label, 100),
@@ -353,16 +435,17 @@ function buildRecords(input, settings) {
       requested_relations: [{ type: 'derived_from', target_id: sourceId }]
     });
   }
-  if (records.length > settings.limits.max_records) throw new Error('结构化记录数量超过安全上限');
+  assertSourceRecordLimit(records, settings, sourceId);
   return { records, registry, route, sourceId };
 }
 
 function buildCanonicalRecords(input, settings) {
   const result = input.universalResult;
   const document = result.document || input.document || {};
-  const units = (result.knowledge_units || []).filter((unit) =>
+  const eligibleUnits = (result.knowledge_units || []).filter((unit) =>
     !(result.review_decisions || []).some((review) => review.unit_ids?.includes(unit.unit_id)));
-  const now = clean(input.logicalTime || document.ingested_at || '1970-01-01T00:00:00.000Z', 80);
+  const units = coalesceCanonicalUnits(eligibleUnits);
+  const now = chinaTime(input.logicalTime || document.ingested_at || '1970-01-01T00:00:00.000Z');
   const sourceId = stableId('source_document', sourceIdentity(document));
   const registryMatches = (input.projectRegistry || []).filter((entry) =>
     units.some((unit) => unit.project_ids?.includes(entry.project_id)));
@@ -373,7 +456,7 @@ function buildCanonicalRecords(input, settings) {
   const sourceLibrary = units.some((unit) => unit.route?.library === 'active_tender') ? 'active_tender' : 'business';
   const source = {
     schema_version: '1.0', record_kind: 'source_document', record_id: sourceId,
-    title: clean(document.title || '来源文档', 300), library: sourceLibrary,
+    title: sourceFilename(document), library: sourceLibrary,
     created_at: now, updated_at: now, source_path: clean(document.source_path, 800),
     source_hash: clean(document.source_hash, 128), media_type: clean(document.media_type, 100),
     owner_source_id: sourceId, summary: `统一语义管线来源记录；共形成 ${units.length} 个知识单元。`,
@@ -394,12 +477,20 @@ function buildCanonicalRecords(input, settings) {
     records.unshift(project);
   }
   const unitToRecord = new Map();
+  const recordsById = new Map(records.map((record) => [record.record_id, record]));
   for (const unit of units) {
     const recordKind = unit.route.library === 'business' && unit.reusable === true
       ? 'company_knowledge' : 'business_item';
     const recordId = stableId(recordKind, `${sourceId}:unit:${unit.fingerprint || unit.unit_id}`);
     unitToRecord.set(unit.unit_id, recordId);
-    records.push({
+    for (const memberId of unit.member_unit_ids || []) unitToRecord.set(memberId, recordId);
+    if (recordsById.has(recordId)) {
+      const existing = recordsById.get(recordId);
+      const evidence = [...(existing.evidence_list || []), ...(unit.evidence || [])];
+      existing.evidence_list = [...new Map(evidence.map((item) => [hash(item), item])).values()];
+      continue;
+    }
+    const record = {
       schema_version: '1.0', record_kind: recordKind, record_id: recordId,
       title: clean(unit.title, 160) || '知识单元', library: unit.route.library,
       created_at: now, updated_at: now, category: unit.route.category,
@@ -408,15 +499,20 @@ function buildCanonicalRecords(input, settings) {
       summary: clean(unit.statement, 8000), evidence: unit.evidence?.[0],
       evidence_translation: unit.source_language === 'zh' ? '' : clean(unit.translated_statement, 8000),
       evidence_list: unit.evidence, tags: unit.tags, semantic_kind: unit.semantic_kind,
+      search_title: unit.search_title || unit.title, aliases: unit.aliases || [],
+      keywords: uniq([...(unit.keywords || []), ...(unit.tags || []), unit.subject]),
       source_language: unit.source_language, output_language: unit.output_language || 'zh-CN',
       original_statement: unit.original_statement, translated_statement: unit.translated_statement,
       translation: unit.translation,
       conditions: unit.applicable_conditions, exceptions: unit.exceptions,
       structured_facts: unit.structured_facts, confidence: unit.confidence,
       uncertainty: unit.uncertainty, owner_source_id: sourceId,
+      source_file: source.title, source_document_names: [source.title],
       source_document_ids: [sourceId], project_ids: project ? [project.record_id] : [],
       requested_relations: [{ type: 'derived_from', target_id: sourceId }]
-    });
+    };
+    records.push(record);
+    recordsById.set(recordId, record);
   }
   for (const relation of result.relations || []) {
     const from = records.find((record) => record.record_id === unitToRecord.get(relation.from_unit_id));
@@ -426,12 +522,127 @@ function buildCanonicalRecords(input, settings) {
     const to = records.find((record) => record.record_id === toId);
     if (to) to.requested_relations.push({ type: relation.type, target_id: from.record_id, evidence_locator: relation.evidence });
   }
-  if (records.length > settings.limits.max_records) throw new Error('结构化记录数量超过安全上限');
+  assertSourceRecordLimit(records, settings, sourceId);
   return {
     records, registry, sourceId,
     route: { library: sourceLibrary, directory_category: source.category },
     reviewDecisions: result.review_decisions || []
   };
+}
+
+function assertSourceRecordLimit(records, settings, sourceId) {
+  const knowledgeRecords = records.filter((record) => KNOWLEDGE_RECORD_KINDS.has(record.record_kind)).length;
+  if (knowledgeRecords <= PLAN_LIMITS.max_source_records) return;
+  const partitionSize = settings.limits.max_records;
+  const partitionCount = Math.ceil(knowledgeRecords / partitionSize);
+  const error = new Error(`单来源结构化记录 ${knowledgeRecords} 条，超过全局安全上限 ${PLAN_LIMITS.max_source_records} 条。`);
+  error.code = 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED';
+  error.details = {
+    actual_records: knowledgeRecords, global_safe_limit: PLAN_LIMITS.max_source_records,
+    transaction_record_limit: partitionSize, required_partitions: partitionCount,
+    source_document_id: sourceId,
+    recovery: '保留 canonical 与 translation checkpoint；检查异常重复单元后从 structured writer 重试。'
+  };
+  throw error;
+}
+
+function normalizeCanonicalPresentation(rawUnit) {
+  const title = cleanTitleBoundary(clean(rawUnit.title, 160).replace(/^(?:标题|名称)[：:]\s*/, '').replace(/([要求方法流程参数定义])(?:要求|方法|流程|参数|定义)$/u, '$1'), 160) || '知识单元';
+  const statement = dedupeSemanticTexts(String(rawUnit.statement || '').split(/\n+/)
+    .map((line) => clean(line).replace(/^(?:标题|名称)[：:]\s*/, ''))).join('\n');
+  let searchTitle = cleanTitleBoundary(rawUnit.search_title || title, 240);
+  if (normalizeSemanticText(searchTitle) === normalizeSemanticText(title)) {
+    const retrieval = distinctSemanticTexts([rawUnit.subject, ...(rawUnit.keywords || [])], [title])[0];
+    if (retrieval) searchTitle = `${title} ${retrieval}`;
+  }
+  return { ...rawUnit, title, search_title: searchTitle,
+    aliases: distinctSemanticTexts(rawUnit.aliases || [], [title, searchTitle]), statement };
+}
+
+function coalesceCanonicalUnits(units, options = {}) {
+  const maxChars = Math.max(1000, Number(options.max_chars) || 12000);
+  const output = [];
+  for (const rawUnit of units) {
+    const presented = normalizeCanonicalPresentation(rawUnit);
+    const unit = { ...presented, statement: dedupeSemanticTexts(String(presented.statement || '').split(/\n+/)).join('\n'),
+      evidence: mergeEvidence(rawUnit.evidence || []) };
+    const semanticFingerprint = `semantic:${hash([unit.semantic_kind, normalizeSemanticText(unit.subject || unit.title),
+      normalizeSemanticText(unit.statement), unit.scope || '', unit.route?.library || '', unit.route?.category || '',
+      [...(unit.project_ids || [])].sort()])}`;
+    const exact = output.find((candidate) => candidate.semantic_kind === unit.semantic_kind
+      && normalizeSemanticText(candidate.subject || candidate.title) === normalizeSemanticText(unit.subject || unit.title)
+      && semanticTextSignature(candidate.statement) === semanticTextSignature(unit.statement)
+      && candidate.scope === unit.scope && candidate.route?.library === unit.route?.library
+      && candidate.route?.category === unit.route?.category);
+    if (exact) {
+      exact.member_unit_ids = uniq([...(exact.member_unit_ids || [exact.unit_id]), ...(unit.member_unit_ids || [unit.unit_id])]);
+      exact.evidence = mergeEvidence([...(exact.evidence || []), ...(unit.evidence || [])]);
+      exact.fingerprint = semanticFingerprint;
+      continue;
+    }
+    const previous = unit.card_plan?.plan_id
+      ? output.find((candidate) => candidate.card_plan?.plan_id === unit.card_plan.plan_id) : null;
+    if (!previous
+      || String(previous.statement || '').length + String(unit.statement || '').length > maxChars) {
+      output.push({ ...unit, member_unit_ids: [...(unit.member_unit_ids || [unit.unit_id])] });
+      continue;
+    }
+    const members = [...previous.member_unit_ids, ...(unit.member_unit_ids || [unit.unit_id])];
+    previous.member_unit_ids = uniq(members);
+    previous.unit_id = `coalesced-${hash(previous.member_unit_ids).slice(0, 24)}`;
+    previous.fingerprint = `coalesced:${hash(previous.member_unit_ids.map((id) => String(id)))}`;
+    previous.statement = dedupeSemanticTexts([previous.statement, unit.statement]).join('\n');
+    previous.evidence = mergeEvidence([...(previous.evidence || []), ...(unit.evidence || [])]);
+    previous.tags = uniq([...(previous.tags || []), ...(unit.tags || [])]);
+    previous.applicable_conditions = uniq([...(previous.applicable_conditions || []), ...(unit.applicable_conditions || [])]);
+    previous.exceptions = uniq([...(previous.exceptions || []), ...(unit.exceptions || [])]);
+    previous.uncertainty = uniq([...(previous.uncertainty || []), ...(unit.uncertainty || [])]);
+  }
+  return output;
+}
+
+function sameStructuralTopic(left, right) {
+  // useful-card/2.0 already made an explicit split/combine decision. Never
+  // undo an independent split in the writer merely because headings match.
+  if (left?.card_plan || right?.card_plan) return left?.card_plan?.plan_id === right?.card_plan?.plan_id;
+  const a = stableJson(left?.structure_context?.heading_path || []);
+  const b = stableJson(right?.structure_context?.heading_path || []);
+  return a !== '[]' && a === b && semanticTopic(left) && semanticTopic(left) === semanticTopic(right)
+    && left.route?.library === right.route?.library
+    && left.route?.category === right.route?.category && left.semantic_kind === right.semantic_kind
+    && left.scope === right.scope;
+}
+
+function semanticTopic(unit) {
+  return clean(unit.subject || unit.title, 200).toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
+}
+
+function locatorOrdinal(unit) {
+  const value = unit.evidence?.[0]?.locator?.value ?? unit.evidence?.[0]?.locator?.paragraph
+    ?? unit.evidence?.[0]?.locator?.row ?? '';
+  const match = String(value).match(/\d+/); return match ? Number(match[0]) : null;
+}
+
+function locatorSection(unit) {
+  const locator = unit.evidence?.[0]?.locator || {};
+  const value = String(locator.value ?? '');
+  return `${locator.scheme || ''}:${value.replace(/(?:[\/#]p(?:aragraph)?=?)\d+.*$/i, '')}`;
+}
+
+function semanticallyAdjacent(left, right) {
+  if (left?.card_plan || right?.card_plan) return left?.card_plan?.plan_id === right?.card_plan?.plan_id;
+  if (!left?.route || !right?.route) return false;
+  if (left.route.library !== right.route.library || left.route.category !== right.route.category
+    || left.semantic_kind !== right.semantic_kind || left.scope !== right.scope) return false;
+  const a = locatorOrdinal(left); const b = locatorOrdinal(right);
+  const leftHeading = stableJson(left.structure_context?.heading_path || []);
+  const rightHeading = stableJson(right.structure_context?.heading_path || []);
+  const sameHeading = leftHeading !== '[]' && leftHeading === rightHeading;
+  const adjacent = a == null || b == null || (b >= a && b - a <= (sameHeading ? 10 : 2));
+  const sameTopic = semanticTopic(left) && semanticTopic(left) === semanticTopic(right);
+  return adjacent && sameTopic && (sameHeading || (a != null && b != null
+    && (left.evidence?.[0]?.locator?.scheme === right.evidence?.[0]?.locator?.scheme
+      || (locatorSection(left) && locatorSection(left) === locatorSection(right)))));
 }
 
 function buildPlan(input) {
@@ -486,12 +697,29 @@ function buildPlan(input) {
       summary: '新建 0，更新 0，不变 0，移动 0，需要处理 1。'
     };
   }
-  for (const record of records) {
-    record.path = routeRecord(record, { ...route, directory_category: record.category || route.directory_category }, registry, settings);
+  const reserved = new Map(Object.keys(input.existingFiles || {}).map((path) => [path, frontmatterValue(input.existingFiles[path], 'record_id')]));
+  const allocated = new Map();
+  for (const record of records.sort((a, b) => a.record_id.localeCompare(b.record_id))) {
+    const desired = routeRecord(record, { ...route, directory_category: record.category || route.directory_category }, registry, settings);
     const existingIndex = index.records?.[record.record_id];
-    if (existingIndex && existingIndex.path !== record.path && input.archiveTransition !== true) {
-      record.path = existingIndex.path; // rename/title changes never move identity
+    const oldPath = existingIndex?.path;
+    const managedTechnical = oldPath && oldPath.split('/').at(-1) === `${record.record_id}.md`
+      && input.existingFiles?.[oldPath] !== undefined && Boolean(existingIndex.content_hash);
+    const priorTitle = cleanTitleBoundary(frontmatterValue(input.existingFiles?.[oldPath], 'title'), 160);
+    const priorGeneratedPath = priorTitle ? routeRecord({ ...record, title: priorTitle },
+      { ...route, directory_category: record.category || route.directory_category }, registry, settings) : '';
+    const managedHumanPath = Boolean(oldPath && oldPath === priorGeneratedPath
+      && input.existingFiles?.[oldPath] !== undefined && existingIndex?.content_hash);
+    const mayMigrate = managedTechnical || managedHumanPath;
+    let candidate = existingIndex && !mayMigrate && input.archiveTransition !== true ? oldPath : desired;
+    const ext = '.md'; const stem = candidate.slice(0, -ext.length);
+    let ordinal = 1;
+    while ((allocated.has(candidate) && allocated.get(candidate) !== record.record_id)
+      || (reserved.has(candidate) && reserved.get(candidate) !== record.record_id && candidate !== oldPath)) {
+      ordinal += 1; candidate = `${stem}（${ordinal}）${ext}`;
     }
+    record.path = candidate; allocated.set(candidate, record.record_id);
+    if (mayMigrate && oldPath !== candidate && input.archiveTransition !== true) record.migrate_from_path = oldPath;
   }
   const reviewGroups = resolveRelations(records, index, settings.limits);
   const byPath = input.existingFiles || {};
@@ -499,10 +727,6 @@ function buildPlan(input) {
   for (const record of records.sort((a, b) => a.record_id.localeCompare(b.record_id))) {
     const indexed = index.records?.[record.record_id];
     const occupied = byPath[record.path];
-    if (indexed && indexed.path !== record.path && byPath[indexed.path] !== undefined) {
-      conflicts.push({ cause: 'same_id_multiple_paths', record_id: record.record_id, paths: uniq([indexed.path, record.path]) });
-      continue;
-    }
     if (occupied !== undefined) {
       const occupiedId = clean((occupied.match(/^record_id:\s*["']?([^"'\n]+)/m) || [])[1], 300);
       if (occupiedId && occupiedId !== record.record_id) {
@@ -512,19 +736,23 @@ function buildPlan(input) {
     }
     const content = serializeRecord(record);
     const contentHash = hash(content);
-    const prior = byPath[record.path];
+    const fromPath = record.migrate_from_path;
+    const prior = fromPath ? byPath[fromPath] : byPath[record.path];
     const priorHash = prior === undefined ? null : hash(prior);
     const indexedHash = indexed?.content_hash || null;
     if (prior !== undefined && indexedHash && priorHash !== indexedHash) {
       conflicts.push({ cause: 'optimistic_hash_mismatch', record_id: record.record_id, path: record.path, expected: indexedHash, actual: priorHash });
       continue;
     }
-    const action = priorHash === contentHash ? 'noop' : prior === undefined ? 'create' : 'update';
+    const action = fromPath ? (priorHash === contentHash ? 'move' : 'update_and_move')
+      : priorHash === contentHash ? 'noop' : prior === undefined ? 'create' : 'update';
     actions.push({
       action, record_id: record.record_id, record_kind: record.record_kind, path: record.path,
+      ...(fromPath ? { from_path: fromPath } : {}),
       content, content_hash: contentHash, prior_hash: priorHash, prior_content: prior,
       owner_source_id: sourceId, source_hash: clean(input.document?.source_hash, 128),
-      source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100)
+      source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
+      record_snapshot: JSON.parse(JSON.stringify(record))
     });
   }
   if (input.archiveTransition) {
@@ -542,15 +770,29 @@ function buildPlan(input) {
         }
         action.path = to;
       }
+      const movedLinks = new Map(actions.filter((action) => action.from_path).map((action) => [action.from_path, action.path]));
+      for (const action of actions) {
+        for (const [from, to] of movedLinks) action.content = action.content.split(`[[${from}|`).join(`[[${to}|`);
+        action.content_hash = hash(action.content);
+      }
     }
   }
-  if (actions.length > settings.limits.max_actions) throw new Error('写入计划超过安全上限');
+  if (actions.length > PLAN_LIMITS.max_source_actions) {
+    const error = new Error(`单来源写入动作 ${actions.length} 个，超过全局安全上限 ${PLAN_LIMITS.max_source_actions} 个。`);
+    error.code = 'STRUCTURED_ACTION_LIMIT_EXCEEDED';
+    error.details = { actual_actions: actions.length, global_safe_limit: PLAN_LIMITS.max_source_actions,
+      transaction_action_limit: settings.limits.max_actions, source_document_id: sourceId };
+    throw error;
+  }
   const counts = {};
   for (const action of actions) counts[action.action] = (counts[action.action] || 0) + 1;
   const universalMode = Boolean(input.universalResult?.knowledge_units);
   const phase3HandlingGroups = universalMode ? reviewDecisions
     : [...(input.phase3Result?.handling_groups || []), ...reviewDecisions];
-  const blocked = conflicts.length > 0 || reviewGroups.length > 0 || phase3HandlingGroups.length > 0;
+  // Phase-3 decisions refer to units already excluded by buildCanonicalRecords.
+  // They remain durable review evidence, but must not block an atomic commit of
+  // the independent, verified knowledge set.
+  const blocked = conflicts.length > 0 || reviewGroups.length > 0;
   const planCore = {
     version: WRITER_VERSION, mode: settings.mode, source_document_id: sourceId,
     generator: 'structured-writer', actions, conflicts, review_groups: reviewGroups,
@@ -558,11 +800,53 @@ function buildPlan(input) {
     source_hash: clean(input.document?.source_hash, 128),
     source_version: clean(input.document?.source_version || input.document?.metadata?.version_label, 100),
     index_revision: Number(index.revision || 0), blocked,
-    writes_performed: 0
+    writes_performed: 0,
+    transaction_limits: { max_records: settings.limits.max_records, max_actions: settings.limits.max_actions }
   };
   planCore.plan_id = `plan-${hash({ ...planCore, actions: actions.map(({ prior_content, ...item }) => item) }).slice(0, 24)}`;
   planCore.summary = `新建 ${counts.create || 0}，更新 ${counts.update || 0}，不变 ${counts.noop || 0}，移动 ${counts.move || 0}，需要处理 ${conflicts.length + reviewGroups.length + planCore.phase3_handling_groups.length}。`;
   return planCore;
+}
+
+function partitionPlan(plan) {
+  if (!plan?.actions || plan.mode === 'feature_off') return [plan];
+  const maxRecords = Math.max(1, Number(plan.transaction_limits?.max_records) || 100);
+  const maxActions = Math.max(1, Number(plan.transaction_limits?.max_actions) || 300);
+  const support = plan.actions.filter((action) => !KNOWLEDGE_RECORD_KINDS.has(action.record_kind));
+  const knowledge = plan.actions.filter((action) => KNOWLEDGE_RECORD_KINDS.has(action.record_kind));
+  if (support.length > maxActions) {
+    const error = new Error(`来源支撑记录 ${support.length} 个，无法放入上限 ${maxActions} 的有界事务。`);
+    error.code = 'STRUCTURED_PARTITION_UNSAFE';
+    error.details = { actual_support_actions: support.length, transaction_action_limit: maxActions,
+      actual_records: knowledge.length, recovery: '保留已有检查点，调整单事务 action 上限后重试。' };
+    throw error;
+  }
+  const partitions = [];
+  let offset = 0;
+  while (offset < knowledge.length || (!partitions.length && support.length)) {
+    const prefix = partitions.length ? [] : support;
+    const capacity = Math.min(maxRecords, maxActions - prefix.length);
+    if (knowledge.length > offset && capacity < 1) {
+      const error = new Error(`事务 action 上限 ${maxActions} 无法同时容纳来源支撑记录和知识记录。`);
+      error.code = 'STRUCTURED_PARTITION_UNSAFE';
+      error.details = { actual_support_actions: support.length, transaction_action_limit: maxActions,
+        actual_records: knowledge.length, recovery: '保留已有检查点，调整单事务 action 上限后重试。' };
+      throw error;
+    }
+    const actions = [...prefix, ...knowledge.slice(offset, offset + capacity)];
+    offset += Math.max(0, actions.length - prefix.length);
+    partitions.push(actions);
+  }
+  const total = partitions.length;
+  return partitions.map((actions, index) => {
+    const partition = { ...plan, actions, partition: { schema_version: 'structured-partition/1.0',
+      index: index + 1, total, knowledge_offset: index === 0 ? 0 : partitions.slice(0, index)
+        .reduce((sum, rows) => sum + rows.filter((a) => KNOWLEDGE_RECORD_KINDS.has(a.record_kind)).length, 0),
+      knowledge_count: actions.filter((a) => KNOWLEDGE_RECORD_KINDS.has(a.record_kind)).length } };
+    partition.plan_id = `plan-${hash({ parent_plan_id: plan.plan_id, partition: partition.partition,
+      actions: actions.map(({ prior_content, ...item }) => item) }).slice(0, 24)}`;
+    return partition;
+  });
 }
 
 async function ensureParent(vault, path) {
@@ -672,6 +956,7 @@ async function commitPlan(plan, options) {
     status: 'staging', steps: [], created_at: options.logicalTime || ''
   };
   manifest.previous_index = JSON.parse(JSON.stringify(options.index || emptyIndex()));
+  manifest.required_artifacts = [];
   let indexSaved = false;
   try {
     await ensureParent(vault, manifestPath);
@@ -704,6 +989,16 @@ async function commitPlan(plan, options) {
     index.source_versions[plan.source_document_id] = { source_hash: plan.source_hash, source_version: plan.source_version };
     await options.saveIndex(index);
     indexSaved = true;
+    for (const artifact of (options.requiredArtifacts || [])) {
+      const prior = await vault.readIfExists(artifact.path);
+      const step = { action: 'required_artifact', record_id: artifact.id, record_kind: 'production_state',
+        path: artifact.path, prior_content: prior, content_hash: hash(artifact.content), status: 'started' };
+      manifest.steps.push(step); manifest.required_artifacts.push({ id: artifact.id, path: artifact.path, content_hash: step.content_hash });
+      await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+      await vault.write(artifact.path, artifact.content); step.status = 'committed';
+      if (hash(await vault.readIfExists(artifact.path)) !== step.content_hash) throw new Error(`必需生产产物最终校验失败：${artifact.id}`);
+      await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
+    }
     manifest.status = 'files_committed';
     manifest.index_revision = index.revision;
     await vault.write(manifestPath, JSON.stringify(manifest, null, 2));
@@ -711,6 +1006,7 @@ async function commitPlan(plan, options) {
     const verified = await verifyCommittedRecords(plan, vault, {
       transactionId, verifiedAt: new Date().toISOString(), runId: options.runId, targetRoots
     });
+    if (typeof options.verifyRequiredArtifacts === 'function') await options.verifyRequiredArtifacts({ index, verified, manifest });
     const plannedPaths = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind)).map((item) => item.path);
     const committedPaths = plan.actions.filter((item) => KNOWLEDGE_RECORD_KINDS.has(item.record_kind)
       && (item.action === 'noop' || manifest.steps.some((step) => step.record_id === item.record_id && step.status === 'committed'))).map((item) => item.path);
@@ -806,5 +1102,5 @@ module.exports = {
   WRITER_VERSION, INDEX_VERSION, PLAN_LIMITS, MODES, RELATION_TYPES,
   stableJson, hash, stableId, pathSafe, normalizeSettings, sourceIdentity,
   candidateIdentity, emptyIndex, validateIndex, serializeRecord, resolveRelations,
-  buildPlan, commitPlan, rollbackTransaction, verifyCommittedRecords
+  buildPlan, partitionPlan, commitPlan, rollbackTransaction, verifyCommittedRecords, coalesceCanonicalUnits, normalizeCanonicalPresentation
 };

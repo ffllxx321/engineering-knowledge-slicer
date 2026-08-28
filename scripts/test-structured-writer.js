@@ -4,8 +4,8 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const {
-  stableId, emptyIndex, serializeRecord, buildPlan, commitPlan, rollbackTransaction,
-  pathSafe, hash
+  stableId, emptyIndex, serializeRecord, buildPlan, partitionPlan, commitPlan, rollbackTransaction,
+  pathSafe, hash, coalesceCanonicalUnits
 } = require('../src/structured-writer.js');
 const { runPhase2CandidatePipeline } = require('../src/phase2-candidate-pipeline.js');
 const { evaluatePhase3 } = require('../src/phase3-review-gate.js');
@@ -185,6 +185,21 @@ async function realPhasePath() {
 }
 
 async function main() {
+  const semanticBase = {
+    route: { library: 'business', category: 'safety' }, semantic_kind: 'requirement', scope: 'project',
+    subject: '临边防护', title: '临边防护', tags: [], applicable_conditions: [], exceptions: [], uncertainty: []
+  };
+  const adjacent = coalesceCanonicalUnits([
+    { ...semanticBase, unit_id: 'adj-1', statement: '临边必须设置防护栏杆。', evidence: [{ locator: { scheme: 'paragraph', value: 'p10' }, verbatim: '临边必须设置防护栏杆。' }] },
+    { ...semanticBase, unit_id: 'adj-2', statement: '栏杆底部必须设置挡脚板。', evidence: [{ locator: { scheme: 'paragraph', value: 'p11' }, verbatim: '栏杆底部必须设置挡脚板。' }] }
+  ]);
+  assert.strictEqual(adjacent.length, 2, 'adjacent independent requirements remain separate without an explicit card plan');
+  assert(adjacent.every((unit) => unit.evidence.length === 1), 'separate requirements retain their own evidence');
+  const unrelated = coalesceCanonicalUnits([
+    { ...semanticBase, unit_id: 'apart-1', statement: '临边必须设置防护栏杆。', evidence: [{ locator: { scheme: 'paragraph', value: 'p10' }, verbatim: '临边必须设置防护栏杆。' }] },
+    { ...semanticBase, unit_id: 'apart-2', subject: '混凝土养护', title: '混凝土养护', statement: '混凝土应保湿养护。', evidence: [{ locator: { scheme: 'paragraph', value: 'p11' }, verbatim: '混凝土应保湿养护。' }] }
+  ]);
+  assert.strictEqual(unrelated.length, 2, 'semantically unrelated units never merge merely to satisfy a count');
   assert.strictEqual(pathSafe('../逃逸'), false);
   assert.strictEqual(pathSafe('/绝对'), false);
   assert.strictEqual(buildPlan({ settings: {}, document: {} }).mode, 'feature_off');
@@ -197,7 +212,8 @@ async function main() {
   assert.deepStrictEqual(plan.counts, { create: 2 });
   assert(plan.summary.includes('新建 2'));
   assert(plan.actions.every((item) => item.path.startsWith('06-知识库/业务库/')));
-  assert(plan.actions.some((item) => item.content.includes('[[src-')));
+  assert(plan.actions.some((item) => item.content.includes('|报价单.docx]]')));
+  assert(plan.actions.every((item) => !item.path.split('/').at(-1).startsWith(`${item.record_id}.md`)));
 
   const idsByKind = Object.fromEntries(plan.actions.map((item) => [item.record_kind, item.record_id]));
   const renamed = buildPlan({ ...base, document: document({ title: '改名后的报价单', filename: '改名.docx' }) });
@@ -222,7 +238,8 @@ async function main() {
   const occupied = buildPlan({
     ...base, existingFiles: { [occupiedPath]: '---\nrecord_id: \"other-id\"\n---\n' }
   });
-  assert(occupied.conflicts.some((item) => item.cause === 'path_occupied_by_different_id'));
+  assert.strictEqual(occupied.blocked, false);
+  assert(occupied.actions.some((item) => /（2）\.md$/.test(item.path)), '同名占用应稳定使用可读序号消歧');
 
   const dirty = { ...files, [occupiedPath]: `${files[occupiedPath]}\n用户修改` };
   const optimistic = buildPlan({ ...base, index, existingFiles: dirty });
@@ -273,8 +290,8 @@ async function main() {
   });
   assert(archived.actions.every((item) => item.from_path?.startsWith('06-知识库/招投标库/P-001/')));
   assert(archived.actions.every((item) => item.path.startsWith('06-知识库/业务库/complete_historical_projects/')));
-  assert(archived.actions.some((item) => item.content.includes('[[src-')),
-    'stable basename links survive archive moves');
+  assert(archived.actions.some((item) => item.content.includes('complete_historical_projects') && item.content.includes('|报价单.docx]]')),
+    '关系链接应在归档事务中改写 target_path 并保留人类标题');
 
   const ambiguous = buildPlan({
     ...base, document: activeDoc,
@@ -399,6 +416,88 @@ async function main() {
   assert.strictEqual(second22.verified.counts.knowledge_records, 22);
   assert.strictEqual(second22.verified.counts.knowledge_unchanged, 22);
   assert.strictEqual(new Set(second22.verified.knowledge_paths).size, 22);
+
+  const universal101 = universalResult(101);
+  universal101.knowledge_units.forEach((unit, index) => {
+    unit.evidence = [{ ...unit.evidence[0], locator: { scheme: 'paragraph', value: `p-${index}` },
+      verbatim: `第 ${index + 1} 项要求必须执行并留存记录。` }];
+  });
+  const preliminary101 = buildPlan({ ...input(), document: universal101.document, universalResult: universal101,
+    phase2Result: undefined, phase3Result: undefined });
+  const orderedKnowledge101 = preliminary101.actions.filter((item) =>
+    ['business_item', 'company_knowledge'].includes(item.record_kind));
+  const unitForTitle = (title) => universal101.knowledge_units.find((unit) => unit.title === title);
+  universal101.relations = [{ type: 'related',
+    from_unit_id: unitForTitle(orderedKnowledge101[0].record_snapshot.title).unit_id,
+    to_unit_id: unitForTitle(orderedKnowledge101[100].record_snapshot.title).unit_id,
+    evidence: { scheme: 'paragraph', value: 'p-0' } }];
+  const plan101 = buildPlan({
+    ...input(), document: universal101.document, universalResult: universal101,
+    phase2Result: undefined, phase3Result: undefined
+  });
+  const partitions101 = partitionPlan({ ...plan101, mode: 'structured-write' });
+  assert.strictEqual(partitions101.length, 2, '101 knowledge records use two bounded transactions');
+  assert(partitions101.every((part) => part.actions.filter((action) =>
+    ['business_item', 'company_knowledge'].includes(action.record_kind)).length <= 100));
+  const relatedAction = partitions101.flatMap((part) => part.actions).find((action) =>
+    action.record_snapshot?.relations?.some((relation) => relation.type === 'related'));
+  const relatedTarget = relatedAction?.record_snapshot?.relations?.find((relation) => relation.type === 'related');
+  assert(relatedAction?.content.includes(`[[${relatedTarget?.target_path}|${relatedTarget?.target_title}]]`),
+    'cross-partition relationships retain resolved target paths and human titles');
+  const vault101 = new MemoryVault();
+  let index101 = emptyIndex();
+  const first101 = await commitPlan(partitions101[0], { vault: vault101, lock: lock(), stateRoot: '状态',
+    index: index101, logicalTime: TIME, runId: 'run-101-p1', saveIndex: async (next) => { index101 = next; } });
+  assert.strictEqual(first101.verified.counts.knowledge_records, 100);
+  const failingSecond = new MemoryVault(Object.fromEntries(vault101.files), 5);
+  await assert.rejects(() => commitPlan(partitions101[1], { vault: failingSecond, lock: lock(), stateRoot: '状态',
+    index: index101, logicalTime: TIME, runId: 'run-101-p2-fail', saveIndex: async () => {} }),
+  (error) => Boolean(error.transactionManifest));
+  for (const action of partitions101[0].actions.filter((item) => item.action !== 'noop')) {
+    assert.strictEqual(failingSecond.files.get(action.path), action.content,
+      'a failed later partition does not roll back an earlier committed partition');
+  }
+  const resumedVault = new MemoryVault(Object.fromEntries(failingSecond.files));
+  const second101 = await commitPlan(partitions101[1], { vault: resumedVault, lock: lock(), stateRoot: '状态',
+    index: index101, logicalTime: TIME, runId: 'run-101-p2-retry', saveIndex: async (next) => { index101 = next; } });
+  assert.strictEqual(second101.verified.counts.knowledge_records, 1);
+  const knowledgeActions101 = partitions101.flatMap((part) => part.actions)
+    .filter((item) => ['business_item', 'company_knowledge'].includes(item.record_kind));
+  assert.strictEqual(knowledgeActions101.length, 101);
+  assert(knowledgeActions101.every((action) => action.record_snapshot.evidence_list.length === 1
+    && action.content.includes(action.record_snapshot.evidence_list[0].verbatim)),
+  'partitioning retains every knowledge record and its evidence');
+  assert.throws(() => buildPlan({
+    ...input(), document: universalResult(10001).document, universalResult: universalResult(10001),
+    phase2Result: undefined, phase3Result: undefined
+  }), (error) => error.code === 'STRUCTURED_KNOWLEDGE_LIMIT_EXCEEDED'
+    && error.details.actual_records === 10001 && error.details.required_partitions === 101,
+  'the independent global ceiling still rejects runaway input with recovery detail');
+
+  const reviewed = universalResult(3);
+  reviewed.review_decisions = [{ decision_id: 'review-1', unit_ids: [reviewed.knowledge_units[2].unit_id],
+    cause: 'insufficient_evidence', action: 'manual_group' }];
+  const reviewedPlan = buildPlan({
+    ...input(), document: reviewed.document, universalResult: reviewed,
+    phase2Result: undefined, phase3Result: undefined
+  });
+  assert.strictEqual(reviewedPlan.blocked, false,
+    'quarantined review units do not block independent verified knowledge');
+  assert.strictEqual(reviewedPlan.phase3_handling_groups.length, 1);
+  assert.strictEqual(reviewedPlan.actions.filter((item) =>
+    ['business_item', 'company_knowledge'].includes(item.record_kind)).length, 2);
+
+  const duplicated = universalResult(3);
+  duplicated.knowledge_units[1].fingerprint = duplicated.knowledge_units[0].fingerprint;
+  const duplicatePlan = buildPlan({
+    ...input(), document: duplicated.document, universalResult: duplicated,
+    phase2Result: undefined, phase3Result: undefined
+  });
+  const duplicateKnowledge = duplicatePlan.actions.filter((item) =>
+    ['business_item', 'company_knowledge'].includes(item.record_kind));
+  assert.strictEqual(duplicateKnowledge.length, 2, 'stable semantic identities are coalesced before commit');
+  assert.strictEqual(new Set(duplicateKnowledge.map((item) => item.path)).size, 2,
+    'one plan never writes the same stable path twice');
 
   const noopVault = new NoopRecordVault();
   await assert.rejects(() => commitPlan({ ...plan22, mode: 'structured-write' }, {

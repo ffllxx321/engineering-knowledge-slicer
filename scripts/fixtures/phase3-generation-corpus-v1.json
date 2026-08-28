@@ -1,0 +1,67 @@
+{
+  "schema": "eks-phase3-generation-corpus/1.0",
+  "document": {
+    "source_identity": "phase3-public-generic-corpus-v1",
+    "source_document_id": "phase3-public-generic-corpus-v1",
+    "source_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "source_path": "fixtures/generic-engineering-manual.md",
+    "filename": "generic-engineering-manual.md",
+    "title": "通用工程安装与调试手册",
+    "media_type": "text/markdown",
+    "metadata": { "library": "business" },
+    "blocks": [
+      { "block_id": "h-install", "kind": "heading", "text": "室内配电安装要求", "metadata": { "outline_level": 0 }, "locator": { "scheme": "section", "value": "1" } },
+      { "block_id": "install-scope", "kind": "paragraph", "text": "以下要求适用于室内低压配电柜。", "locator": { "scheme": "paragraph", "value": "1.0" } },
+      { "block_id": "install-r1", "kind": "list_item", "text": "1. 施工方必须检查保护接地连续性。", "metadata": { "list_id": "install-requirements", "parent_clause_id": "install-scope" }, "locator": { "scheme": "paragraph", "value": "1.1", "page": 2 } },
+      { "block_id": "install-r2", "kind": "list_item", "text": "2. 施工方必须记录绝缘电阻；但经设计单位书面批准的测试点除外。", "metadata": { "list_id": "install-requirements", "parent_clause_id": "install-scope" }, "locator": { "scheme": "paragraph", "value": "1.2", "page": 2 } },
+
+      { "block_id": "h-start", "kind": "heading", "text": "循环泵启动程序", "metadata": { "outline_level": 0 }, "locator": { "scheme": "section", "value": "2" } },
+      { "block_id": "start-1", "kind": "list_item", "text": "1. 打开入口阀。", "metadata": { "list_id": "pump-start", "knowledge_event_type": "procedure", "sequence": 1 }, "locator": { "scheme": "paragraph", "value": "2.1", "page": 3 } },
+      { "block_id": "start-2", "kind": "list_item", "text": "2. 点动电机并确认旋向。", "metadata": { "list_id": "pump-start", "knowledge_event_type": "procedure", "sequence": 2 }, "locator": { "scheme": "paragraph", "value": "2.2", "page": 3 } },
+      { "block_id": "start-3", "kind": "list_item", "text": "3. 缓慢开启出口阀并记录压力。", "metadata": { "list_id": "pump-start", "knowledge_event_type": "procedure", "sequence": 3 }, "locator": { "scheme": "paragraph", "value": "2.3", "page": 3 } },
+      { "block_id": "h-storage", "kind": "heading", "text": "仓储安全", "metadata": { "outline_level": 0 }, "locator": { "scheme": "section", "value": "3" } },
+      { "block_id": "storage-1", "kind": "paragraph", "text": "仓库通道不得堆放包装材料。", "locator": { "scheme": "paragraph", "value": "3.1", "page": 3 } },
+
+      { "block_id": "h-table", "kind": "heading", "text": "风机运行参数", "metadata": { "outline_level": 0 }, "locator": { "scheme": "section", "value": "4" } },
+      { "block_id": "table-head", "kind": "table_row", "text": "设备 | 轴承温度 (°C) | 振动速度 (mm/s)", "metadata": { "table_id": "fan-parameters", "table_header": true }, "locator": { "scheme": "table", "value": "4.header", "page": 4 } },
+      { "block_id": "table-a", "kind": "table_row", "text": "送风机 A | 不超过 80 | 不超过 4.5", "metadata": { "table_id": "fan-parameters", "row_id": "fan-a", "table_headers": ["设备", "轴承温度 (°C)", "振动速度 (mm/s)"] }, "locator": { "scheme": "table", "value": "4.A", "page": 4, "row": 2 } },
+
+      { "block_id": "h-def", "kind": "heading", "text": "术语和缩略语", "metadata": { "outline_level": 0 }, "locator": { "scheme": "section", "value": "5" } },
+      { "block_id": "def-vfd", "kind": "paragraph", "text": "变频驱动器（Variable Frequency Drive，VFD）是指通过改变电源频率调节电机转速的装置。", "locator": { "scheme": "paragraph", "value": "5.1", "page": 5 } },
+
+      { "block_id": "h-water", "kind": "heading", "text": "冷却水供水压力", "metadata": { "outline_level": 0 }, "locator": { "scheme": "section", "value": "6" } },
+      { "block_id": "water-pressure", "kind": "paragraph", "text": "冷却水供水压力不得低于 0.25 MPa。", "locator": { "scheme": "paragraph", "value": "6.1", "page": 6 } },
+      { "block_id": "h-air", "kind": "heading", "text": "仪表空气供气压力", "metadata": { "outline_level": 0 }, "locator": { "scheme": "section", "value": "7" } },
+      { "block_id": "air-pressure", "kind": "paragraph", "text": "仪表空气供气压力不得低于 0.55 MPa。", "locator": { "scheme": "paragraph", "value": "7.1", "page": 6 } },
+
+      { "block_id": "boiler-1", "kind": "paragraph", "text": "通用工程有限公司 技术文件 受控副本", "metadata": { "repeated_marginalia": true }, "locator": { "scheme": "page", "value": "7.footer", "page": 7 } },
+      { "block_id": "boiler-2", "kind": "paragraph", "text": "通用工程有限公司 技术文件 受控副本", "metadata": { "repeated_marginalia": true }, "locator": { "scheme": "page", "value": "8.footer", "page": 8 } }
+    ]
+  },
+  "questions": [
+    { "id": "install-grounding", "query": "室内低压配电柜保护接地连续性由谁检查", "subject": "施工方", "evidence_block": "install-r1", "expected_evidence": "保护接地连续性" },
+    { "id": "install-exception", "query": "室内配电绝缘电阻测试有什么例外", "evidence_block": "install-r2", "expected_evidence": "设计单位书面批准" },
+    { "id": "pump-sequence", "query": "循环泵启动时入口阀旋向出口阀的顺序", "evidence_block": "start-1", "expected_evidence": "打开入口阀" },
+    { "id": "fan-temperature", "query": "送风机 A 轴承温度上限是多少摄氏度", "evidence_block": "table-a", "expected_evidence": "不超过 80" },
+    { "id": "vfd-definition", "query": "VFD Variable Frequency Drive 中文是什么装置", "evidence_block": "def-vfd", "expected_evidence": "改变电源频率" },
+    { "id": "water-pressure", "query": "冷却水供水压力最低值", "evidence_block": "water-pressure", "expected_evidence": "0.25 MPa" },
+    { "id": "air-pressure", "query": "仪表空气供气压力最低值", "evidence_block": "air-pressure", "expected_evidence": "0.55 MPa" },
+    { "id": "no-answer", "query": "塔式起重机最大起重力矩是多少", "answerable": false, "min_lexical_score": 0.01 }
+  ],
+  "expectation": {
+    "answerable_questions": 7,
+    "recall_at_1": 1,
+    "evidence_hit_rate": 1,
+    "no_answer_false_positive_rate": 0,
+    "deterministic_repeatability": 1,
+    "boilerplate_cards": 0,
+    "report_sha256": "81e5a95d1d825ac2869da1218c9cfe52697b7873f11b957bb9191d2ad5d71cfa",
+    "pre_change_failures": [
+      "ordered_procedure_split_into_three_cards",
+      "exception_split_from_governing_requirement",
+      "definition_aliases_missing",
+      "repeated_marginalia_planned_as_unknown_cards",
+      "MPa_parameter_truncated"
+    ]
+  }
+}

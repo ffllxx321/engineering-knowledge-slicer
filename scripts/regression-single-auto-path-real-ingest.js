@@ -34,14 +34,22 @@ async function main() {
   const port = new KnowledgeWritePort(vault);
   await assert.rejects(() => port.verify({ record_id: 'missing', record_kind: 'business_item', path: '06-知识库/业务库/missing.md', content_hash: hash('') }, 'tx', '', { runId: 'run', targetRoots: { business: '06-知识库/业务库' } }), /校验失败/);
   const calls = []; const parser = new AutoDocumentParser({ local: async () => { calls.push('local'); return ok('local'); },
-    probePdf: (_buffer, context) => context.probe, localPdf: async () => { calls.push('localPdf'); return ok('localPdf'); },
+    probePdf: (_buffer, context) => context.probe, localPdf: async (_p, _b, context) => { calls.push('localPdf'); return context.forceLocalPdfFailure ? { status: 'failed' } : ok('localPdf'); },
     mineru: async (_p, _b, context) => { calls.push('mineru'); return context.failMineru ? { status: 'failed' } : ok('mineru'); },
     localOcr: async (_p, _b, context) => { calls.push('localOcr'); return context.failOcr ? { status: 'failed' } : ok('localOcr'); } });
   for (const ext of ['docx', 'xlsx', 'pptx', 'msg', 'eml', 'txt', 'md']) { calls.length = 0; await parser.parse(`a.${ext}`, Buffer.from('x')); assert.deepStrictEqual(calls, ['local']); }
   calls.length = 0; await parser.parse('native.pdf', Buffer.from('x'), { probe: { reliableLocal: true } }); assert.deepStrictEqual(calls, ['localPdf']);
-  calls.length = 0; await parser.parse('scan.pdf', Buffer.from('x'), { probe: { reliableLocal: false }, mineruConfigured: true, allowNecessaryCloud: true }); assert.deepStrictEqual(calls, ['mineru']);
-  calls.length = 0; await parser.parse('fallback.pdf', Buffer.from('x'), { probe: { reliableLocal: false }, mineruConfigured: true, allowNecessaryCloud: true, failMineru: true }); assert.deepStrictEqual(calls, ['mineru', 'localOcr']);
-  await assert.rejects(() => parser.parse('bad.pdf', Buffer.from('x'), { probe: { reliableLocal: false }, failOcr: true }), /未产生可核验知识证据/);
+  calls.length = 0; await parser.parse('scan.pdf', Buffer.from('x'), { probe: { reliableLocal: false }, forceLocalPdfFailure: true, mineruConfigured: true, allowNecessaryCloud: true }); assert.deepStrictEqual(calls, ['localPdf', 'mineru']);
+  calls.length = 0; await parser.parse('fallback.pdf', Buffer.from('x'), { probe: { reliableLocal: false }, forceLocalPdfFailure: true, mineruConfigured: true, allowNecessaryCloud: true, failMineru: true }); assert.deepStrictEqual(calls, ['localPdf', 'mineru', 'localOcr']);
+  calls.length = 0; let consentRequests = 0;
+  await parser.parse('consent.pdf', Buffer.from('x'), { probe: { reliableLocal: false }, forceLocalPdfFailure: true, mineruConfigured: true,
+    confirmNecessaryUpload: async () => { consentRequests += 1; return true; } });
+  assert.deepStrictEqual(calls, ['localPdf', 'mineru']); assert.strictEqual(consentRequests, 1, 'per-file consent must unlock MinerU');
+  const actionable = new AutoDocumentParser({ probePdf: () => ({ reliableLocal: false }), localPdf: async () => ({ status: 'failed' }),
+    localOcr: async () => ({ status: 'ocr_required', actionable: { code: 'PDF_OCR_PROVIDER_REQUIRED', retryable: true } }) });
+  const needsOcr = await actionable.parse('needs-ocr.pdf', Buffer.from('x'));
+  assert.strictEqual(needsOcr.status, 'ocr_required', 'actionable OCR state must not become an internal quality-gate failure');
+  await assert.rejects(() => parser.parse('bad.pdf', Buffer.from('x'), { probe: { reliableLocal: false }, forceLocalPdfFailure: true, failOcr: true }), /未产生可核验知识证据/);
   const bundle = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
   assert(bundle.includes("knowledgeTenderRoot: '06-知识库/招投标库'")); assert(bundle.includes("knowledgeBusinessRoot: '06-知识库/业务库'"));
   console.log('single-auto-path + real-ingest regressions: PASS');

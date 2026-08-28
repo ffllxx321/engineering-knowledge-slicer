@@ -1,0 +1,9 @@
+{
+  "schema": "eks-real-card-question-set/1.0",
+  "name": "production-serializer-representative-v1",
+  "questions": [
+    {"id":"pressure-duration","query":"管道水压试验需要稳压多久","answerable":true,"expected_ids":["bi-pressure"],"expected_evidence":"稳压30 min","require_locator":true},
+    {"id":"coating-weather","query":"外墙真石漆耐候年限是多少","answerable":true,"expected_ids":["ck-coating"],"expected_evidence":"≥10年","require_locator":true},
+    {"id":"no-answer-quantum","query":"量子芯片低温校准频率","answerable":false,"expected_ids":[]}
+  ]
+}

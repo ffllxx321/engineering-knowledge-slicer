@@ -6,8 +6,14 @@
  * content, order, provenance and structural hints.
  */
 const crypto = require('crypto');
+const { normalizeSemanticText, semanticTextSignature, dedupeSemanticTexts } = require('./semantic-text.js');
+const { analyzeText } = require('./content-integrity.js');
+const { generateUsefulCards, SEMANTIC_KIND } = require('./useful-card-generation.js');
+const { STRUCTURE_VERSION, buildStructureContext } = require('./structure-context.js');
+const { PRE_GENERATION_SEMANTIC_CONTRACT_VERSION, PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT,
+  preparePreGenerationBlocks } = require('./pre-generation-structure.js');
 
-const PIPELINE_VERSION = '3.1';
+const PIPELINE_VERSION = '5.0-structure-aware-useful-card';
 const OUTPUT_LANGUAGE = 'zh-CN';
 const TRANSLATION_VERSION = 'universal-zh-v1';
 const SEMANTIC_KINDS = Object.freeze([
@@ -20,8 +26,8 @@ const ACTIVE_STATES = new Set(['lead', 'approved', 'bidding', 'submitted', 'eval
 const HISTORICAL_STATES = new Set(['lost', 'paused', 'terminated', 'archived', 'completed', 'cancelled', 'suspended']);
 const BLOCK_KINDS = new Set([
   'heading', 'paragraph', 'list', 'list_item', 'table', 'table_row', 'key_value',
-  'figure', 'caption', 'header', 'footer', 'email_envelope', 'email_body',
-  'email_thread', 'sheet', 'page', 'attachment', 'text'
+  'table_cell', 'spreadsheet_cell', 'figure', 'caption', 'header', 'footer', 'email_envelope', 'email_subject', 'email_from', 'email_to', 'email_body',
+  'email_thread', 'quote', 'signature', 'sheet', 'page', 'page-text', 'attachment', 'speaker_note', 'parsed-markdown', 'text'
 ]);
 const TAG_SYNONYMS = Object.freeze({
   '质量管理': '质量', '品质': '质量', '安全管理': '安全', '工期': '时间',
@@ -127,7 +133,7 @@ function deterministicChinese(text) {
 function normalizeLocator(raw, fallback) {
   const locator = raw && typeof raw === 'object' ? raw : {};
   const result = {};
-  for (const key of ['scheme', 'value', 'page', 'sheet', 'range', 'row', 'column', 'message_id', 'attachment_id', 'heading_path']) {
+  for (const key of ['scheme', 'value', 'fragment', 'page', 'sheet', 'range', 'row', 'column', 'message_id', 'attachment_id', 'heading_path']) {
     if (locator[key] !== undefined && locator[key] !== null && String(locator[key]).trim()) result[key] = locator[key];
   }
   if (!result.scheme) result.scheme = 'block';
@@ -135,13 +141,49 @@ function normalizeLocator(raw, fallback) {
   return result;
 }
 
+function expandStructuredBlocks(rawBlocks, source) {
+  const output = []; const identityOccurrences = new Map();
+  for (const raw of rawBlocks) {
+    const value = String(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown || '');
+    const parser = clean(raw?.parse?.method || source.parser, 80);
+    const markdownLike = raw?.kind === 'parsed-markdown' || (raw?.kind === 'page-text' && parser === 'mineru-api');
+    if (!markdownLike && raw?.kind !== 'table') { output.push(raw); continue; }
+    const lines = value.split(/\r?\n/); let paragraph = []; let start = 0;
+    const emit = (kind, parts, line, metadata = {}) => {
+      const content = parts.join('\n').trim(); if (!content) return;
+      const identityKey = `${kind}\0${content}`; const occurrence = identityOccurrences.get(identityKey) || 0; identityOccurrences.set(identityKey, occurrence + 1);
+      const stable = `blk-${digest([source.source_document_id || source.source_hash, kind, content, occurrence]).slice(0, 20)}`;
+      output.push({ ...raw, block_id: stable, kind, raw: { ...(raw.raw || {}), text: content }, text: content,
+        locator: { ...(raw.locator || {}), fragment: `lines=${line + 1}-${line + parts.length}` }, metadata: { ...(raw.metadata || {}), ...metadata, structure_origin: markdownLike ? 'parser' : 'native' } });
+    };
+    const flush = (line) => { emit('paragraph', paragraph, start); paragraph = []; };
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i]; const heading = markdownLike && line.match(/^(#{1,6})\s+(.+)$/); const item = markdownLike && line.match(/^\s*([-*+] |\d+[.)]\s+)(.+)$/);
+      const tableRow = /^\s*\|.*\|\s*$/.test(line);
+      if (heading) { flush(i); emit('heading', [heading[2]], i, { heading_level: heading[1].length }); }
+      else if (item) { flush(i); emit('list_item', [item[2]], i, { list_id: `markdown-list:${raw.block_id || raw.locator?.value || 'document'}`, list_level: Math.floor((line.match(/^\s*/)?.[0].length || 0) / 2), numbering_token: item[1].trim() }); }
+      else if (tableRow) {
+        flush(i); const cells = line.split('|').slice(1, -1).map((cell) => clean(cell, 500));
+        const tableId = `markdown-table:${raw.block_id || raw.locator?.value || 'document'}`;
+        const header = output.find((b) => b.kind === 'table_row' && b.metadata?.table_id === tableId && b.metadata?.table_header);
+        if (!cells.every((cell) => /^:?-{3,}:?$/.test(cell))) emit('table_row', [cells.join(' | ')], i, { table_id: tableId, row_id: `row:${digest(cells).slice(0, 12)}`, table_header: !header, table_headers: header ? header.raw.text.split(' | ') : [] });
+      } else if (!line.trim()) flush(i); else { if (!paragraph.length) start = i; paragraph.push(line); }
+    }
+    flush(lines.length);
+  }
+  return output;
+}
+
 function canonicalizeDocument(input = {}) {
   const source = input.document || input;
-  const rawBlocks = Array.isArray(source.blocks) ? source.blocks
+  const inputBlocks = Array.isArray(source.blocks) ? source.blocks
     : Array.isArray(source.normalized_blocks) ? source.normalized_blocks
       : clean(source.text || source.markdown) ? [{ kind: 'text', raw: { text: source.text || source.markdown } }] : [];
-  const blocks = rawBlocks.map((raw, order) => {
-    const rawText = clean(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown, 30000);
+  const prepared = preparePreGenerationBlocks(inputBlocks, source);
+  const rawBlocks = prepared.blocks;
+  const blocks = expandStructuredBlocks(rawBlocks, source).map((raw, order) => {
+    const originalText = String(raw?.raw?.text || raw?.text || raw?.content || raw?.markdown || '');
+    const rawText = clean(originalText, 30000);
     const kind = BLOCK_KINDS.has(clean(raw?.kind, 80)) ? clean(raw.kind, 80) : 'text';
     const metadata = raw?.metadata && typeof raw.metadata === 'object' ? { ...raw.metadata } : {};
     const hierarchy = uniq([
@@ -151,26 +193,58 @@ function canonicalizeDocument(input = {}) {
     ]);
     const blockId = clean(raw?.block_id, 160) || `blk-${digest([source.source_document_id || source.source_hash || 'source', order, rawText]).slice(0, 20)}`;
     return {
-      block_id: blockId, order, kind, text: rawText,
+      block_id: blockId, order, kind, text: rawText, raw_verbatim: originalText,
       source_language: detectLanguage(rawText),
       hierarchy, locator: normalizeLocator(raw?.locator, blockId),
       parse_status: clean(raw?.parse?.status, 40) || (rawText ? 'present' : 'missing'),
-      metadata, provenance: Array.isArray(raw?.provenance) ? raw.provenance : []
+      parent_id: clean(raw?.parent_id, 160), inferred: raw?.inferred && typeof raw.inferred === 'object' ? { ...raw.inferred } : {},
+      parse_method: clean(raw?.parse?.method || raw?.parse_method, 80), parse_quality: Number(raw?.parse?.quality ?? raw?.parse_quality),
+      card_eligible: raw?.card_eligible !== false, metadata, provenance: Array.isArray(raw?.provenance) ? raw.provenance : [],
+      content_integrity: analyzeText(originalText)
     };
-  }).filter((block) => block.text || ['figure', 'attachment', 'page', 'sheet'].includes(block.kind));
+  }).filter((block) => block.content_integrity.ok
+    && (block.text || ['figure', 'attachment', 'page', 'sheet'].includes(block.kind)));
   const sourceId = clean(source.source_document_id || source.source_identity, 300)
     || `src-${digest([source.source_hash, source.source_path, blocks.map((block) => block.text)]).slice(0, 24)}`;
-  return {
-    schema_version: 'canonical-document/1.0', pipeline_version: PIPELINE_VERSION,
+  const canonical = {
+    schema_version: 'canonical-document/2.0', pipeline_version: PIPELINE_VERSION,
+    pre_generation_semantic_contract: {
+      version: PRE_GENERATION_SEMANTIC_CONTRACT_VERSION,
+      fingerprint: PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT
+    },
     source_document_id: sourceId, source_identity: clean(source.source_identity, 300) || sourceId,
     source_hash: clean(source.source_hash, 128), source_path: clean(source.source_path, 1000),
     title: clean(source.title || source.filename, 400) || '未命名资料',
     media_type: clean(source.media_type || source.source_type, 120) || 'unknown',
     source_language: detectLanguage(blocks.map((block) => block.text).join('\n')),
     output_language: OUTPUT_LANGUAGE,
-    metadata: source.metadata && typeof source.metadata === 'object' ? { ...source.metadata } : {},
-    blocks, fingerprint: digest(blocks.map(({ kind, text, hierarchy }) => ({ kind, text, hierarchy })))
+    metadata: { ...(source.metadata && typeof source.metadata === 'object' ? source.metadata : {}), pre_generation_diagnostics: prepared.diagnostics },
+    blocks
   };
+  canonical.structure = buildStructureContext(source, blocks);
+  canonical.fingerprint = digest([blocks.map(({ block_id, kind, text }) => ({ block_id, kind, text })), canonical.structure]);
+  return canonical;
+}
+
+function isReusableUniversalArtifact(artifact, sourceHash) {
+  return artifact?.document?.source_hash === sourceHash
+    && artifact?.pipeline_version === PIPELINE_VERSION
+    && artifact?.document?.pre_generation_semantic_contract?.version === PRE_GENERATION_SEMANTIC_CONTRACT_VERSION
+    && artifact?.document?.pre_generation_semantic_contract?.fingerprint === PRE_GENERATION_SEMANTIC_CONTRACT_FINGERPRINT
+    && artifact?.document?.structure?.schema_version === STRUCTURE_VERSION
+    && Array.isArray(artifact?.knowledge_units)
+    && Array.isArray(artifact?.knowledge_events)
+    && artifact.knowledge_events.every((event) => event?.schema_version === 'useful-card/2.0/knowledge-event')
+    && Array.isArray(artifact?.card_plans)
+    && artifact.card_plans.every((plan) => plan?.schema_version === 'useful-card/2.0/card-plan');
+}
+
+function reusableTranslationCache(checkpoint, priorArtifact, sourceHash) {
+  if (checkpoint?.schema_version === 'translation-checkpoint/2.0'
+    && checkpoint?.source_hash === sourceHash && checkpoint?.cache && typeof checkpoint.cache === 'object') return checkpoint.cache;
+  if (priorArtifact?.document?.source_hash === sourceHash
+    && priorArtifact?.translation_cache && typeof priorArtifact.translation_cache === 'object') return priorArtifact.translation_cache;
+  return {};
 }
 
 function semanticSignals(text) {
@@ -261,11 +335,10 @@ function segmentDocument(document) {
     const heading = block.kind === 'heading' || block.hierarchy.length
       ? clean(block.text || block.hierarchy.at(-1), 300) : '';
     const subject = heading || clean(block.hierarchy.at(-1), 300) || clean(block.text.split(/[。；;\n]/)[0], 160);
-    const boundary = !current || kind === 'noise' || current.semantic_kind === 'noise'
-      || heading || kind !== current.semantic_kind
-      || (block.metadata.scope_id && block.metadata.scope_id !== current.scope_id)
-      || (block.metadata.temporal_scope && block.metadata.temporal_scope !== current.temporal_scope)
-      || current.blocks.length >= 8;
+    // Canonical structural blocks are translation/request units only. Semantic
+    // knowledge boundaries are decided later from events, never from length,
+    // dominant keywords, or a fixed block count.
+    const boundary = !current || current.blocks.length > 0;
     if (boundary) {
       flush();
       current = {
@@ -282,9 +355,10 @@ function segmentDocument(document) {
   for (const region of regions) {
     const level = Math.max(0, region.blocks[0]?.hierarchy?.length || 0);
     while (stack.length > level) stack.pop();
-    if (stack.length) {
-      region.parent_region_id = stack.at(-1).region_id;
-      stack.at(-1).child_region_ids.push(region.region_id);
+    const parent = [...stack].reverse().find(Boolean);
+    if (parent) {
+      region.parent_region_id = parent.region_id;
+      parent.child_region_ids.push(region.region_id);
     }
     stack[level] = region;
     stack.length = level + 1;
@@ -345,12 +419,45 @@ function translationCacheKey(region, options = {}) {
   ]);
 }
 
+const DEFAULT_TRANSLATION_BATCH_CHARS = 24000;
+const MIN_TRANSLATION_CHUNK_CHARS = 600;
+const MAX_TRANSLATION_SEMANTIC_RETRIES = 2;
+const TRANSLATION_SEMANTIC_ERROR_CODES = new Set([
+  'TRANSLATION_NOT_CHINESE', 'TRANSLATION_FIDELITY_INVALID'
+]);
+
+function splitTranslationText(text, maxChars) {
+  const source = clean(text, 30000);
+  if (source.length <= maxChars) return [source];
+  const chunks = [];
+  let rest = source;
+  while (rest.length > maxChars) {
+    const window = rest.slice(0, maxChars + 1);
+    const candidates = [window.lastIndexOf('\n'), window.lastIndexOf('。'), window.lastIndexOf('. '), window.lastIndexOf('；'), window.lastIndexOf('; ')];
+    let cut = Math.max(...candidates);
+    if (cut < Math.min(MIN_TRANSLATION_CHUNK_CHARS, Math.floor(maxChars * 0.5))) cut = maxChars;
+    else cut += 1;
+    chunks.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) chunks.push(rest);
+  return chunks.filter(Boolean);
+}
+
+function translationWorkItems(pending, maxChars) {
+  return pending.flatMap((item) => splitTranslationText(item.region.text, maxChars).map((text, index, parts) => ({
+    ...item, text, part_index: index, part_count: parts.length,
+    request_id: parts.length === 1 ? item.region.region_id : `${item.region.region_id}::${index + 1}/${parts.length}`
+  })));
+}
+
 async function translateRegions(regions, options = {}) {
   const cache = options.translation_cache && typeof options.translation_cache === 'object'
     ? { ...options.translation_cache } : {};
   const telemetry = {
     regions: [], cache_hits: 0, cache_misses: 0, provider_calls: 0,
-    provider_tokens: 0, failures: 0, fallback_count: 0
+    provider_tokens: 0, failures: 0, fallback_count: 0,
+    semantic_retries: 0, semantic_retry_failures: 0
   };
   const pending = [];
   for (const region of regions) {
@@ -364,8 +471,17 @@ async function translateRegions(regions, options = {}) {
       continue;
     }
     const key = translationCacheKey(region, options);
-    if (cache[key]?.translated_text) {
-      region.translated_text = cache[key].translated_text;
+    let cachedTranslation = null;
+    if (cache[key]?.version === TRANSLATION_VERSION && cache[key]?.source_language === language.language) {
+      try {
+        cachedTranslation = validateTranslationResult(
+          [{ region_id: region.region_id, text: region.text }],
+          [{ region_id: region.region_id, translated_text: cache[key].translated_text }]
+        )[0].translated_text;
+      } catch (_) { delete cache[key]; }
+    }
+    if (cachedTranslation) {
+      region.translated_text = cachedTranslation;
       region.translation = { status: 'translated', version: TRANSLATION_VERSION, provenance: 'cache', cache_key: key };
       telemetry.cache_hits += 1;
       telemetry.regions.push({ region_id: region.region_id, source_language: language.language, status: 'cache_hit' });
@@ -390,37 +506,111 @@ async function translateRegions(regions, options = {}) {
     });
   }
   const batchSize = Math.max(1, Math.min(20, Number(options.translation_batch_size) || 8));
-  for (let offset = 0; offset < pending.length; offset += batchSize) {
-    const batch = pending.slice(offset, offset + batchSize);
-    const request = batch.map(({ region }) => ({
-      region_id: region.region_id, source_language: region.source_language.language,
-      text: region.text, preserve_exactly: protectedTokens(region.text)
+  const maxChars = Math.max(MIN_TRANSLATION_CHUNK_CHARS, Math.min(30000,
+    Number(options.translation_batch_char_budget) || DEFAULT_TRANSLATION_BATCH_CHARS));
+  const uniquePending = [...new Map(pending.map((item) => [item.key, item])).values()];
+  const work = uniquePending.map((item) => ({ ...item, text: item.region.text, request_id: item.region.region_id }));
+  const completedParts = new Map();
+  const batches = [];
+  for (const item of work) {
+    const last = batches.at(-1);
+    if (!last || last.length >= batchSize || last.reduce((sum, row) => sum + row.text.length, 0) + item.text.length > maxChars) batches.push([item]);
+    else last.push(item);
+  }
+  const saveCheckpoint = async () => {
+    if (typeof options.save_translation_checkpoint === 'function') {
+      await options.save_translation_checkpoint({ cache, missing_region_ids: pending
+        .filter((item) => !cache[item.key]?.translated_text).map((item) => item.region.region_id), telemetry });
+    }
+  };
+  const runBatch = async (batch) => {
+    const request = batch.map((item) => ({
+      region_id: item.request_id, source_language: item.region.source_language.language,
+      text: item.text, preserve_exactly: protectedTokens(item.text)
     }));
     try {
-      telemetry.provider_calls += 1;
-      const response = await options.translate_batch(request, {
-        target_language: OUTPUT_LANGUAGE, prompt_version: options.translation_prompt_version || TRANSLATION_VERSION,
-        contract: '只返回 translations；区域 ID 必须完整且无额外项；保留名称、代码、标准、数字、日期、单位、模态、条件和例外。'
-      });
-      const validated = validateTranslationResult(request, response);
-      telemetry.provider_tokens += Number(response?.usage?.total_tokens) || 0;
-      for (const row of validated) {
-        const item = batch.find(({ region }) => region.region_id === row.region_id);
-        item.region.translated_text = row.translated_text;
-        item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
-          provenance: 'configured-provider', cache_key: item.key };
-        cache[item.key] = { translated_text: row.translated_text,
-          source_language: item.region.source_language.language, version: TRANSLATION_VERSION };
-        telemetry.regions.push({ region_id: row.region_id,
-          source_language: item.region.source_language.language, status: 'provider' });
+      let response;
+      let validated;
+      for (let retryAttempt = 0; retryAttempt <= MAX_TRANSLATION_SEMANTIC_RETRIES; retryAttempt += 1) {
+        telemetry.provider_calls += 1;
+        const retryInstruction = retryAttempt > 0
+          ? '上一次返回未通过简体中文或忠实度校验。请逐区域修复：输出简体中文，完整保留 region_id、数字、单位、型号、条件和例外，不得返回原文、纯英文或日文。'
+          : undefined;
+        try {
+          response = await options.translate_batch(request, {
+            target_language: OUTPUT_LANGUAGE, prompt_version: options.translation_prompt_version || TRANSLATION_VERSION,
+            contract: '只返回 translations；区域 ID 必须完整且无额外项；保留名称、代码、标准、数字、日期、单位、模态、条件和例外。',
+            ...(retryAttempt > 0 ? { retry_attempt: retryAttempt, retry_instruction: retryInstruction } : {})
+          });
+          telemetry.provider_tokens += Number(response?.usage?.total_tokens) || 0;
+          validated = validateTranslationResult(request, response);
+          break;
+        } catch (error) {
+          if (!TRANSLATION_SEMANTIC_ERROR_CODES.has(error?.code)) throw error;
+          if (retryAttempt >= MAX_TRANSLATION_SEMANTIC_RETRIES) {
+            telemetry.semantic_retry_failures += 1;
+            throw error;
+          }
+          telemetry.semantic_retries += 1;
+        }
       }
+      for (const row of validated) {
+        const item = batch.find((candidate) => candidate.request_id === row.region_id);
+        completedParts.set(item.request_id, row.translated_text);
+        if (!item.fragment) {
+          const translatedText = row.translated_text;
+          item.region.translated_text = translatedText;
+          item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
+            provenance: 'configured-provider', cache_key: item.key };
+          cache[item.key] = { translated_text: translatedText,
+            source_language: item.region.source_language.language, version: TRANSLATION_VERSION };
+          telemetry.regions.push({ region_id: item.region.region_id,
+            source_language: item.region.source_language.language, status: 'provider' });
+        }
+      }
+      await saveCheckpoint();
     } catch (error) {
+      if (error?.code === 'AI_OUTPUT_TRUNCATED' && batch.length > 1) {
+        const middle = Math.ceil(batch.length / 2);
+        await runBatch(batch.slice(0, middle));
+        await runBatch(batch.slice(middle));
+        return;
+      }
+      if (error?.code === 'AI_OUTPUT_TRUNCATED' && batch.length === 1 && batch[0].text.length > MIN_TRANSLATION_CHUNK_CHARS) {
+        const item = batch[0];
+        const pieces = splitTranslationText(item.text, Math.ceil(item.text.length / 2));
+        if (pieces.length > 1) {
+          const fragments = pieces.map((text, index) => ({ ...item, text, fragment: true,
+            request_id: `${item.request_id}::recovery-${index + 1}/${pieces.length}` }));
+          for (const fragment of fragments) await runBatch([fragment]);
+          const translatedText = fragments.map((fragment) => completedParts.get(fragment.request_id)).join('\n');
+          item.region.translated_text = translatedText;
+          item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
+            provenance: 'configured-provider', cache_key: item.key };
+          cache[item.key] = { translated_text: translatedText,
+            source_language: item.region.source_language.language, version: TRANSLATION_VERSION };
+          telemetry.regions.push({ region_id: item.region.region_id,
+            source_language: item.region.source_language.language, status: 'provider-recovered-after-truncation' });
+          await saveCheckpoint();
+          return;
+        }
+      }
       telemetry.failures += batch.length;
       throw Object.assign(new Error(`翻译批次失败：${error.message}`), {
         code: error.code || 'TRANSLATION_PROVIDER_FAILED', retryable: true, cause: error,
-        checkpoint: { cache, missing_region_ids: pending.slice(offset).map((item) => item.region.region_id), telemetry }
+        checkpoint: { cache, missing_region_ids: pending.filter((item) => !cache[item.key]?.translated_text)
+          .map((item) => item.region.region_id), telemetry }
       });
     }
+  }
+  for (const batch of batches) await runBatch(batch);
+  for (const item of pending.filter((candidate) => !candidate.region.translated_text && cache[candidate.key]?.translated_text)) {
+    item.region.translated_text = cache[item.key].translated_text;
+    item.region.translation = { status: 'translated', version: TRANSLATION_VERSION,
+      provenance: 'cache', cache_key: item.key };
+    telemetry.cache_hits += 1;
+    telemetry.regions.push({ region_id: item.region.region_id,
+      source_language: item.region.source_language.language, status: 'cache_hit' });
   }
   return { regions, cache, telemetry };
 }
@@ -470,9 +660,11 @@ function normalizeKnowledgeUnit(raw, context = {}) {
   const originalStatement = clean(raw.original_statement || raw.statement || raw.summary || raw.content || raw.title, 8000);
   const sourceId = clean(raw.source_document_id || context.source_document_id, 300);
   const projectIds = uniq(raw.project_ids || (raw.project_id ? [raw.project_id] : context.project_ids || []));
-  const fingerprint = digest({ kind, source_meaning: clean(raw.source_meaning_fingerprint, 128)
-      || originalStatement.toLocaleLowerCase().replace(/\s+/g, ''), projectIds,
-    evidence: evidence.map((item) => [item.block_id, item.locator]) });
+  const semanticIdentity = {
+    kind, subject: normalizeSemanticText(raw.subject || raw.title),
+    statement: normalizeSemanticText(originalStatement || statement), projectIds, scope: clean(raw.scope, 120)
+  };
+  const fingerprint = digest(semanticIdentity);
   return {
     schema_version: 'knowledge-unit/1.0', unit_id: clean(raw.unit_id || raw.candidate_id || raw.card_id, 300) || `ku-${fingerprint.slice(0, 24)}`,
     fingerprint, title: clean(raw.translated_title || raw.title, 180) || clean(statement.split(/[。；;\n]/)[0], 120) || '知识单元',
@@ -508,7 +700,7 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
       continue;
     }
     const evidence = region.blocks.filter((block) => block.text).map((block) => ({
-      block_id: block.block_id, locator: block.locator, verbatim: block.text,
+      block_id: block.block_id, locator: block.locator, verbatim: block.raw_verbatim ?? block.text,
       provenance: [block.locator, ...block.provenance]
     }));
     if (!evidence.length) {
@@ -539,11 +731,12 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
     if (previous && previous.semantic_kind === unit.semantic_kind && previous.subject === unit.subject
       && previous.scope === unit.scope && previous.status === unit.status
       && previous.statement.length + unit.statement.length < 10000) {
-      previous.statement += `\n${unit.statement}`;
+      previous.statement = dedupeSemanticTexts([previous.statement, unit.statement]).join('\n');
       previous.evidence.push(...unit.evidence);
       previous.source_region_ids.push(region.region_id);
       previous.structured_facts = extractFacts(previous.statement);
-      previous.fingerprint = digest([previous.semantic_kind, previous.statement, previous.project_ids]);
+      previous.fingerprint = digest({ kind: previous.semantic_kind, subject: normalizeSemanticText(previous.subject),
+        statement: normalizeSemanticText(previous.statement), projectIds: previous.project_ids, scope: previous.scope });
       coverage[region.region_id] = { status: 'merged', unit_id: previous.unit_id, reason: '相邻且主题、范围、责任和语义类型兼容' };
     } else {
       units.push(unit);
@@ -552,7 +745,10 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
   }
   const deduped = [];
   for (const unit of units) {
-    const duplicate = deduped.find((item) => item.fingerprint === unit.fingerprint);
+    const duplicate = deduped.find((item) => item.fingerprint === unit.fingerprint
+      || (item.semantic_kind === unit.semantic_kind && normalizeSemanticText(item.subject) === normalizeSemanticText(unit.subject)
+        && semanticTextSignature(item.statement) === semanticTextSignature(unit.statement)
+        && stableJson(item.project_ids || []) === stableJson(unit.project_ids || []) && item.scope === unit.scope));
     if (duplicate) {
       duplicate.evidence.push(...unit.evidence);
       duplicate.source_region_ids.push(...unit.source_region_ids);
@@ -569,6 +765,69 @@ function planKnowledgeUnits(document, profile, regions, options = {}) {
     unit.confidence.route = unit.route.confidence;
   }
   return { units: deduped, coverage };
+}
+
+function planUsefulKnowledgeUnits(document, profile, regions, options = {}) {
+  const generated = generateUsefulCards(document, regions, options);
+  const evidenceById = new Map(document.blocks.map((block) => [block.block_id, {
+    block_id: block.block_id, locator: block.locator, verbatim: block.raw_verbatim ?? block.text,
+    provenance: [block.locator, ...block.provenance]
+  }]));
+  const eventsById = new Map(generated.events.map((event) => [event.event_id, event]));
+  const units = generated.plans.map((plan) => {
+    const event = eventsById.get(plan.included_event_ids[0]);
+    const projectIds = uniq([...profile.project_scope]);
+    const eventEvidence = plan.evidence_ids.map((id) => evidenceById.get(id)).filter(Boolean);
+    const originalStatement = eventEvidence.map((item) => item.verbatim).join('\n');
+    const originalLanguage = detectLanguage(originalStatement);
+    const raw = {
+      semantic_kind: SEMANTIC_KIND[event.semantic_type] || event.semantic_type,
+      title: plan.title, original_title: event.subject, translated_title: plan.title,
+      search_title: plan.search_title, aliases: plan.aliases || [],
+      subject: event.subject, statement: plan.body, original_statement: originalStatement || event.predicate,
+      translated_statement: plan.body, source_language: originalLanguage,
+      source_meaning_fingerprint: digest([plan.included_event_ids, plan.body]),
+      evidence: eventEvidence,
+      project_ids: projectIds, source_document_id: document.source_document_id,
+      source_region_ids: plan.evidence_ids, scope: event.applicability_scope || (projectIds.length ? 'project' : 'general'),
+      status: profile.lifecycle, authority: profile.authority,
+      conditions: event.conditions, exceptions: event.exceptions,
+      reusable_knowledge_candidate: ['method', 'procedure', 'guideline', 'requirement', 'lesson', 'term_definition'].includes(event.semantic_type)
+        && !/(本项目|本工程|this\s+project)/i.test(event.predicate),
+      uncertainty: event.uncertainty, confidence: { semantics: event.confidence, evidence: 0.95, route: 0.8 }
+    };
+    const unit = normalizeKnowledgeUnit(raw, profile);
+    unit.knowledge_event = event;
+    unit.card_plan = plan;
+    unit.search_title = plan.search_title;
+    unit.aliases = uniq(plan.aliases || []);
+    unit.keywords = uniq(plan.keywords || []);
+    unit.structure_context = plan.necessary_inherited_context;
+    unit.semantic_kind = SEMANTIC_KIND[event.semantic_type] || event.semantic_type;
+    unit.event_type = event.semantic_type;
+    unit.fingerprint = digest([plan.included_event_ids, plan.search_title, plan.body, plan.evidence_ids]);
+    unit.route = routeUnit(unit, profile, { explicit_library: options.explicit_library });
+    unit.tags = normalizeTags([KIND_TAG[unit.semantic_kind], ...profile.business_domains, ...unit.project_ids,
+      unit.route.library === 'active_tender' ? '在办' : '业务知识'], options.existing_tags || []);
+    unit.confidence.route = unit.route.confidence;
+    return unit;
+  });
+  const unitByEvent = new Map();
+  for (const unit of units) for (const eventId of unit.card_plan.included_event_ids) unitByEvent.set(eventId, unit);
+  for (const unit of units) {
+    for (const relatedEventId of unit.card_plan.related_but_not_merged_event_ids) {
+      const related = unitByEvent.get(relatedEventId);
+      if (related) unit.relations.push({ from_unit_id: unit.unit_id, to_unit_id: related.unit_id,
+        type: 'related', confidence: 1, evidence: { kind: 'planner_related_not_merged' } });
+    }
+  }
+  const coverage = {};
+  for (const region of regions) {
+    const ids = region.blocks.flatMap((block) => generated.coverage[block.block_id]?.event_ids || []);
+    coverage[region.region_id] = ids.length ? { status: 'covered', unit_ids: units.filter((unit) => unit.card_plan.included_event_ids.some((id) => ids.includes(id))).map((unit) => unit.unit_id) }
+      : { status: 'dropped', reason: region.semantic_kind === 'noise' ? region.dropped_reason : '仅提供结构上下文' };
+  }
+  return { units, coverage, useful_card: generated };
 }
 
 function repairCoverage(document, profile, regions, planned, options = {}) {
@@ -610,6 +869,7 @@ function groupedReview(units) {
     const causes = [];
     if (unit.route.ambiguous) causes.push('ambiguous_library_route');
     if (unit.uncertainty.includes('material_conflict')) causes.push('material_conflict');
+    if (unit.event_type === 'unknown') causes.push('unknown_knowledge_event_type');
     for (const cause of causes) {
       if (!byCause.has(cause)) byCause.set(cause, []);
       byCause.get(cause).push(unit.unit_id);
@@ -619,7 +879,8 @@ function groupedReview(units) {
     review_id: `review-${digest([units[0]?.source_document_id, cause]).slice(0, 20)}`,
     cause, unit_ids: unitIds,
     reason: cause === 'ambiguous_library_route' ? '资料涉及项目，但无法确认项目当前是否在办。'
-      : '同一关键事项出现实质冲突，需要确认采用哪一项。',
+      : cause === 'unknown_knowledge_event_type' ? '知识事件类型无法确定，已显式保留并等待审核。'
+        : '同一关键事项出现实质冲突，需要确认采用哪一项。',
     action: cause === 'ambiguous_library_route' ? '请选择整份资料的在办库或业务库归属。' : '查看原文差异并选择有效内容。'
   }));
 }
@@ -628,15 +889,15 @@ function runUniversalPipeline(input = {}) {
   const document = canonicalizeDocument(input.document || input);
   const profile = inferProfile(document);
   const regions = segmentDocument(document);
-  let planned = planKnowledgeUnits(document, profile, regions, input);
-  planned = repairCoverage(document, profile, regions, planned, input);
-  const relations = relationEvidence(planned.units);
+  const planned = planUsefulKnowledgeUnits(document, profile, regions, input);
+  const relations = [...relationEvidence(planned.units), ...planned.units.flatMap((unit) => unit.relations || [])];
   for (const relation of relations) {
     const source = planned.units.find((unit) => unit.unit_id === relation.from_unit_id);
     if (source) source.relations.push(relation);
   }
   const meaningful = regions.filter((region) => region.semantic_kind !== 'noise').length;
-  const covered = Object.values(planned.coverage).filter((entry) => ['covered', 'merged'].includes(entry.status)).length;
+  const covered = regions.filter((region) => region.semantic_kind !== 'noise'
+    && ['covered', 'merged', 'dropped'].includes(planned.coverage[region.region_id]?.status)).length;
   const telemetry = {
     parse_blocks: document.blocks.length, semantic_regions: regions.length,
     planned_units: planned.units.length, semantic_coverage: meaningful ? covered / meaningful : 1,
@@ -644,12 +905,14 @@ function runUniversalPipeline(input = {}) {
     llm_calls: 0, llm_tokens: 0, cache_hits: Number(input.cache_hits) || 0,
     accepted: planned.units.length - groupedReview(planned.units).flatMap((group) => group.unit_ids).length,
     review: groupedReview(planned.units).length, rejected: regions.filter((region) => region.semantic_kind === 'noise').length,
-    relations: relations.length, writes: 0
+    relations: relations.length, writes: 0,
+    structure_contract_version: STRUCTURE_VERSION, structure: planned.useful_card.diagnostics.structure
   };
   return {
     schema_version: 'universal-pipeline/1.0', pipeline_version: PIPELINE_VERSION,
     document, profile, regions, knowledge_units: planned.units, coverage: planned.coverage,
-    repaired_region_ids: planned.repaired_region_ids, relations,
+    repaired_region_ids: [], relations, knowledge_events: planned.useful_card.events,
+    card_plans: planned.useful_card.plans, generation_diagnostics: planned.useful_card.diagnostics,
     review_decisions: groupedReview(planned.units), telemetry,
     cache_key: digest([document.fingerprint, PIPELINE_VERSION, input.prompt_version || 'local-v1', input.model_version || 'none'])
   };
@@ -657,24 +920,31 @@ function runUniversalPipeline(input = {}) {
 
 async function runUniversalPipelineMultilingual(input = {}) {
   const document = canonicalizeDocument(input.document || input);
+  if (!document.blocks.some((block) => block.text)) {
+    const error = new Error('未发现可核验的自然语言证据；不会翻译或生成知识卡片。');
+    error.code = 'NO_VERIFIABLE_NATURAL_LANGUAGE_EVIDENCE';
+    throw error;
+  }
   const profile = inferProfile(document);
   const regions = segmentDocument(document);
   const translated = await translateRegions(regions, input);
-  let planned = planKnowledgeUnits(document, profile, translated.regions, input);
-  planned = repairCoverage(document, profile, translated.regions, planned, input);
-  const relations = relationEvidence(planned.units);
+  const planned = planUsefulKnowledgeUnits(document, profile, translated.regions, input);
+  const relations = [...relationEvidence(planned.units), ...planned.units.flatMap((unit) => unit.relations || [])];
   for (const relation of relations) {
     const source = planned.units.find((unit) => unit.unit_id === relation.from_unit_id);
     if (source) source.relations.push(relation);
   }
   const meaningful = regions.filter((region) => region.semantic_kind !== 'noise').length;
-  const covered = Object.values(planned.coverage).filter((entry) => ['covered', 'merged'].includes(entry.status)).length;
+  const covered = regions.filter((region) => region.semantic_kind !== 'noise'
+    && ['covered', 'merged', 'dropped'].includes(planned.coverage[region.region_id]?.status)).length;
   const review = groupedReview(planned.units);
   return {
     schema_version: 'universal-pipeline/1.1', pipeline_version: PIPELINE_VERSION,
     output_language: OUTPUT_LANGUAGE, document, profile, regions: translated.regions,
     knowledge_units: planned.units, coverage: planned.coverage,
-    repaired_region_ids: planned.repaired_region_ids, relations, review_decisions: review,
+    repaired_region_ids: [], relations, review_decisions: review,
+    knowledge_events: planned.useful_card.events, card_plans: planned.useful_card.plans,
+    generation_diagnostics: planned.useful_card.diagnostics,
     translation_cache: translated.cache, translation_checkpoint: { status: 'complete', missing_region_ids: [] },
     telemetry: {
       parse_blocks: document.blocks.length, semantic_regions: regions.length,
@@ -684,7 +954,8 @@ async function runUniversalPipelineMultilingual(input = {}) {
       cache_hits: translated.telemetry.cache_hits, translation: translated.telemetry,
       accepted: planned.units.length - review.flatMap((group) => group.unit_ids).length,
       review: review.length, rejected: regions.filter((region) => region.semantic_kind === 'noise').length,
-      relations: relations.length, writes: 0
+      relations: relations.length, writes: 0,
+      structure_contract_version: STRUCTURE_VERSION, structure: planned.useful_card.diagnostics.structure
     },
     cache_key: digest([document.fingerprint, PIPELINE_VERSION,
       input.translation_prompt_version || TRANSLATION_VERSION, input.model_version || 'configured-provider'])
@@ -696,5 +967,7 @@ module.exports = {
   detectLanguage, deterministicChinese, validateTranslationResult, translationCacheKey, translateRegions,
   canonicalizeDocument, inferProfile, segmentDocument, normalizeKnowledgeUnit,
   normalizeTags, routeUnit, planKnowledgeUnits, repairCoverage, relationEvidence,
-  groupedReview, runUniversalPipeline, runUniversalPipelineMultilingual, digest, stableJson
+  planUsefulKnowledgeUnits,
+  groupedReview, runUniversalPipeline, runUniversalPipelineMultilingual, isReusableUniversalArtifact,
+  reusableTranslationCache, digest, stableJson
 };

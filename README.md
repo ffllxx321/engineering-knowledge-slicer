@@ -15,7 +15,7 @@
 - **v2.7 切片引擎**：借鉴 Tencent/WeKnora 的知识点切片思路——文档画像驱动策略选择、标题层级面包屑、受保护区域（表格/代码块/公式）永不切断、小节合并、切片重叠、覆盖校验
 - **可信度门槛**：五维加权（解析/类型/证据/结构/原子质量）+ 硬性门槛，低于 `autoApproveConfidenceThreshold`（默认 0.9）的卡片进入审核台
 - **Block-native 证据闭环**：本地 DOCX/XLSX/PPTX/MSG 与 PDF/OCR 块使用稳定 `block_id` 贯穿切片、总结、原子和卡片；逐字证据无法回到来源块时只进入审核
-- **选择性缓存失效**：解析缓存绑定全部 ingestion 设置与 parser/block 合同；页级 OCR checkpoint 可独立复用，后续阶段仅在输入指纹匹配时恢复
+- **选择性缓存失效**：解析缓存绑定全部 ingestion 设置与 parser/block 合同；页级 OCR checkpoint 可独立复用；通用 canonical 还必须匹配显式的预生成语义契约指纹，失配时只重建受影响的通用结构/事件/计划并继续复用安全翻译 checkpoint
 - **进度可观察**：批次进度 + 1 秒心跳计时 + HTML5 进度条，长任务不再「无响应假死」
 - **并发 + 限流**：文档级并发（默认 3）+ AI 请求限流器（指数退避、遵循 Retry-After），原子化批次内支持有限并发（默认 2 路）
 - **SSE 流式输出（POC）**：可选开启，AI 调用期间逐 token 回显
@@ -23,6 +23,8 @@
 - **诊断报告**：Dashboard 错误详情一键复制结构化脱敏报告（64 KiB JSON 硬上限），优先提交该报告而不是原始日志
 - **生产影子评估（v2.13）**：默认关闭；在插件内复用本地解析与已有检查点，以确定性分层队列采集脱敏质量/成本/时延指标，不写卡片、MOC、索引，也不改变任务终态。provider 请求有每次运行硬预算，设为 0 时绝不联网
 - **受控结构化写入（未发布）**：仅在高级设置显式开启。Pilot 复用真实 normalized block 和既有 AI 产物生成四类记录的 dry-run 计划，零结构化写入；Cutover 与旧卡 writer 互斥，并通过稳定 ID/路径索引、Phase 3 硬风险、事务 manifest、乐观 hash 与失败恢复后才写两库。
+- **Phase 6 生产演化（集成阶段，未发布）**：稳定提交链复用 Phase 5 合同，把版本、冲突、适用范围和证据关系写入卡片及事务必需 sidecar；详见 [Phase 6 设计与限制](docs/PHASE6_PRODUCTION_EVOLUTION.md)。旧版 Markdown 仍按未注明日期、无关系记录读取。
+- **v3 Phase 5 跨文档演进实验**：以稳定来源/块/证据身份构建版本化事实图，区分逐字重复、等价、相关、冲突与明确取代；Markdown 重载保留原文与关系，检索支持显式 `as_of` 和历史版本。设计与局限见 `docs/phase5-cross-document-evolution.md`。
 - **诊断日志**：全链路脱敏 diag 日志，默认写到 `~/.eks/logs/diag.log`，保留为本地深度排查兼容入口
 - **安全检查点与结构化错误**：阶段产物以 source/pipeline/prompt/schema 指纹校验后复用；错误提供稳定代码、可重试性和建议操作，日志递归脱敏 Header、JWT 和敏感 URL 参数
 - **可取消的外部工作**：取消会中止 MiniMax 与必要 MinerU 请求、上传、轮询等待和下载，不再等当前远程阶段自然超时
@@ -144,6 +146,14 @@ npm test
 npm run benchmark  # 仅测本地编排，不调用付费 API
 npm run dev        # 监听模式
 ```
+
+真实卡片检索评测直接读取生产 serializer 格式的 Markdown（单文件或递归目录），并要求显式、版本化的 `eks-real-card-question-set/1.0` ground truth：
+
+```bash
+npm run eval:real-cards -- ./卡片目录 ./questions-v1.json ./retrieval-report.json
+```
+
+报告仅包含 corpus 计数、聚合指标、重复项 ID、失败分类和逐问题排名/得分解释，不包含完整卡片、完整来源文档或 provider 原始响应。损坏编码、疑似二进制、空 corpus 和空/无效 ground truth 均失败关闭。问题集可参考 `scripts/fixtures/real-card-questions-v1.json`；`npm run test:retrieval` 会用真实 `serializeRecord` 生成代表性临时 corpus，验证 round-trip、检索、证据与重启一致性。
 
 烟雾测试（不需要 Obsidian，从 main.js 抽取真实模块隔离执行）：
 

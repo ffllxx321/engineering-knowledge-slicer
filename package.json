@@ -5,22 +5,41 @@
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs watch",
-    "build": "node scripts/embed-local-ocr.js --check && node scripts/embed-ooxml.js --check && node scripts/embed-structured-writer.js --check && node scripts/embed-table-knowledge.js --check && node scripts/gate-production-architecture.js && node scripts/regression-production-state-machine.js && node scripts/validate-bundle-build.js",
-    "pretest": "node scripts/regression-single-auto-path-real-ingest.js && node scripts/regression-knowledge-write-port.js && node scripts/audit-success-claims.js && node scripts/regression-false-success-v2208.js && node scripts/regression-workflow-consistency-v2207.js && node scripts/regression-local-text-blocks.js && node scripts/regression-parse-artifact-upgrade.js && node scripts/regression-evidence-scope-v219.js && node scripts/regression-review-migration-v219.js && node scripts/regression-review-policy-v220.js && node scripts/regression-universal-production-path-v2201.js && node scripts/regression-production-vault-root-boundary.js && node scripts/regression-consistency-repair-v2205.js && node scripts/regression-provenance-production-fix.js && node scripts/regression-summary-map-provenance-v219.js && node scripts/regression-production-canonical-boundaries.js && node scripts/regression-table-review-v2191.js",
+    "test:acceptance-truthfulness": "node scripts/regression-acceptance-truthfulness.js",
+    "test:acceptance-lifecycle": "node scripts/regression-acceptance-lifecycle.js",
+    "build": "node scripts/embed-local-ocr.js --check && node scripts/embed-ooxml.js --check && node scripts/embed-structured-writer.js --check && node scripts/embed-auto-document-parser.js --check && node scripts/embed-table-knowledge.js --check && node scripts/gate-production-architecture.js && node scripts/regression-production-state-machine.js && node scripts/validate-bundle-build.js",
+    "pretest": "node scripts/regression-upgrade-compatibility.js && node scripts/regression-pdf-extraction-parity.js && node scripts/regression-content-integrity.js && node scripts/regression-mineru-markdown-quality.js && node scripts/regression-single-auto-path-real-ingest.js && node scripts/regression-knowledge-write-port.js && node scripts/audit-success-claims.js && node scripts/regression-false-success-v2208.js && node scripts/regression-workflow-consistency-v2207.js && node scripts/regression-local-text-blocks.js && node scripts/regression-parse-artifact-upgrade.js && node scripts/regression-evidence-scope-v219.js && node scripts/regression-review-migration-v219.js && node scripts/regression-review-policy-v220.js && node scripts/regression-universal-production-path-v2201.js && node scripts/regression-production-vault-root-boundary.js && node scripts/regression-consistency-repair-v2205.js && node scripts/regression-provenance-production-fix.js && node scripts/regression-summary-map-provenance-v219.js && node scripts/regression-production-canonical-boundaries.js && node scripts/regression-table-review-v2191.js",
     "lint": "node --check main.js && node --check scripts/*.js && node --check src/*.js",
     "typecheck": "tsc -p tsconfig.json",
+    "test:useful-card": "node scripts/test-useful-card-generation.js && node scripts/test-useful-card-bounded-optimization.js && node scripts/test-structure-aware-useful-cards.js && node scripts/test-inline-enumeration-generation.js && node scripts/regression-pre-generation-final-review.js && node scripts/test-human-readable-card.js && node scripts/test-phase3-generation-quality.js && node scripts/test-phase4-ocr-complex-tables.js",
+    "test:phase4-structure": "node scripts/test-phase4-ocr-complex-tables.js",
+    "test:v3": "node scripts/test-v3-core.js",
+    "test:v3-phase2": "node scripts/test-v3-phase2.js",
+    "test:v3-phase3": "node scripts/test-v3-phase3.js",
+    "test:v3-phase4": "node scripts/test-v3-phase4.js",
+    "test:v3-phase5": "node scripts/test-v3-phase5.js",
+    "test:v3-phase6": "node scripts/test-v3-phase6.js && node scripts/regression-phase6-startup.js",
+    "gate:v3-architecture": "node scripts/gate-v3-architecture.js",
+    "gate:v3-obsidian": "node scripts/verify-v3-real-obsidian.js",
     "test:multilingual": "node scripts/test-multilingual-zh-output.js",
+    "test:translation-resume": "node scripts/regression-universal-translation-resume.js",
+    "test:minimax-output-limit": "node scripts/regression-minimax-output-limit.js",
     "test:phase1": "node scripts/test-phase1-foundation.js",
     "test:phase2": "node scripts/test-phase2-candidate-pipeline.js",
     "test:phase3": "node scripts/test-phase3-review-gate.js",
-    "test:structured": "node scripts/test-structured-writer.js && node scripts/regression-production-vault-root-boundary.js",
-    "test": "node scripts/test-universal-pipeline.js && npm run test:phase1 && npm run test:phase2 && npm run test:phase3 && node scripts/regression-task-ledger-lossless.js && node scripts/regression-generic-card-architecture.js && node scripts/regression-review-explosion-v218.js && node scripts/test-semantic-embedding.js && node scripts/regression-minimal-settings-ui.js && node scripts/regression-cache-maintenance.js && node scripts/regression-reliability-consistency.js && node scripts/regression-component-runtime.js && node scripts/regression-builtin-component-fallback.js && node scripts/regression-shadow-evaluation.js && node scripts/regression-block-native-quality.js && node scripts/smoke-timestamp-policy.js && node scripts/smoke-split.js && node scripts/smoke-splitter-v26.js && node scripts/smoke-ratelimit.js && node scripts/smoke-json-repair.js && node scripts/smoke-v292.js && node scripts/smoke-performance-reliability.js && node scripts/smoke-reliability-v210.js && node scripts/regression-diagnostic-report.js && node scripts/smoke-summary-reduce-recovery.js && node scripts/integration-workflow-recovery.js && node scripts/gap-closure-tests.js && node scripts/regression-production-repair.js && node scripts/regression-production-ux.js && node scripts/regression-ocr-provenance.js && node scripts/regression-local-ocr.js && node scripts/regression-ooxml.js && node scripts/regression-selected-regeneration.js && node scripts/regression-completion-transition.js",
+    "test:structured": "node scripts/test-title-boundary.js && node scripts/test-audit-real-obsidian-cards.js && node scripts/test-structured-writer.js && node scripts/regression-semantic-card-dedup.js && node scripts/regression-production-vault-root-boundary.js",
+    "test": "node scripts/test-universal-pipeline.js && npm run test:phase1 && npm run test:phase2 && npm run test:phase3 && npm run test:useful-card && npm run test:retrieval && node scripts/regression-task-ledger-lossless.js && node scripts/regression-generic-card-architecture.js && node scripts/regression-review-explosion-v218.js && node scripts/test-semantic-embedding.js && node scripts/regression-minimal-settings-ui.js && node scripts/regression-cache-maintenance.js && node scripts/regression-reliability-consistency.js && node scripts/regression-component-runtime.js && node scripts/regression-builtin-component-fallback.js && node scripts/regression-shadow-evaluation.js && node scripts/regression-block-native-quality.js && node scripts/smoke-timestamp-policy.js && node scripts/smoke-split.js && node scripts/smoke-splitter-v26.js && node scripts/smoke-ratelimit.js && node scripts/smoke-json-repair.js && node scripts/smoke-v292.js && node scripts/smoke-performance-reliability.js && node scripts/smoke-reliability-v210.js && node scripts/regression-diagnostic-report.js && node scripts/smoke-summary-reduce-recovery.js && node scripts/integration-workflow-recovery.js && node scripts/gap-closure-tests.js && node scripts/regression-production-repair.js && node scripts/regression-production-ux.js && node scripts/regression-ocr-provenance.js && node scripts/regression-local-ocr.js && node scripts/regression-ooxml.js && node scripts/regression-selected-regeneration.js && node scripts/regression-completion-transition.js",
     "test:production-slice": "node scripts/regression-block-v0-adapters.js && node scripts/regression-local-ocr.js && node scripts/regression-ooxml.js",
     "benchmark": "node scripts/benchmark-optimization.js && node scripts/benchmark-semantic.js",
     "release:obsidian": "node scripts/release-verify-real-obsidian.js",
+    "acceptance:real": "node scripts/acceptance-real.js",
+    "acceptance:provider-real": "node scripts/acceptance-provider-real.js",
     "release:verify": "npm run lint && npm run typecheck && npm test && npm run build && npm run benchmark && npm run release:obsidian && node scripts/check-release-evidence.js",
     "test:semantic": "node scripts/test-semantic-embedding.js",
-    "benchmark:semantic": "node scripts/benchmark-semantic.js"
+    "benchmark:semantic": "node scripts/benchmark-semantic.js",
+    "test:retrieval": "node scripts/test-retrieval-phase1.js && node scripts/test-real-card-evaluation.js",
+    "eval:retrieval": "node scripts/test-retrieval-phase1.js",
+    "eval:real-cards": "node scripts/evaluate-real-cards.js"
   },
   "keywords": [
     "obsidian",
@@ -40,5 +59,8 @@
     "obsidian": "^1.5.0",
     "tslib": "^2.6.2",
     "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^3.11.174"
   }
 }

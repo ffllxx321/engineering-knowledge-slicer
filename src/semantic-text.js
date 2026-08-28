@@ -8,8 +8,13 @@ const crypto = require('crypto');
 // remain part of the signature.
 const LIST_PREFIX = /^(?:\s*(?:[-*•●▪■□☐✓✔]+|[（(]?\d+[)）.、]|[（(]?[一二三四五六七八九十百]+[)）、.])\s*)+/u;
 const PRESENTATION_PUNCTUATION = /[\s,，.。;；!?！？、'"“”‘’`´…]/gu;
-const MARKDOWN_BOUNDARY_PREFIX = /^(?:\s*(?:#{1,6}\s*|>\s*|[-+*•●▪■□☐✓✔]+\s*|\[[ xX]\]\s*|[（(]?\d+[)）.、]\s*|[（(]?[一二三四五六七八九十百]+[)）、.]\s*))+/u;
-const BOUNDARY_PUNCTUATION = /^[\s\p{P}\p{S}]+|[\s\p{P}\p{S}]+$/gu;
+const MARKDOWN_BOUNDARY_PREFIX = /^(?:\s*(?:#{1,6}(?=\s)\s*|>(?=\s)\s*|[-+*](?=\s)\s*|[•●▪■□☐✓✔]\s*|\[[ xX]\](?=\s)\s*|[（(]?\d+[)）.、](?=\s)\s*|[（(]?[一二三四五六七八九十百]+[)）、.](?=\s)\s*))+/u;
+const PRESENTATION_WRAPPERS = [
+  [/^\*\*(.+)\*\*$/u, '$1'], [/^__(.+)__$/u, '$1'], [/^~~(.+)~~$/u, '$1'],
+  [/^`+(.+?)`+$/u, '$1'], [/^"(.+)"$/u, '$1'], [/^'(.+)'$/u, '$1'],
+  [/^“(.+)”$/u, '$1'], [/^‘(.+)’$/u, '$1'], [/^《(.+)》$/u, '$1'],
+  [/^【(.+)】$/u, '$1'], [/^\[(.+)\]$/u, '$1'], [/^（(.+)）$/u, '$1'], [/^\((.+)\)$/u, '$1']
+];
 
 function cleanTitleBoundary(value, max = 160) {
   let output = String(value ?? '').normalize('NFKC')
@@ -19,9 +24,13 @@ function cleanTitleBoundary(value, max = 160) {
   // boundary is ordinary prose. Internal punctuation and engineering symbols
   // are deliberately retained.
   let previous;
-  do { previous = output; output = output.replace(MARKDOWN_BOUNDARY_PREFIX, '').replace(BOUNDARY_PUNCTUATION, '').trim(); }
+  do {
+    previous = output;
+    output = output.replace(MARKDOWN_BOUNDARY_PREFIX, '').trim();
+    for (const [wrapper, replacement] of PRESENTATION_WRAPPERS) output = output.replace(wrapper, replacement).trim();
+  }
   while (output && output !== previous);
-  return output.slice(0, max).replace(BOUNDARY_PUNCTUATION, '').trim();
+  return output.slice(0, max).trim();
 }
 
 function normalizeSemanticText(value) {

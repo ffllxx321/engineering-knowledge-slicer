@@ -962,12 +962,12 @@ module.exports = class EngineeringKnowledgeSlicerPlugin extends Plugin {
     await port.write(sourcePaths[1], '# 招投标材料\n\n这是从默认招投标源目录发起的等价用户任务。');
     const fixtures = [
       ['bi-gate-zh', 'business_item', `${businessBase}/中文/安全检查.md`, '安全检查'],
-      ['ck-gate-ja', 'company_knowledge', `${businessBase}/日本語/品質 基準.md`, '品質基準'],
+      ['ck-gate-ja', 'company_knowledge', `${businessBase}/日本語/品質 基準.md`, '品質 基準'],
       ['ck-gate-en', 'company_knowledge', `${businessBase}/English Space/Field Note.md`, 'Field Note'],
       ['bi-gate-tender', 'business_item', `${tenderBase}/投标检查.md`, '投标检查']
     ];
     const actions = fixtures.map(([record_id, record_kind, path, title]) => {
-      const content = `---\nrecord_id: "${record_id}"\nrecord_kind: "${record_kind}"\nsource_document_ids: ["src-real-gate"]\n---\n\n# ${title}\n\n- 归属来源：src-real-gate\n`;
+      const content = `---\nrecord_id: "${record_id}"\nrecord_kind: "${record_kind}"\ntitle: "${title}"\nsearch_title: "${title}"\naliases: []\nsource_document_ids: ["src-real-gate"]\n---\n\n# ${title}\n\n- 归属来源：src-real-gate\n`;
       return { record_id, record_kind, path, content, content_hash: structuredContentHash(content), owner_source_id: 'src-real-gate',
         record_snapshot: { record_kind, title, search_title: title, summary: title, semantic_kind: 'gate_probe',
           evidence: { block_id: `block-${record_id}`, locator: { fixture: record_id }, verbatim: title } } };
@@ -95240,8 +95240,13 @@ const crypto = require('crypto');
 // remain part of the signature.
 const LIST_PREFIX = /^(?:\s*(?:[-*•●▪■□☐✓✔]+|[（(]?\d+[)）.、]|[（(]?[一二三四五六七八九十百]+[)）、.])\s*)+/u;
 const PRESENTATION_PUNCTUATION = /[\s,，.。;；!?！？、'"“”‘’`´…]/gu;
-const MARKDOWN_BOUNDARY_PREFIX = /^(?:\s*(?:#{1,6}\s*|>\s*|[-+*•●▪■□☐✓✔]+\s*|\[[ xX]\]\s*|[（(]?\d+[)）.、]\s*|[（(]?[一二三四五六七八九十百]+[)）、.]\s*))+/u;
-const BOUNDARY_PUNCTUATION = /^[\s\p{P}\p{S}]+|[\s\p{P}\p{S}]+$/gu;
+const MARKDOWN_BOUNDARY_PREFIX = /^(?:\s*(?:#{1,6}(?=\s)\s*|>(?=\s)\s*|[-+*](?=\s)\s*|[•●▪■□☐✓✔]\s*|\[[ xX]\](?=\s)\s*|[（(]?\d+[)）.、](?=\s)\s*|[（(]?[一二三四五六七八九十百]+[)）、.](?=\s)\s*))+/u;
+const PRESENTATION_WRAPPERS = [
+  [/^\*\*(.+)\*\*$/u, '$1'], [/^__(.+)__$/u, '$1'], [/^~~(.+)~~$/u, '$1'],
+  [/^`+(.+?)`+$/u, '$1'], [/^"(.+)"$/u, '$1'], [/^'(.+)'$/u, '$1'],
+  [/^“(.+)”$/u, '$1'], [/^‘(.+)’$/u, '$1'], [/^《(.+)》$/u, '$1'],
+  [/^【(.+)】$/u, '$1'], [/^\[(.+)\]$/u, '$1'], [/^（(.+)）$/u, '$1'], [/^\((.+)\)$/u, '$1']
+];
 
 function cleanTitleBoundary(value, max = 160) {
   let output = String(value ?? '').normalize('NFKC')
@@ -95251,9 +95256,13 @@ function cleanTitleBoundary(value, max = 160) {
   // boundary is ordinary prose. Internal punctuation and engineering symbols
   // are deliberately retained.
   let previous;
-  do { previous = output; output = output.replace(MARKDOWN_BOUNDARY_PREFIX, '').replace(BOUNDARY_PUNCTUATION, '').trim(); }
+  do {
+    previous = output;
+    output = output.replace(MARKDOWN_BOUNDARY_PREFIX, '').trim();
+    for (const [wrapper, replacement] of PRESENTATION_WRAPPERS) output = output.replace(wrapper, replacement).trim();
+  }
   while (output && output !== previous);
-  return output.slice(0, max).replace(BOUNDARY_PUNCTUATION, '').trim();
+  return output.slice(0, max).trim();
 }
 
 function normalizeSemanticText(value) {

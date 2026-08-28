@@ -81,9 +81,17 @@ if (expected.includes(oldPredicate)) expected = expected.replace(oldPredicate, n
 const oldTranslationCache = 'translation_cache: translationCheckpoint?.cache || priorUniversal?.translation_cache || {},';
 const newTranslationCache = 'translation_cache: reusableTranslationCache(translationCheckpoint, priorUniversal, document.source_hash),';
 if (expected.includes(oldTranslationCache)) expected = expected.replace(oldTranslationCache, newTranslationCache);
+const oldGateJapaneseFixture = "['ck-gate-ja', 'company_knowledge', `${businessBase}/日本語/品質 基準.md`, '品質基準'],";
+const newGateJapaneseFixture = "['ck-gate-ja', 'company_knowledge', `${businessBase}/日本語/品質 基準.md`, '品質 基準'],";
+if (expected.includes(oldGateJapaneseFixture)) expected = expected.replace(oldGateJapaneseFixture, newGateJapaneseFixture);
+const oldGateFrontmatter = 'const content = `---\\nrecord_id: "${record_id}"\\nrecord_kind: "${record_kind}"\\nsource_document_ids: ["src-real-gate"]\\n---';
+const newGateFrontmatter = 'const content = `---\\nrecord_id: "${record_id}"\\nrecord_kind: "${record_kind}"\\ntitle: "${title}"\\nsearch_title: "${title}"\\naliases: []\\nsource_document_ids: ["src-real-gate"]\\n---';
+if (expected.includes(oldGateFrontmatter)) expected = expected.replace(oldGateFrontmatter, newGateFrontmatter);
 assert(expected.includes(newImport), '找不到 universal pipeline 运行时导入锚点');
 assert(expected.includes(newPredicate), '找不到 universal canonical 复用谓词锚点');
 assert(expected.includes(newTranslationCache), '找不到安全 translation cache 复用锚点');
+assert(expected.includes(newGateJapaneseFixture), '找不到真实 Obsidian 日文标题契约锚点');
+assert(expected.includes(newGateFrontmatter), '找不到真实 Obsidian 卡片 frontmatter 契约锚点');
 if (process.argv.includes('--check')) {
   assert.strictEqual(current, expected, 'main.js 内嵌结构化模块与 src 源文件不同步');
   console.log('structured phase embed: synchronized');

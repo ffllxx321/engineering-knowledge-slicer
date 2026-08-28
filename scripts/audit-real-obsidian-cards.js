@@ -10,6 +10,36 @@ const MALFORMED_SOURCE = '__malformed_source_document_ids__';
 function frontmatter(content) {
   return String(content).match(/^---\s*\r?\n([\s\S]*?)\r?\n---(?:\s*\r?\n|$)/)?.[1] || '';
 }
+function inspectDocumentH1(content) {
+  const text = String(content);
+  const frontmatterMatch = text.match(/^---\s*\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
+  const body = frontmatterMatch ? text.slice(frontmatterMatch[0].length) : text;
+  const lines = body.split(/\r?\n/);
+  const firstBodyLine = lines.findIndex((line) => !/^[\t ]*$/.test(line));
+  const headings = [];
+  const fencedHeadings = [];
+  let fence = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (fence) {
+      if (new RegExp(`^ {0,3}${fence.marker}{${fence.length},}[ \\t]*$`).test(line)) fence = null;
+      else {
+        const heading = line.match(/^ {0,3}#[ \t]+(.*)$/);
+        if (heading) fencedHeadings.push({ line: index + 1, text: heading[1] });
+      }
+      continue;
+    }
+    const openingFence = line.match(/^ {0,3}(`{3,}|~{3,})[^\r\n]*$/);
+    if (openingFence) {
+      fence = { marker: openingFence[1][0], length: openingFence[1].length };
+      continue;
+    }
+    const heading = line.match(/^ {0,3}#[ \t]+(.*)$/);
+    if (heading) headings.push({ line: index + 1, text: heading[1], atBodyStart: index === firstBodyLine });
+  }
+  return { headings, fencedHeadings, firstBodyLine: firstBodyLine < 0 ? null : firstBodyLine + 1,
+    firstBodyText: firstBodyLine < 0 ? '' : lines[firstBodyLine] };
+}
 function field(content, key) {
   const match = frontmatter(content).match(new RegExp(`^${key}:\\s*(.*)$`, 'm'));
   if (!match) return { present: false, valid: false, value: undefined };
@@ -41,9 +71,9 @@ function auditVault(vault) {
     .filter(({ content }) => /^(?:record_kind):\s*["']?(?:business_item|company_knowledge)["']?\s*$/m.test(frontmatter(content)))
     .map((record) => {
       const title = field(record.content, 'title'); const search = field(record.content, 'search_title');
-      return { ...record, titleField: title, searchField: search, title: typeof title.value === 'string' ? title.value.trim() : '',
+      return { ...record, titleField: title, searchField: search, title: typeof title.value === 'string' ? title.value : '',
         search: typeof search.value === 'string' ? search.value.trim() : '', aliasesField: arrayField(record.content, 'aliases'),
-        sourcesField: arrayField(record.content, 'source_document_ids'), h1: record.content.match(/^#\s+(.+)$/m)?.[1]?.trim() || '' };
+        sourcesField: arrayField(record.content, 'source_document_ids'), h1Inspection: inspectDocumentH1(record.content) };
     });
   const failures = [];
   for (const record of records) {
@@ -54,7 +84,14 @@ function auditVault(vault) {
     if (!record.aliasesField.valid) failures.push({ kind: 'invalid_aliases', file: record.file });
     if (!record.sourcesField.valid || record.sourcesField.value.length === 0) failures.push({ kind: 'invalid_source_document_ids', file: record.file });
     if (record.title && record.title !== cleanTitleBoundary(record.title)) failures.push({ kind: 'title_boundary', file: record.file, title: record.title });
-    if (record.h1 !== record.title) failures.push({ kind: 'h1_mismatch', file: record.file, title: record.title, h1: record.h1 });
+    const { headings, fencedHeadings, firstBodyLine, firstBodyText } = record.h1Inspection;
+    if (headings.length === 0) failures.push({ kind: 'missing_h1', file: record.file, title: record.title,
+      fenced_h1s: fencedHeadings, first_body_line: firstBodyLine, first_body_text: firstBodyText });
+    else if (headings.length > 1) failures.push({ kind: 'multiple_h1', file: record.file, title: record.title, h1s: headings });
+    else if (!headings[0].atBodyStart) failures.push({ kind: 'h1_not_at_body_start', file: record.file, title: record.title,
+      h1: headings[0], first_body_line: firstBodyLine, first_body_text: firstBodyText });
+    else if (headings[0].text !== record.title) failures.push({ kind: 'h1_mismatch', file: record.file,
+      title: record.title, h1: headings[0].text, line: headings[0].line });
     if (basename !== expectedBasename && !new RegExp(`^${expectedBasename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}（[2-9]\\d*）$`).test(basename)) {
       failures.push({ kind: 'path_title_mismatch', file: record.file, title: record.title, basename });
     }

@@ -35,6 +35,14 @@ expectOnly('missing_or_invalid_search_title', 'Missing search', markdown('Missin
 expectOnly('invalid_aliases', 'Bad aliases', markdown('Bad aliases', { aliases: 'not-an-array' }));
 expectOnly('invalid_source_document_ids', 'Bad sources', markdown('Bad sources', { source_document_ids: '[""]' }));
 expectOnly('h1_mismatch', 'Expected', markdown('Expected', { h1: 'Expected.' }));
+expectOnly('missing_h1', 'No heading', markdown('No heading').replace('# No heading\n', ''));
+expectOnly('missing_h1', 'Fence only', markdown('Fence only').replace('# Fence only\n', '```text\n# Fence only\n```\n'));
+expectOnly('h1_mismatch', 'Byte exact', markdown('Byte exact', { h1: 'Byte exact ' }));
+expectOnly('multiple_h1', 'Duplicate heading', `${markdown('Duplicate heading')}\n# Duplicate heading\n`);
+expectOnly('multiple_h1', 'Conflicting heading', `${markdown('Conflicting heading')}\n# Other heading\n`);
+expectOnly('h1_not_at_body_start', 'Late heading', markdown('Late heading').replace('\n# Late heading\n', '\nintro\n\n# Late heading\n'));
+assert(run({ 'Evidence heading': `${markdown('Evidence heading')}\n## 来源证据\n\n~~~markdown\n# Fake evidence H1\n~~~\n` }).passed,
+  'headings inside source evidence fences must not be classified as document H1s');
 expectOnly('path_title_mismatch', 'Path', markdown('Different'));
 for (const [marked, filename] of [['- Marked', '- Marked'], ['> Quoted', '- Quoted'],
   ['（二） Listed', '（二） Listed'], ['[x] Task', '-x- Task']]) {

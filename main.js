@@ -97451,7 +97451,13 @@ function buildPlan(input) {
     const oldPath = existingIndex?.path;
     const managedTechnical = oldPath && oldPath.split('/').at(-1) === `${record.record_id}.md`
       && input.existingFiles?.[oldPath] !== undefined && Boolean(existingIndex.content_hash);
-    let candidate = desired;
+    const priorTitle = cleanTitleBoundary(frontmatterValue(input.existingFiles?.[oldPath], 'title'), 160);
+    const priorGeneratedPath = priorTitle ? routeRecord({ ...record, title: priorTitle },
+      { ...route, directory_category: record.category || route.directory_category }, registry, settings) : '';
+    const managedHumanPath = Boolean(oldPath && oldPath === priorGeneratedPath
+      && input.existingFiles?.[oldPath] !== undefined && existingIndex?.content_hash);
+    const mayMigrate = managedTechnical || managedHumanPath;
+    let candidate = existingIndex && !mayMigrate && input.archiveTransition !== true ? oldPath : desired;
     const ext = '.md'; const stem = candidate.slice(0, -ext.length);
     let ordinal = 1;
     while ((allocated.has(candidate) && allocated.get(candidate) !== record.record_id)
@@ -97459,7 +97465,7 @@ function buildPlan(input) {
       ordinal += 1; candidate = `${stem}（${ordinal}）${ext}`;
     }
     record.path = candidate; allocated.set(candidate, record.record_id);
-    if (oldPath && oldPath !== candidate && input.archiveTransition !== true) record.migrate_from_path = oldPath;
+    if (mayMigrate && oldPath !== candidate && input.archiveTransition !== true) record.migrate_from_path = oldPath;
   }
   const reviewGroups = resolveRelations(records, index, settings.limits);
   const byPath = input.existingFiles || {};

@@ -100,4 +100,13 @@ const renamedAction = renamedPlan.actions.find((action) => /防护网/.test(acti
 assert(renamedAction && renamedAction.from_path && /move/.test(renamedAction.action), 'canonical title update safely renames the indexed file on rerun');
 assert(!/[<>:"|?*#]/.test(path.basename(renamedAction.path)) && !path.basename(renamedAction.path).startsWith('-'), 'renamed path is boundary and filename safe');
 assert(!renamedAction.content.includes('aliases: ["检查员如何复核防护网固定"'), 'aliases do not duplicate search_title');
+const manuallyMovedPath = `知识/业务/用户整理/${path.basename(first.plan.actions.find((action) => action.record_id === renamedAction.record_id).path)}`;
+const manuallyMovedIndex = structuredClone(restartIndex); manuallyMovedIndex.records[renamedAction.record_id].path = manuallyMovedPath;
+const manuallyMovedFiles = Object.fromEntries(first.plan.actions.map((action) => [
+  action.record_id === renamedAction.record_id ? manuallyMovedPath : action.path, action.content]));
+const manualPlan = buildPlan({ settings, document, universalResult: renamedResult, projectRegistry: [], index: manuallyMovedIndex,
+  existingFiles: manuallyMovedFiles, logicalTime: '2026-08-25T00:00:00.000Z' });
+const manualAction = manualPlan.actions.find((action) => action.record_id === renamedAction.record_id);
+assert(manualAction && manualAction.path === manuallyMovedPath && !manualAction.from_path && manualAction.action === 'update',
+  'a user-manually-moved generated card is updated in place instead of unexpectedly renamed');
 console.log('bounded useful-card ten-case production audit: ok');
